@@ -22,7 +22,7 @@ export class Camera {
   // Camera settings
   angularSensitivity: number = 0.005
   wheelPrecision: number = 0.005
-  pinchPrecision: number = 0.01
+  pinchPrecision: number = 0.05
   minZ: number = 0.1
   maxZ: number = 100
   lowerBetaLimit: number = 0.001
