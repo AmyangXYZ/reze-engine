@@ -44,12 +44,12 @@ export default function Home() {
 
       {/* Floating header */}
       <header className="absolute top-0 left-0 right-0 p-6 pointer-events-none">
-        <h1 className="text-3xl font-bold text-white drop-shadow-lg">Reze Engine</h1>
+        {/* <h1 className="text-3xl font-bold text-white drop-shadow-lg">Reze Engine</h1> */}
       </header>
 
       {/* Stats panel */}
       {stats && (
-        <div className="absolute top-20 right-6 bg-black/70 text-white p-4 rounded-lg text-sm font-mono pointer-events-none backdrop-blur-sm min-w-[180px]">
+        <div className="absolute top-20 right-6 bg-black/70 text-white p-4 rounded-lg text-sm font-mono pointer-events-none backdrop-blur-sm min-w-[180px] md:block hidden">
           <div className="space-y-1">
             <div className="flex justify-between gap-4">
               <span className="text-muted-foreground">FPS:</span>
