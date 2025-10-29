@@ -349,6 +349,11 @@ export class Engine {
   }
 
   public render() {
+    // Safety check - don't render if not fully initialized
+    if (!this.multisampleTexture || !this.camera || !this.device) {
+      return
+    }
+
     const frameStart = performance.now()
 
     // Update camera matrices

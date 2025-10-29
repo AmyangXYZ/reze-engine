@@ -34,9 +34,9 @@ export default function Home() {
   }, [initEngine])
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden">
+    <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
       {/* Full-screen canvas */}
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none" />
 
       {/* Floating header */}
       <header className="absolute top-0 left-0 right-0 p-6 pointer-events-none">
