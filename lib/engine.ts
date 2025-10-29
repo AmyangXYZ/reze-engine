@@ -27,6 +27,7 @@ export class Engine {
   private resizeObserver: ResizeObserver | null = null
   private renderPassDescriptor!: GPURenderPassDescriptor
   private renderPassColorAttachment!: GPURenderPassColorAttachment
+  private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
@@ -171,6 +172,12 @@ export class Engine {
         module: shaderModule,
         targets: [{ format: this.presentationFormat }],
       },
+      primitive: { cullMode: "back" },
+      depthStencil: {
+        format: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      },
       multisample: {
         count: this.sampleCount,
       },
@@ -219,6 +226,23 @@ export class Engine {
         format: this.presentationFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
+
+      // Recreate depth texture
+      this.depthTexture = this.device.createTexture({
+        label: "depth texture",
+        size: [width, height],
+        sampleCount: this.sampleCount,
+        format: "depth24plus",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+
+      // Update depth attachment on the render pass descriptor
+      this.renderPassDescriptor.depthStencilAttachment = {
+        view: this.depthTexture.createView(),
+        depthClearValue: 1.0,
+        depthLoadOp: "clear",
+        depthStoreOp: "store",
+      }
 
       // Update camera aspect ratio
       this.camera.aspect = width / height
@@ -351,6 +375,9 @@ export class Engine {
     // Update render targets for current frame
     this.renderPassColorAttachment.view = this.multisampleTexture.createView()
     this.renderPassColorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
+    if (this.renderPassDescriptor.depthStencilAttachment) {
+      this.renderPassDescriptor.depthStencilAttachment.view = this.depthTexture.createView()
+    }
 
     const encoder = this.device.createCommandEncoder({ label: "our encoder" })
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
