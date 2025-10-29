@@ -19,6 +19,11 @@ export class Engine {
   public camera!: Camera
   private cameraUniformBuffer!: GPUBuffer
   private cameraMatrixData = new Float32Array(32) // Reused every frame
+  private lightUniformBuffer!: GPUBuffer
+  // Multi-light system: ambient(1) + padding(3), then 4 lights: each light = direction(3) + padding(1), color(3) + intensity(1) = 8 floats per light
+  // Total: 4 + (4 * 8) = 36 floats, padded to 64 floats (256 bytes) for proper alignment
+  private lightData = new Float32Array(64)
+  private lightCount: number = 0 // Number of active lights (0-4)
   private bindGroup!: GPUBindGroup
   private vertexBuffer!: GPUBuffer
   private vertexCount: number = 0
@@ -80,6 +85,23 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
+    // Create uniform buffer for lighting (aligned to 256 bytes = 64 floats)
+    this.lightUniformBuffer = this.device.createBuffer({
+      label: "light uniforms",
+      size: 64 * 4, // 64 floats * 4 bytes = 256 bytes
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
+    // Initialize MMD-style multi-light setup
+    this.setAmbient(0.4)
+    this.clearLights()
+    // Key light (main, bright from front-right)
+    this.addLight(new Vec3(-0.5, 0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
+    // Fill light (softer from left)
+    this.addLight(new Vec3(0.7, 0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.6)
+    // Rim light (from behind for edge highlighting)
+    this.addLight(new Vec3(0.3, 0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.4)
+
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
       view: this.context.getCurrentTexture().createView(), // Placeholder, updated each frame
@@ -89,7 +111,7 @@ export class Engine {
     }
 
     this.renderPassDescriptor = {
-      label: "our basic canvas renderPass",
+      label: "renderPass",
       colorAttachments: [this.renderPassColorAttachment],
     }
 
@@ -105,9 +127,24 @@ export class Engine {
     const shaderModule = this.device.createShaderModule({
       label: "model shaders",
       code: /* wgsl */ `
-        struct Uniforms {
+        struct CameraUniforms {
           view: mat4x4f,
           projection: mat4x4f,
+        };
+
+        struct Light {
+          direction: vec3f,
+          _padding1: f32,
+          color: vec3f,
+          intensity: f32,
+        };
+
+        struct LightUniforms {
+          ambient: f32,
+          lightCount: f32,
+          _padding1: f32,
+          _padding2: f32,
+          lights: array<Light, 4>,
         };
 
         struct VertexOutput {
@@ -116,7 +153,8 @@ export class Engine {
           @location(1) uv: vec2f,
         };
 
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        @group(0) @binding(0) var<uniform> camera: CameraUniforms;
+        @group(0) @binding(1) var<uniform> light: LightUniforms;
 
         @vertex fn vs(
           @location(0) position: vec3f,
@@ -124,18 +162,43 @@ export class Engine {
           @location(2) uv: vec2f
         ) -> VertexOutput {
           var output: VertexOutput;
-          output.position = uniforms.projection * uniforms.view * vec4f(position, 1.0);
+          output.position = camera.projection * camera.view * vec4f(position, 1.0);
           output.normal = normal;
           output.uv = uv;
           return output;
         }
   
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
-          // Simple diffuse lighting based on normal
-          let lightDir = normalize(vec3f(0.5, 1.0, 0.3));
-          let diffuse = max(dot(normalize(input.normal), lightDir), 0.3);
-          let color = vec3f(0.8, 0.6, 0.9);
-          return vec4f(color * diffuse, 1.0);
+          let normal = normalize(input.normal);
+          
+          // Ambient lighting
+          let ambient = light.ambient;
+          let numLights = u32(light.lightCount);
+          
+          // Accumulate diffuse from all active lights
+          var totalDiffuse = vec3f(0.0);
+          
+          for (var i = 0u; i < numLights; i++) {
+            let lightDir = normalize(light.lights[i].direction);
+            let diffuseFactor = max(dot(normal, lightDir), 0.0);
+            let lightColor = light.lights[i].color;
+            let lightIntensity = light.lights[i].intensity;
+            totalDiffuse += lightColor * (diffuseFactor * lightIntensity);
+          }
+          
+          // Combine lighting
+          let lighting = vec3f(ambient) + totalDiffuse;
+          
+          // Base color (albedo)
+          let baseColor = vec3f(0.8, 0.6, 0.9);
+          
+          // Final color with lighting (linear space)
+          var finalColor = baseColor * lighting;
+          
+          // Gamma correction (linear to sRGB for true color)
+          finalColor = pow(finalColor, vec3f(1.0 / 2.2));
+          
+          return vec4f(finalColor, 1.0);
         }
       `,
     })
@@ -191,6 +254,10 @@ export class Engine {
         {
           binding: 0,
           resource: { buffer: this.cameraUniformBuffer },
+        },
+        {
+          binding: 1,
+          resource: { buffer: this.lightUniformBuffer },
         },
       ],
     })
@@ -266,6 +333,49 @@ export class Engine {
 
     // Attach controls
     this.camera.attachControl(this.canvas)
+  }
+
+  // Clear all lights
+  public clearLights() {
+    this.lightCount = 0
+    this.lightData[1] = 0 // lightCount
+    this.updateLightBuffer()
+  }
+
+  // Add a light (up to 4 lights)
+  public addLight(direction: Vec3, color: Vec3, intensity: number = 1.0): boolean {
+    if (this.lightCount >= 4) return false
+
+    const normalized = direction.normalize()
+    const baseIndex = 4 + this.lightCount * 8
+
+    // Store direction
+    this.lightData[baseIndex] = normalized.x
+    this.lightData[baseIndex + 1] = normalized.y
+    this.lightData[baseIndex + 2] = normalized.z
+    this.lightData[baseIndex + 3] = 0 // padding
+
+    // Store color and intensity
+    this.lightData[baseIndex + 4] = color.x
+    this.lightData[baseIndex + 5] = color.y
+    this.lightData[baseIndex + 6] = color.z
+    this.lightData[baseIndex + 7] = intensity
+
+    this.lightCount++
+    this.lightData[1] = this.lightCount
+    this.updateLightBuffer()
+    return true
+  }
+
+  // Set ambient light intensity (0.0 to 1.0)
+  public setAmbient(intensity: number) {
+    this.lightData[0] = intensity
+    this.updateLightBuffer()
+  }
+
+  // Update light buffer on GPU
+  private updateLightBuffer() {
+    this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
   public getStats(): EngineStats {
