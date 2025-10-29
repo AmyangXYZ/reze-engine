@@ -16,10 +16,13 @@ export class Camera {
   private lastMousePos = { x: 0, y: 0 }
   private lastTouchPos = { x: 0, y: 0 }
   private touchIdentifier: number | null = null
+  private isPinching: boolean = false
+  private lastPinchDistance: number = 0
 
   // Camera settings
   angularSensitivity: number = 0.005
   wheelPrecision: number = 0.001
+  pinchPrecision: number = 0.01
   minZ: number = 0.5
   maxZ: number = 10
   lowerBetaLimit: number = 0.001
@@ -132,42 +135,80 @@ export class Camera {
       // Single touch - rotation
       const touch = e.touches[0]
       this.isDragging = true
+      this.isPinching = false
       this.touchIdentifier = touch.identifier
       this.lastTouchPos = { x: touch.clientX, y: touch.clientY }
+    } else if (e.touches.length === 2) {
+      // Two touches - pinch zoom
+      this.isDragging = false
+      this.isPinching = true
+      const touch1 = e.touches[0]
+      const touch2 = e.touches[1]
+      const dx = touch2.clientX - touch1.clientX
+      const dy = touch2.clientY - touch1.clientY
+      this.lastPinchDistance = Math.sqrt(dx * dx + dy * dy)
     }
   }
 
   private onTouchMove(e: TouchEvent) {
     e.preventDefault()
 
-    if (!this.isDragging || this.touchIdentifier === null) return
+    if (this.isPinching && e.touches.length === 2) {
+      // Two-finger pinch zoom
+      const touch1 = e.touches[0]
+      const touch2 = e.touches[1]
+      const dx = touch2.clientX - touch1.clientX
+      const dy = touch2.clientY - touch1.clientY
+      const distance = Math.sqrt(dx * dx + dy * dy)
 
-    // Find the touch we're tracking
-    let touch: Touch | null = null
-    for (let i = 0; i < e.touches.length; i++) {
-      if (e.touches[i].identifier === this.touchIdentifier) {
-        touch = e.touches[i]
-        break
+      const delta = this.lastPinchDistance - distance
+      this.radius += delta * this.pinchPrecision
+
+      // Clamp radius to reasonable bounds
+      this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+
+      this.lastPinchDistance = distance
+    } else if (this.isDragging && this.touchIdentifier !== null) {
+      // Single-finger rotation
+      // Find the touch we're tracking
+      let touch: Touch | null = null
+      for (let i = 0; i < e.touches.length; i++) {
+        if (e.touches[i].identifier === this.touchIdentifier) {
+          touch = e.touches[i]
+          break
+        }
       }
+
+      if (!touch) return
+
+      const deltaX = touch.clientX - this.lastTouchPos.x
+      const deltaY = touch.clientY - this.lastTouchPos.y
+
+      this.alpha -= deltaX * this.angularSensitivity
+      this.beta -= deltaY * this.angularSensitivity
+
+      // Clamp beta to prevent flipping
+      this.beta = Math.max(this.lowerBetaLimit, Math.min(this.upperBetaLimit, this.beta))
+
+      this.lastTouchPos = { x: touch.clientX, y: touch.clientY }
     }
-
-    if (!touch) return
-
-    const deltaX = touch.clientX - this.lastTouchPos.x
-    const deltaY = touch.clientY - this.lastTouchPos.y
-
-    this.alpha -= deltaX * this.angularSensitivity
-    this.beta -= deltaY * this.angularSensitivity
-
-    // Clamp beta to prevent flipping
-    this.beta = Math.max(this.lowerBetaLimit, Math.min(this.upperBetaLimit, this.beta))
-
-    this.lastTouchPos = { x: touch.clientX, y: touch.clientY }
   }
 
   private onTouchEnd(e: TouchEvent) {
-    // Check if our tracked touch ended
-    if (this.touchIdentifier !== null) {
+    if (e.touches.length === 0) {
+      // All touches ended
+      this.isDragging = false
+      this.isPinching = false
+      this.touchIdentifier = null
+    } else if (e.touches.length === 1 && this.isPinching) {
+      // Went from 2 fingers to 1 - switch to rotation
+      const touch = e.touches[0]
+      this.isPinching = false
+      this.isDragging = true
+      this.touchIdentifier = touch.identifier
+      this.lastTouchPos = { x: touch.clientX, y: touch.clientY }
+    } else if (this.touchIdentifier !== null) {
+      // Check if our tracked touch ended
       let touchStillActive = false
       for (let i = 0; i < e.touches.length; i++) {
         if (e.touches[i].identifier === this.touchIdentifier) {
