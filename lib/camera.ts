@@ -46,15 +46,17 @@ export class Camera {
     this.onTouchEnd = this.onTouchEnd.bind(this)
   }
 
-  getViewMatrix(): Mat4 {
+  getPosition(): Vec3 {
     // Convert spherical coordinates to Cartesian position
     const x = this.target.x + this.radius * Math.sin(this.beta) * Math.sin(this.alpha)
     const y = this.target.y + this.radius * Math.cos(this.beta)
     const z = this.target.z + this.radius * Math.sin(this.beta) * Math.cos(this.alpha)
+    return new Vec3(x, y, z)
+  }
 
-    const eye = new Vec3(x, y, z)
+  getViewMatrix(): Mat4 {
+    const eye = this.getPosition()
     const up = new Vec3(0, 1, 0)
-
     return Mat4.lookAt(eye, this.target, up)
   }
 

@@ -18,12 +18,15 @@ export class Engine {
   private presentationFormat!: GPUTextureFormat
   public camera!: Camera
   private cameraUniformBuffer!: GPUBuffer
-  private cameraMatrixData = new Float32Array(32) // Reused every frame
+  private cameraMatrixData = new Float32Array(36) // view(16) + projection(16) + viewPos(3) + padding(1) = 36 floats
   private lightUniformBuffer!: GPUBuffer
   // Multi-light system: ambient(1) + padding(3), then 4 lights: each light = direction(3) + padding(1), color(3) + intensity(1) = 8 floats per light
   // Total: 4 + (4 * 8) = 36 floats, padded to 64 floats (256 bytes) for proper alignment
   private lightData = new Float32Array(64)
   private lightCount: number = 0 // Number of active lights (0-4)
+  private materialUniformBuffer!: GPUBuffer
+  // Material properties: baseColor(3) + metallic(1), roughness(1) + padding(3) = 8 floats (32 bytes, needs 64 byte alignment)
+  private materialData = new Float32Array(16) // padded to 64 bytes
   private bindGroup!: GPUBindGroup
   private vertexBuffer!: GPUBuffer
   private vertexCount: number = 0
@@ -78,10 +81,10 @@ export class Engine {
       format: this.presentationFormat,
     })
 
-    // Create uniform buffer for camera matrices (view + projection = 32 floats)
+    // Create uniform buffer for camera matrices (view + projection + viewPos = 36 floats, padded to 40 for alignment)
     this.cameraUniformBuffer = this.device.createBuffer({
       label: "camera uniforms",
-      size: 32 * 4, // 32 floats * 4 bytes each
+      size: 40 * 4, // 40 floats * 4 bytes = 160 bytes (aligned)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
@@ -92,15 +95,25 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
+    // Create uniform buffer for material properties (64 bytes aligned)
+    this.materialUniformBuffer = this.device.createBuffer({
+      label: "material uniforms",
+      size: 16 * 4, // 16 floats * 4 bytes = 64 bytes
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
+    // Initialize default PBR material (non-metallic, semi-glossy - good for anime characters)
+    this.setMaterial(new Vec3(0.94, 0.88, 0.82), 0.0, 0.45)
+
     // Initialize MMD-style multi-light setup
-    this.setAmbient(0.4)
+    this.setAmbient(0.4) // Reduced ambient to make lights more visible
     this.clearLights()
     // Key light (main, bright from front-right)
-    this.addLight(new Vec3(-0.5, 0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
+    this.addLight(new Vec3(-0.5, 0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.6)
     // Fill light (softer from left)
-    this.addLight(new Vec3(0.7, 0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.6)
+    this.addLight(new Vec3(0.7, 0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.0)
     // Rim light (from behind for edge highlighting)
-    this.addLight(new Vec3(0.3, 0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.4)
+    this.addLight(new Vec3(0.3, 0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.8)
 
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
@@ -130,6 +143,8 @@ export class Engine {
         struct CameraUniforms {
           view: mat4x4f,
           projection: mat4x4f,
+          viewPos: vec3f,
+          _padding: f32,
         };
 
         struct Light {
@@ -147,14 +162,23 @@ export class Engine {
           lights: array<Light, 4>,
         };
 
+        struct MaterialUniforms {
+          baseColor: vec3f,
+          metallic: f32,
+          roughness: f32,
+          _padding: vec3f,
+        };
+
         struct VertexOutput {
           @builtin(position) position: vec4f,
           @location(0) normal: vec3f,
           @location(1) uv: vec2f,
+          @location(2) worldPos: vec3f,
         };
 
         @group(0) @binding(0) var<uniform> camera: CameraUniforms;
         @group(0) @binding(1) var<uniform> light: LightUniforms;
+        @group(0) @binding(2) var<uniform> material: MaterialUniforms;
 
         @vertex fn vs(
           @location(0) position: vec3f,
@@ -162,40 +186,102 @@ export class Engine {
           @location(2) uv: vec2f
         ) -> VertexOutput {
           var output: VertexOutput;
+          let worldPos = position; // Model space = world space for now (no model matrix)
           output.position = camera.projection * camera.view * vec4f(position, 1.0);
           output.normal = normal;
           output.uv = uv;
+          output.worldPos = worldPos;
           return output;
         }
   
+        // PBR helper functions (Cook-Torrance BRDF)
+        fn fresnelSchlick(cosTheta: f32, f0: vec3f) -> vec3f {
+          return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+        }
+
+        fn distributionGGX(n: vec3f, h: vec3f, roughness: f32) -> f32 {
+          let a = roughness * roughness;
+          let a2 = a * a;
+          let nDotH = max(dot(n, h), 0.0);
+          let nDotH2 = nDotH * nDotH;
+          let denom = (nDotH2 * (a2 - 1.0) + 1.0);
+          return a2 / (3.14159265 * denom * denom);
+        }
+
+        fn geometrySchlickGGX(nDotV: f32, roughness: f32) -> f32 {
+          let r = (roughness + 1.0);
+          let k = (r * r) / 8.0;
+          return nDotV / (nDotV * (1.0 - k) + k);
+        }
+
+        fn geometrySmith(n: vec3f, v: vec3f, l: vec3f, roughness: f32) -> f32 {
+          let nDotV = max(dot(n, v), 0.0);
+          let nDotL = max(dot(n, l), 0.0);
+          let ggx2 = geometrySchlickGGX(nDotV, roughness);
+          let ggx1 = geometrySchlickGGX(nDotL, roughness);
+          return ggx1 * ggx2;
+        }
+
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
-          let normal = normalize(input.normal);
+          let n = normalize(input.normal);
+          // Calculate view direction from camera position
+          let viewDir = input.worldPos - camera.viewPos;
+          let v = normalize(viewDir);
           
-          // Ambient lighting
-          let ambient = light.ambient;
+          // Material properties
+          let albedo = material.baseColor;
+          let metallic = material.metallic;
+          let roughness = material.roughness;
+          
+          // Calculate F0 (base reflectance at normal incidence)
+          let f0 = mix(vec3f(0.04), albedo, metallic);
+          
+          // Ambient term
+          let ambient = vec3f(light.ambient) * albedo;
+          
+          // Accumulate lighting from all active lights
+          var lo = vec3f(0.0);
           let numLights = u32(light.lightCount);
           
-          // Accumulate diffuse from all active lights
-          var totalDiffuse = vec3f(0.0);
-          
           for (var i = 0u; i < numLights; i++) {
-            let lightDir = normalize(light.lights[i].direction);
-            let diffuseFactor = max(dot(normal, lightDir), 0.0);
-            let lightColor = light.lights[i].color;
-            let lightIntensity = light.lights[i].intensity;
-            totalDiffuse += lightColor * (diffuseFactor * lightIntensity);
+            let lightDir = normalize(-light.lights[i].direction); // Direction to light
+            let lightColor = light.lights[i].color * light.lights[i].intensity;
+            let h = normalize(v + lightDir);
+            
+            // Calculate radiance
+            let radiance = lightColor;
+            
+            // Cook-Torrance BRDF
+            let nDotL = max(dot(n, lightDir), 0.0);
+            
+            if (nDotL > 0.0) {
+              // Specular BRDF
+              let d = distributionGGX(n, h, roughness);
+              let g = geometrySmith(n, v, lightDir, roughness);
+              let f = fresnelSchlick(max(dot(h, v), 0.0), f0);
+              
+              let kS = f;
+              let kD = (1.0 - kS) * (1.0 - metallic);
+              
+              let numerator = d * g * f;
+              let denominator = 4.0 * max(dot(n, v), 0.0) * nDotL + 0.001;
+              let specular = numerator / denominator;
+              
+              // Diffuse BRDF (Lambertian)
+              let diffuse = albedo / 3.14159265;
+              
+              // Combine
+              lo += (kD * diffuse + specular) * radiance * nDotL;
+            }
           }
           
-          // Combine lighting
-          let lighting = vec3f(ambient) + totalDiffuse;
+          // Final color (ambient + direct lighting)
+          var finalColor = ambient + lo;
           
-          // Base color (albedo)
-          let baseColor = vec3f(0.8, 0.6, 0.9);
+          // Tone mapping (simple Reinhard)
+          finalColor = finalColor / (finalColor + vec3f(1.0));
           
-          // Final color with lighting (linear space)
-          var finalColor = baseColor * lighting;
-          
-          // Gamma correction (linear to sRGB for true color)
+          // Gamma correction (linear to sRGB)
           finalColor = pow(finalColor, vec3f(1.0 / 2.2));
           
           return vec4f(finalColor, 1.0);
@@ -258,6 +344,10 @@ export class Engine {
         {
           binding: 1,
           resource: { buffer: this.lightUniformBuffer },
+        },
+        {
+          binding: 2,
+          resource: { buffer: this.materialUniformBuffer },
         },
       ],
     })
@@ -378,6 +468,18 @@ export class Engine {
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
+  // Set PBR material properties
+  public setMaterial(baseColor: Vec3, metallic: number, roughness: number) {
+    // Clamp values to valid ranges
+    this.materialData[0] = Math.max(0.0, Math.min(1.0, baseColor.x))
+    this.materialData[1] = Math.max(0.0, Math.min(1.0, baseColor.y))
+    this.materialData[2] = Math.max(0.0, Math.min(1.0, baseColor.z))
+    this.materialData[3] = Math.max(0.0, Math.min(1.0, metallic))
+    this.materialData[4] = Math.max(0.01, Math.min(1.0, roughness)) // Roughness must be > 0
+    // Padding is already zeros
+    this.device.queue.writeBuffer(this.materialUniformBuffer, 0, this.materialData)
+  }
+
   public getStats(): EngineStats {
     return { ...this.stats }
   }
@@ -475,10 +577,15 @@ export class Engine {
     // Update camera matrices
     const viewMatrix = this.camera.getViewMatrix()
     const projectionMatrix = this.camera.getProjectionMatrix()
+    const cameraPos = this.camera.getPosition()
 
-    // Combine matrices into reused buffer
+    // Combine matrices and camera position into reused buffer
     this.cameraMatrixData.set(viewMatrix.values, 0)
     this.cameraMatrixData.set(projectionMatrix.values, 16)
+    this.cameraMatrixData[32] = cameraPos.x
+    this.cameraMatrixData[33] = cameraPos.y
+    this.cameraMatrixData[34] = cameraPos.z
+    this.cameraMatrixData[35] = 0 // padding
 
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
