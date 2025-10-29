@@ -1,5 +1,7 @@
 import { Camera } from "./camera"
 import { Vec3 } from "./math"
+import { RzmModel } from "./rzm"
+import { PmxLoader } from "./pmx-loader"
 
 export interface EngineStats {
   fps: number
@@ -20,6 +22,8 @@ export class Engine {
   private bindGroup!: GPUBindGroup
   private vertexBuffer!: GPUBuffer
   private vertexCount: number = 0
+  private indexBuffer?: GPUBuffer
+  private indexCount: number = 0
   private resizeObserver: ResizeObserver | null = null
   private renderPassDescriptor!: GPURenderPassDescriptor
   private renderPassColorAttachment!: GPURenderPassColorAttachment
@@ -75,9 +79,6 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
-    // Create dummy humanoid vertices (simple stick figure)
-    this.createDummyHumanoid()
-
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
       view: this.context.getCurrentTexture().createView(), // Placeholder, updated each frame
@@ -101,41 +102,66 @@ export class Engine {
 
   private initPipeline() {
     const shaderModule = this.device.createShaderModule({
-      label: "humanoid with camera shaders",
+      label: "model shaders",
       code: /* wgsl */ `
         struct Uniforms {
           view: mat4x4f,
           projection: mat4x4f,
         };
 
+        struct VertexOutput {
+          @builtin(position) position: vec4f,
+          @location(0) normal: vec3f,
+          @location(1) uv: vec2f,
+        };
+
         @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
         @vertex fn vs(
-          @location(0) position: vec3f
-        ) -> @builtin(position) vec4f {
-          let worldPos = vec4f(position, 1.0);
-          return uniforms.projection * uniforms.view * worldPos;
+          @location(0) position: vec3f,
+          @location(1) normal: vec3f,
+          @location(2) uv: vec2f
+        ) -> VertexOutput {
+          var output: VertexOutput;
+          output.position = uniforms.projection * uniforms.view * vec4f(position, 1.0);
+          output.normal = normal;
+          output.uv = uv;
+          return output;
         }
   
-        @fragment fn fs() -> @location(0) vec4f {
-          return vec4f(0.8, 0.6, 0.9, 1.0); // Light purple color for the humanoid
+        @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
+          // Simple diffuse lighting based on normal
+          let lightDir = normalize(vec3f(0.5, 1.0, 0.3));
+          let diffuse = max(dot(normalize(input.normal), lightDir), 0.3);
+          let color = vec3f(0.8, 0.6, 0.9);
+          return vec4f(color * diffuse, 1.0);
         }
       `,
     })
 
     this.pipeline = this.device.createRenderPipeline({
-      label: "humanoid with camera pipeline",
+      label: "model pipeline",
       layout: "auto",
       vertex: {
         module: shaderModule,
         buffers: [
           {
-            arrayStride: 3 * 4, // 3 floats per vertex * 4 bytes per float
+            arrayStride: 8 * 4, // 8 floats per vertex * 4 bytes per float = 32 bytes
             attributes: [
               {
-                shaderLocation: 0, // @location(0) in shader
+                shaderLocation: 0, // position
                 offset: 0,
                 format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 1, // normal
+                offset: 3 * 4,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 2, // uv
+                offset: 6 * 4,
+                format: "float32x2" as GPUVertexFormat,
               },
             ],
           },
@@ -204,10 +230,10 @@ export class Engine {
   private initCamera() {
     // Create camera with default settings for character viewing
     this.camera = new Camera(
-      0, // alpha - start facing front
-      Math.PI / 3, // beta - slightly elevated view
-      3, // radius - 3 units away
-      new Vec3(0, 0.5, 0) // target - look at chest height
+      Math.PI, // alpha
+      Math.PI / 2.5, // beta
+      30, // radius
+      new Vec3(0, 13, 0) // target
     )
 
     // Set aspect ratio
@@ -262,90 +288,46 @@ export class Engine {
     }
   }
 
-  private createDummyHumanoid() {
-    // Simple humanoid made of boxes: head, torso, arms, legs
-    // Each vertex has position (x, y, z)
-    const vertices = new Float32Array([
-      // Head (cube at top) - 36 vertices (6 faces * 2 triangles * 3 vertices)
-      // Front face
-      -0.15, 0.9, 0.15, 0.15, 0.9, 0.15, 0.15, 1.2, 0.15, -0.15, 0.9, 0.15, 0.15, 1.2, 0.15, -0.15, 1.2, 0.15,
-      // Back face
-      -0.15, 0.9, -0.15, 0.15, 1.2, -0.15, 0.15, 0.9, -0.15, -0.15, 0.9, -0.15, -0.15, 1.2, -0.15, 0.15, 1.2, -0.15,
-      // Top face
-      -0.15, 1.2, 0.15, 0.15, 1.2, 0.15, 0.15, 1.2, -0.15, -0.15, 1.2, 0.15, 0.15, 1.2, -0.15, -0.15, 1.2, -0.15,
-      // Bottom face
-      -0.15, 0.9, 0.15, 0.15, 0.9, -0.15, 0.15, 0.9, 0.15, -0.15, 0.9, 0.15, -0.15, 0.9, -0.15, 0.15, 0.9, -0.15,
-      // Right face
-      0.15, 0.9, 0.15, 0.15, 0.9, -0.15, 0.15, 1.2, -0.15, 0.15, 0.9, 0.15, 0.15, 1.2, -0.15, 0.15, 1.2, 0.15,
-      // Left face
-      -0.15, 0.9, 0.15, -0.15, 1.2, -0.15, -0.15, 0.9, -0.15, -0.15, 0.9, 0.15, -0.15, 1.2, 0.15, -0.15, 1.2, -0.15,
+  // Load RZM model from URL
+  public async loadRzm(url: string) {
+    const model = await RzmModel.load(url)
+    this.drawModel(model)
+  }
 
-      // Torso (taller box)
-      // Front
-      -0.25, 0.2, 0.1, 0.25, 0.2, 0.1, 0.25, 0.9, 0.1, -0.25, 0.2, 0.1, 0.25, 0.9, 0.1, -0.25, 0.9, 0.1,
-      // Back
-      -0.25, 0.2, -0.1, 0.25, 0.9, -0.1, 0.25, 0.2, -0.1, -0.25, 0.2, -0.1, -0.25, 0.9, -0.1, 0.25, 0.9, -0.1,
-      // Top
-      -0.25, 0.9, 0.1, 0.25, 0.9, 0.1, 0.25, 0.9, -0.1, -0.25, 0.9, 0.1, 0.25, 0.9, -0.1, -0.25, 0.9, -0.1,
-      // Bottom
-      -0.25, 0.2, 0.1, 0.25, 0.2, -0.1, 0.25, 0.2, 0.1, -0.25, 0.2, 0.1, -0.25, 0.2, -0.1, 0.25, 0.2, -0.1,
-      // Right
-      0.25, 0.2, 0.1, 0.25, 0.2, -0.1, 0.25, 0.9, -0.1, 0.25, 0.2, 0.1, 0.25, 0.9, -0.1, 0.25, 0.9, 0.1,
-      // Left
-      -0.25, 0.2, 0.1, -0.25, 0.9, -0.1, -0.25, 0.2, -0.1, -0.25, 0.2, 0.1, -0.25, 0.9, 0.1, -0.25, 0.9, -0.1,
+  // Load PMX model from URL
+  public async loadPmx(url: string) {
+    const model = await PmxLoader.load(url)
+    this.drawModel(model)
+  }
 
-      // Left Leg
-      // Front
-      -0.25, -0.8, 0.08, -0.08, -0.8, 0.08, -0.08, 0.2, 0.08, -0.25, -0.8, 0.08, -0.08, 0.2, 0.08, -0.25, 0.2, 0.08,
-      // Back
-      -0.25, -0.8, -0.08, -0.08, 0.2, -0.08, -0.08, -0.8, -0.08, -0.25, -0.8, -0.08, -0.25, 0.2, -0.08, -0.08, 0.2,
-      -0.08,
-      // Outer
-      -0.25, -0.8, 0.08, -0.25, 0.2, 0.08, -0.25, 0.2, -0.08, -0.25, -0.8, 0.08, -0.25, 0.2, -0.08, -0.25, -0.8, -0.08,
-      // Inner
-      -0.08, -0.8, 0.08, -0.08, 0.2, -0.08, -0.08, 0.2, 0.08, -0.08, -0.8, 0.08, -0.08, -0.8, -0.08, -0.08, 0.2, -0.08,
+  private drawModel(model: RzmModel) {
+    const vertices = model.getVertices()
 
-      // Right Leg
-      // Front
-      0.08, -0.8, 0.08, 0.25, -0.8, 0.08, 0.25, 0.2, 0.08, 0.08, -0.8, 0.08, 0.25, 0.2, 0.08, 0.08, 0.2, 0.08,
-      // Back
-      0.08, -0.8, -0.08, 0.25, 0.2, -0.08, 0.25, -0.8, -0.08, 0.08, -0.8, -0.08, 0.08, 0.2, -0.08, 0.25, 0.2, -0.08,
-      // Inner
-      0.08, -0.8, 0.08, 0.08, 0.2, 0.08, 0.08, 0.2, -0.08, 0.08, -0.8, 0.08, 0.08, 0.2, -0.08, 0.08, -0.8, -0.08,
-      // Outer
-      0.25, -0.8, 0.08, 0.25, 0.2, -0.08, 0.25, 0.2, 0.08, 0.25, -0.8, 0.08, 0.25, -0.8, -0.08, 0.25, 0.2, -0.08,
-
-      // Left Arm
-      // Front
-      -0.25, 0.5, 0.05, -0.15, 0.5, 0.05, -0.15, 0.85, 0.05, -0.25, 0.5, 0.05, -0.15, 0.85, 0.05, -0.25, 0.85, 0.05,
-      // Back
-      -0.25, 0.5, -0.05, -0.15, 0.85, -0.05, -0.15, 0.5, -0.05, -0.25, 0.5, -0.05, -0.25, 0.85, -0.05, -0.15, 0.85,
-      -0.05,
-      // Outer
-      -0.25, 0.5, 0.05, -0.25, 0.85, 0.05, -0.25, 0.85, -0.05, -0.25, 0.5, 0.05, -0.25, 0.85, -0.05, -0.25, 0.5, -0.05,
-      // Inner
-      -0.15, 0.5, 0.05, -0.15, 0.85, -0.05, -0.15, 0.85, 0.05, -0.15, 0.5, 0.05, -0.15, 0.5, -0.05, -0.15, 0.85, -0.05,
-
-      // Right Arm
-      // Front
-      0.15, 0.5, 0.05, 0.25, 0.5, 0.05, 0.25, 0.85, 0.05, 0.15, 0.5, 0.05, 0.25, 0.85, 0.05, 0.15, 0.85, 0.05,
-      // Back
-      0.15, 0.5, -0.05, 0.25, 0.85, -0.05, 0.25, 0.5, -0.05, 0.15, 0.5, -0.05, 0.15, 0.85, -0.05, 0.25, 0.85, -0.05,
-      // Inner
-      0.15, 0.5, 0.05, 0.15, 0.85, 0.05, 0.15, 0.85, -0.05, 0.15, 0.5, 0.05, 0.15, 0.85, -0.05, 0.15, 0.5, -0.05,
-      // Outer
-      0.25, 0.5, 0.05, 0.25, 0.85, -0.05, 0.25, 0.85, 0.05, 0.25, 0.5, 0.05, 0.25, 0.5, -0.05, 0.25, 0.85, -0.05,
-    ])
-
-    this.vertexCount = vertices.length / 3
-
+    // Create vertex buffer from interleaved data
     this.vertexBuffer = this.device.createBuffer({
-      label: "humanoid vertex buffer",
+      label: "model vertex buffer",
       size: vertices.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     })
 
+    // Write vertex data to GPU buffer
     this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices)
+    this.vertexCount = model.getVertexCount()
+
+    // Create index buffer if model has indices
+    const indices = model.getIndices()
+    if (indices) {
+      this.indexBuffer = this.device.createBuffer({
+        label: "model index buffer",
+        size: indices.byteLength,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(this.indexBuffer, 0, indices)
+      this.indexCount = model.getIndexCount()
+    } else {
+      this.indexBuffer = undefined
+      this.indexCount = 0
+    }
   }
 
   public render() {
@@ -375,7 +357,15 @@ export class Engine {
     pass.setPipeline(this.pipeline)
     pass.setBindGroup(0, this.bindGroup)
     pass.setVertexBuffer(0, this.vertexBuffer)
-    pass.draw(this.vertexCount)
+
+    // Use indexed rendering if index buffer exists
+    if (this.indexBuffer) {
+      pass.setIndexBuffer(this.indexBuffer, "uint32")
+      pass.drawIndexed(this.indexCount)
+    } else {
+      pass.draw(this.vertexCount)
+    }
+
     pass.end()
 
     const commandBuffer = encoder.finish()
@@ -418,7 +408,7 @@ export class Engine {
     }
 
     // GPU stats (basic - draw calls and vertices this frame)
-    this.stats.drawCalls = 1 // Currently rendering 1 draw call
+    this.stats.drawCalls = 1
     this.stats.vertices = this.vertexCount
   }
 }

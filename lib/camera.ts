@@ -21,10 +21,10 @@ export class Camera {
 
   // Camera settings
   angularSensitivity: number = 0.005
-  wheelPrecision: number = 0.001
+  wheelPrecision: number = 0.005
   pinchPrecision: number = 0.01
-  minZ: number = 0.5
-  maxZ: number = 10
+  minZ: number = 0.1
+  maxZ: number = 100
   lowerBetaLimit: number = 0.001
   upperBetaLimit: number = Math.PI - 0.001
 
@@ -40,6 +40,7 @@ export class Camera {
     this.onMouseMove = this.onMouseMove.bind(this)
     this.onMouseUp = this.onMouseUp.bind(this)
     this.onWheel = this.onWheel.bind(this)
+    this.onContextMenu = this.onContextMenu.bind(this)
     this.onTouchStart = this.onTouchStart.bind(this)
     this.onTouchMove = this.onTouchMove.bind(this)
     this.onTouchEnd = this.onTouchEnd.bind(this)
@@ -70,6 +71,7 @@ export class Camera {
     window.addEventListener("mousemove", this.onMouseMove)
     window.addEventListener("mouseup", this.onMouseUp)
     this.canvas.addEventListener("wheel", this.onWheel)
+    this.canvas.addEventListener("contextmenu", this.onContextMenu)
 
     // Attach touch event listeners for mobile
     this.canvas.addEventListener("touchstart", this.onTouchStart, { passive: false })
@@ -85,6 +87,7 @@ export class Camera {
     window.removeEventListener("mousemove", this.onMouseMove)
     window.removeEventListener("mouseup", this.onMouseUp)
     this.canvas.removeEventListener("wheel", this.onWheel)
+    this.canvas.removeEventListener("contextmenu", this.onContextMenu)
 
     // Remove touch event listeners
     this.canvas.removeEventListener("touchstart", this.onTouchStart)
@@ -126,6 +129,10 @@ export class Camera {
 
     // Clamp radius to reasonable bounds
     this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+  }
+
+  private onContextMenu(e: Event) {
+    e.preventDefault()
   }
 
   private onTouchStart(e: TouchEvent) {

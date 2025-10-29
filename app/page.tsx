@@ -15,6 +15,10 @@ export default function Home() {
       engineRef.current = engine
       await engine.init()
 
+      // Load default model
+      // await engine.loadRzm("/models/dummy.rzm")
+      await engine.loadPmx("/models/梵天.pmx")
+
       // Start render loop with stats callback
       engine.runRenderLoop(() => {
         setStats(engine.getStats())
@@ -48,24 +52,24 @@ export default function Home() {
         <div className="absolute top-20 right-6 bg-black/70 text-white p-4 rounded-lg text-sm font-mono pointer-events-none backdrop-blur-sm min-w-[180px]">
           <div className="space-y-1">
             <div className="flex justify-between gap-4">
-              <span className="text-gray-400">FPS:</span>
-              <span className="text-green-400 font-bold">{stats.fps}</span>
+              <span className="text-muted-foreground">FPS:</span>
+              <span className="font-bold">{stats.fps}</span>
             </div>
             <div className="flex justify-between gap-4">
-              <span className="text-gray-400">Frame:</span>
+              <span className="text-muted-foreground">Frame:</span>
               <span>{stats.frameTime.toFixed(2)} ms</span>
             </div>
             <div className="flex justify-between gap-4">
-              <span className="text-gray-400">Draw Calls:</span>
+              <span className="text-muted-foreground">Draw Calls:</span>
               <span>{stats.drawCalls}</span>
             </div>
             <div className="flex justify-between gap-4">
-              <span className="text-gray-400">Vertices:</span>
+              <span className="text-muted-foreground">Vertices:</span>
               <span>{stats.vertices}</span>
             </div>
             {stats.memoryUsed > 0 && (
               <div className="flex justify-between gap-4">
-                <span className="text-gray-400">Memory:</span>
+                <span className="text-muted-foreground">Memory:</span>
                 <span>{stats.memoryUsed} MB</span>
               </div>
             )}
