@@ -107,12 +107,12 @@ export class Engine {
     this.setMaterial(new Vec3(0.94, 0.88, 0.82), 0.0, 0.45)
 
     // Initialize MMD-style multi-light setup
-    this.setAmbient(0.6) // Reduced ambient to make lights more visible
+    this.setAmbient(0.65) // Reduced ambient to make lights more visible
     this.clearLights()
     // Key light (main, bright from front-right)
     this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
     // Fill light (softer from left)`
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
+    this.addLight(new Vec3(0.7, -0.5, 0.4).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
     // Rim light (from behind for edge highlighting)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1)
 
