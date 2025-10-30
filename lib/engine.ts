@@ -602,9 +602,9 @@ export class Engine {
     await this.drawModel(model)
     console.log(model.getBoneNames())
     model.rotateBones(
-      ["首", "左腕", "右腕"],
-      [new Quat(0.3, 0.3, 0, 1), new Quat(0.3, 0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
-      5000
+      ["腰", "右腕", "左足"],
+      [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, 0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
+      3000
     )
   }
 

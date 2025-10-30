@@ -271,7 +271,18 @@ export class PmxLoader {
       const count = this.getInt32()
       const bones: RzmBone[] = []
       // Collect absolute positions, then convert to parent-relative offsets
-      const abs: { name: string; parent: number; x: number; y: number; z: number }[] = new Array(count)
+      type AbsBone = {
+        name: string
+        parent: number
+        x: number
+        y: number
+        z: number
+        appendParent?: number
+        appendRatio?: number
+        appendRotate?: boolean
+        appendMove?: boolean
+      }
+      const abs: AbsBone[] = new Array(count)
       // PMX 2.x bone flags (best-effort common masks)
       const FLAG_TAIL_IS_BONE = 0x0001
       const FLAG_IK = 0x0020
@@ -302,9 +313,15 @@ export class PmxLoader {
         }
 
         // Append transform (inherit/ratio)
+        let appendParent: number | undefined = undefined
+        let appendRatio: number | undefined = undefined
+        let appendRotate = false
+        let appendMove = false
         if ((flags & (FLAG_APPEND_ROTATE | FLAG_APPEND_MOVE)) !== 0) {
-          this.getNonVertexIndex(this.boneIndexSize) // append parent
-          this.getFloat32() // ratio
+          appendParent = this.getNonVertexIndex(this.boneIndexSize) // append parent
+          appendRatio = this.getFloat32() // ratio
+          appendRotate = (flags & FLAG_APPEND_ROTATE) !== 0
+          appendMove = (flags & FLAG_APPEND_MOVE) !== 0
         }
 
         // Axis limit
@@ -351,15 +368,32 @@ export class PmxLoader {
             }
           }
         }
-        abs[i] = { name, parent: parentIndex, x, y, z }
+        // Stash minimal bone info; append data will be merged later
+        abs[i] = { name, parent: parentIndex, x, y, z, appendParent, appendRatio, appendRotate, appendMove }
       }
       for (let i = 0; i < count; i++) {
         const a = abs[i]
         if (a.parent >= 0 && a.parent < count) {
           const p = abs[a.parent]
-          bones.push({ name: a.name, parentIndex: a.parent, bindTranslation: [a.x - p.x, a.y - p.y, a.z - p.z] })
+          bones.push({
+            name: a.name,
+            parentIndex: a.parent,
+            bindTranslation: [a.x - p.x, a.y - p.y, a.z - p.z],
+            appendParentIndex: a.appendParent,
+            appendRatio: a.appendRatio,
+            appendRotate: a.appendRotate,
+            appendMove: a.appendMove,
+          })
         } else {
-          bones.push({ name: a.name, parentIndex: a.parent, bindTranslation: [a.x, a.y, a.z] })
+          bones.push({
+            name: a.name,
+            parentIndex: a.parent,
+            bindTranslation: [a.x, a.y, a.z],
+            appendParentIndex: a.appendParent,
+            appendRatio: a.appendRatio,
+            appendRotate: a.appendRotate,
+            appendMove: a.appendMove,
+          })
         }
       }
       this.bones = bones

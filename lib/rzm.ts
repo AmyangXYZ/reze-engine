@@ -29,6 +29,11 @@ export interface RzmBone {
   name: string
   parentIndex: number // -1 if no parent
   bindTranslation: [number, number, number]
+  // Optional PMX append/inherit transform
+  appendParentIndex?: number // index of the bone to inherit from
+  appendRatio?: number // 0..1
+  appendRotate?: boolean
+  appendMove?: boolean
 }
 
 export interface RzmSkeleton {
@@ -142,6 +147,52 @@ export class RzmModel {
     const z = s0 * aZ + s1 * bz
     const w = s0 * aW + s1 * bw
     return [x, y, z, w]
+  }
+
+  // Extract unit quaternion (x,y,z,w) from a column-major rotation matrix (upper-left 3x3 of mat4)
+  private static mat3ToQuat(m: Float32Array): [number, number, number, number] {
+    const m00 = m[0],
+      m01 = m[4],
+      m02 = m[8]
+    const m10 = m[1],
+      m11 = m[5],
+      m12 = m[9]
+    const m20 = m[2],
+      m21 = m[6],
+      m22 = m[10]
+    const trace = m00 + m11 + m22
+    let x = 0,
+      y = 0,
+      z = 0,
+      w = 1
+    if (trace > 0) {
+      const s = Math.sqrt(trace + 1.0) * 2 // s = 4w
+      w = 0.25 * s
+      x = (m21 - m12) / s
+      y = (m02 - m20) / s
+      z = (m10 - m01) / s
+    } else if (m00 > m11 && m00 > m22) {
+      const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2 // s = 4x
+      w = (m21 - m12) / s
+      x = 0.25 * s
+      y = (m01 + m10) / s
+      z = (m02 + m20) / s
+    } else if (m11 > m22) {
+      const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2 // s = 4y
+      w = (m02 - m20) / s
+      x = (m01 + m10) / s
+      y = 0.25 * s
+      z = (m12 + m21) / s
+    } else {
+      const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2 // s = 4z
+      w = (m10 - m01) / s
+      x = (m02 + m20) / s
+      y = (m12 + m21) / s
+      z = 0.25 * s
+    }
+    // Normalize to be safe
+    const invLen = 1 / Math.hypot(x, y, z, w)
+    return [x * invLen, y * invLen, z * invLen, w * invLen]
   }
 
   private updateRotationTweens(): void {
@@ -523,15 +574,64 @@ export class RzmModel {
         console.warn(`[RZM] bone ${i} parent out of range: ${bones[i].parentIndex}`)
       }
       const qi = i * 4
-      // runtime local translation ignored in pure-rotation mode
-      const rotateM = Mat4.fromQuat(localRot[qi], localRot[qi + 1], localRot[qi + 2], localRot[qi + 3])
+      // Start from bone's local rotation
+      let rotateM = Mat4.fromQuat(localRot[qi], localRot[qi + 1], localRot[qi + 2], localRot[qi + 3])
+      // Accumulated local translation from append move
+      let addLocalTx = 0
+      let addLocalTy = 0
+      let addLocalTz = 0
+
+      // Apply PMX append/inherit rotation with decoded ratio
+      const b = bones[i]
+      if (
+        b.appendRotate &&
+        b.appendParentIndex !== undefined &&
+        b.appendParentIndex >= 0 &&
+        b.appendParentIndex < bones.length &&
+        (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)
+      ) {
+        const ap = b.appendParentIndex
+        // Use append parent's LOCAL rotation/translation with ratio, as per PMX
+        const apQi = ap * 4
+        const apTi = ap * 3
+        let ratio = b.appendRatio === undefined ? 1 : b.appendRatio
+        ratio = Math.max(-1, Math.min(1, ratio))
+        // Rotation append
+        if (b.appendRotate) {
+          let ax = localRot[apQi]
+          let ay = localRot[apQi + 1]
+          let az = localRot[apQi + 2]
+          const aw = localRot[apQi + 3]
+          if (ratio < 0) {
+            // inverse (conjugate) for negative ratios
+            ax = -ax
+            ay = -ay
+            az = -az
+            ratio = -ratio
+          }
+          const [rx, ry, rz, rw] = RzmModel.slerp(0, 0, 0, 1, ax, ay, az, aw, ratio)
+          const ratioM = Mat4.fromQuat(rx, ry, rz, rw)
+          rotateM = ratioM.multiply(rotateM)
+        }
+        // Move append
+        if (b.appendMove && (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)) {
+          const apTx = this.boneLocalTranslations![apTi]
+          const apTy = this.boneLocalTranslations![apTi + 1]
+          const apTz = this.boneLocalTranslations![apTi + 2]
+          addLocalTx += apTx * (b.appendRatio ?? 1)
+          addLocalTy += apTy * (b.appendRatio ?? 1)
+          addLocalTz += apTz * (b.appendRatio ?? 1)
+        }
+      }
       const translateBind = Mat4.identity().translateInPlace(
         bones[i].bindTranslation[0],
         bones[i].bindTranslation[1],
         bones[i].bindTranslation[2]
       )
-      // Local: move from parent to joint, then rotate around joint
-      const localM = translateBind.multiply(rotateM)
+      // Apply additional local translation due to appendMove
+      const translateLocal = Mat4.identity().translateInPlace(addLocalTx, addLocalTy, addLocalTz)
+      // Local: move from parent to joint, then rotate around joint, then local translation
+      const localM = translateBind.multiply(rotateM).multiply(translateLocal)
 
       const worldSeg = worldBuf.subarray(i * 16, i * 16 + 16)
       let worldM: Mat4
