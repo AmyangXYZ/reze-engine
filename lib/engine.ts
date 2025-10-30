@@ -321,7 +321,7 @@ export class Engine {
         module: shaderModule,
         targets: [{ format: this.presentationFormat }],
       },
-      primitive: { cullMode: "back" },
+      primitive: { cullMode: "none" },
       depthStencil: {
         format: "depth24plus",
         depthWriteEnabled: true,
