@@ -1,21 +1,50 @@
 // RZM (Reze Model) Format - WebGPU-native model format
-// Phase 1: Geometry only (positions, normals, UVs)
+// Phase 2: Geometry + Textures + Materials
 
 const RZM_MAGIC = 0x455a4552 // "REZE" in little-endian
-const RZM_VERSION = 1
+const RZM_VERSION = 2 // Updated version for texture support
 const VERTEX_STRIDE = 8 // floats per vertex: position(3) + normal(3) + uv(2) = 8
+
+export interface RzmTexture {
+  path: string
+  name: string
+}
+
+export interface RzmMaterial {
+  name: string
+  diffuse: [number, number, number, number]
+  specular: [number, number, number]
+  ambient: [number, number, number]
+  shininess: number
+  diffuseTextureIndex: number
+  normalTextureIndex: number
+  sphereTextureIndex: number
+  sphereMode: number
+  toonTextureIndex: number
+  edgeFlag: number
+  vertexCount: number
+}
 
 export class RzmModel {
   private vertexData: Float32Array<ArrayBuffer>
   private vertexCount: number
   private indexData?: Uint32Array<ArrayBuffer>
   private indexCount: number
+  private textures: RzmTexture[] = []
+  private materials: RzmMaterial[] = []
 
-  constructor(vertexData: Float32Array<ArrayBuffer>, indexData?: Uint32Array<ArrayBuffer>) {
+  constructor(
+    vertexData: Float32Array<ArrayBuffer>,
+    indexData?: Uint32Array<ArrayBuffer>,
+    textures: RzmTexture[] = [],
+    materials: RzmMaterial[] = []
+  ) {
     this.vertexData = vertexData
     this.vertexCount = vertexData.length / VERTEX_STRIDE
     this.indexData = indexData
     this.indexCount = indexData ? indexData.length : 0
+    this.textures = textures
+    this.materials = materials
   }
 
   // Load RZM model from URL
@@ -63,6 +92,24 @@ export class RzmModel {
   // Format: [x,y,z, nx,ny,nz, u,v, x,y,z, nx,ny,nz, u,v, ...]
   getVertices(): Float32Array<ArrayBuffer> {
     return this.vertexData
+  }
+
+  // Get texture information
+  getTextures(): RzmTexture[] {
+    return this.textures
+  }
+
+  // Get material information
+  getMaterials(): RzmMaterial[] {
+    return this.materials
+  }
+
+  // Get diffuse texture path for a material
+  getDiffuseTexturePath(materialIndex: number): string | null {
+    if (materialIndex < 0 || materialIndex >= this.materials.length) return null
+    const material = this.materials[materialIndex]
+    if (material.diffuseTextureIndex < 0 || material.diffuseTextureIndex >= this.textures.length) return null
+    return this.textures[material.diffuseTextureIndex].path
   }
 
   // Get vertex count

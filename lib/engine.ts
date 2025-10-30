@@ -32,6 +32,8 @@ export class Engine {
   private vertexCount: number = 0
   private indexBuffer?: GPUBuffer
   private indexCount: number = 0
+  private diffuseTexture?: GPUTexture
+  private diffuseSampler?: GPUSampler
   private resizeObserver: ResizeObserver | null = null
   private renderPassDescriptor!: GPURenderPassDescriptor
   private renderPassColorAttachment!: GPURenderPassColorAttachment
@@ -67,7 +69,6 @@ export class Engine {
       throw new Error("need a browser that supports WebGPU")
     }
     this.device = device
-    console.log("WebGPU device created")
 
     const context = this.canvas.getContext("webgpu")
     if (!context) {
@@ -106,14 +107,14 @@ export class Engine {
     this.setMaterial(new Vec3(0.94, 0.88, 0.82), 0.0, 0.45)
 
     // Initialize MMD-style multi-light setup
-    this.setAmbient(0.4) // Reduced ambient to make lights more visible
+    this.setAmbient(0.6) // Reduced ambient to make lights more visible
     this.clearLights()
     // Key light (main, bright from front-right)
-    this.addLight(new Vec3(-0.5, 0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.6)
-    // Fill light (softer from left)
-    this.addLight(new Vec3(0.7, 0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.0)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
+    // Fill light (softer from left)`
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
     // Rim light (from behind for edge highlighting)
-    this.addLight(new Vec3(0.3, 0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.8)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1)
 
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
@@ -179,6 +180,8 @@ export class Engine {
         @group(0) @binding(0) var<uniform> camera: CameraUniforms;
         @group(0) @binding(1) var<uniform> light: LightUniforms;
         @group(0) @binding(2) var<uniform> material: MaterialUniforms;
+        @group(0) @binding(3) var diffuseTexture: texture_2d<f32>;
+        @group(0) @binding(4) var diffuseSampler: sampler;
 
         @vertex fn vs(
           @location(0) position: vec3f,
@@ -224,67 +227,33 @@ export class Engine {
 
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
           let n = normalize(input.normal);
-          // Calculate view direction from camera position
-          let viewDir = input.worldPos - camera.viewPos;
-          let v = normalize(viewDir);
-          
-          // Material properties
-          let albedo = material.baseColor;
-          let metallic = material.metallic;
-          let roughness = material.roughness;
-          
-          // Calculate F0 (base reflectance at normal incidence)
-          let f0 = mix(vec3f(0.04), albedo, metallic);
-          
+          let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
+
           // Ambient term
-          let ambient = vec3f(light.ambient) * albedo;
-          
-          // Accumulate lighting from all active lights
-          var lo = vec3f(0.0);
+          var color = albedo * vec3f(light.ambient);
+
+          // View direction for subtle specular
+          let v = normalize(camera.viewPos - input.worldPos);
+
+          // Lambert diffuse with 1/pi plus a gentle Blinn-Phong highlight
+          let diffuse = albedo / 3.14159265;
           let numLights = u32(light.lightCount);
-          
           for (var i = 0u; i < numLights; i++) {
-            let lightDir = normalize(-light.lights[i].direction); // Direction to light
-            let lightColor = light.lights[i].color * light.lights[i].intensity;
-            let h = normalize(v + lightDir);
-            
-            // Calculate radiance
-            let radiance = lightColor;
-            
-            // Cook-Torrance BRDF
-            let nDotL = max(dot(n, lightDir), 0.0);
-            
+            let l = normalize(-light.lights[i].direction);
+            let nDotL = max(dot(n, l), 0.0);
             if (nDotL > 0.0) {
-              // Specular BRDF
-              let d = distributionGGX(n, h, roughness);
-              let g = geometrySmith(n, v, lightDir, roughness);
-              let f = fresnelSchlick(max(dot(h, v), 0.0), f0);
-              
-              let kS = f;
-              let kD = (1.0 - kS) * (1.0 - metallic);
-              
-              let numerator = d * g * f;
-              let denominator = 4.0 * max(dot(n, v), 0.0) * nDotL + 0.001;
-              let specular = numerator / denominator;
-              
-              // Diffuse BRDF (Lambertian)
-              let diffuse = albedo / 3.14159265;
-              
-              // Combine
-              lo += (kD * diffuse + specular) * radiance * nDotL;
+              let radiance = light.lights[i].color * light.lights[i].intensity;
+              // subtle specular
+              let h = normalize(l + v);
+              let spec = pow(max(dot(n, h), 0.0), 24.0) * 0.06;
+              color += diffuse * radiance * nDotL + vec3f(spec) * radiance;
             }
           }
-          
-          // Final color (ambient + direct lighting)
-          var finalColor = ambient + lo;
-          
-          // Tone mapping (simple Reinhard)
-          finalColor = finalColor / (finalColor + vec3f(1.0));
-          
-          // Gamma correction (linear to sRGB)
-          finalColor = pow(finalColor, vec3f(1.0 / 2.2));
-          
-          return vec4f(finalColor, 1.0);
+
+          // Soft rolloff to keep brightness natural without looking flat
+          color = color / (vec3f(1.0) + color * 0.15);
+          color = clamp(color, vec3f(0.0), vec3f(1.0));
+          return vec4f(color, 1.0);
         }
       `,
     })
@@ -332,25 +301,8 @@ export class Engine {
       },
     })
 
-    // Create bind group
-    this.bindGroup = this.device.createBindGroup({
-      label: "camera bind group",
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: { buffer: this.cameraUniformBuffer },
-        },
-        {
-          binding: 1,
-          resource: { buffer: this.lightUniformBuffer },
-        },
-        {
-          binding: 2,
-          resource: { buffer: this.materialUniformBuffer },
-        },
-      ],
-    })
+    // Create bind group (will be updated when textures are loaded)
+    this.updateBindGroup()
   }
 
   private initResizeObserver() {
@@ -413,7 +365,7 @@ export class Engine {
     this.camera = new Camera(
       Math.PI, // alpha
       Math.PI / 2.5, // beta
-      30, // radius
+      27, // radius
       new Vec3(0, 12.5, 0) // target
     )
 
@@ -533,10 +485,10 @@ export class Engine {
   // Load PMX model from URL
   public async loadPmx(url: string) {
     const model = await PmxLoader.load(url)
-    this.drawModel(model)
+    await this.drawModel(model)
   }
 
-  private drawModel(model: RzmModel) {
+  private async drawModel(model: RzmModel) {
     const vertices = model.getVertices()
 
     // Create vertex buffer from interleaved data
@@ -564,6 +516,181 @@ export class Engine {
       this.indexBuffer = undefined
       this.indexCount = 0
     }
+
+    // Load textures and prepare per-material draws
+    await this.prepareMaterialDraws(model)
+  }
+
+  private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup }[] = []
+
+  private async prepareMaterialDraws(model: RzmModel) {
+    const materials = model.getMaterials()
+    if (materials.length === 0) {
+      // Fallback single bind group with default texture
+      this.updateBindGroup()
+      return
+    }
+
+    // Load all unique diffuse textures
+    const modelDir = "/models/梵天/"
+    const textures = model.getTextures()
+
+    const textureCache = new Map<number, { texture: GPUTexture; sampler: GPUSampler }>()
+
+    const loadTextureByIndex = async (texIndex: number) => {
+      if (texIndex < 0 || texIndex >= textures.length) return null
+      if (textureCache.has(texIndex)) return textureCache.get(texIndex)!
+
+      const path = modelDir + textures[texIndex].path
+      const resource = await this.createTextureFromPath(path)
+      if (resource) textureCache.set(texIndex, resource)
+      return resource
+    }
+
+    // Preload all referenced textures (diffuse only for now)
+    const uniqueDiffuse = Array.from(new Set(materials.map((m) => m.diffuseTextureIndex).filter((i) => i >= 0)))
+    await Promise.all(uniqueDiffuse.map(loadTextureByIndex))
+
+    // Default white texture if missing
+    const defaultTexture = this.createDefaultTexture()
+    const defaultSampler = this.device.createSampler({ magFilter: "linear", minFilter: "linear" })
+
+    // Build per-material bind groups and draw ranges
+    this.materialDraws = []
+    let runningFirstIndex = 0
+    for (let i = 0; i < materials.length; i++) {
+      const mat = materials[i]
+      const texResource = await loadTextureByIndex(mat.diffuseTextureIndex)
+
+      const entries: GPUBindGroupEntry[] = [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+        { binding: 3, resource: (texResource ? texResource.texture : defaultTexture).createView() },
+        { binding: 4, resource: texResource ? texResource.sampler : defaultSampler },
+      ]
+
+      const bindGroup = this.device.createBindGroup({
+        label: `material ${i} bind group`,
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries,
+      })
+
+      const count = Math.max(0, mat.vertexCount | 0) // PMX stores indexCount here
+      this.materialDraws.push({ count, firstIndex: runningFirstIndex, bindGroup })
+      runningFirstIndex += count
+    }
+    const total = this.materialDraws.reduce((a, d) => a + d.count, 0)
+    if (this.indexCount && total !== this.indexCount) {
+      console.warn(`[PMX] material index sum ${total} != indexCount ${this.indexCount}`)
+    }
+  }
+
+  private async loadTexture(path: string): Promise<void> {
+    try {
+      // Load image
+      const response = await fetch(path)
+      const imageBitmap = await createImageBitmap(await response.blob())
+
+      // Create texture
+      this.diffuseTexture = this.device.createTexture({
+        label: `texture: ${path}`,
+        size: [imageBitmap.width, imageBitmap.height],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+
+      // Create sampler
+      this.diffuseSampler = this.device.createSampler({
+        label: `sampler: ${path}`,
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "repeat",
+        addressModeV: "repeat",
+      })
+
+      // Copy image data to texture
+      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture: this.diffuseTexture }, [
+        imageBitmap.width,
+        imageBitmap.height,
+      ])
+
+      // Update bind group with new texture (legacy single-texture path)
+      this.updateBindGroup()
+    } catch (error) {
+      console.warn(`Failed to load texture: ${path}`, error)
+    }
+  }
+
+  private async createTextureFromPath(path: string): Promise<{ texture: GPUTexture; sampler: GPUSampler } | null> {
+    try {
+      const response = await fetch(path)
+      const imageBitmap = await createImageBitmap(await response.blob())
+      const texture = this.device.createTexture({
+        label: `texture: ${path}`,
+        size: [imageBitmap.width, imageBitmap.height],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [
+        imageBitmap.width,
+        imageBitmap.height,
+      ])
+      const sampler = this.device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "repeat",
+        addressModeV: "repeat",
+      })
+      return { texture, sampler }
+    } catch (e) {
+      console.warn(`Failed to load texture: ${path}`, e)
+      return null
+    }
+  }
+
+  private updateBindGroup() {
+    const entries: GPUBindGroupEntry[] = [
+      { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+      { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+    ]
+
+    // Add texture and sampler if available
+    if (this.diffuseTexture && this.diffuseSampler) {
+      entries.push(
+        { binding: 3, resource: this.diffuseTexture.createView() },
+        { binding: 4, resource: this.diffuseSampler }
+      )
+    } else {
+      // Use a default white texture if no texture is loaded
+      const defaultTexture = this.createDefaultTexture()
+      const defaultSampler = this.device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+      })
+
+      entries.push({ binding: 3, resource: defaultTexture.createView() }, { binding: 4, resource: defaultSampler })
+    }
+
+    this.bindGroup = this.device.createBindGroup({
+      label: "model bind group",
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries,
+    })
+  }
+
+  private createDefaultTexture(): GPUTexture {
+    const size = 1
+    const texture = this.device.createTexture({
+      size: [size, size],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+
+    // Fill with white
+    const data = new Uint8Array([255, 255, 255, 255])
+    this.device.queue.writeTexture({ texture }, data, { bytesPerRow: size * 4 }, [size, size])
+
+    return texture
   }
 
   public render() {
@@ -599,14 +726,25 @@ export class Engine {
     const encoder = this.device.createCommandEncoder({ label: "our encoder" })
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     pass.setPipeline(this.pipeline)
-    pass.setBindGroup(0, this.bindGroup)
     pass.setVertexBuffer(0, this.vertexBuffer)
 
     // Use indexed rendering if index buffer exists
     if (this.indexBuffer) {
       pass.setIndexBuffer(this.indexBuffer, "uint32")
-      pass.drawIndexed(this.indexCount)
+      if (this.materialDraws.length > 0) {
+        for (const draw of this.materialDraws) {
+          pass.setBindGroup(0, draw.bindGroup)
+          if (draw.count > 0) {
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          }
+        }
+      } else {
+        // Legacy single-bind-group path
+        pass.setBindGroup(0, this.bindGroup)
+        pass.drawIndexed(this.indexCount)
+      }
     } else {
+      pass.setBindGroup(0, this.bindGroup)
       pass.draw(this.vertexCount)
     }
 
