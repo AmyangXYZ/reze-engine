@@ -5,7 +5,7 @@ import type { EngineStats } from "@/lib/engine"
 
 export default function Header({ stats }: { stats: EngineStats }) {
   return (
-    <header className="absolute top-0 left-0 right-0 px-4 md:px-6 py-3 md:py-4 pointer-events-none z-10 flex items-center gap-3">
+    <header className="absolute top-0 left-0 right-0 px-4 md:px-6 py-3 md:py-4 pointer-events-none z-10 flex items-center gap-2">
       {/* Left: Title (hidden on very small screens to save space) */}
       <h1 className="text-2xl font-extrabold tracking-tight">Reze Engine</h1>
 
@@ -40,7 +40,7 @@ export default function Header({ stats }: { stats: EngineStats }) {
       </div>
 
       {/* GitHub button (clickable) */}
-      <div className="pointer-events-auto ml-2">
+      <div className="pointer-events-auto md:ml-2">
         <Button size="icon" asChild className="bg-black text-white hover:bg-black hover:text-white rounded-full">
           <Link href="https://github.com/AmyangXYZ/reze-engine" target="_blank">
             <Image src="/github-mark-white.svg" alt="GitHub" width={20} height={20} />
