@@ -7,8 +7,8 @@ export class Camera {
   target: Vec3
   fov: number
   aspect: number = 1
-  near: number = 0.1
-  far: number = 100
+  near: number = 0.05
+  far: number = 1000
 
   // Input state
   private canvas: HTMLCanvasElement | null = null
@@ -24,7 +24,7 @@ export class Camera {
   wheelPrecision: number = 0.005
   pinchPrecision: number = 0.05
   minZ: number = 0.1
-  maxZ: number = 100
+  maxZ: number = 1000
   lowerBetaLimit: number = 0.001
   upperBetaLimit: number = Math.PI - 0.001
 
@@ -131,6 +131,8 @@ export class Camera {
 
     // Clamp radius to reasonable bounds
     this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+    // Expand far plane to keep scene visible when zooming out
+    this.far = Math.max(500, this.radius * 4)
   }
 
   private onContextMenu(e: Event) {
@@ -175,6 +177,8 @@ export class Camera {
 
       // Clamp radius to reasonable bounds
       this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+      // Expand far plane for pinch zoom as well
+      this.far = Math.max(500, this.radius * 4)
 
       this.lastPinchDistance = distance
     } else if (this.isDragging && this.touchIdentifier !== null) {
