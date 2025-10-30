@@ -120,11 +120,11 @@ export class Engine {
     this.setAmbient(0.65) // Reduced ambient to make lights more visible
     this.clearLights()
     // Key light (main, bright from front-right)
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
+    this.addLight(new Vec3(0.5, -0.8, -0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
     // Fill light (softer from left)`
-    this.addLight(new Vec3(0.7, -0.5, 0.4).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
+    this.addLight(new Vec3(-0.7, -0.5, -0.4).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
     // Rim light (from behind for edge highlighting)
-    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1)
+    this.addLight(new Vec3(-0.3, -0.5, 1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1)
 
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
@@ -391,7 +391,7 @@ export class Engine {
     })
 
     // Build grid vertex buffer (moderate extent and spacing)
-    this.buildGrid(16, 2)
+    this.buildGrid(20, 2)
   }
 
   private buildGrid(halfLines: number, step: number) {
@@ -477,7 +477,7 @@ export class Engine {
   private initCamera() {
     // Create camera with default settings for character viewing
     this.camera = new Camera(
-      Math.PI, // alpha
+      0, // alpha
       Math.PI / 2.5, // beta
       27, // radius
       new Vec3(0, 12.5, 0) // target
@@ -601,7 +601,7 @@ export class Engine {
     const model = await PmxLoader.load(url)
     await this.drawModel(model)
     console.log(model.getBoneNames())
-    model.setBoneRotation("首", new Quat(-0.05, 0.15, 0, 1).normalize())
+    model.setBoneRotation("首", new Quat(0.05, 0.15, 0, 1).normalize())
   }
 
   private async drawModel(model: RzmModel) {

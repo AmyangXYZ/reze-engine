@@ -86,8 +86,17 @@ export class PmxLoader {
     const weights = new Uint8Array(count * 4) // UNORM8, will be normalized to 255
 
     for (let i = 0; i < count; i++) {
-      positions.push(this.getFloat32(), this.getFloat32(), this.getFloat32())
-      normals.push(this.getFloat32(), this.getFloat32(), this.getFloat32())
+      // Convert from PMX (left-handed, +Z forward) to engine (right-handed) by negating Z
+      const px = this.getFloat32()
+      const py = this.getFloat32()
+      const pz = this.getFloat32()
+      // Convert PMX (LH, +Z forward) to engine (RH, -Z forward): flip Z only
+      positions.push(px, py, -pz)
+
+      const nx = this.getFloat32()
+      const ny = this.getFloat32()
+      const nz = this.getFloat32()
+      normals.push(nx, ny, -nz)
 
       const u = this.getFloat32()
       const v = this.getFloat32()
@@ -172,7 +181,7 @@ export class PmxLoader {
       indices.push(this.getIndex(this.vertexIndexSize))
     }
 
-    // Reverse winding order (DirectX to OpenGL)
+    // After flipping Z to change handedness, triangle winding is inverted; fix it
     for (let i = 0; i < indices.length; i += 3) {
       ;[indices[i + 1], indices[i + 2]] = [indices[i + 2], indices[i + 1]]
     }
@@ -274,9 +283,10 @@ export class PmxLoader {
       for (let i = 0; i < count; i++) {
         const name = this.getText()
         this.getText() // englishName (skip)
+        // Convert to right-handed space by negating Z
         const x = this.getFloat32()
         const y = this.getFloat32()
-        const z = this.getFloat32()
+        const z = -this.getFloat32()
         const parentIndex = this.getNonVertexIndex(this.boneIndexSize)
         this.getInt32() // transform order (skip)
         const flags = this.getUint16()
