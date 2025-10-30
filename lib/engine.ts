@@ -39,6 +39,7 @@ export class Engine {
   private renderPassColorAttachment!: GPURenderPassColorAttachment
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
+  private gridPipeline?: GPURenderPipeline
   private jointsBuffer?: GPUBuffer
   private weightsBuffer?: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
@@ -46,6 +47,10 @@ export class Engine {
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
   private currentModel: RzmModel | null = null
+  // Grid
+  private gridVertexBuffer?: GPUBuffer
+  private gridVertexCount: number = 0
+  private gridBindGroup?: GPUBindGroup
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -136,6 +141,7 @@ export class Engine {
 
     // Create shader and pipeline
     this.initPipeline()
+    this.initGridPipeline()
 
     // Setup camera and resize observer
     this.initCamera()
@@ -331,6 +337,86 @@ export class Engine {
 
     // Create bind group (will be updated when textures are loaded)
     this.updateBindGroup()
+  }
+
+  private initGridPipeline() {
+    // Simple grid shader using only camera uniforms
+    const shader = this.device.createShaderModule({
+      code: /* wgsl */ `
+        struct CameraUniforms {
+          view: mat4x4f,
+          projection: mat4x4f,
+          viewPos: vec3f,
+          _padding: f32,
+        };
+
+        struct VSOut { @builtin(position) pos: vec4f, @location(0) color: vec3f };
+        @group(0) @binding(0) var<uniform> camera: CameraUniforms;
+
+        @vertex fn vs(@location(0) position: vec3f, @location(1) color: vec3f) -> VSOut {
+          var o: VSOut;
+          o.pos = camera.projection * camera.view * vec4f(position, 1.0);
+          o.color = color;
+          return o;
+        }
+
+        @fragment fn fs(i: VSOut) -> @location(0) vec4f { return vec4f(i.color, 1.0); }
+      `,
+    })
+
+    this.gridPipeline = this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: {
+        module: shader,
+        buffers: [
+          {
+            arrayStride: 6 * 4,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
+            ],
+          },
+        ],
+      },
+      fragment: { module: shader, targets: [{ format: this.presentationFormat }] },
+      primitive: { topology: "line-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+      multisample: { count: this.sampleCount },
+    })
+
+    // Bind group with only camera uniforms
+    this.gridBindGroup = this.device.createBindGroup({
+      layout: this.gridPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: this.cameraUniformBuffer } }],
+    })
+
+    // Build grid vertex buffer (moderate extent and spacing)
+    this.buildGrid(16, 2)
+  }
+
+  private buildGrid(halfLines: number, step: number) {
+    const count = halfLines
+    const size = count * step
+    const lines = [] as number[]
+    const faint = [0.3, 0.4, 0.45] // subtle cyan tint
+    const strong = [0.35, 0.72, 0.82]
+    for (let i = -count; i <= count; i++) {
+      const c = i === 0 ? strong : faint
+      // lines parallel to X (varying Z)
+      lines.push(-size, 0, i * step, c[0], c[1], c[2])
+      lines.push(size, 0, i * step, c[0], c[1], c[2])
+      // lines parallel to Z (varying X)
+      lines.push(i * step, 0, -size, c[0], c[1], c[2])
+      lines.push(i * step, 0, size, c[0], c[1], c[2])
+    }
+    const data = new Float32Array(lines)
+    this.gridVertexCount = data.length / 6
+    this.gridVertexBuffer = this.device.createBuffer({
+      label: "grid",
+      size: data.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.gridVertexBuffer, 0, data)
   }
 
   private initResizeObserver() {
@@ -820,6 +906,14 @@ export class Engine {
 
     const encoder = this.device.createCommandEncoder({ label: "our encoder" })
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
+    // Draw grid (if created)
+    if (this.gridPipeline && this.gridVertexBuffer && this.gridBindGroup && this.gridVertexCount > 0) {
+      pass.setPipeline(this.gridPipeline)
+      pass.setVertexBuffer(0, this.gridVertexBuffer)
+      pass.setBindGroup(0, this.gridBindGroup)
+      pass.draw(this.gridVertexCount)
+    }
+    // Draw model
     pass.setPipeline(this.pipeline)
     pass.setVertexBuffer(0, this.vertexBuffer)
     if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
