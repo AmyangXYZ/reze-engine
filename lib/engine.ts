@@ -118,7 +118,7 @@ export class Engine {
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
       view: this.context.getCurrentTexture().createView(), // Placeholder, updated each frame
-      clearValue: [0.3, 0.3, 0.3, 1],
+      clearValue: { r: 0.05, g: 0.066, b: 0.086, a: 1.0 },
       loadOp: "clear",
       storeOp: "store",
     }
@@ -414,7 +414,7 @@ export class Engine {
       Math.PI, // alpha
       Math.PI / 2.5, // beta
       30, // radius
-      new Vec3(0, 13, 0) // target
+      new Vec3(0, 12.5, 0) // target
     )
 
     // Set aspect ratio

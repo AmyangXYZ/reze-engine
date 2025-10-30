@@ -1,12 +1,19 @@
 "use client"
 
+import Header from "@/components/header"
 import { Engine, EngineStats } from "@/lib/engine"
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react"
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
-  const [stats, setStats] = useState<EngineStats | null>(null)
+  const [stats, setStats] = useState<EngineStats>({
+    fps: 0,
+    frameTime: 0,
+    memoryUsed: 0,
+    drawCalls: 0,
+    vertices: 0,
+  })
 
   const initEngine = useCallback(async () => {
     if (canvasRef.current) {
@@ -39,43 +46,13 @@ export default function Home() {
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
+      {/* Header with stats like a menu bar */}
+      <Header stats={stats} />
+
       {/* Full-screen canvas */}
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none" />
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
 
-      {/* Floating header */}
-      <header className="absolute top-0 left-0 right-0 p-6 pointer-events-none">
-        {/* <h1 className="text-3xl font-bold text-white drop-shadow-lg">Reze Engine</h1> */}
-      </header>
-
-      {/* Stats panel */}
-      {stats && (
-        <div className="absolute top-20 right-6 bg-black/70 text-white p-4 rounded-lg text-sm font-mono pointer-events-none backdrop-blur-sm min-w-[180px] md:block hidden">
-          <div className="space-y-1">
-            <div className="flex justify-between gap-4">
-              <span className="text-muted-foreground">FPS:</span>
-              <span className="font-bold">{stats.fps}</span>
-            </div>
-            <div className="flex justify-between gap-4">
-              <span className="text-muted-foreground">Frame:</span>
-              <span>{stats.frameTime.toFixed(2)} ms</span>
-            </div>
-            <div className="flex justify-between gap-4">
-              <span className="text-muted-foreground">Draw Calls:</span>
-              <span>{stats.drawCalls}</span>
-            </div>
-            <div className="flex justify-between gap-4">
-              <span className="text-muted-foreground">Vertices:</span>
-              <span>{stats.vertices}</span>
-            </div>
-            {stats.memoryUsed > 0 && (
-              <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Memory:</span>
-                <span>{stats.memoryUsed} MB</span>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+      {/* Inline stats moved to the header; remove floating stats panel */}
     </div>
-  );
+  )
 }
