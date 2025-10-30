@@ -68,6 +68,16 @@ export class Quat {
   multiply(other: Quat): Quat {
     return new Quat(this.x * other.x, this.y * other.y, this.z * other.z, this.w * other.w)
   }
+
+  length(): number {
+    return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w)
+  }
+
+  normalize(): Quat {
+    const len = this.length()
+    if (len === 0) return new Quat(0, 0, 0, 1)
+    return new Quat(this.x / len, this.y / len, this.z / len, this.w / len)
+  }
 }
 
 export class Mat4 {
@@ -135,24 +145,66 @@ export class Mat4 {
   }
 
   multiply(other: Mat4): Mat4 {
-    const result = new Float32Array(16)
+    // Column-major multiplication (matches WGSL/GLSL convention):
+    // result = a * b
+    const out = new Float32Array(16)
     const a = this.values
     const b = other.values
-
-    for (let i = 0; i < 4; i++) {
-      for (let j = 0; j < 4; j++) {
-        result[i * 4 + j] =
-          a[i * 4 + 0] * b[0 * 4 + j] +
-          a[i * 4 + 1] * b[1 * 4 + j] +
-          a[i * 4 + 2] * b[2 * 4 + j] +
-          a[i * 4 + 3] * b[3 * 4 + j]
-      }
+    for (let c = 0; c < 4; c++) {
+      const b0 = b[c * 4 + 0]
+      const b1 = b[c * 4 + 1]
+      const b2 = b[c * 4 + 2]
+      const b3 = b[c * 4 + 3]
+      out[c * 4 + 0] = a[0] * b0 + a[4] * b1 + a[8] * b2 + a[12] * b3
+      out[c * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9] * b2 + a[13] * b3
+      out[c * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3
+      out[c * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3
     }
-
-    return new Mat4(result)
+    return new Mat4(out)
   }
 
   clone(): Mat4 {
     return new Mat4(this.values.slice())
+  }
+
+  static fromQuat(x: number, y: number, z: number, w: number): Mat4 {
+    // Column-major rotation matrix from quaternion (matches glMatrix/WGSL)
+    const out = new Float32Array(16)
+    const x2 = x + x,
+      y2 = y + y,
+      z2 = z + z
+    const xx = x * x2,
+      xy = x * y2,
+      xz = x * z2
+    const yy = y * y2,
+      yz = y * z2,
+      zz = z * z2
+    const wx = w * x2,
+      wy = w * y2,
+      wz = w * z2
+    out[0] = 1 - (yy + zz)
+    out[1] = xy + wz
+    out[2] = xz - wy
+    out[3] = 0
+    out[4] = xy - wz
+    out[5] = 1 - (xx + zz)
+    out[6] = yz + wx
+    out[7] = 0
+    out[8] = xz + wy
+    out[9] = yz - wx
+    out[10] = 1 - (xx + yy)
+    out[11] = 0
+    out[12] = 0
+    out[13] = 0
+    out[14] = 0
+    out[15] = 1
+    return new Mat4(out)
+  }
+
+  translateInPlace(tx: number, ty: number, tz: number): this {
+    this.values[12] += tx
+    this.values[13] += ty
+    this.values[14] += tz
+    return this
   }
 }

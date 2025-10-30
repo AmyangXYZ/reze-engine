@@ -1,5 +1,5 @@
 import { Camera } from "./camera"
-import { Vec3 } from "./math"
+import { Quat, Vec3 } from "./math"
 import { RzmModel } from "./rzm"
 import { PmxLoader } from "./pmx-loader"
 
@@ -39,8 +39,13 @@ export class Engine {
   private renderPassColorAttachment!: GPURenderPassColorAttachment
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
+  private jointsBuffer?: GPUBuffer
+  private weightsBuffer?: GPUBuffer
+  private skinMatrixBuffer?: GPUBuffer
+  private fallbackSkinMatrixBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
+  private currentModel: RzmModel | null = null
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -182,16 +187,31 @@ export class Engine {
         @group(0) @binding(2) var<uniform> material: MaterialUniforms;
         @group(0) @binding(3) var diffuseTexture: texture_2d<f32>;
         @group(0) @binding(4) var diffuseSampler: sampler;
+        @group(0) @binding(5) var<storage, read> skinMats: array<mat4x4f>;
 
         @vertex fn vs(
           @location(0) position: vec3f,
           @location(1) normal: vec3f,
-          @location(2) uv: vec2f
+          @location(2) uv: vec2f,
+          @location(3) joints0: vec4<u32>,
+          @location(4) weights0: vec4<f32>
         ) -> VertexOutput {
           var output: VertexOutput;
-          let worldPos = position; // Model space = world space for now (no model matrix)
-          output.position = camera.projection * camera.view * vec4f(position, 1.0);
-          output.normal = normal;
+          // GPU skinning (LBS4)
+          var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
+          var skinnedNrm = vec3f(0.0, 0.0, 0.0);
+          for (var i = 0u; i < 4u; i++) {
+            let j = joints0[i];
+            let w = weights0[i];
+            let m = skinMats[j];
+            skinnedPos += (m * vec4f(position, 1.0)) * w;
+            // normal (upper-left 3x3)
+            let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
+            skinnedNrm += (r3 * normal) * w;
+          }
+          let worldPos = skinnedPos.xyz;
+          output.position = camera.projection * camera.view * vec4f(worldPos, 1.0);
+          output.normal = normalize(skinnedNrm);
           output.uv = uv;
           output.worldPos = worldPos;
           return output;
@@ -283,6 +303,14 @@ export class Engine {
                 format: "float32x2" as GPUVertexFormat,
               },
             ],
+          },
+          {
+            arrayStride: 4 * 2, // 4 * uint16
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4, // 4 * unorm8 packed
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
           },
         ],
       },
@@ -486,9 +514,12 @@ export class Engine {
   public async loadPmx(url: string) {
     const model = await PmxLoader.load(url)
     await this.drawModel(model)
+    console.log(model.getBoneNames())
+    model.setBoneRotation("首", new Quat(-0.05, 0.15, 0, 1).normalize())
   }
 
   private async drawModel(model: RzmModel) {
+    this.currentModel = model
     const vertices = model.getVertices()
 
     // Create vertex buffer from interleaved data
@@ -501,6 +532,54 @@ export class Engine {
     // Write vertex data to GPU buffer
     this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices)
     this.vertexCount = model.getVertexCount()
+
+    // Optional skinning buffers
+    const skinning = model.getSkinning()
+    if (skinning) {
+      // joints buffer (u16x4 per vertex)
+      this.jointsBuffer = this.device.createBuffer({
+        label: "joints buffer",
+        size: skinning.joints0.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(
+        this.jointsBuffer,
+        0,
+        skinning.joints0.buffer,
+        skinning.joints0.byteOffset,
+        skinning.joints0.byteLength
+      )
+
+      // weights buffer (unorm8x4 per vertex)
+      this.weightsBuffer = this.device.createBuffer({
+        label: "weights buffer",
+        size: skinning.weights0.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(
+        this.weightsBuffer,
+        0,
+        skinning.weights0.buffer,
+        skinning.weights0.byteOffset,
+        skinning.weights0.byteLength
+      )
+
+      // skin matrices storage buffer
+      const skel = model.getSkeleton()
+      const boneCount = skel ? skel.bones.length : 0
+      const byteSize = boneCount * 16 * 4
+      this.skinMatrixBuffer = this.device.createBuffer({
+        label: "skin matrices",
+        size: Math.max(256, byteSize),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      })
+
+      // (debug dump removed)
+    } else {
+      this.jointsBuffer = undefined
+      this.weightsBuffer = undefined
+      this.skinMatrixBuffer = undefined
+    }
 
     // Create index buffer if model has indices
     const indices = model.getIndices()
@@ -568,6 +647,9 @@ export class Engine {
         { binding: 3, resource: (texResource ? texResource.texture : defaultTexture).createView() },
         { binding: 4, resource: texResource ? texResource.sampler : defaultSampler },
       ]
+
+      // Bind skin buffer (fallback if actual not present)
+      entries.push({ binding: 5, resource: { buffer: this.skinMatrixBuffer || this.fallbackSkinMatrixBuffer! } })
 
       const bindGroup = this.device.createBindGroup({
         label: `material ${i} bind group`,
@@ -671,6 +753,19 @@ export class Engine {
       entries.push({ binding: 3, resource: defaultTexture.createView() }, { binding: 4, resource: defaultSampler })
     }
 
+    // Ensure binding 5 is always present
+    if (!this.skinMatrixBuffer && !this.fallbackSkinMatrixBuffer) {
+      const size = 16 * 4
+      this.fallbackSkinMatrixBuffer = this.device.createBuffer({
+        label: "fallback skin matrices",
+        size,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      })
+      const identity = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+      this.device.queue.writeBuffer(this.fallbackSkinMatrixBuffer, 0, identity)
+    }
+    entries.push({ binding: 5, resource: { buffer: this.skinMatrixBuffer || this.fallbackSkinMatrixBuffer! } })
+
     this.bindGroup = this.device.createBindGroup({
       label: "model bind group",
       layout: this.pipeline.getBindGroupLayout(0),
@@ -727,6 +822,15 @@ export class Engine {
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     pass.setPipeline(this.pipeline)
     pass.setVertexBuffer(0, this.vertexBuffer)
+    if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
+    if (this.weightsBuffer) pass.setVertexBuffer(2, this.weightsBuffer)
+
+    // Update skin matrices if present
+    if (this.skinMatrixBuffer && this.currentModel) {
+      this.currentModel.evaluatePose()
+      const mats = this.currentModel.getSkinMatrices()
+      if (mats) this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+    }
 
     // Use indexed rendering if index buffer exists
     if (this.indexBuffer) {
