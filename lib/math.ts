@@ -78,6 +78,10 @@ export class Quat {
     if (len === 0) return new Quat(0, 0, 0, 1)
     return new Quat(this.x / len, this.y / len, this.z / len, this.w / len)
   }
+
+  toArray(): [number, number, number, number] {
+    return [this.x, this.y, this.z, this.w]
+  }
 }
 
 export class Mat4 {

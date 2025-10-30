@@ -78,6 +78,106 @@ export class RzmModel {
     }
   }
 
+  // --- Simple per-bone rotation tween state (runtime only) ---
+  private _rotTweenActive?: Uint8Array // 0/1 per bone
+  private _rotTweenStartQuat?: Float32Array // quat per bone (x,y,z,w)
+  private _rotTweenTargetQuat?: Float32Array // quat per bone (x,y,z,w)
+  private _rotTweenStartTimeMs?: Float32Array // one float per bone (ms)
+  private _rotTweenDurationMs?: Float32Array // one float per bone (ms)
+
+  private ensureRotTweenBuffers(): void {
+    if (!this.skeleton) return
+    const n = this.skeleton.bones.length
+    if (!this._rotTweenActive) this._rotTweenActive = new Uint8Array(n)
+    if (!this._rotTweenStartQuat) this._rotTweenStartQuat = new Float32Array(n * 4)
+    if (!this._rotTweenTargetQuat) this._rotTweenTargetQuat = new Float32Array(n * 4)
+    if (!this._rotTweenStartTimeMs) this._rotTweenStartTimeMs = new Float32Array(n)
+    if (!this._rotTweenDurationMs) this._rotTweenDurationMs = new Float32Array(n)
+  }
+
+  private static easeInOut(t: number): number {
+    return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2
+  }
+
+  private static slerp(
+    aX: number,
+    aY: number,
+    aZ: number,
+    aW: number,
+    bX: number,
+    bY: number,
+    bZ: number,
+    bW: number,
+    t: number
+  ): [number, number, number, number] {
+    // Robust basic slerp with shortest path
+    let cos = aX * bX + aY * bY + aZ * bZ + aW * bW
+    let bx = bX,
+      by = bY,
+      bz = bZ,
+      bw = bW
+    if (cos < 0) {
+      cos = -cos
+      bx = -bx
+      by = -by
+      bz = -bz
+      bw = -bw
+    }
+    if (cos > 0.9995) {
+      // Linear fallback
+      const x = aX + t * (bx - aX)
+      const y = aY + t * (by - aY)
+      const z = aZ + t * (bz - aZ)
+      const w = aW + t * (bw - aW)
+      const invLen = 1 / Math.hypot(x, y, z, w)
+      return [x * invLen, y * invLen, z * invLen, w * invLen]
+    }
+    const theta0 = Math.acos(cos)
+    const sinTheta0 = Math.sin(theta0)
+    const theta = theta0 * t
+    const s0 = Math.sin(theta0 - theta) / sinTheta0
+    const s1 = Math.sin(theta) / sinTheta0
+    const x = s0 * aX + s1 * bx
+    const y = s0 * aY + s1 * by
+    const z = s0 * aZ + s1 * bz
+    const w = s0 * aW + s1 * bw
+    return [x, y, z, w]
+  }
+
+  private updateRotationTweens(): void {
+    if (!this.skeleton) return
+    if (!this._rotTweenActive) return
+    this.ensureRuntimePose()
+    this.ensureRotTweenBuffers()
+    if (!this.boneLocalRotations) return
+    const now = performance.now()
+    const n = this.skeleton.bones.length
+    for (let i = 0; i < n; i++) {
+      if (this._rotTweenActive[i] !== 1) continue
+      const startMs = this._rotTweenStartTimeMs![i]
+      const durMs = Math.max(1, this._rotTweenDurationMs![i])
+      const t = Math.max(0, Math.min(1, (now - startMs) / durMs))
+      const e = RzmModel.easeInOut(t)
+      const qi = i * 4
+      const a0 = this._rotTweenStartQuat![qi]
+      const a1 = this._rotTweenStartQuat![qi + 1]
+      const a2 = this._rotTweenStartQuat![qi + 2]
+      const a3 = this._rotTweenStartQuat![qi + 3]
+      const b0 = this._rotTweenTargetQuat![qi]
+      const b1 = this._rotTweenTargetQuat![qi + 1]
+      const b2 = this._rotTweenTargetQuat![qi + 2]
+      const b3 = this._rotTweenTargetQuat![qi + 3]
+      const [x, y, z, w] = RzmModel.slerp(a0, a1, a2, a3, b0, b1, b2, b3, e)
+      this.boneLocalRotations[qi] = x
+      this.boneLocalRotations[qi + 1] = y
+      this.boneLocalRotations[qi + 2] = z
+      this.boneLocalRotations[qi + 3] = w
+      if (t >= 1) {
+        this._rotTweenActive[i] = 0
+      }
+    }
+  }
+
   // Load RZM model from URL
   static async load(url: string): Promise<RzmModel> {
     const response = await fetch(url)
@@ -267,6 +367,84 @@ export class RzmModel {
     }
   }
 
+  // Batched rotation with optional interpolation and retargeting.
+  rotateBones(indicesOrNames: Array<number | string>, quats: Quat[], durationMs?: number): void {
+    if (!this.skeleton) return
+    this.ensureRuntimePose()
+    this.ensureRotTweenBuffers()
+    if (!this.boneLocalRotations || !this._rotTweenActive) return
+
+    quats = quats.map((q) => q.normalize())
+    // Resolve indices
+    const indices: number[] = new Array(indicesOrNames.length)
+    for (let i = 0; i < indicesOrNames.length; i++) {
+      const v = indicesOrNames[i]
+      const idx = typeof v === "number" ? v : this.getBoneIndexByName(v)
+      if (idx < 0 || idx >= this.skeleton.bones.length) continue
+      indices[i] = idx
+    }
+
+    // Quats are normalized above; use toArray() for xyzw
+
+    const now = performance.now()
+    const dur = durationMs && durationMs > 0 ? durationMs : 0
+
+    for (let i = 0; i < indices.length; i++) {
+      const bi = indices[i]
+      if (bi === undefined) continue
+      const qi = bi * 4
+      const [tx, ty, tz, tw] = quats[i].toArray()
+
+      if (dur === 0) {
+        // Immediate set, cancel any tween
+        this.boneLocalRotations[qi] = tx
+        this.boneLocalRotations[qi + 1] = ty
+        this.boneLocalRotations[qi + 2] = tz
+        this.boneLocalRotations[qi + 3] = tw
+        this._rotTweenActive[bi] = 0
+        continue
+      }
+
+      // Retarget: if active, compute current pose as new start; else start from current local
+      let sx = this.boneLocalRotations[qi]
+      let sy = this.boneLocalRotations[qi + 1]
+      let sz = this.boneLocalRotations[qi + 2]
+      let sw = this.boneLocalRotations[qi + 3]
+      if (this._rotTweenActive[bi] === 1) {
+        const startMs = this._rotTweenStartTimeMs![bi]
+        const prevDur = Math.max(1, this._rotTweenDurationMs![bi])
+        const t = Math.max(0, Math.min(1, (now - startMs) / prevDur))
+        const e = RzmModel.easeInOut(t)
+        const a0 = this._rotTweenStartQuat![qi]
+        const a1 = this._rotTweenStartQuat![qi + 1]
+        const a2 = this._rotTweenStartQuat![qi + 2]
+        const a3 = this._rotTweenStartQuat![qi + 3]
+        const b0 = this._rotTweenTargetQuat![qi]
+        const b1 = this._rotTweenTargetQuat![qi + 1]
+        const b2 = this._rotTweenTargetQuat![qi + 2]
+        const b3 = this._rotTweenTargetQuat![qi + 3]
+        const cur = RzmModel.slerp(a0, a1, a2, a3, b0, b1, b2, b3, e)
+        sx = cur[0]
+        sy = cur[1]
+        sz = cur[2]
+        sw = cur[3]
+      }
+
+      // Write start and target, mark active
+      this._rotTweenStartQuat![qi] = sx
+      this._rotTweenStartQuat![qi + 1] = sy
+      this._rotTweenStartQuat![qi + 2] = sz
+      this._rotTweenStartQuat![qi + 3] = sw
+      this._rotTweenTargetQuat![qi] = tx
+      this._rotTweenTargetQuat![qi + 1] = ty
+      this._rotTweenTargetQuat![qi + 2] = tz
+      this._rotTweenTargetQuat![qi + 3] = tw
+      this._rotTweenStartTimeMs![bi] = now
+      this._rotTweenDurationMs![bi] = dur
+      this._rotTweenActive[bi] = 1
+    }
+  }
+
   setBoneRotation(indexOrName: number | string, quat: Quat): void {
     if (!this.skeleton) return
     const index = typeof indexOrName === "number" ? indexOrName : this.getBoneIndexByName(indexOrName)
@@ -325,6 +503,8 @@ export class RzmModel {
   evaluatePose(): void {
     if (!this.skeleton) return
     this.ensureRuntimePose()
+    // Advance rotation tweens before composing matrices
+    this.updateRotationTweens()
     if (!this.boneLocalRotations || !this.boneLocalTranslations || !this.boneWorldMatrices || !this.boneSkinMatrices)
       return
     const bones = this.skeleton.bones

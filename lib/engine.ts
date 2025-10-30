@@ -601,7 +601,11 @@ export class Engine {
     const model = await PmxLoader.load(url)
     await this.drawModel(model)
     console.log(model.getBoneNames())
-    model.setBoneRotation("首", new Quat(0.05, 0.15, 0, 1).normalize())
+    model.rotateBones(
+      ["首", "左腕", "右腕"],
+      [new Quat(0.3, 0.3, 0, 1), new Quat(0.3, 0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
+      5000
+    )
   }
 
   private async drawModel(model: RzmModel) {
