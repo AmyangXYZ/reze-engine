@@ -29,6 +29,7 @@ export interface RzmBone {
   name: string
   parentIndex: number // -1 if no parent
   bindTranslation: [number, number, number]
+  children: number[] // child bone indices (built on skeleton creation)
   // Optional PMX append/inherit transform
   appendParentIndex?: number // index of the bone to inherit from
   appendRatio?: number // 0..1
@@ -40,6 +41,36 @@ export interface RzmSkeleton {
   bones: RzmBone[]
   // One inverse-bind matrix per bone (column-major mat4, 16 floats per bone)
   inverseBindMatrices: Float32Array
+  // Cached lookup for efficient bone access (built on creation)
+  nameIndex: Record<string, number> // bone name -> bone index
+}
+
+export interface RzmSkinning {
+  joints: Uint16Array // length = vertexCount * 4, bone indices per vertex
+  weights: Uint8Array // UNORM8, length = vertexCount * 4, sums ~ 255 per-vertex
+}
+
+export interface SpringBone {
+  // Bone indices
+  parentBoneIndex: number // Bone that acts as the anchor/root of the spring
+  childBoneIndex: number // Bone that will be affected by spring physics
+  // Spring parameters
+  stiffness: number // Spring stiffness (higher = stiffer, typical range: 0.01-1.0)
+  damping: number // Damping factor (higher = less oscillation, typical range: 0.1-0.9)
+  restLength?: number // Rest length of spring (auto-calculated if not provided)
+  // Collision/limits (optional)
+  collideRadius?: number // Sphere collision radius
+  // Gravity (optional)
+  gravityScale?: number // Multiplier for gravity effect
+}
+
+// Rotation tween state per bone
+interface RotationTweenState {
+  active: Uint8Array // 0/1 per bone
+  startQuat: Float32Array // quat per bone (x,y,z,w)
+  targetQuat: Float32Array // quat per bone (x,y,z,w)
+  startTimeMs: Float32Array // one float per bone (ms)
+  durationMs: Float32Array // one float per bone (ms)
 }
 
 import { Mat4, Vec3, Quat } from "./math"
@@ -47,57 +78,85 @@ import { Mat4, Vec3, Quat } from "./math"
 export class RzmModel {
   private vertexData: Float32Array<ArrayBuffer>
   private vertexCount: number
-  private indexData?: Uint32Array<ArrayBuffer>
+  private indexData: Uint32Array<ArrayBuffer>
   private indexCount: number
   private textures: RzmTexture[] = []
   private materials: RzmMaterial[] = []
   // Static skeleton/skinning (not necessarily serialized yet)
-  private skeleton?: RzmSkeleton
-  private joints0?: Uint16Array // length = vertexCount * 4
-  private weights0?: Uint8Array // UNORM8, length = vertexCount * 4, sums ~ 255 per-vertex
+  private skeleton: RzmSkeleton
+  private skinning: RzmSkinning
 
-  // Runtime (non-serialized) pose data
-  private boneLocalRotations?: Float32Array // quat per bone (x,y,z,w) length = boneCount*4
-  private boneLocalTranslations?: Float32Array // vec3 per bone length = boneCount*3
-  private boneWorldMatrices?: Float32Array // mat4 per bone length = boneCount*16
-  private boneSkinMatrices?: Float32Array // mat4 per bone length = boneCount*16
+  // Runtime (non-serialized) pose data (initialized during construction)
+  private boneLocalRotations!: Float32Array // quat per bone (x,y,z,w) length = boneCount*4
+  private boneLocalTranslations!: Float32Array // vec3 per bone length = boneCount*3
+  private boneWorldMatrices!: Float32Array // mat4 per bone length = boneCount*16
+  private boneSkinMatrices!: Float32Array // mat4 per bone length = boneCount*16
+
+  // Spring bone physics
+  private springBones: SpringBone[] = []
+  // Verlet integration state: current and previous tail positions in world space
+  private springCurrentTails?: Float32Array // vec3 per spring bone (current tail position)
+  private springPrevTails?: Float32Array // vec3 per spring bone (previous tail position)
+  private springInitialized = false
 
   constructor(
     vertexData: Float32Array<ArrayBuffer>,
-    indexData?: Uint32Array<ArrayBuffer>,
-    textures: RzmTexture[] = [],
-    materials: RzmMaterial[] = [],
-    skeleton?: RzmSkeleton,
-    skinning?: { joints0: Uint16Array; weights0: Uint8Array }
+    indexData: Uint32Array<ArrayBuffer>,
+    textures: RzmTexture[],
+    materials: RzmMaterial[],
+    skeleton: RzmSkeleton,
+    skinning: RzmSkinning
   ) {
     this.vertexData = vertexData
     this.vertexCount = vertexData.length / VERTEX_STRIDE
     this.indexData = indexData
-    this.indexCount = indexData ? indexData.length : 0
+    this.indexCount = indexData.length
     this.textures = textures
     this.materials = materials
     this.skeleton = skeleton
-    if (skinning) {
-      this.joints0 = skinning.joints0
-      this.weights0 = skinning.weights0
+    this.skinning = skinning
+    if (this.skeleton.bones.length > 0) {
+      this.buildBoneLookups()
+      this.initializeRuntimePose()
+      this.initializeRotTweenBuffers()
     }
   }
 
-  // --- Simple per-bone rotation tween state (runtime only) ---
-  private _rotTweenActive?: Uint8Array // 0/1 per bone
-  private _rotTweenStartQuat?: Float32Array // quat per bone (x,y,z,w)
-  private _rotTweenTargetQuat?: Float32Array // quat per bone (x,y,z,w)
-  private _rotTweenStartTimeMs?: Float32Array // one float per bone (ms)
-  private _rotTweenDurationMs?: Float32Array // one float per bone (ms)
+  // Build caches for O(1) bone lookups and populate children arrays
+  // Called during model initialization
+  private buildBoneLookups(): void {
+    const nameToIndex: Record<string, number> = {}
 
-  private ensureRotTweenBuffers(): void {
-    if (!this.skeleton) return
+    // Initialize children arrays for all bones and build name index
+    for (let i = 0; i < this.skeleton.bones.length; i++) {
+      this.skeleton.bones[i].children = []
+      nameToIndex[this.skeleton.bones[i].name] = i
+    }
+
+    // Build parent->children relationships
+    for (let i = 0; i < this.skeleton.bones.length; i++) {
+      const bone = this.skeleton.bones[i]
+      const parentIdx = bone.parentIndex
+      if (parentIdx >= 0 && parentIdx < this.skeleton.bones.length) {
+        this.skeleton.bones[parentIdx].children.push(i)
+      }
+    }
+
+    this.skeleton.nameIndex = nameToIndex
+  }
+
+  // Rotation tween state (runtime only, initialized during construction)
+  private rotTweenState!: RotationTweenState
+
+  private initializeRotTweenBuffers(): void {
     const n = this.skeleton.bones.length
-    if (!this._rotTweenActive) this._rotTweenActive = new Uint8Array(n)
-    if (!this._rotTweenStartQuat) this._rotTweenStartQuat = new Float32Array(n * 4)
-    if (!this._rotTweenTargetQuat) this._rotTweenTargetQuat = new Float32Array(n * 4)
-    if (!this._rotTweenStartTimeMs) this._rotTweenStartTimeMs = new Float32Array(n)
-    if (!this._rotTweenDurationMs) this._rotTweenDurationMs = new Float32Array(n)
+    this.rotTweenState = {
+      active: new Uint8Array(n),
+      startQuat: new Float32Array(n * 4),
+      targetQuat: new Float32Array(n * 4),
+      startTimeMs: new Float32Array(n),
+      durationMs: new Float32Array(n),
+    }
   }
 
   private static easeInOut(t: number): number {
@@ -196,35 +255,32 @@ export class RzmModel {
   }
 
   private updateRotationTweens(): void {
-    if (!this.skeleton) return
-    if (!this._rotTweenActive) return
-    this.ensureRuntimePose()
-    this.ensureRotTweenBuffers()
-    if (!this.boneLocalRotations) return
+    const state = this.rotTweenState
     const now = performance.now()
     const n = this.skeleton.bones.length
+
     for (let i = 0; i < n; i++) {
-      if (this._rotTweenActive[i] !== 1) continue
-      const startMs = this._rotTweenStartTimeMs![i]
-      const durMs = Math.max(1, this._rotTweenDurationMs![i])
+      if (state.active[i] !== 1) continue
+      const startMs = state.startTimeMs[i]
+      const durMs = Math.max(1, state.durationMs[i])
       const t = Math.max(0, Math.min(1, (now - startMs) / durMs))
       const e = RzmModel.easeInOut(t)
       const qi = i * 4
-      const a0 = this._rotTweenStartQuat![qi]
-      const a1 = this._rotTweenStartQuat![qi + 1]
-      const a2 = this._rotTweenStartQuat![qi + 2]
-      const a3 = this._rotTweenStartQuat![qi + 3]
-      const b0 = this._rotTweenTargetQuat![qi]
-      const b1 = this._rotTweenTargetQuat![qi + 1]
-      const b2 = this._rotTweenTargetQuat![qi + 2]
-      const b3 = this._rotTweenTargetQuat![qi + 3]
+      const a0 = state.startQuat[qi]
+      const a1 = state.startQuat[qi + 1]
+      const a2 = state.startQuat[qi + 2]
+      const a3 = state.startQuat[qi + 3]
+      const b0 = state.targetQuat[qi]
+      const b1 = state.targetQuat[qi + 1]
+      const b2 = state.targetQuat[qi + 2]
+      const b3 = state.targetQuat[qi + 3]
       const [x, y, z, w] = RzmModel.slerp(a0, a1, a2, a3, b0, b1, b2, b3, e)
       this.boneLocalRotations[qi] = x
       this.boneLocalRotations[qi + 1] = y
       this.boneLocalRotations[qi + 2] = z
       this.boneLocalRotations[qi + 3] = w
       if (t >= 1) {
-        this._rotTweenActive[i] = 0
+        state.active[i] = 0
       }
     }
   }
@@ -259,15 +315,32 @@ export class RzmModel {
     const sourceVertexData = new Float32Array(buffer, 64, vertexDataLength)
     const vertexData = new Float32Array(sourceVertexData) // Copy to new array
 
-    // Read index data if present (starts after vertex data)
-    let indexData: Uint32Array<ArrayBuffer> | undefined
+    // Read index data (starts after vertex data)
+    let indexData: Uint32Array<ArrayBuffer>
     if (indexCount > 0) {
       const indexOffset = 64 + vertexDataLength * 4 // 4 bytes per float
       const sourceIndexData = new Uint32Array(buffer, indexOffset, indexCount)
       indexData = new Uint32Array(sourceIndexData) // Copy to new array
+    } else {
+      indexData = new Uint32Array(0)
     }
 
-    return new RzmModel(vertexData, indexData)
+    // Create minimal skeleton and skinning for static model
+    const skeleton: RzmSkeleton = {
+      bones: [],
+      inverseBindMatrices: new Float32Array(0),
+      nameIndex: {},
+    }
+    const skinning: RzmSkinning = {
+      joints: new Uint16Array(vertexCount * 4),
+      weights: new Uint8Array(vertexCount * 4),
+    }
+    // Initialize weights to single bone (index 0, weight 255) per vertex
+    for (let i = 0; i < vertexCount; i++) {
+      skinning.joints[i * 4] = 0
+      skinning.weights[i * 4] = 255
+    }
+    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning)
   }
 
   // Get interleaved vertex data for GPU upload
@@ -300,7 +373,7 @@ export class RzmModel {
   }
 
   // Get index data for GPU upload
-  getIndices(): Uint32Array<ArrayBuffer> | undefined {
+  getIndices(): Uint32Array<ArrayBuffer> {
     return this.indexData
   }
 
@@ -334,32 +407,49 @@ export class RzmModel {
       vertexData[vertIdx + 7] = 0
     }
 
-    return new RzmModel(vertexData)
+    // Create minimal skeleton and skinning for static model
+    const skeleton: RzmSkeleton = {
+      bones: [],
+      inverseBindMatrices: new Float32Array(0),
+      nameIndex: {},
+    }
+    const skinning: RzmSkinning = {
+      joints: new Uint16Array(vertexCount * 4),
+      weights: new Uint8Array(vertexCount * 4),
+    }
+    // Initialize weights to single bone (index 0, weight 255) per vertex
+    for (let i = 0; i < vertexCount; i++) {
+      skinning.joints[i * 4] = 0
+      skinning.weights[i * 4] = 255
+    }
+    // Create sequential indices (0, 1, 2, ...)
+    const indexData = new Uint32Array(vertexCount)
+    for (let i = 0; i < vertexCount; i++) {
+      indexData[i] = i
+    }
+    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning)
   }
 
   // Accessors for skeleton/skinning
-  getSkeleton(): RzmSkeleton | undefined {
+  getSkeleton(): RzmSkeleton {
     return this.skeleton
   }
 
-  getSkinning(): { joints0: Uint16Array; weights0: Uint8Array } | undefined {
-    if (this.joints0 && this.weights0) return { joints0: this.joints0, weights0: this.weights0 }
-    return undefined
+  getSkinning(): RzmSkinning {
+    return this.skinning
   }
 
-  getSkinMatrices(): Float32Array | undefined {
-    if (!this.boneSkinMatrices || !this.skeleton) return undefined
+  getSkinMatrices(): Float32Array {
     return this.boneSkinMatrices
   }
 
-  // Runtime pose (non-serialized) setters/getters (minimal for now)
-  ensureRuntimePose(): void {
-    if (!this.skeleton) return
+  // Initialize runtime pose buffers (called once during construction)
+  private initializeRuntimePose(): void {
     const boneCount = this.skeleton.bones.length
-    if (!this.boneLocalRotations) this.boneLocalRotations = new Float32Array(boneCount * 4)
-    if (!this.boneLocalTranslations) this.boneLocalTranslations = new Float32Array(boneCount * 3)
-    if (!this.boneWorldMatrices) this.boneWorldMatrices = new Float32Array(boneCount * 16)
-    if (!this.boneSkinMatrices) this.boneSkinMatrices = new Float32Array(boneCount * 16)
+    this.boneLocalRotations = new Float32Array(boneCount * 4)
+    this.boneLocalTranslations = new Float32Array(boneCount * 3)
+    this.boneWorldMatrices = new Float32Array(boneCount * 16)
+    this.boneSkinMatrices = new Float32Array(boneCount * 16)
     // Initialize rotations to identity (0,0,0,1). Translations default to zero
     for (let i = 0; i < boneCount; i++) {
       const qi = i * 4
@@ -374,32 +464,23 @@ export class RzmModel {
 
   // ------- Bone helpers (public API) -------
   getBoneCount(): number {
-    return this.skeleton ? this.skeleton.bones.length : 0
+    return this.skeleton.bones.length
   }
 
   getBoneNames(): string[] {
-    if (!this.skeleton) return []
     return this.skeleton.bones.map((b) => b.name)
   }
 
   getBoneIndexByName(name: string): number {
-    if (!this.skeleton) return -1
-    for (let i = 0; i < this.skeleton.bones.length; i++) {
-      if (this.skeleton.bones[i].name === name) return i
-    }
-    return -1
+    return this.skeleton.nameIndex[name] ?? -1
   }
 
   getBoneName(index: number): string | undefined {
-    if (!this.skeleton) return undefined
     if (index < 0 || index >= this.skeleton.bones.length) return undefined
     return this.skeleton.bones[index].name
   }
 
   getBoneLocal(index: number): { rotation: Quat; translation: Vec3 } | undefined {
-    if (!this.skeleton) return undefined
-    this.ensureRuntimePose()
-    if (!this.boneLocalRotations || !this.boneLocalTranslations) return undefined
     if (index < 0 || index >= this.skeleton.bones.length) return undefined
     const qi = index * 4
     const ti = index * 3
@@ -420,12 +501,9 @@ export class RzmModel {
 
   // Batched rotation with optional interpolation and retargeting.
   rotateBones(indicesOrNames: Array<number | string>, quats: Quat[], durationMs?: number): void {
-    if (!this.skeleton) return
-    this.ensureRuntimePose()
-    this.ensureRotTweenBuffers()
-    if (!this.boneLocalRotations || !this._rotTweenActive) return
-
+    const state = this.rotTweenState
     quats = quats.map((q) => q.normalize())
+
     // Resolve indices
     const indices: number[] = new Array(indicesOrNames.length)
     for (let i = 0; i < indicesOrNames.length; i++) {
@@ -434,8 +512,6 @@ export class RzmModel {
       if (idx < 0 || idx >= this.skeleton.bones.length) continue
       indices[i] = idx
     }
-
-    // Quats are normalized above; use toArray() for xyzw
 
     const now = performance.now()
     const dur = durationMs && durationMs > 0 ? durationMs : 0
@@ -452,7 +528,7 @@ export class RzmModel {
         this.boneLocalRotations[qi + 1] = ty
         this.boneLocalRotations[qi + 2] = tz
         this.boneLocalRotations[qi + 3] = tw
-        this._rotTweenActive[bi] = 0
+        state.active[bi] = 0
         continue
       }
 
@@ -461,19 +537,20 @@ export class RzmModel {
       let sy = this.boneLocalRotations[qi + 1]
       let sz = this.boneLocalRotations[qi + 2]
       let sw = this.boneLocalRotations[qi + 3]
-      if (this._rotTweenActive[bi] === 1) {
-        const startMs = this._rotTweenStartTimeMs![bi]
-        const prevDur = Math.max(1, this._rotTweenDurationMs![bi])
+
+      if (state.active[bi] === 1) {
+        const startMs = state.startTimeMs[bi]
+        const prevDur = Math.max(1, state.durationMs[bi])
         const t = Math.max(0, Math.min(1, (now - startMs) / prevDur))
         const e = RzmModel.easeInOut(t)
-        const a0 = this._rotTweenStartQuat![qi]
-        const a1 = this._rotTweenStartQuat![qi + 1]
-        const a2 = this._rotTweenStartQuat![qi + 2]
-        const a3 = this._rotTweenStartQuat![qi + 3]
-        const b0 = this._rotTweenTargetQuat![qi]
-        const b1 = this._rotTweenTargetQuat![qi + 1]
-        const b2 = this._rotTweenTargetQuat![qi + 2]
-        const b3 = this._rotTweenTargetQuat![qi + 3]
+        const a0 = state.startQuat[qi]
+        const a1 = state.startQuat[qi + 1]
+        const a2 = state.startQuat[qi + 2]
+        const a3 = state.startQuat[qi + 3]
+        const b0 = state.targetQuat[qi]
+        const b1 = state.targetQuat[qi + 1]
+        const b2 = state.targetQuat[qi + 2]
+        const b3 = state.targetQuat[qi + 3]
         const cur = RzmModel.slerp(a0, a1, a2, a3, b0, b1, b2, b3, e)
         sx = cur[0]
         sy = cur[1]
@@ -482,26 +559,23 @@ export class RzmModel {
       }
 
       // Write start and target, mark active
-      this._rotTweenStartQuat![qi] = sx
-      this._rotTweenStartQuat![qi + 1] = sy
-      this._rotTweenStartQuat![qi + 2] = sz
-      this._rotTweenStartQuat![qi + 3] = sw
-      this._rotTweenTargetQuat![qi] = tx
-      this._rotTweenTargetQuat![qi + 1] = ty
-      this._rotTweenTargetQuat![qi + 2] = tz
-      this._rotTweenTargetQuat![qi + 3] = tw
-      this._rotTweenStartTimeMs![bi] = now
-      this._rotTweenDurationMs![bi] = dur
-      this._rotTweenActive[bi] = 1
+      state.startQuat[qi] = sx
+      state.startQuat[qi + 1] = sy
+      state.startQuat[qi + 2] = sz
+      state.startQuat[qi + 3] = sw
+      state.targetQuat[qi] = tx
+      state.targetQuat[qi + 1] = ty
+      state.targetQuat[qi + 2] = tz
+      state.targetQuat[qi + 3] = tw
+      state.startTimeMs[bi] = now
+      state.durationMs[bi] = dur
+      state.active[bi] = 1
     }
   }
 
   setBoneRotation(indexOrName: number | string, quat: Quat): void {
-    if (!this.skeleton) return
     const index = typeof indexOrName === "number" ? indexOrName : this.getBoneIndexByName(indexOrName)
     if (index < 0 || index >= this.skeleton.bones.length) return
-    this.ensureRuntimePose()
-    if (!this.boneLocalRotations) return
     const qi = index * 4
     this.boneLocalRotations[qi] = quat.x
     this.boneLocalRotations[qi + 1] = quat.y
@@ -510,11 +584,8 @@ export class RzmModel {
   }
 
   setBoneTranslation(indexOrName: number | string, t: Vec3): void {
-    if (!this.skeleton) return
     const index = typeof indexOrName === "number" ? indexOrName : this.getBoneIndexByName(indexOrName)
     if (index < 0 || index >= this.skeleton.bones.length) return
-    this.ensureRuntimePose()
-    if (!this.boneLocalTranslations) return
     const ti = index * 3
     this.boneLocalTranslations[ti] = t.x
     this.boneLocalTranslations[ti + 1] = t.y
@@ -522,9 +593,6 @@ export class RzmModel {
   }
 
   resetBone(index: number): void {
-    if (!this.skeleton) return
-    this.ensureRuntimePose()
-    if (!this.boneLocalRotations || !this.boneLocalTranslations) return
     const qi = index * 4
     const ti = index * 3
     this.boneLocalRotations[qi] = 0
@@ -541,29 +609,314 @@ export class RzmModel {
     for (let i = 0; i < count; i++) this.resetBone(i)
   }
 
+  // --- Spring Bone Physics ---
+
+  // Add a spring bone constraint
+  addSpringBone(springBone: SpringBone): void {
+    // Validate bone indices
+    const boneCount = this.skeleton.bones.length
+    if (
+      springBone.parentBoneIndex < 0 ||
+      springBone.parentBoneIndex >= boneCount ||
+      springBone.childBoneIndex < 0 ||
+      springBone.childBoneIndex >= boneCount
+    ) {
+      console.warn(
+        `[RZM] Invalid spring bone indices: parent=${springBone.parentBoneIndex}, child=${springBone.childBoneIndex}`
+      )
+      return
+    }
+    this.springBones.push(springBone)
+    this.springInitialized = false // Will reinitialize on next update
+  }
+
+  // Get all spring bones
+  getSpringBones(): SpringBone[] {
+    return [...this.springBones]
+  }
+
+  // Helper: get bone's bind translation as Vec3
+  private getBindTranslation(boneIndex: number): Vec3 {
+    const bone = this.skeleton!.bones[boneIndex]
+    return new Vec3(bone.bindTranslation[0], bone.bindTranslation[1], bone.bindTranslation[2])
+  }
+
+  // Helper: extract world position from bone matrix
+  private getBoneWorldPosition(boneIndex: number): Vec3 {
+    const matIdx = boneIndex * 16
+    return new Vec3(
+      this.boneWorldMatrices![matIdx + 12],
+      this.boneWorldMatrices![matIdx + 13],
+      this.boneWorldMatrices![matIdx + 14]
+    )
+  }
+
+  // Helper: get parent's world transform (position and rotation)
+  private getParentWorldTransform(parentBoneIdx: number): { pos: Vec3; quat: Quat } {
+    const parentMatIdx = parentBoneIdx * 16
+    const parentM = new Mat4(
+      new Float32Array(this.boneWorldMatrices!.buffer, this.boneWorldMatrices!.byteOffset + parentMatIdx * 4, 16)
+    )
+    const pos = new Vec3(
+      this.boneWorldMatrices![parentMatIdx + 12],
+      this.boneWorldMatrices![parentMatIdx + 13],
+      this.boneWorldMatrices![parentMatIdx + 14]
+    )
+    const [px, py, pz, pw] = RzmModel.mat3ToQuat(parentM.values)
+    const quat = new Quat(px, py, pz, pw).normalize()
+    return { pos, quat }
+  }
+
+  // Helper: compute anchor position for spring bone
+  private computeAnchorPosition(springBoneIdx: number): { anchor: Vec3; parentQuat: Quat | null } {
+    const springBone = this.skeleton!.bones[springBoneIdx]
+
+    if (springBone.parentIndex >= 0) {
+      const { pos: parentPos, quat: parentQuat } = this.getParentWorldTransform(springBone.parentIndex)
+      const bindTransLocal = this.getBindTranslation(springBoneIdx)
+      const bindTransWorld = parentQuat.rotate(bindTransLocal)
+      return { anchor: parentPos.add(bindTransWorld), parentQuat }
+    }
+
+    // Root bone
+    const bindTrans = this.getBindTranslation(springBoneIdx)
+    return { anchor: bindTrans, parentQuat: null }
+  }
+
+  // Evaluate spring bone physics using proper VRM-style Verlet integration
+  evaluateSpringBones(deltaTime: number): void {
+    if (!this.springBones || this.springBones.length === 0) return
+
+    const springCount = this.springBones.length
+    const dt = Math.max(0.0001, Math.min(deltaTime, 0.033))
+    const dt2 = dt * dt
+
+    // Initialize spring tail positions if needed
+    if (!this.springInitialized || !this.springCurrentTails || !this.springPrevTails) {
+      this.springCurrentTails = new Float32Array(springCount * 3)
+      this.springPrevTails = new Float32Array(springCount * 3)
+
+      for (let i = 0; i < springCount; i++) {
+        const spring = this.springBones[i]
+        const springBoneIdx = spring.childBoneIndex
+        const springBone = this.skeleton.bones[springBoneIdx]
+        const idx = i * 3
+
+        // Calculate rest length from bind translation
+        const bindTrans = this.getBindTranslation(springBoneIdx)
+        const restLen = bindTrans.length()
+        spring.restLength = restLen > 0.001 ? restLen : 0.1
+
+        // Initialize tail position
+        const bone = this.skeleton.bones[springBoneIdx]
+        const childBoneIdx = bone.children.length > 0 ? bone.children[0] : -1
+        if (childBoneIdx >= 0) {
+          // Use child bone's position
+          const childPos = this.getBoneWorldPosition(childBoneIdx)
+          this.springCurrentTails[idx] = childPos.x
+          this.springCurrentTails[idx + 1] = childPos.y
+          this.springCurrentTails[idx + 2] = childPos.z
+        } else {
+          // No child - extend in bind direction from anchor
+          const { anchor } = this.computeAnchorPosition(springBoneIdx)
+          let bindDirWorld: Vec3
+
+          if (springBone.parentIndex >= 0) {
+            const { quat: parentQuat } = this.getParentWorldTransform(springBone.parentIndex)
+            bindDirWorld = parentQuat.rotate(bindTrans).normalize()
+          } else {
+            bindDirWorld = bindTrans.normalize()
+          }
+
+          const tailPos = anchor.add(bindDirWorld.scale(spring.restLength))
+          this.springCurrentTails[idx] = tailPos.x
+          this.springCurrentTails[idx + 1] = tailPos.y
+          this.springCurrentTails[idx + 2] = tailPos.z
+        }
+
+        // Initialize previous tail to current (no initial velocity)
+        this.springPrevTails[idx] = this.springCurrentTails[idx]
+        this.springPrevTails[idx + 1] = this.springCurrentTails[idx + 1]
+        this.springPrevTails[idx + 2] = this.springCurrentTails[idx + 2]
+      }
+      this.springInitialized = true
+    }
+
+    // Sort springs by dependency order
+    const childToSpringMap = new Map<number, number>()
+    for (let i = 0; i < springCount; i++) {
+      childToSpringMap.set(this.springBones[i].childBoneIndex, i)
+    }
+
+    const sortedIndices = Array.from({ length: springCount }, (_, i) => i)
+    sortedIndices.sort((a, b) => {
+      const springA = this.springBones[a]
+      const springB = this.springBones[b]
+      const parentOfA = childToSpringMap.get(springA.parentBoneIndex)
+      const parentOfB = childToSpringMap.get(springB.parentBoneIndex)
+      if (parentOfA === b) return 1
+      if (parentOfB === a) return -1
+      return 0
+    })
+
+    // Helper: recompute world matrix after updating rotation
+    const recomputeWorldMatrix = (boneIndex: number): Mat4 => {
+      const bones = this.skeleton!.bones
+      const bone = bones[boneIndex]
+      const qi = boneIndex * 4
+      const ti = boneIndex * 3
+
+      const rotateM = Mat4.fromQuat(
+        this.boneLocalRotations![qi],
+        this.boneLocalRotations![qi + 1],
+        this.boneLocalRotations![qi + 2],
+        this.boneLocalRotations![qi + 3]
+      )
+      const translateBind = Mat4.identity().translateInPlace(
+        bone.bindTranslation[0],
+        bone.bindTranslation[1],
+        bone.bindTranslation[2]
+      )
+      const translateLocal = Mat4.identity().translateInPlace(
+        this.boneLocalTranslations![ti],
+        this.boneLocalTranslations![ti + 1],
+        this.boneLocalTranslations![ti + 2]
+      )
+      const localM = translateBind.multiply(rotateM).multiply(translateLocal)
+
+      if (bone.parentIndex >= 0 && bone.parentIndex < bones.length) {
+        const parentMatIdx = bone.parentIndex * 16
+        const parentM = new Mat4(
+          new Float32Array(this.boneWorldMatrices!.buffer, this.boneWorldMatrices!.byteOffset + parentMatIdx * 4, 16)
+        )
+        return parentM.multiply(localM)
+      }
+      return localM
+    }
+
+    // Process each spring bone in dependency order
+    for (const i of sortedIndices) {
+      const spring = this.springBones[i]
+      const springBoneIdx = spring.childBoneIndex
+      const idx = i * 3
+
+      // Compute anchor position (where spring attaches to parent)
+      const { anchor: anchorPos, parentQuat: parentWorldQuat } = this.computeAnchorPosition(springBoneIdx)
+
+      // Get current and previous tail positions for Verlet integration
+      const currentTail = new Vec3(
+        this.springCurrentTails[idx],
+        this.springCurrentTails[idx + 1],
+        this.springCurrentTails[idx + 2]
+      )
+      const prevTail = new Vec3(this.springPrevTails[idx], this.springPrevTails[idx + 1], this.springPrevTails[idx + 2])
+
+      // Verlet integration: compute new position from velocity
+      const velocity = currentTail.subtract(prevTail)
+      const damping = spring.damping || 0.5
+      let newTail = currentTail.add(velocity.scale(1.0 - damping))
+
+      // Apply gravity (downward in world space)
+      if (spring.gravityScale && spring.gravityScale > 0) {
+        const gravityAccel = spring.gravityScale * 980.0 // cm/s²
+        newTail = newTail.add(new Vec3(0, -1, 0).scale(gravityAccel * dt2))
+      }
+
+      // Apply spring force to maintain rest length
+      const restLen = spring.restLength || 0.1
+      const toTail = newTail.subtract(anchorPos)
+      const currentDist = toTail.length()
+
+      if (currentDist > 0.001) {
+        const stiffness = spring.stiffness || 0.01
+        const distanceError = currentDist - restLen
+        // Scale spring force to reduce jitter (frame-rate independent)
+        const springForceScale = Math.min(0.8, dt * 60.0 * 0.5)
+        const springForce = toTail.normalize().scale(-distanceError * stiffness * springForceScale)
+        newTail = newTail.add(springForce)
+      }
+
+      // Constraint: clamp distance to prevent extreme stretching/compression
+      const finalDir = newTail.subtract(anchorPos)
+      const finalDist = finalDir.length()
+      if (finalDist > 0.001) {
+        const maxDist = restLen * 2.5
+        const minDist = restLen * 0.3
+        const clampedDist = Math.max(minDist, Math.min(maxDist, finalDist))
+        newTail = anchorPos.add(finalDir.normalize().scale(clampedDist))
+      }
+
+      // Exponential smoothing to reduce high-frequency jitter
+      const smoothingFactor = 0.5 // 50% new, 50% old for smooth convergence
+      const smoothedTail = currentTail.scale(1.0 - smoothingFactor).add(newTail.scale(smoothingFactor))
+      newTail = smoothedTail
+
+      // Update Verlet integration state
+      this.springPrevTails[idx] = currentTail.x
+      this.springPrevTails[idx + 1] = currentTail.y
+      this.springPrevTails[idx + 2] = currentTail.z
+      this.springCurrentTails[idx] = newTail.x
+      this.springCurrentTails[idx + 1] = newTail.y
+      this.springCurrentTails[idx + 2] = newTail.z
+
+      // Update bone rotation to point from anchor toward newTail
+      if (parentWorldQuat !== null) {
+        const targetDirWorld = newTail.subtract(anchorPos).normalize()
+
+        // Get bind direction in parent's local space
+        const bindDirLocal = this.getBindTranslation(springBoneIdx).normalize()
+
+        // Transform target direction to parent's local space
+        const invParentQuat = parentWorldQuat.conjugate().normalize()
+        const targetDirLocal = invParentQuat.rotate(targetDirWorld)
+
+        // Compute rotation from bind direction to target direction
+        const localRotation = Quat.fromTo(bindDirLocal, targetDirLocal)
+
+        // Update bone's local rotation
+        const springBoneQi = springBoneIdx * 4
+        this.boneLocalRotations[springBoneQi] = localRotation.x
+        this.boneLocalRotations[springBoneQi + 1] = localRotation.y
+        this.boneLocalRotations[springBoneQi + 2] = localRotation.z
+        this.boneLocalRotations[springBoneQi + 3] = localRotation.w
+
+        // Update world matrix for next spring in chain
+        const springBoneMatIdx = springBoneIdx * 16
+        const springWorldM = recomputeWorldMatrix(springBoneIdx)
+        this.boneWorldMatrices.set(springWorldM.values, springBoneMatIdx)
+      }
+    }
+  }
+
+  // Clear all spring bones
+  clearSpringBones(): void {
+    this.springBones = []
+    this.springCurrentTails = undefined
+    this.springPrevTails = undefined
+    this.springInitialized = false
+  }
+
   getBoneWorldMatrix(index: number): Float32Array | undefined {
-    if (!this.skeleton) return undefined
-    this.ensureRuntimePose()
     this.evaluatePose()
-    if (!this.boneWorldMatrices) return undefined
     const start = index * 16
     return this.boneWorldMatrices.slice(start, start + 16)
   }
 
   // Evaluate world and skin matrices from local TR and bind
-  evaluatePose(): void {
-    if (!this.skeleton) return
-    this.ensureRuntimePose()
+  // If deltaTime is provided, also updates spring bone physics
+  evaluatePose(deltaTime?: number): void {
+    // Evaluate spring bones before evaluating pose (if deltaTime provided)
+    if (deltaTime !== undefined) {
+      this.evaluateSpringBones(deltaTime)
+    }
+
     // Advance rotation tweens before composing matrices
     this.updateRotationTweens()
-    if (!this.boneLocalRotations || !this.boneLocalTranslations || !this.boneWorldMatrices || !this.boneSkinMatrices)
-      return
     const bones = this.skeleton.bones
     const invBind = this.skeleton.inverseBindMatrices
-    // Local references (non-null) for inner closure
-    const localRot = this.boneLocalRotations!
-    const worldBuf = this.boneWorldMatrices!
-    const skinBuf = this.boneSkinMatrices!
+    const localRot = this.boneLocalRotations
+    const worldBuf = this.boneWorldMatrices
+    const skinBuf = this.boneSkinMatrices
 
     // compute recursively to respect parent-before-child regardless of file order
     const computed: boolean[] = new Array(bones.length).fill(false)

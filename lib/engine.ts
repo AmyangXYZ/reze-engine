@@ -55,6 +55,7 @@ export class Engine {
   private framesSinceLastUpdate = 0
   private frameTimeSamples: number[] = []
   private drawCallCount: number = 0 // Per-frame draw call counter
+  private lastFrameTime = performance.now() // For spring bone deltaTime calculation
   private stats: EngineStats = {
     fps: 0,
     frameTime: 0,
@@ -544,12 +545,74 @@ export class Engine {
     const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
     await this.drawModel(model)
-    console.log(model.getBoneNames())
+
+    // Test spring bones - find some bones that would benefit from spring physics
+    // (e.g., hair, skirts, accessories)
+    const boneNames = model.getBoneNames()
+    console.log("Available bones:", boneNames)
+
     model.rotateBones(
-      ["腰", "右腕", "左足"],
-      [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, 0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
+      ["腰", "左腕", "左足"],
+      [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, -0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
       3000
     )
+
+    // Example: Add a test spring bone (you can customize this based on your model)
+    // This is a simple test - find parent-child bone pairs and add spring physics
+    this.setupTestSpringBones(model)
+  }
+
+  private setupTestSpringBones(model: RzmModel): void {
+    const boneNames = model.getBoneNames()
+    const skeleton = model.getSkeleton()
+    if (!skeleton) return
+
+    // Find bda1 through bda18 bones (exact names: bda1, bda2, ..., bda18)
+    const bdaBoneMap = new Map<number, number>() // bone number -> bone index
+
+    for (let i = 0; i < boneNames.length; i++) {
+      const boneName = boneNames[i]
+      // Match exactly "bda" followed by digits 1-18 (case insensitive)
+      const match = boneName.match(/^M-bda([1-9]|1[0-8])$/i)
+      if (match) {
+        const num = parseInt(match[1], 10)
+        if (num >= 1 && num <= 18) {
+          bdaBoneMap.set(num, i)
+        }
+      }
+    }
+
+    if (bdaBoneMap.size === 0) {
+      console.log("No bda bones found for spring bone chain")
+      return
+    }
+
+    console.log(`Found ${bdaBoneMap.size} bda bones for spring chain`)
+
+    // Create spring chain: bda1 -> bda2 -> ... -> bda18
+    // Each spring connects the previous bone to the next
+    const sortedNumbers = Array.from(bdaBoneMap.keys()).sort((a, b) => a - b)
+
+    for (let i = 0; i < sortedNumbers.length - 1; i++) {
+      const currentNum = sortedNumbers[i]
+      const nextNum = sortedNumbers[i + 1]
+
+      const parentBoneIndex = bdaBoneMap.get(currentNum)!
+      const childBoneIndex = bdaBoneMap.get(nextNum)!
+
+      // Add spring bone with parameters suitable for hair/accessory chains
+      model.addSpringBone({
+        parentBoneIndex,
+        childBoneIndex,
+        stiffness: 0.001, // Very loose spring - minimal constraint
+        damping: 0.5, // Lower damping for slower, more natural convergence
+        gravityScale: 1.0, // Strong gravity to make it clearly visible
+      })
+
+      console.log(`Added spring bone: ${boneNames[parentBoneIndex]} -> ${boneNames[childBoneIndex]}`)
+    }
+
+    console.log(`Added ${model.getSpringBones().length} spring bones in bda chain`)
   }
 
   private async drawModel(model: RzmModel) {
@@ -567,53 +630,45 @@ export class Engine {
     this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices)
     this.vertexCount = model.getVertexCount()
 
-    // Optional skinning buffers
+    // Skinning buffers
     const skinning = model.getSkinning()
-    if (skinning) {
-      // joints buffer (u16x4 per vertex)
-      this.jointsBuffer = this.device.createBuffer({
-        label: "joints buffer",
-        size: skinning.joints0.byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      })
-      this.device.queue.writeBuffer(
-        this.jointsBuffer,
-        0,
-        skinning.joints0.buffer,
-        skinning.joints0.byteOffset,
-        skinning.joints0.byteLength
-      )
+    // joints buffer (u16x4 per vertex)
+    this.jointsBuffer = this.device.createBuffer({
+      label: "joints buffer",
+      size: skinning.joints.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(
+      this.jointsBuffer,
+      0,
+      skinning.joints.buffer,
+      skinning.joints.byteOffset,
+      skinning.joints.byteLength
+    )
 
-      // weights buffer (unorm8x4 per vertex)
-      this.weightsBuffer = this.device.createBuffer({
-        label: "weights buffer",
-        size: skinning.weights0.byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      })
-      this.device.queue.writeBuffer(
-        this.weightsBuffer,
-        0,
-        skinning.weights0.buffer,
-        skinning.weights0.byteOffset,
-        skinning.weights0.byteLength
-      )
+    // weights buffer (unorm8x4 per vertex)
+    this.weightsBuffer = this.device.createBuffer({
+      label: "weights buffer",
+      size: skinning.weights.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(
+      this.weightsBuffer,
+      0,
+      skinning.weights.buffer,
+      skinning.weights.byteOffset,
+      skinning.weights.byteLength
+    )
 
-      // skin matrices storage buffer
-      const skel = model.getSkeleton()
-      const boneCount = skel ? skel.bones.length : 0
-      const byteSize = boneCount * 16 * 4
-      this.skinMatrixBuffer = this.device.createBuffer({
-        label: "skin matrices",
-        size: Math.max(256, byteSize),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      })
-
-      // (debug dump removed)
-    } else {
-      this.jointsBuffer = undefined
-      this.weightsBuffer = undefined
-      this.skinMatrixBuffer = undefined
-    }
+    // skin matrices storage buffer
+    const skeleton = model.getSkeleton()
+    const boneCount = skeleton.bones.length
+    const byteSize = boneCount * 16 * 4
+    this.skinMatrixBuffer = this.device.createBuffer({
+      label: "skin matrices",
+      size: Math.max(256, byteSize),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
 
     // Create index buffer if model has indices
     const indices = model.getIndices()
@@ -905,11 +960,19 @@ export class Engine {
     if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
     if (this.weightsBuffer) pass.setVertexBuffer(2, this.weightsBuffer)
 
-    // Update skin matrices if present
+    // Update spring bone physics and skin matrices if present
     if (this.skinMatrixBuffer && this.currentModel) {
-      this.currentModel.evaluatePose()
-      const mats = this.currentModel.getSkinMatrices()
-      if (mats) this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+      // Calculate deltaTime for physics (convert from ms to seconds)
+      const currentTime = performance.now()
+      const deltaTime = (currentTime - this.lastFrameTime) / 1000.0 // Convert to seconds
+      this.lastFrameTime = currentTime
+
+      // Evaluate pose (includes spring bone physics update if spring bones exist)
+      if (this.currentModel) {
+        this.currentModel.evaluatePose(deltaTime)
+        const mats = this.currentModel.getSkinMatrices()
+        if (mats) this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+      }
     }
 
     // Use indexed rendering if index buffer exists

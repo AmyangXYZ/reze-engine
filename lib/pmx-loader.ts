@@ -1,4 +1,4 @@
-import { RzmModel, RzmTexture, RzmMaterial, RzmBone, RzmSkeleton } from "./rzm"
+import { RzmModel, RzmTexture, RzmMaterial, RzmBone, RzmSkeleton, RzmSkinning } from "./rzm"
 import { Mat4 } from "./math"
 
 export class PmxLoader {
@@ -379,6 +379,7 @@ export class PmxLoader {
             name: a.name,
             parentIndex: a.parent,
             bindTranslation: [a.x - p.x, a.y - p.y, a.z - p.z],
+            children: [], // Will be populated later when building skeleton
             appendParentIndex: a.appendParent,
             appendRatio: a.appendRatio,
             appendRotate: a.appendRotate,
@@ -389,6 +390,7 @@ export class PmxLoader {
             name: a.name,
             parentIndex: a.parent,
             bindTranslation: [a.x, a.y, a.z],
+            children: [], // Will be populated later when building skeleton
             appendParentIndex: a.appendParent,
             appendRatio: a.appendRatio,
             appendRotate: a.appendRotate,
@@ -461,12 +463,14 @@ export class PmxLoader {
     // Create index buffer
     const indexData = new Uint32Array(indices)
 
-    let skeleton: RzmSkeleton | undefined
-    if (this.bones.length > 0 && this.inverseBindMatrices) {
-      skeleton = { bones: this.bones, inverseBindMatrices: this.inverseBindMatrices }
+    // Create skeleton (required)
+    const skeleton: RzmSkeleton = {
+      bones: this.bones.length > 0 ? this.bones : [],
+      inverseBindMatrices: this.inverseBindMatrices || new Float32Array(0),
+      nameIndex: {}, // Will be populated by RzmModel during initialization
     }
 
-    let skinning: { joints0: Uint16Array; weights0: Uint8Array } | undefined
+    let skinning: RzmSkinning
     if (this.joints0 && this.weights0) {
       // Clamp joints to valid range now that we know bone count, and renormalize weights
       const boneCount = this.bones.length
@@ -495,7 +499,17 @@ export class PmxLoader {
           weights[i + 3] = Math.max(0, Math.min(255, 255 - accum))
         }
       }
-      skinning = { joints0: joints, weights0: weights }
+      skinning = { joints, weights }
+    } else {
+      // Create default skinning (single bone per vertex)
+      const vertexCount = positions.length / 3
+      const joints = new Uint16Array(vertexCount * 4)
+      const weights = new Uint8Array(vertexCount * 4)
+      for (let i = 0; i < vertexCount; i++) {
+        joints[i * 4] = 0
+        weights[i * 4] = 255
+      }
+      skinning = { joints, weights }
     }
 
     return new RzmModel(vertexData, indexData, this.textures, this.materials, skeleton, skinning)

@@ -24,7 +24,7 @@ export default function Home() {
 
       // Load default model
       // await engine.loadRzm("/models/dummy.rzm")
-      await engine.loadPmx("/models/梵天/", "梵天.pmx")
+      await engine.loadPmx("/models/梵天/", "梵天-o.pmx")
 
       // Start render loop with stats callback
       engine.runRenderLoop(() => {
@@ -46,13 +46,8 @@ export default function Home() {
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
-      {/* Header with stats like a menu bar */}
       <Header stats={stats} />
-
-      {/* Full-screen canvas */}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
-
-      {/* Inline stats moved to the header; remove floating stats panel */}
     </div>
   )
 }

@@ -39,6 +39,10 @@ export class Vec3 {
     return this.x * other.x + this.y * other.y + this.z * other.z
   }
 
+  scale(scalar: number): Vec3 {
+    return new Vec3(this.x * scalar, this.y * scalar, this.z * scalar)
+  }
+
   clone(): Vec3 {
     return new Vec3(this.x, this.y, this.z)
   }
@@ -66,7 +70,18 @@ export class Quat {
   }
 
   multiply(other: Quat): Quat {
-    return new Quat(this.x * other.x, this.y * other.y, this.z * other.z, this.w * other.w)
+    // Proper quaternion multiplication (not component-wise)
+    return new Quat(
+      this.w * other.x + this.x * other.w + this.y * other.z - this.z * other.y,
+      this.w * other.y - this.x * other.z + this.y * other.w + this.z * other.x,
+      this.w * other.z + this.x * other.y - this.y * other.x + this.z * other.w,
+      this.w * other.w - this.x * other.x - this.y * other.y - this.z * other.z
+    )
+  }
+
+  conjugate(): Quat {
+    // Conjugate (inverse for unit quaternions): (x, y, z, w) -> (-x, -y, -z, w)
+    return new Quat(-this.x, -this.y, -this.z, this.w)
   }
 
   length(): number {
@@ -77,6 +92,55 @@ export class Quat {
     const len = this.length()
     if (len === 0) return new Quat(0, 0, 0, 1)
     return new Quat(this.x / len, this.y / len, this.z / len, this.w / len)
+  }
+
+  // Rotate a vector by this quaternion: result = q * v * q^-1
+  rotateVec(v: Vec3): Vec3 {
+    // Treat v as pure quaternion (x, y, z, 0)
+    const qx = this.x,
+      qy = this.y,
+      qz = this.z,
+      qw = this.w
+    const vx = v.x,
+      vy = v.y,
+      vz = v.z
+
+    // t = 2 * cross(q.xyz, v)
+    const tx = 2 * (qy * vz - qz * vy)
+    const ty = 2 * (qz * vx - qx * vz)
+    const tz = 2 * (qx * vy - qy * vx)
+
+    // result = v + q.w * t + cross(q.xyz, t)
+    return new Vec3(
+      vx + qw * tx + (qy * tz - qz * ty),
+      vy + qw * ty + (qz * tx - qx * tz),
+      vz + qw * tz + (qx * ty - qy * tx)
+    )
+  }
+
+  // Rotate a vector by this quaternion (Babylon.js style naming)
+  rotate(v: Vec3): Vec3 {
+    const qv = new Vec3(this.x, this.y, this.z)
+    const uv = qv.cross(v)
+    const uuv = qv.cross(uv)
+    return v.add(uv.scale(2 * this.w)).add(uuv.scale(2))
+  }
+
+  // Static method: create quaternion that rotates from one direction to another
+  static fromTo(from: Vec3, to: Vec3): Quat {
+    const dot = from.dot(to)
+    if (dot > 0.999999) return new Quat(0, 0, 0, 1) // Already aligned
+    if (dot < -0.999999) {
+      // 180 degrees
+      let axis = from.cross(new Vec3(1, 0, 0))
+      if (axis.length() < 0.001) axis = from.cross(new Vec3(0, 1, 0))
+      return new Quat(axis.x, axis.y, axis.z, 0).normalize()
+    }
+
+    const axis = from.cross(to)
+    const w = Math.sqrt((1 + dot) * 2)
+    const invW = 1 / w
+    return new Quat(axis.x * invW, axis.y * invW, axis.z * invW, w * 0.5).normalize()
   }
 
   toArray(): [number, number, number, number] {
