@@ -583,11 +583,8 @@ export class Engine {
     }
 
     if (bdaBoneMap.size === 0) {
-      console.log("No bda bones found for spring bone chain")
       return
     }
-
-    console.log(`Found ${bdaBoneMap.size} bda bones for spring chain`)
 
     // Create spring chain: bda1 -> bda2 -> ... -> bda18
     // Each spring connects the previous bone to the next
@@ -604,15 +601,11 @@ export class Engine {
       model.addSpringBone({
         parentBoneIndex,
         childBoneIndex,
-        stiffness: 0.001, // Very loose spring - minimal constraint
-        damping: 0.5, // Lower damping for slower, more natural convergence
-        gravityScale: 1.0, // Strong gravity to make it clearly visible
+        stiffness: 0.6,
+        damping: 0.8,
+        gravityScale: 1.0,
       })
-
-      console.log(`Added spring bone: ${boneNames[parentBoneIndex]} -> ${boneNames[childBoneIndex]}`)
     }
-
-    console.log(`Added ${model.getSpringBones().length} spring bones in bda chain`)
   }
 
   private async drawModel(model: RzmModel) {

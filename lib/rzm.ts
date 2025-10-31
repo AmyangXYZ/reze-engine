@@ -811,30 +811,53 @@ export class RzmModel {
       )
       const prevTail = new Vec3(this.springPrevTails[idx], this.springPrevTails[idx + 1], this.springPrevTails[idx + 2])
 
-      // Verlet integration: compute new position from velocity
+      // Verlet integration: compute velocity
       const velocity = currentTail.subtract(prevTail)
       const damping = spring.damping || 0.5
-      let newTail = currentTail.add(velocity.scale(1.0 - damping))
 
-      // Apply gravity (downward in world space)
+      // Calculate current direction from anchor to current tail (before applying forces)
+      const toCurrentTail = currentTail.subtract(anchorPos)
+      const currentDist = toCurrentTail.length()
+      const currentDir = currentDist > 0.001 ? toCurrentTail.normalize() : new Vec3(0, 0, 1)
+
+      // Accumulate forces (all in acceleration units: cm/s²)
+      let force = new Vec3(0, 0, 0)
+
+      // 1. Gravity (world-space down)
       if (spring.gravityScale && spring.gravityScale > 0) {
-        const gravityAccel = spring.gravityScale * 980.0 // cm/s²
-        newTail = newTail.add(new Vec3(0, -1, 0).scale(gravityAccel * dt2))
+        const gravity = spring.gravityScale * 980.0 // cm/s²
+        force = force.add(new Vec3(0, -1, 0).scale(gravity))
       }
 
-      // Apply spring force to maintain rest length
+      // 2. Stiffness force: restore orientation toward rest pose
+      const bindTrans = this.getBindTranslation(springBoneIdx)
+      let restDir: Vec3
+      if (parentWorldQuat !== null) {
+        restDir = parentWorldQuat.rotate(bindTrans).normalize()
+      } else {
+        restDir = bindTrans.normalize()
+      }
+
+      const stiffness = spring.stiffness || 0.01
+      const directionError = restDir.subtract(currentDir)
+
+      // Scale stiffness force to match gravity magnitude
+      // Stiffness of 1.0 should approximately balance gravity
+      const stiffnessScale = 5000.0 // Tuning factor (experiment with 3000-10000)
+      const stiffnessForce = directionError.scale(stiffness * stiffnessScale)
+      force = force.add(stiffnessForce)
+
+      // 3. Length constraint (only if stretched/compressed significantly)
       const restLen = spring.restLength || 0.1
-      const toTail = newTail.subtract(anchorPos)
-      const currentDist = toTail.length()
-
-      if (currentDist > 0.001) {
-        const stiffness = spring.stiffness || 0.01
-        const distanceError = currentDist - restLen
-        // Scale spring force to reduce jitter (frame-rate independent)
-        const springForceScale = Math.min(0.8, dt * 60.0 * 0.5)
-        const springForce = toTail.normalize().scale(-distanceError * stiffness * springForceScale)
-        newTail = newTail.add(springForce)
+      const distanceError = currentDist - restLen
+      if (Math.abs(distanceError) > 0.01) {
+        // Soft constraint - restore length gently
+        const lengthForce = currentDir.scale(-distanceError * 500.0) // Moderate spring constant
+        force = force.add(lengthForce)
       }
+
+      // Apply Verlet: newPos = currentPos + velocity*(1-drag) + force*dt²
+      let newTail = currentTail.add(velocity.scale(1.0 - damping)).add(force.scale(dt2))
 
       // Constraint: clamp distance to prevent extreme stretching/compression
       const finalDir = newTail.subtract(anchorPos)
