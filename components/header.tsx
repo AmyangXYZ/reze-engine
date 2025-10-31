@@ -6,10 +6,7 @@ import type { EngineStats } from "@/lib/engine"
 export default function Header({ stats }: { stats: EngineStats }) {
   return (
     <header className="absolute top-0 left-0 right-0 px-4 md:px-6 py-3 md:py-4 pointer-events-none z-10 flex items-center gap-2">
-      {/* Left: Title (hidden on very small screens to save space) */}
-      <h1 className="text-2xl font-extrabold tracking-tight">Reze Engine</h1>
-
-      {/* Center/Right: Stats like a menu bar. Click-through by default */}
+      <h1 className="text-xl font-extrabold tracking-tight">Reze Engine</h1>
 
       <div className="ml-auto flex items-center gap-3 text-xs text-white/90 pointer-events-none bg-black py-2 px-4 rounded-full font-mono font-medium">
         {/* Mobile: show only FPS */}

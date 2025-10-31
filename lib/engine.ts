@@ -7,8 +7,8 @@ export interface EngineStats {
   fps: number
   frameTime: number // ms
   memoryUsed: number // MB
-  drawCalls: number
   vertices: number
+  drawCalls: number
 }
 
 export class Engine {
@@ -24,9 +24,6 @@ export class Engine {
   // Total: 4 + (4 * 8) = 36 floats, padded to 64 floats (256 bytes) for proper alignment
   private lightData = new Float32Array(64)
   private lightCount: number = 0 // Number of active lights (0-4)
-  private materialUniformBuffer!: GPUBuffer
-  // Material properties: baseColor(3) + metallic(1), roughness(1) + padding(3) = 8 floats (32 bytes, needs 64 byte alignment)
-  private materialData = new Float32Array(16) // padded to 64 bytes
   private bindGroup!: GPUBindGroup
   private vertexBuffer!: GPUBuffer
   private vertexCount: number = 0
@@ -47,6 +44,7 @@ export class Engine {
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
   private currentModel: RzmModel | null = null
+  private modelDir: string = "" // Directory for loading model textures
   // Grid
   private gridVertexBuffer?: GPUBuffer
   private gridVertexCount: number = 0
@@ -56,12 +54,13 @@ export class Engine {
   private lastFpsUpdate = performance.now()
   private framesSinceLastUpdate = 0
   private frameTimeSamples: number[] = []
+  private drawCallCount: number = 0 // Per-frame draw call counter
   private stats: EngineStats = {
     fps: 0,
     frameTime: 0,
     memoryUsed: 0,
-    drawCalls: 0,
     vertices: 0,
+    drawCalls: 0,
   }
 
   // Render loop
@@ -105,16 +104,6 @@ export class Engine {
       size: 64 * 4, // 64 floats * 4 bytes = 256 bytes
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
-
-    // Create uniform buffer for material properties (64 bytes aligned)
-    this.materialUniformBuffer = this.device.createBuffer({
-      label: "material uniforms",
-      size: 16 * 4, // 16 floats * 4 bytes = 64 bytes
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
-
-    // Initialize default PBR material (non-metallic, semi-glossy - good for anime characters)
-    this.setMaterial(new Vec3(0.94, 0.88, 0.82), 0.0, 0.45)
 
     // Initialize MMD-style multi-light setup
     this.setAmbient(0.65) // Reduced ambient to make lights more visible
@@ -174,13 +163,6 @@ export class Engine {
           lights: array<Light, 4>,
         };
 
-        struct MaterialUniforms {
-          baseColor: vec3f,
-          metallic: f32,
-          roughness: f32,
-          _padding: vec3f,
-        };
-
         struct VertexOutput {
           @builtin(position) position: vec4f,
           @location(0) normal: vec3f,
@@ -190,10 +172,9 @@ export class Engine {
 
         @group(0) @binding(0) var<uniform> camera: CameraUniforms;
         @group(0) @binding(1) var<uniform> light: LightUniforms;
-        @group(0) @binding(2) var<uniform> material: MaterialUniforms;
-        @group(0) @binding(3) var diffuseTexture: texture_2d<f32>;
-        @group(0) @binding(4) var diffuseSampler: sampler;
-        @group(0) @binding(5) var<storage, read> skinMats: array<mat4x4f>;
+        @group(0) @binding(2) var diffuseTexture: texture_2d<f32>;
+        @group(0) @binding(3) var diffuseSampler: sampler;
+        @group(0) @binding(4) var<storage, read> skinMats: array<mat4x4f>;
 
         @vertex fn vs(
           @location(0) position: vec3f,
@@ -221,34 +202,6 @@ export class Engine {
           output.uv = uv;
           output.worldPos = worldPos;
           return output;
-        }
-  
-        // PBR helper functions (Cook-Torrance BRDF)
-        fn fresnelSchlick(cosTheta: f32, f0: vec3f) -> vec3f {
-          return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-        }
-
-        fn distributionGGX(n: vec3f, h: vec3f, roughness: f32) -> f32 {
-          let a = roughness * roughness;
-          let a2 = a * a;
-          let nDotH = max(dot(n, h), 0.0);
-          let nDotH2 = nDotH * nDotH;
-          let denom = (nDotH2 * (a2 - 1.0) + 1.0);
-          return a2 / (3.14159265 * denom * denom);
-        }
-
-        fn geometrySchlickGGX(nDotV: f32, roughness: f32) -> f32 {
-          let r = (roughness + 1.0);
-          let k = (r * r) / 8.0;
-          return nDotV / (nDotV * (1.0 - k) + k);
-        }
-
-        fn geometrySmith(n: vec3f, v: vec3f, l: vec3f, roughness: f32) -> f32 {
-          let nDotV = max(dot(n, v), 0.0);
-          let nDotL = max(dot(n, l), 0.0);
-          let ggx2 = geometrySchlickGGX(nDotV, roughness);
-          let ggx1 = geometrySchlickGGX(nDotL, roughness);
-          return ggx1 * ggx2;
         }
 
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
@@ -534,18 +487,6 @@ export class Engine {
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
-  // Set PBR material properties
-  public setMaterial(baseColor: Vec3, metallic: number, roughness: number) {
-    // Clamp values to valid ranges
-    this.materialData[0] = Math.max(0.0, Math.min(1.0, baseColor.x))
-    this.materialData[1] = Math.max(0.0, Math.min(1.0, baseColor.y))
-    this.materialData[2] = Math.max(0.0, Math.min(1.0, baseColor.z))
-    this.materialData[3] = Math.max(0.0, Math.min(1.0, metallic))
-    this.materialData[4] = Math.max(0.01, Math.min(1.0, roughness)) // Roughness must be > 0
-    // Padding is already zeros
-    this.device.queue.writeBuffer(this.materialUniformBuffer, 0, this.materialData)
-  }
-
   public getStats(): EngineStats {
     return { ...this.stats }
   }
@@ -596,8 +537,11 @@ export class Engine {
     this.drawModel(model)
   }
 
-  // Load PMX model from URL
-  public async loadPmx(url: string) {
+  // Load PMX model from directory and filename
+  public async loadPmx(dir: string, fileName: string) {
+    // Ensure directory ends with /
+    this.modelDir = dir.endsWith("/") ? dir : dir + "/"
+    const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
     await this.drawModel(model)
     console.log(model.getBoneNames())
@@ -701,7 +645,6 @@ export class Engine {
     }
 
     // Load all unique diffuse textures
-    const modelDir = "/models/梵天/"
     const textures = model.getTextures()
 
     const textureCache = new Map<number, { texture: GPUTexture; sampler: GPUSampler }>()
@@ -710,7 +653,7 @@ export class Engine {
       if (texIndex < 0 || texIndex >= textures.length) return null
       if (textureCache.has(texIndex)) return textureCache.get(texIndex)!
 
-      const path = modelDir + textures[texIndex].path
+      const path = this.modelDir + textures[texIndex].path
       const resource = await this.createTextureFromPath(path)
       if (resource) textureCache.set(texIndex, resource)
       return resource
@@ -724,32 +667,67 @@ export class Engine {
     const defaultTexture = this.createDefaultTexture()
     const defaultSampler = this.device.createSampler({ magFilter: "linear", minFilter: "linear" })
 
-    // Build per-material bind groups and draw ranges
+    // Build batched draw calls - group consecutive materials with same texture together
     this.materialDraws = []
     let runningFirstIndex = 0
+    let currentTexResource: { texture: GPUTexture; sampler: GPUSampler } | null = null
+    let currentBindGroup: GPUBindGroup | null = null
+    let batchedCount = 0
+    let batchedFirstIndex = runningFirstIndex
+
     for (let i = 0; i < materials.length; i++) {
       const mat = materials[i]
       const texResource = await loadTextureByIndex(mat.diffuseTextureIndex)
+      const matCount = Math.max(0, mat.vertexCount | 0) // PMX stores indexCount here
 
-      const entries: GPUBindGroupEntry[] = [
-        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
-        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-        { binding: 3, resource: (texResource ? texResource.texture : defaultTexture).createView() },
-        { binding: 4, resource: texResource ? texResource.sampler : defaultSampler },
-      ]
+      // Check if we can batch with previous draw (same texture resource)
+      const canBatch = currentTexResource === texResource && currentBindGroup !== null && matCount > 0
 
-      // Bind skin buffer (fallback if actual not present)
-      entries.push({ binding: 5, resource: { buffer: this.skinMatrixBuffer || this.fallbackSkinMatrixBuffer! } })
+      if (!canBatch) {
+        // Flush previous batched draw if any
+        if (currentBindGroup !== null && batchedCount > 0) {
+          this.materialDraws.push({
+            count: batchedCount,
+            firstIndex: batchedFirstIndex,
+            bindGroup: currentBindGroup,
+          })
+        }
 
-      const bindGroup = this.device.createBindGroup({
-        label: `material ${i} bind group`,
-        layout: this.pipeline.getBindGroupLayout(0),
-        entries,
+        // Start new batch
+        const entries: GPUBindGroupEntry[] = [
+          { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+          { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+          { binding: 2, resource: (texResource ? texResource.texture : defaultTexture).createView() },
+          { binding: 3, resource: texResource ? texResource.sampler : defaultSampler },
+        ]
+
+        // Bind skin buffer (fallback if actual not present)
+        entries.push({ binding: 4, resource: { buffer: this.skinMatrixBuffer || this.fallbackSkinMatrixBuffer! } })
+
+        currentBindGroup = this.device.createBindGroup({
+          label: `batched material bind group`,
+          layout: this.pipeline.getBindGroupLayout(0),
+          entries,
+        })
+
+        currentTexResource = texResource
+        batchedFirstIndex = runningFirstIndex
+        batchedCount = matCount
+      } else {
+        // Extend current batch
+        batchedCount += matCount
+      }
+
+      runningFirstIndex += matCount
+    }
+
+    // Flush final batch if any
+    if (currentBindGroup !== null && batchedCount > 0) {
+      this.materialDraws.push({
+        count: batchedCount,
+        firstIndex: batchedFirstIndex,
+        bindGroup: currentBindGroup,
       })
-
-      const count = Math.max(0, mat.vertexCount | 0) // PMX stores indexCount here
-      this.materialDraws.push({ count, firstIndex: runningFirstIndex, bindGroup })
-      runningFirstIndex += count
     }
     const total = this.materialDraws.reduce((a, d) => a + d.count, 0)
     if (this.indexCount && total !== this.indexCount) {
@@ -829,8 +807,8 @@ export class Engine {
     // Add texture and sampler if available
     if (this.diffuseTexture && this.diffuseSampler) {
       entries.push(
-        { binding: 3, resource: this.diffuseTexture.createView() },
-        { binding: 4, resource: this.diffuseSampler }
+        { binding: 2, resource: this.diffuseTexture.createView() },
+        { binding: 3, resource: this.diffuseSampler }
       )
     } else {
       // Use a default white texture if no texture is loaded
@@ -840,10 +818,10 @@ export class Engine {
         minFilter: "linear",
       })
 
-      entries.push({ binding: 3, resource: defaultTexture.createView() }, { binding: 4, resource: defaultSampler })
+      entries.push({ binding: 2, resource: defaultTexture.createView() }, { binding: 3, resource: defaultSampler })
     }
 
-    // Ensure binding 5 is always present
+    // Ensure binding 4 is always present
     if (!this.skinMatrixBuffer && !this.fallbackSkinMatrixBuffer) {
       const size = 16 * 4
       this.fallbackSkinMatrixBuffer = this.device.createBuffer({
@@ -854,7 +832,7 @@ export class Engine {
       const identity = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
       this.device.queue.writeBuffer(this.fallbackSkinMatrixBuffer, 0, identity)
     }
-    entries.push({ binding: 5, resource: { buffer: this.skinMatrixBuffer || this.fallbackSkinMatrixBuffer! } })
+    entries.push({ binding: 4, resource: { buffer: this.skinMatrixBuffer || this.fallbackSkinMatrixBuffer! } })
 
     this.bindGroup = this.device.createBindGroup({
       label: "model bind group",
@@ -908,6 +886,9 @@ export class Engine {
       this.renderPassDescriptor.depthStencilAttachment.view = this.depthTexture.createView()
     }
 
+    // Reset draw call counter for this frame
+    this.drawCallCount = 0
+
     const encoder = this.device.createCommandEncoder({ label: "our encoder" })
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     // Draw grid (if created)
@@ -916,6 +897,7 @@ export class Engine {
       pass.setVertexBuffer(0, this.gridVertexBuffer)
       pass.setBindGroup(0, this.gridBindGroup)
       pass.draw(this.gridVertexCount)
+      this.drawCallCount++
     }
     // Draw model
     pass.setPipeline(this.pipeline)
@@ -938,16 +920,19 @@ export class Engine {
           pass.setBindGroup(0, draw.bindGroup)
           if (draw.count > 0) {
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            this.drawCallCount++
           }
         }
       } else {
         // Legacy single-bind-group path
         pass.setBindGroup(0, this.bindGroup)
         pass.drawIndexed(this.indexCount)
+        this.drawCallCount++
       }
     } else {
       pass.setBindGroup(0, this.bindGroup)
       pass.draw(this.vertexCount)
+      this.drawCallCount++
     }
 
     pass.end()
@@ -991,8 +976,7 @@ export class Engine {
       }
     }
 
-    // GPU stats (basic - draw calls and vertices this frame)
-    this.stats.drawCalls = 1
     this.stats.vertices = this.vertexCount
+    this.stats.drawCalls = this.drawCallCount
   }
 }

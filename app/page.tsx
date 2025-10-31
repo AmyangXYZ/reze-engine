@@ -24,7 +24,7 @@ export default function Home() {
 
       // Load default model
       // await engine.loadRzm("/models/dummy.rzm")
-      await engine.loadPmx("/models/梵天/梵天.pmx")
+      await engine.loadPmx("/models/梵天/", "梵天.pmx")
 
       // Start render loop with stats callback
       engine.runRenderLoop(() => {
