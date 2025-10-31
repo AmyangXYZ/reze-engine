@@ -693,6 +693,10 @@ export class RzmModel {
 
     // Initialize spring tail positions if needed
     if (!this.springInitialized || !this.springCurrentTails || !this.springPrevTails) {
+      // Evaluate pose with identity rotations to get bind pose world matrices
+      this.evaluatePose()
+
+      // Now initialize spring tail positions from the bind pose
       this.springCurrentTails = new Float32Array(springCount * 3)
       this.springPrevTails = new Float32Array(springCount * 3)
 
@@ -707,28 +711,19 @@ export class RzmModel {
         const restLen = bindTrans.length()
         spring.restLength = restLen > 0.001 ? restLen : 0.1
 
-        // Initialize tail position
-        const bone = this.skeleton.bones[springBoneIdx]
-        const childBoneIdx = bone.children.length > 0 ? bone.children[0] : -1
+        // Initialize tail position from bind pose (using world matrices computed with identity rotations)
+        const childBoneIdx = springBone.children.length > 0 ? springBone.children[0] : -1
         if (childBoneIdx >= 0) {
-          // Use child bone's position
+          // Use child bone's position from bind pose world matrix
           const childPos = this.getBoneWorldPosition(childBoneIdx)
           this.springCurrentTails[idx] = childPos.x
           this.springCurrentTails[idx + 1] = childPos.y
           this.springCurrentTails[idx + 2] = childPos.z
         } else {
           // No child - extend in bind direction from anchor
-          const { anchor } = this.computeAnchorPosition(springBoneIdx)
-          let bindDirWorld: Vec3
-
-          if (springBone.parentIndex >= 0) {
-            const { quat: parentQuat } = this.getParentWorldTransform(springBone.parentIndex)
-            bindDirWorld = parentQuat.rotate(bindTrans).normalize()
-          } else {
-            bindDirWorld = bindTrans.normalize()
-          }
-
-          const tailPos = anchor.add(bindDirWorld.scale(spring.restLength))
+          const { anchor: anchorPos } = this.computeAnchorPosition(springBoneIdx)
+          const bindDirWorld = bindTrans.normalize() // In bind pose, direction is just the bind translation direction
+          const tailPos = anchorPos.add(bindDirWorld.scale(spring.restLength))
           this.springCurrentTails[idx] = tailPos.x
           this.springCurrentTails[idx + 1] = tailPos.y
           this.springCurrentTails[idx + 2] = tailPos.z
