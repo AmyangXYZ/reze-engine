@@ -50,18 +50,29 @@ export interface RzmSkinning {
   weights: Uint8Array // UNORM8, length = vertexCount * 4, sums ~ 255 per-vertex
 }
 
-export interface SpringBone {
-  // Bone indices
-  parentBoneIndex: number // Bone that acts as the anchor/root of the spring
-  childBoneIndex: number // Bone that will be affected by spring physics
-  // Spring parameters
+// VRM-like spring bone chain
+export interface SpringBoneChain {
+  // Root bone (anchor point - this bone is not affected by physics)
+  rootBoneIndex: number
+  // Chain of bones to apply spring physics to (ordered from root to tip)
+  boneIndices: number[] // Array of bone indices in the chain
+  // Spring parameters (applied to each bone in the chain)
   stiffness: number // Spring stiffness (higher = stiffer, typical range: 0.01-1.0)
-  damping: number // Damping factor (higher = less oscillation, typical range: 0.1-0.9)
-  restLength?: number // Rest length of spring (auto-calculated if not provided)
-  // Collision/limits (optional)
-  collideRadius?: number // Sphere collision radius
-  // Gravity (optional)
-  gravityScale?: number // Multiplier for gravity effect
+  dragForce: number // Damping factor (higher = less oscillation, typical range: 0.1-0.9)
+  hitRadius: number // Sphere collision radius for this chain (in cm, typically 0.5-5.0)
+  // Optional center point for rotation (relative to root bone)
+  center?: [number, number, number]
+}
+
+// Simplified rigidbody for collision detection with spring bones (sphere-based, similar to VRM)
+export interface RzmRigidbody {
+  boneIndex: number // -1 if not attached to a bone
+  radius: number // Sphere radius (all shapes converted to spheres)
+  // Collision groups (for filtering which rigidbodies interact)
+  group: number // Collision group (0-15)
+  collisionMask: number // Bitmask for collision groups this rigidbody collides with
+  // Transform relative to bone (will be transformed by bone's world matrix)
+  position: [number, number, number] // Position relative to bone (or world if boneIndex is -1)
 }
 
 // Rotation tween state per bone
@@ -92,12 +103,16 @@ export class RzmModel {
   private boneWorldMatrices!: Float32Array // mat4 per bone length = boneCount*16
   private boneSkinMatrices!: Float32Array // mat4 per bone length = boneCount*16
 
-  // Spring bone physics
-  private springBones: SpringBone[] = []
-  // Verlet integration state: current and previous tail positions in world space
-  private springCurrentTails?: Float32Array // vec3 per spring bone (current tail position)
-  private springPrevTails?: Float32Array // vec3 per spring bone (previous tail position)
+  // Spring bone physics (VRM-like chains)
+  private springChains: SpringBoneChain[] = []
+  // Verlet integration state: current and previous positions for each bone in all chains
+  // Stores [chain0_bone0, chain0_bone1, ..., chain1_bone0, ...]
+  private springCurrentPositions?: Float32Array // vec3 per bone in chains (current position)
+  private springPrevPositions?: Float32Array // vec3 per bone in chains (previous position)
   private springInitialized = false
+
+  // Rigidbodies for collision detection with spring bones
+  private rigidbodies: RzmRigidbody[] = []
 
   constructor(
     vertexData: Float32Array<ArrayBuffer>,
@@ -105,7 +120,8 @@ export class RzmModel {
     textures: RzmTexture[],
     materials: RzmMaterial[],
     skeleton: RzmSkeleton,
-    skinning: RzmSkinning
+    skinning: RzmSkinning,
+    rigidbodies: RzmRigidbody[] = []
   ) {
     this.vertexData = vertexData
     this.vertexCount = vertexData.length / VERTEX_STRIDE
@@ -115,6 +131,7 @@ export class RzmModel {
     this.materials = materials
     this.skeleton = skeleton
     this.skinning = skinning
+    this.rigidbodies = rigidbodies
     if (this.skeleton.bones.length > 0) {
       this.buildBoneLookups()
       this.initializeRuntimePose()
@@ -340,7 +357,7 @@ export class RzmModel {
       skinning.joints[i * 4] = 0
       skinning.weights[i * 4] = 255
     }
-    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning)
+    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning, [])
   }
 
   // Get interleaved vertex data for GPU upload
@@ -427,7 +444,7 @@ export class RzmModel {
     for (let i = 0; i < vertexCount; i++) {
       indexData[i] = i
     }
-    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning)
+    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning, [])
   }
 
   // Accessors for skeleton/skinning
@@ -609,30 +626,41 @@ export class RzmModel {
     for (let i = 0; i < count; i++) this.resetBone(i)
   }
 
-  // --- Spring Bone Physics ---
+  // --- Spring Bone Physics (VRM-like chains) ---
 
-  // Add a spring bone constraint
-  addSpringBone(springBone: SpringBone): void {
+  // Add a spring bone chain
+  addSpringBoneChain(chain: SpringBoneChain): void {
     // Validate bone indices
     const boneCount = this.skeleton.bones.length
-    if (
-      springBone.parentBoneIndex < 0 ||
-      springBone.parentBoneIndex >= boneCount ||
-      springBone.childBoneIndex < 0 ||
-      springBone.childBoneIndex >= boneCount
-    ) {
-      console.warn(
-        `[RZM] Invalid spring bone indices: parent=${springBone.parentBoneIndex}, child=${springBone.childBoneIndex}`
-      )
+    if (chain.rootBoneIndex < 0 || chain.rootBoneIndex >= boneCount) {
+      console.warn(`[RZM] Invalid spring chain root bone index: ${chain.rootBoneIndex}`)
       return
     }
-    this.springBones.push(springBone)
+    for (const boneIdx of chain.boneIndices) {
+      if (boneIdx < 0 || boneIdx >= boneCount) {
+        console.warn(`[RZM] Invalid spring chain bone index: ${boneIdx}`)
+        return
+      }
+    }
+    if (chain.boneIndices.length === 0) {
+      console.warn(`[RZM] Spring chain must have at least one bone`)
+      return
+    }
+    this.springChains.push(chain)
     this.springInitialized = false // Will reinitialize on next update
   }
 
-  // Get all spring bones
-  getSpringBones(): SpringBone[] {
-    return [...this.springBones]
+  // Get all spring chains
+  getSpringChains(): SpringBoneChain[] {
+    return [...this.springChains]
+  }
+
+  // Clear all spring chains
+  clearSpringBones(): void {
+    this.springChains = []
+    this.springCurrentPositions = undefined
+    this.springPrevPositions = undefined
+    this.springInitialized = false
   }
 
   // Helper: get bone's bind translation as Vec3
@@ -683,76 +711,91 @@ export class RzmModel {
     return { anchor: bindTrans, parentQuat: null }
   }
 
-  // Evaluate spring bone physics using proper VRM-style Verlet integration
-  evaluateSpringBones(deltaTime: number): void {
-    if (!this.springBones || this.springBones.length === 0) return
+  // Helper: compute anchor position for first bone in chain (anchored to root bone)
+  private computeAnchorPositionForChainBone(
+    boneIdx: number,
+    rootBoneIdx: number
+  ): { anchor: Vec3; parentQuat: Quat | null } {
+    if (rootBoneIdx >= 0 && rootBoneIdx < this.skeleton.bones.length) {
+      const { pos: rootPos, quat: rootQuat } = this.getParentWorldTransform(rootBoneIdx)
+      const bindTransLocal = this.getBindTranslation(boneIdx)
+      const bindTransWorld = rootQuat.rotate(bindTransLocal)
+      return { anchor: rootPos.add(bindTransWorld), parentQuat: rootQuat }
+    }
+    // Fallback to regular anchor computation
+    return this.computeAnchorPosition(boneIdx)
+  }
 
-    const springCount = this.springBones.length
+  // Evaluate spring bone physics using proper VRM-style Verlet integration with chains
+  evaluateSpringBones(deltaTime: number): void {
+    if (!this.springChains || this.springChains.length === 0) return
+
     const dt = Math.max(0.0001, Math.min(deltaTime, 0.033))
     const dt2 = dt * dt
 
-    // Initialize spring tail positions if needed
-    if (!this.springInitialized || !this.springCurrentTails || !this.springPrevTails) {
+    // Count total bones across all chains and create mapping
+    let totalBones = 0
+    const chainBoneOffsets: number[] = [] // Offset in position array for each chain
+    const boneToChainMap = new Map<number, { chainIdx: number; boneIdx: number }>() // bone index -> {chain, position in chain}
+
+    for (let chainIdx = 0; chainIdx < this.springChains.length; chainIdx++) {
+      const chain = this.springChains[chainIdx]
+      chainBoneOffsets.push(totalBones)
+      for (let boneIdx = 0; boneIdx < chain.boneIndices.length; boneIdx++) {
+        boneToChainMap.set(chain.boneIndices[boneIdx], { chainIdx, boneIdx })
+        totalBones++
+      }
+    }
+
+    if (totalBones === 0) return
+
+    // Initialize spring positions if needed
+    if (!this.springInitialized || !this.springCurrentPositions || !this.springPrevPositions) {
       // Evaluate pose with identity rotations to get bind pose world matrices
       this.evaluatePose()
 
-      // Now initialize spring tail positions from the bind pose
-      this.springCurrentTails = new Float32Array(springCount * 3)
-      this.springPrevTails = new Float32Array(springCount * 3)
+      // Initialize position arrays for all bones in all chains
+      this.springCurrentPositions = new Float32Array(totalBones * 3)
+      this.springPrevPositions = new Float32Array(totalBones * 3)
 
-      for (let i = 0; i < springCount; i++) {
-        const spring = this.springBones[i]
-        const springBoneIdx = spring.childBoneIndex
-        const springBone = this.skeleton.bones[springBoneIdx]
-        const idx = i * 3
+      let globalBoneIdx = 0
+      for (let chainIdx = 0; chainIdx < this.springChains.length; chainIdx++) {
+        const chain = this.springChains[chainIdx]
+        const rootPos = this.getBoneWorldPosition(chain.rootBoneIndex)
 
-        // Calculate rest length from bind translation
-        const bindTrans = this.getBindTranslation(springBoneIdx)
-        const restLen = bindTrans.length()
-        spring.restLength = restLen > 0.001 ? restLen : 0.1
+        // Initialize positions for each bone in chain from bind pose
+        let lastBonePos = rootPos
+        for (let boneIdx = 0; boneIdx < chain.boneIndices.length; boneIdx++) {
+          const boneIndex = chain.boneIndices[boneIdx]
 
-        // Initialize tail position from bind pose (using world matrices computed with identity rotations)
-        const childBoneIdx = springBone.children.length > 0 ? springBone.children[0] : -1
-        if (childBoneIdx >= 0) {
-          // Use child bone's position from bind pose world matrix
-          const childPos = this.getBoneWorldPosition(childBoneIdx)
-          this.springCurrentTails[idx] = childPos.x
-          this.springCurrentTails[idx + 1] = childPos.y
-          this.springCurrentTails[idx + 2] = childPos.z
-        } else {
-          // No child - extend in bind direction from anchor
-          const { anchor: anchorPos } = this.computeAnchorPosition(springBoneIdx)
-          const bindDirWorld = bindTrans.normalize() // In bind pose, direction is just the bind translation direction
-          const tailPos = anchorPos.add(bindDirWorld.scale(spring.restLength))
-          this.springCurrentTails[idx] = tailPos.x
-          this.springCurrentTails[idx + 1] = tailPos.y
-          this.springCurrentTails[idx + 2] = tailPos.z
+          // Calculate position from bind pose: accumulate from root
+          let currentBonePos = lastBonePos
+          if (boneIdx > 0) {
+            // This bone's position is parent's position + bind translation
+            const prevBoneIndex = chain.boneIndices[boneIdx - 1]
+            const prevBonePos = this.getBoneWorldPosition(prevBoneIndex)
+            const bindTrans = this.getBindTranslation(boneIndex)
+            currentBonePos = prevBonePos.add(bindTrans)
+          } else {
+            // First bone: root position + bind translation
+            const bindTrans = this.getBindTranslation(boneIndex)
+            currentBonePos = rootPos.add(bindTrans)
+          }
+
+          const posIdx = globalBoneIdx * 3
+          this.springCurrentPositions[posIdx] = currentBonePos.x
+          this.springCurrentPositions[posIdx + 1] = currentBonePos.y
+          this.springCurrentPositions[posIdx + 2] = currentBonePos.z
+          this.springPrevPositions[posIdx] = currentBonePos.x
+          this.springPrevPositions[posIdx + 1] = currentBonePos.y
+          this.springPrevPositions[posIdx + 2] = currentBonePos.z
+
+          lastBonePos = currentBonePos
+          globalBoneIdx++
         }
-
-        // Initialize previous tail to current (no initial velocity)
-        this.springPrevTails[idx] = this.springCurrentTails[idx]
-        this.springPrevTails[idx + 1] = this.springCurrentTails[idx + 1]
-        this.springPrevTails[idx + 2] = this.springCurrentTails[idx + 2]
       }
       this.springInitialized = true
     }
-
-    // Sort springs by dependency order
-    const childToSpringMap = new Map<number, number>()
-    for (let i = 0; i < springCount; i++) {
-      childToSpringMap.set(this.springBones[i].childBoneIndex, i)
-    }
-
-    const sortedIndices = Array.from({ length: springCount }, (_, i) => i)
-    sortedIndices.sort((a, b) => {
-      const springA = this.springBones[a]
-      const springB = this.springBones[b]
-      const parentOfA = childToSpringMap.get(springA.parentBoneIndex)
-      const parentOfB = childToSpringMap.get(springB.parentBoneIndex)
-      if (parentOfA === b) return 1
-      if (parentOfB === a) return -1
-      return 0
-    })
 
     // Helper: recompute world matrix after updating rotation
     const recomputeWorldMatrix = (boneIndex: number): Mat4 => {
@@ -789,129 +832,220 @@ export class RzmModel {
       return localM
     }
 
-    // Process each spring bone in dependency order
-    for (const i of sortedIndices) {
-      const spring = this.springBones[i]
-      const springBoneIdx = spring.childBoneIndex
-      const idx = i * 3
+    // Process each chain
+    for (let chainIdx = 0; chainIdx < this.springChains.length; chainIdx++) {
+      const chain = this.springChains[chainIdx]
+      const offset = chainBoneOffsets[chainIdx]
+      const gravityDir = new Vec3(0, -1, 0) // Gravity always points downward
 
-      // Compute anchor position (where spring attaches to parent)
-      const { anchor: anchorPos, parentQuat: parentWorldQuat } = this.computeAnchorPosition(springBoneIdx)
+      // Process each bone in the chain sequentially
+      for (let boneIdx = 0; boneIdx < chain.boneIndices.length; boneIdx++) {
+        const boneIndex = chain.boneIndices[boneIdx]
+        const posIdx = (offset + boneIdx) * 3
 
-      // Get current and previous tail positions for Verlet integration
-      const currentTail = new Vec3(
-        this.springCurrentTails[idx],
-        this.springCurrentTails[idx + 1],
-        this.springCurrentTails[idx + 2]
-      )
-      const prevTail = new Vec3(this.springPrevTails[idx], this.springPrevTails[idx + 1], this.springPrevTails[idx + 2])
+        // Get current and previous positions
+        const currentPos = new Vec3(
+          this.springCurrentPositions[posIdx],
+          this.springCurrentPositions[posIdx + 1],
+          this.springCurrentPositions[posIdx + 2]
+        )
+        const prevPos = new Vec3(
+          this.springPrevPositions[posIdx],
+          this.springPrevPositions[posIdx + 1],
+          this.springPrevPositions[posIdx + 2]
+        )
 
-      // Verlet integration: compute velocity
-      const velocity = currentTail.subtract(prevTail)
-      const damping = spring.damping || 0.5
+        // Compute anchor position using the same method as before
+        // For chain bones: if first bone, use root bone; otherwise use previous bone in chain
+        let anchorPos: Vec3
+        let parentWorldQuat: Quat | null = null
 
-      // Calculate current direction from anchor to current tail (before applying forces)
-      const toCurrentTail = currentTail.subtract(anchorPos)
-      const currentDist = toCurrentTail.length()
-      const currentDir = currentDist > 0.001 ? toCurrentTail.normalize() : new Vec3(0, 0, 1)
+        if (boneIdx === 0) {
+          // First bone in chain: anchor to root bone
+          if (chain.rootBoneIndex >= 0) {
+            const { anchor, parentQuat } = this.computeAnchorPositionForChainBone(boneIndex, chain.rootBoneIndex)
+            anchorPos = anchor
+            parentWorldQuat = parentQuat
+          } else {
+            // Fallback to bone's own parent
+            const { anchor, parentQuat } = this.computeAnchorPosition(boneIndex)
+            anchorPos = anchor
+            parentWorldQuat = parentQuat
+          }
+        } else {
+          // Subsequent bones: anchor to previous bone using its world matrix position (more stable)
+          const prevBoneIdx = boneIdx - 1
+          const prevBoneIndex = chain.boneIndices[prevBoneIdx]
 
-      // Accumulate forces (all in acceleration units: cm/s²)
-      let force = new Vec3(0, 0, 0)
+          // Get previous bone's world position and rotation from its updated world matrix
+          // This uses the smoothed, stable position from the bone's world transform
+          const prevBoneMatIdx = prevBoneIndex * 16
+          const prevBoneWorldPos = new Vec3(
+            this.boneWorldMatrices[prevBoneMatIdx + 12],
+            this.boneWorldMatrices[prevBoneMatIdx + 13],
+            this.boneWorldMatrices[prevBoneMatIdx + 14]
+          )
 
-      // 1. Gravity (world-space down)
-      if (spring.gravityScale && spring.gravityScale > 0) {
-        const gravity = spring.gravityScale * 980.0 // cm/s²
-        force = force.add(new Vec3(0, -1, 0).scale(gravity))
-      }
+          // Get previous bone's world rotation from its matrix
+          const prevBoneMat = new Mat4(
+            new Float32Array(this.boneWorldMatrices.buffer, this.boneWorldMatrices.byteOffset + prevBoneMatIdx * 4, 16)
+          )
+          const [px, py, pz, pw] = RzmModel.mat3ToQuat(prevBoneMat.values)
+          parentWorldQuat = new Quat(px, py, pz, pw).normalize()
 
-      // 2. Stiffness force: restore orientation toward rest pose
-      const bindTrans = this.getBindTranslation(springBoneIdx)
-      let restDir: Vec3
-      if (parentWorldQuat !== null) {
-        restDir = parentWorldQuat.rotate(bindTrans).normalize()
-      } else {
-        restDir = bindTrans.normalize()
-      }
+          // Compute anchor: previous bone's world position + this bone's bind translation rotated by previous bone's world rotation
+          const bindTrans = this.getBindTranslation(boneIndex)
+          const bindTransWorld = parentWorldQuat.rotate(bindTrans)
+          anchorPos = prevBoneWorldPos.add(bindTransWorld)
+        }
 
-      const stiffness = spring.stiffness || 0.01
-      const directionError = restDir.subtract(currentDir)
+        // Verlet integration: compute velocity
+        const velocity = currentPos.subtract(prevPos)
 
-      // Scale stiffness force to match gravity magnitude
-      // Stiffness of 1.0 should approximately balance gravity
-      const stiffnessScale = 5000.0 // Tuning factor (experiment with 3000-10000)
-      const stiffnessForce = directionError.scale(stiffness * stiffnessScale)
-      force = force.add(stiffnessForce)
+        // Calculate direction and distance from anchor
+        const toCurrent = currentPos.subtract(anchorPos)
+        const currentDist = toCurrent.length()
+        const currentDir = currentDist > 0.001 ? toCurrent.normalize() : new Vec3(0, 0, 1)
 
-      // 3. Length constraint (only if stretched/compressed significantly)
-      const restLen = spring.restLength || 0.1
-      const distanceError = currentDist - restLen
-      if (Math.abs(distanceError) > 0.01) {
-        // Soft constraint - restore length gently
-        const lengthForce = currentDir.scale(-distanceError * 500.0) // Moderate spring constant
-        force = force.add(lengthForce)
-      }
+        // Rest length from bind translation
+        const bindTrans = this.getBindTranslation(boneIndex)
+        const restLen = bindTrans.length()
 
-      // Apply Verlet: newPos = currentPos + velocity*(1-drag) + force*dt²
-      let newTail = currentTail.add(velocity.scale(1.0 - damping)).add(force.scale(dt2))
+        // Accumulate forces
+        // Units: positions in cm, time in seconds, forces in cm/s² (acceleration)
+        let force = new Vec3(0, 0, 0)
 
-      // Constraint: clamp distance to prevent extreme stretching/compression
-      const finalDir = newTail.subtract(anchorPos)
-      const finalDist = finalDir.length()
-      if (finalDist > 0.001) {
-        const maxDist = restLen * 2.5
-        const minDist = restLen * 0.3
-        const clampedDist = Math.max(minDist, Math.min(maxDist, finalDist))
-        newTail = anchorPos.add(finalDir.normalize().scale(clampedDist))
-      }
+        // 1. Gravity
+        // Gravity magnitude: 980.0 cm/s²
+        // At 60fps (dt=1/60), gravity contributes: 980 * (1/60)² ≈ 0.27 cm/frame
+        const gravity = 980.0
+        force = force.add(gravityDir.scale(gravity))
 
-      // Exponential smoothing to reduce high-frequency jitter
-      const smoothingFactor = 0.5 // 50% new, 50% old for smooth convergence
-      const smoothedTail = currentTail.scale(1.0 - smoothingFactor).add(newTail.scale(smoothingFactor))
-      newTail = smoothedTail
+        // 2. Stiffness force: restore orientation toward rest pose
+        // stiffnessScale is chosen to be ~5x gravity magnitude (5000 vs 980)
+        // This ensures stiffness force dominates when there's significant angular error,
+        // while gravity provides constant downward pull
+        // Formula: stiffnessForce = directionError * stiffness * stiffnessScale
+        // where directionError is normalized (magnitude 0-2), stiffness is 0-1
+        let restDir: Vec3
+        if (parentWorldQuat !== null) {
+          restDir = parentWorldQuat.rotate(bindTrans).normalize()
+        } else {
+          restDir = bindTrans.normalize()
+        }
 
-      // Update Verlet integration state
-      this.springPrevTails[idx] = currentTail.x
-      this.springPrevTails[idx + 1] = currentTail.y
-      this.springPrevTails[idx + 2] = currentTail.z
-      this.springCurrentTails[idx] = newTail.x
-      this.springCurrentTails[idx + 1] = newTail.y
-      this.springCurrentTails[idx + 2] = newTail.z
+        const directionError = restDir.subtract(currentDir)
+        const stiffnessScale = 5000.0
+        const stiffnessForce = directionError.scale(chain.stiffness * stiffnessScale)
+        force = force.add(stiffnessForce)
 
-      // Update bone rotation to point from anchor toward newTail
-      if (parentWorldQuat !== null) {
-        const targetDirWorld = newTail.subtract(anchorPos).normalize()
+        // 3. Length constraint
+        // Length constraint scale is ~0.5x stiffnessScale to be less aggressive
+        // Prevents overstretching while allowing stiffness to handle orientation
+        const distanceError = currentDist - restLen
+        if (Math.abs(distanceError) > 0.01) {
+          const lengthForce = currentDir.scale(-distanceError * 500.0)
+          force = force.add(lengthForce)
+        }
 
-        // Get bind direction in parent's local space
-        const bindDirLocal = this.getBindTranslation(springBoneIdx).normalize()
+        // Verlet integration: newPos = currentPos + velocity*(1-drag) + force*dt²
+        // Since forces are in cm/s² and dt² is (seconds)², force*dt² gives displacement in cm
+        let newPos = currentPos.add(velocity.scale(1.0 - chain.dragForce)).add(force.scale(dt2))
 
-        // Transform target direction to parent's local space
-        const invParentQuat = parentWorldQuat.conjugate().normalize()
-        const targetDirLocal = invParentQuat.rotate(targetDirWorld)
+        // Constraint: clamp distance from anchor
+        const finalDir = newPos.subtract(anchorPos)
+        const finalDist = finalDir.length()
+        if (finalDist > 0.001) {
+          const maxDist = restLen * 2.5
+          const minDist = restLen * 0.3
+          const clampedDist = Math.max(minDist, Math.min(maxDist, finalDist))
+          newPos = anchorPos.add(finalDir.normalize().scale(clampedDist))
+        }
 
-        // Compute rotation from bind direction to target direction
-        const localRotation = Quat.fromTo(bindDirLocal, targetDirLocal)
+        // 4. Collision detection with rigidbodies
+        if (this.rigidbodies && this.rigidbodies.length > 0 && chain.hitRadius > 0) {
+          for (const rigidbody of this.rigidbodies) {
+            if (rigidbody.collisionMask === 0) continue
 
-        // Update bone's local rotation
-        const springBoneQi = springBoneIdx * 4
-        this.boneLocalRotations[springBoneQi] = localRotation.x
-        this.boneLocalRotations[springBoneQi + 1] = localRotation.y
-        this.boneLocalRotations[springBoneQi + 2] = localRotation.z
-        this.boneLocalRotations[springBoneQi + 3] = localRotation.w
+            // Get rigidbody world position
+            let rigidbodyPos: Vec3
+            if (rigidbody.boneIndex >= 0 && rigidbody.boneIndex < this.skeleton.bones.length) {
+              const boneMatIdx = rigidbody.boneIndex * 16
+              const boneMat = new Mat4(
+                new Float32Array(this.boneWorldMatrices.buffer, this.boneWorldMatrices.byteOffset + boneMatIdx * 4, 16)
+              )
+              const localPos = new Vec3(rigidbody.position[0], rigidbody.position[1], rigidbody.position[2])
+              const m = boneMat.values
+              const x = localPos.x
+              const y = localPos.y
+              const z = localPos.z
+              const wx = m[0] * x + m[4] * y + m[8] * z + m[12]
+              const wy = m[1] * x + m[5] * y + m[9] * z + m[13]
+              const wz = m[2] * x + m[6] * y + m[10] * z + m[14]
+              rigidbodyPos = new Vec3(wx, wy, wz)
+            } else {
+              rigidbodyPos = new Vec3(rigidbody.position[0], rigidbody.position[1], rigidbody.position[2])
+            }
 
-        // Update world matrix for next spring in chain
-        const springBoneMatIdx = springBoneIdx * 16
-        const springWorldM = recomputeWorldMatrix(springBoneIdx)
-        this.boneWorldMatrices.set(springWorldM.values, springBoneMatIdx)
+            // Sphere-sphere collision
+            const toRigidbody = newPos.subtract(rigidbodyPos)
+            const distToRigidbody = toRigidbody.length()
+            const combinedRadius = chain.hitRadius + rigidbody.radius
+
+            if (distToRigidbody < combinedRadius && distToRigidbody > 0.001) {
+              const collisionDir = toRigidbody.normalize()
+              const pushDistance = combinedRadius - distToRigidbody
+              newPos = newPos.add(collisionDir.scale(pushDistance))
+            }
+          }
+        }
+
+        // Update Verlet state BEFORE smoothing (to maintain proper velocity)
+        this.springPrevPositions[posIdx] = currentPos.x
+        this.springPrevPositions[posIdx + 1] = currentPos.y
+        this.springPrevPositions[posIdx + 2] = currentPos.z
+
+        // Exponential smoothing to reduce high-frequency jitter (applied after Verlet update)
+        // smoothingFactor is independent of physics - it's a post-processing filter
+        // 0.5 means 50% new position, 50% old position (balanced responsiveness vs stability)
+        // Higher values (0.7+) = more responsive but potentially jittery
+        // Lower values (0.3-) = more stable but potentially laggy
+        const smoothingFactor = 0.5
+        const smoothedPos = currentPos.scale(1.0 - smoothingFactor).add(newPos.scale(smoothingFactor))
+        newPos = smoothedPos
+
+        this.springCurrentPositions[posIdx] = newPos.x
+        this.springCurrentPositions[posIdx + 1] = newPos.y
+        this.springCurrentPositions[posIdx + 2] = newPos.z
+
+        // Update bone rotation to point from anchor toward newPos (like before)
+        if (parentWorldQuat !== null) {
+          const targetDirWorld = newPos.subtract(anchorPos).normalize()
+
+          // Get bind direction in parent's local space
+          const bindDirLocal = bindTrans.normalize()
+
+          // Transform target direction to parent's local space
+          const invParentQuat = parentWorldQuat.conjugate().normalize()
+          const targetDirLocal = invParentQuat.rotate(targetDirWorld)
+
+          // Compute rotation from bind direction to target direction
+          const localRotation = Quat.fromTo(bindDirLocal, targetDirLocal)
+
+          // Update bone's local rotation
+          const boneQi = boneIndex * 4
+          this.boneLocalRotations[boneQi] = localRotation.x
+          this.boneLocalRotations[boneQi + 1] = localRotation.y
+          this.boneLocalRotations[boneQi + 2] = localRotation.z
+          this.boneLocalRotations[boneQi + 3] = localRotation.w
+        }
+
+        // Update world matrix for next bone in chain
+        const boneMatIdx = boneIndex * 16
+        const boneWorldM = recomputeWorldMatrix(boneIndex)
+        this.boneWorldMatrices.set(boneWorldM.values, boneMatIdx)
       }
     }
-  }
-
-  // Clear all spring bones
-  clearSpringBones(): void {
-    this.springBones = []
-    this.springCurrentTails = undefined
-    this.springPrevTails = undefined
-    this.springInitialized = false
   }
 
   getBoneWorldMatrix(index: number): Float32Array | undefined {

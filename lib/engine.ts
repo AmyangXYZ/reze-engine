@@ -586,26 +586,39 @@ export class Engine {
       return
     }
 
-    // Create spring chain: bda1 -> bda2 -> ... -> bda18
-    // Each spring connects the previous bone to the next
+    // Create spring chain: bda1 -> bda2 -> ... -> bda18 as a single VRM-like chain
     const sortedNumbers = Array.from(bdaBoneMap.keys()).sort((a, b) => a - b)
 
-    for (let i = 0; i < sortedNumbers.length - 1; i++) {
-      const currentNum = sortedNumbers[i]
-      const nextNum = sortedNumbers[i + 1]
-
-      const parentBoneIndex = bdaBoneMap.get(currentNum)!
-      const childBoneIndex = bdaBoneMap.get(nextNum)!
-
-      // Add spring bone with parameters suitable for hair/accessory chains
-      model.addSpringBone({
-        parentBoneIndex,
-        childBoneIndex,
-        stiffness: 0.6,
-        damping: 0.8,
-        gravityScale: 1.0,
-      })
+    if (sortedNumbers.length < 2) {
+      return
     }
+
+    // Find root bone: parent of first bone in chain, or use first bone itself if no parent
+    const firstBoneIndex = bdaBoneMap.get(sortedNumbers[0])!
+    let rootBoneIndex = firstBoneIndex
+
+    // Try to find parent of first bone
+    if (skeleton && firstBoneIndex < skeleton.bones.length) {
+      const firstBone = skeleton.bones[firstBoneIndex]
+      if (firstBone.parentIndex >= 0 && firstBone.parentIndex < skeleton.bones.length) {
+        rootBoneIndex = firstBone.parentIndex
+      }
+    }
+
+    // Build chain of bone indices (all bones from bda1 onwards)
+    const boneIndices: number[] = []
+    for (const num of sortedNumbers) {
+      boneIndices.push(bdaBoneMap.get(num)!)
+    }
+
+    // Add spring chain with VRM-like parameters
+    model.addSpringBoneChain({
+      rootBoneIndex,
+      boneIndices,
+      stiffness: 0.6,
+      dragForce: 0.7,
+      hitRadius: 2,
+    })
   }
 
   private async drawModel(model: RzmModel) {
