@@ -1360,7 +1360,9 @@ export class RzmModel {
         }
 
         const directionError = restDir.subtract(currentDir)
-        const stiffnessScale = 5000.0
+        // Reduced stiffness scale to prevent abrupt movements and oscillation
+        // Lower values = smoother, more fluid motion
+        const stiffnessScale = 2000.0 // Reduced from 5000.0
         const stiffnessForce = directionError.scale(chain.stiffness * stiffnessScale)
         force = force.add(stiffnessForce)
 
@@ -1369,13 +1371,16 @@ export class RzmModel {
         // Prevents overstretching while allowing stiffness to handle orientation
         const distanceError = currentDist - restLen
         if (Math.abs(distanceError) > 0.01) {
-          const lengthForce = currentDir.scale(-distanceError * 500.0)
+          // Reduced length constraint force to prevent abrupt movements
+          const lengthForce = currentDir.scale(-distanceError * 300.0) // Reduced from 500.0
           force = force.add(lengthForce)
         }
 
         // Verlet integration: newPos = currentPos + velocity*(1-drag) + force*dt²
         // Since forces are in cm/s² and dt² is (seconds)², force*dt² gives displacement in cm
-        let newPos = currentPos.add(velocity.scale(1.0 - chain.dragForce)).add(force.scale(dt2))
+        // Apply additional velocity damping to reduce oscillations and abrupt movements
+        const velocityDamping = 0.95 // Additional damping to smooth velocity changes
+        let newPos = currentPos.add(velocity.scale((1.0 - chain.dragForce) * velocityDamping)).add(force.scale(dt2))
 
         // Constraint: clamp distance from anchor
         const finalDir = newPos.subtract(anchorPos)
@@ -1449,12 +1454,10 @@ export class RzmModel {
           this.springPhysics.prevPositions[posIdx + 2] = currentPos.z
         }
 
-        // Exponential smoothing to reduce high-frequency jitter (applied after Verlet update)
-        // smoothingFactor is independent of physics - it's a post-processing filter
-        // 0.5 means 50% new position, 50% old position (balanced responsiveness vs stability)
-        // Higher values (0.7+) = more responsive but potentially jittery
-        // Lower values (0.3-) = more stable but potentially laggy
-        const smoothingFactor = 0.5
+        // Exponential smoothing to reduce high-frequency jitter and prevent abrupt bends
+        // Higher smoothing = smoother, more fluid motion (but slightly more laggy)
+        // Lower smoothing = more responsive but potentially jittery/cracked
+        const smoothingFactor = 0.75 // Increased from 0.5 for smoother hair motion
         const smoothedPos = currentPos.scale(1.0 - smoothingFactor).add(newPos.scale(smoothingFactor))
         newPos = smoothedPos
 
@@ -1464,7 +1467,8 @@ export class RzmModel {
           this.springPhysics.currentPositions[posIdx + 2] = newPos.z
         }
 
-        // Update bone rotation to point from anchor toward newPos (like before)
+        // Update bone rotation to point from anchor toward newPos
+        // Use smooth interpolation to prevent cracking/discontinuities
         if (parentWorldQuat !== null) {
           const targetDirWorld = newPos.subtract(anchorPos).normalize()
 
@@ -1475,15 +1479,31 @@ export class RzmModel {
           const invParentQuat = parentWorldQuat.conjugate().normalize()
           const targetDirLocal = invParentQuat.rotate(targetDirWorld)
 
-          // Compute rotation from bind direction to target direction
-          const localRotation = Quat.fromTo(bindDirLocal, targetDirLocal)
+          // Compute target rotation from bind direction to target direction
+          const targetRotation = Quat.fromTo(bindDirLocal, targetDirLocal)
 
-          // Update bone's local rotation
+          // Get current rotation for smooth interpolation
           const boneQi = boneIndex * 4
-          this.runtimeSkeleton.localRotations[boneQi] = localRotation.x
-          this.runtimeSkeleton.localRotations[boneQi + 1] = localRotation.y
-          this.runtimeSkeleton.localRotations[boneQi + 2] = localRotation.z
-          this.runtimeSkeleton.localRotations[boneQi + 3] = localRotation.w
+          const currentRotation = new Quat(
+            this.runtimeSkeleton.localRotations[boneQi],
+            this.runtimeSkeleton.localRotations[boneQi + 1],
+            this.runtimeSkeleton.localRotations[boneQi + 2],
+            this.runtimeSkeleton.localRotations[boneQi + 3]
+          ).normalize()
+
+          // Smoothly interpolate from current rotation to target rotation
+          // Higher blend factor = smoother, more fluid rotation (prevents cracking)
+          // Lower blend factor = more responsive but potentially jerky
+          const rotationBlendFactor = 0.9 // Increased from 0.85 for smoother hair rotation
+          const [sx, sy, sz, sw] = currentRotation.toArray()
+          const [tx, ty, tz, tw] = targetRotation.toArray()
+          const [fx, fy, fz, fw] = RzmModel.slerp(sx, sy, sz, sw, tx, ty, tz, tw, rotationBlendFactor)
+
+          // Update bone's local rotation with smoothed value
+          this.runtimeSkeleton.localRotations[boneQi] = fx
+          this.runtimeSkeleton.localRotations[boneQi + 1] = fy
+          this.runtimeSkeleton.localRotations[boneQi + 2] = fz
+          this.runtimeSkeleton.localRotations[boneQi + 3] = fw
         }
 
         // Update world matrix for next bone in chain
