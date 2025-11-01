@@ -1,6 +1,23 @@
 import { RzmModel, RzmTexture, RzmMaterial, RzmBone, RzmSkeleton, RzmSkinning, RzmRigidbody } from "./rzm"
 import { Mat4 } from "./math"
 
+// MMD joint (PMX format) - used for parsing only, not used in RZM (RZM uses spring bones instead)
+interface MmdJoint {
+  name: string
+  englishName: string
+  type: number // Joint type (uint8)
+  rigidbodyIndexA: number // Index of first rigidbody (-1 for none)
+  rigidbodyIndexB: number // Index of second rigidbody (-1 for none)
+  position: [number, number, number] // Position (world space)
+  rotation: [number, number, number] // Rotation (Euler angles)
+  positionMin: [number, number, number] // Position constraint minimum
+  positionMax: [number, number, number] // Position constraint maximum
+  rotationMin: [number, number, number] // Rotation constraint minimum (Euler)
+  rotationMax: [number, number, number] // Rotation constraint maximum (Euler)
+  springPosition: [number, number, number] // Spring position parameters
+  springRotation: [number, number, number] // Spring rotation parameters
+}
+
 export class PmxLoader {
   private view: DataView
   private offset = 0
@@ -17,6 +34,7 @@ export class PmxLoader {
   private materials: RzmMaterial[] = []
   private bones: RzmBone[] = []
   private rigidbodies: RzmRigidbody[] = []
+  private joints: MmdJoint[] = [] // MMD joints (parsed but not used - RZM uses spring bones)
   private inverseBindMatrices: Float32Array | null = null
   private joints0: Uint16Array | null = null
   private weights0: Uint8Array | null = null
@@ -38,6 +56,7 @@ export class PmxLoader {
     this.parseMaterials()
     this.parseBones()
     this.parseRigidbodies()
+    this.parseJoints()
     this.computeInverseBind()
     return this.toRzmModel(positions, normals, uvs, indices)
   }
@@ -676,6 +695,106 @@ export class PmxLoader {
       console.warn("Error parsing rigidbodies:", e)
       this.rigidbodies = []
     }
+  }
+
+  private parseJoints() {
+    try {
+      // Check bounds before reading joint count
+      if (this.offset + 4 > this.view.buffer.byteLength) {
+        console.warn("Not enough bytes for joint count")
+        this.joints = []
+        return
+      }
+
+      const count = this.getInt32()
+      if (count < 0 || count > 10000) {
+        console.warn(`Suspicious joint count: ${count}`)
+        this.joints = []
+        return
+      }
+
+      this.joints = []
+
+      for (let i = 0; i < count; i++) {
+        try {
+          // Check bounds before reading each joint
+          if (this.offset >= this.view.buffer.byteLength) {
+            console.warn(`Reached end of buffer while reading joint ${i} of ${count}`)
+            break
+          }
+
+          const name = this.getText()
+          const englishName = this.getText()
+          const type = this.getUint8()
+
+          // Rigidbody indices use rigidBodyIndexSize (not boneIndexSize)
+          const rigidbodyIndexA = this.getNonVertexIndex(this.rigidBodyIndexSize)
+          const rigidbodyIndexB = this.getNonVertexIndex(this.rigidBodyIndexSize)
+
+          // Position (convert Z for right-handed space)
+          const posX = this.getFloat32()
+          const posY = this.getFloat32()
+          const posZ = -this.getFloat32()
+
+          // Rotation (convert Z for right-handed space)
+          const rotX = this.getFloat32()
+          const rotY = this.getFloat32()
+          const rotZ = -this.getFloat32()
+
+          // Position constraints (convert Z and swap min/max since we negated Z)
+          const posMinX = this.getFloat32()
+          const posMinY = this.getFloat32()
+          const posMinZRaw = this.getFloat32()
+
+          const posMaxX = this.getFloat32()
+          const posMaxY = this.getFloat32()
+          const posMaxZRaw = this.getFloat32()
+
+          // Rotation constraints (convert Z and swap min/max since we negated Z)
+          const rotMinX = this.getFloat32()
+          const rotMinY = this.getFloat32()
+          const rotMinZRaw = this.getFloat32()
+
+          const rotMaxX = this.getFloat32()
+          const rotMaxY = this.getFloat32()
+          const rotMaxZRaw = this.getFloat32()
+
+          // Spring parameters
+          const springPosX = this.getFloat32()
+          const springPosY = this.getFloat32()
+          const springPosZ = this.getFloat32()
+
+          const springRotX = this.getFloat32()
+          const springRotY = this.getFloat32()
+          const springRotZ = this.getFloat32()
+
+          this.joints.push({
+            name,
+            englishName,
+            type,
+            rigidbodyIndexA,
+            rigidbodyIndexB,
+            position: [posX, posY, posZ],
+            rotation: [rotX, rotY, rotZ],
+            // Swap min/max for Z since we negated it in coordinate conversion
+            positionMin: [posMinX, posMinY, -posMaxZRaw],
+            positionMax: [posMaxX, posMaxY, -posMinZRaw],
+            rotationMin: [rotMinX, rotMinY, -rotMaxZRaw],
+            rotationMax: [rotMaxX, rotMaxY, -rotMinZRaw],
+            springPosition: [springPosX, springPosY, springPosZ],
+            springRotation: [springRotX, springRotY, springRotZ],
+          })
+        } catch (e) {
+          console.warn(`Error reading joint ${i} of ${count}:`, e)
+          // Stop parsing if we encounter an error
+          break
+        }
+      }
+    } catch (e) {
+      console.warn("Error parsing joints:", e)
+      this.joints = []
+    }
+    console.log("Joints parsed:", this.joints)
   }
 
   private computeInverseBind() {
