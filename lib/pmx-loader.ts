@@ -859,7 +859,6 @@ export class PmxLoader {
     const skeleton: RzmSkeleton = {
       bones: this.bones.length > 0 ? this.bones : [],
       inverseBindMatrices: this.inverseBindMatrices || new Float32Array(0),
-      nameIndex: {}, // Will be populated by RzmModel during initialization
     }
 
     let skinning: RzmSkinning
