@@ -76,7 +76,7 @@ export class Engine {
     const adapter = await navigator.gpu?.requestAdapter()
     const device = await adapter?.requestDevice()
     if (!device) {
-      throw new Error("need a browser that supports WebGPU")
+      throw new Error("WebGPU is not supported in this browser.")
     }
     this.device = device
 
@@ -543,7 +543,12 @@ export class Engine {
     // Ensure directory ends with /
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
-    const model = await PmxLoader.load(url)
+    const { model, rigidbodies } = await PmxLoader.load(url)
+
+    // Set up collision groups from PMX rigidbodies
+    if (rigidbodies.length > 0) {
+      model.setupCollisionGroupsFromRigidbodies(rigidbodies)
+    }
     model.rotateBones(
       ["腰", "左腕", "左足"],
       [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, -0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],

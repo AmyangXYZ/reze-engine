@@ -56,9 +56,23 @@ export interface RzmSkeletonRuntime {
   skinMatrices: Float32Array // mat4 per bone length = boneCount*16
 }
 
+// VRM-like collision sphere attached to a bone
+export interface CollisionSphere {
+  boneIndex: number // Bone this sphere is attached to
+  radius: number // Sphere radius in cm
+  offset: [number, number, number] // Offset from bone position (in bone's local space, converted to world)
+}
+
+// Collision group - collection of spheres for body parts (chest, hips, etc.)
+export interface CollisionGroup {
+  name: string // Optional name for debugging
+  spheres: CollisionSphere[]
+}
+
 // Spring bone physics runtime state
 export interface RzmSpringPhysics {
   chains: SpringBoneChain[] // Spring bone chain definitions
+  collisionGroups: CollisionGroup[] // Body collision groups for spring bone collision
   currentPositions?: Float32Array // vec3 per bone in chains (current position)
   prevPositions?: Float32Array // vec3 per bone in chains (previous position)
   initialized: boolean // Whether spring positions have been initialized
@@ -137,6 +151,7 @@ export class RzmModel {
     // Initialize spring physics state
     this.springPhysics = {
       chains: [],
+      collisionGroups: [],
       initialized: false,
       timeAccumulator: 0,
     }
@@ -146,6 +161,7 @@ export class RzmModel {
       this.initializeRuntimePose()
       this.initializeRotTweenBuffers()
       this.autoDetectSpringBones()
+      this.setupChestSpringBones()
     }
   }
 
@@ -667,6 +683,92 @@ export class RzmModel {
     this.springPhysics.initialized = false
   }
 
+  // Add a collision group (body colliders)
+  addCollisionGroup(group: CollisionGroup): void {
+    // Validate bone indices
+    for (const sphere of group.spheres) {
+      if (sphere.boneIndex < 0 || sphere.boneIndex >= this.skeleton.bones.length) {
+        console.warn(`[RZM] Invalid collision sphere bone index: ${sphere.boneIndex}`)
+        return
+      }
+      if (sphere.radius <= 0) {
+        console.warn(`[RZM] Invalid collision sphere radius: ${sphere.radius}`)
+        return
+      }
+    }
+    this.springPhysics.collisionGroups.push(group)
+  }
+
+  // Get all collision groups
+  getCollisionGroups(): CollisionGroup[] {
+    return [...this.springPhysics.collisionGroups]
+  }
+
+  // Clear all collision groups
+  clearCollisionGroups(): void {
+    this.springPhysics.collisionGroups = []
+  }
+
+  // Set up collision groups from PMX rigidbodies
+  // Converts PMX rigidbody data into collision spheres for spring bone collision
+  setupCollisionGroupsFromRigidbodies(
+    rigidbodies: Array<{
+      boneIndex: number
+      radius: number
+      group: number
+      collisionMask: number
+      position: [number, number, number]
+    }>
+  ): void {
+    if (rigidbodies.length === 0) return
+
+    // Group rigidbodies by their group number for better organization
+    const groupsByCollisionGroup = new Map<
+      number,
+      Array<{ boneIndex: number; radius: number; position: [number, number, number] }>
+    >()
+
+    for (const rb of rigidbodies) {
+      // Only use rigidbodies with valid bone indices
+      if (rb.boneIndex < 0 || rb.boneIndex >= this.skeleton.bones.length) {
+        console.warn(`[RZM] Skipping rigidbody with invalid bone index: ${rb.boneIndex}`)
+        continue
+      }
+
+      if (!groupsByCollisionGroup.has(rb.group)) {
+        groupsByCollisionGroup.set(rb.group, [])
+      }
+
+      groupsByCollisionGroup.get(rb.group)!.push({
+        boneIndex: rb.boneIndex,
+        radius: rb.radius,
+        position: rb.position,
+      })
+    }
+
+    // Create collision groups from PMX rigidbody data
+    for (const [groupNum, spheres] of groupsByCollisionGroup.entries()) {
+      const collisionSpheres: CollisionSphere[] = spheres.map((s) => ({
+        boneIndex: s.boneIndex,
+        radius: s.radius,
+        offset: s.position, // PMX position is already in bone's local space
+      }))
+
+      this.addCollisionGroup({
+        name: `pmx_group_${groupNum}`,
+        spheres: collisionSpheres,
+      })
+    }
+
+    if (this.springPhysics.collisionGroups.length > 0) {
+      const groupNames = this.springPhysics.collisionGroups.map((g) => g.name).join(", ")
+      const totalSpheres = this.springPhysics.collisionGroups.reduce((sum, g) => sum + g.spheres.length, 0)
+      console.log(`[RZM] Collision groups from PMX rigidbodies: ${groupNames} (${totalSpheres} spheres total)`)
+    } else {
+      console.warn(`[RZM] No collision groups created from ${rigidbodies.length} rigidbodies`)
+    }
+  }
+
   // Automatically detect and group bones by pattern matching
   // Uses the first number in the name as the varying index and the rest as a pattern key
   // Creates spring bone chains for each group (e.g., hf_1_1, hf_2_1, hf_3_1 form one chain)
@@ -702,8 +804,8 @@ export class RzmModel {
         // Check if pattern key contains only ASCII characters (English, not Japanese)
         const isEnglishOnly = /^[\x00-\x7F]*$/.test(patternKey)
 
-        // Only group if first number is valid and pattern key is English-only
-        if (!isNaN(firstNumber) && patternKey.length > 0 && isEnglishOnly) {
+        // Only group if first number is valid, pattern key is English-only, and bone is not static
+        if (!isNaN(firstNumber) && patternKey.length > 0 && isEnglishOnly && !this.isStaticBone(i)) {
           if (!prefixGroups.has(patternKey)) {
             prefixGroups.set(patternKey, [])
           }
@@ -754,8 +856,126 @@ export class RzmModel {
         boneIndices,
         stiffness: 0.5,
         dragForce: 0.5,
-        hitRadius: 0.3,
+        hitRadius: 0.3, // Increased for better collision detection
       })
+    }
+  }
+
+  // Bones that should never be affected by spring physics (static/kinematic bones)
+  private static readonly STATIC_BONE_NAMES = ["全ての親", "センター", "グルーブ", "腰", "上半身", "上半身2"]
+
+  // Check if a bone should be excluded from spring physics
+  private isStaticBone(boneIndex: number): boolean {
+    if (boneIndex < 0 || boneIndex >= this.skeleton.bones.length) return false
+    const boneName = this.getBoneName(boneIndex)
+    return boneName ? RzmModel.STATIC_BONE_NAMES.includes(boneName) : false
+  }
+
+  // Set up chest spring bone chains manually
+  // Chest bones hierarchy: 上2 (root) -> 変形 -> 胸 -> 胸先
+  private setupChestSpringBones(): void {
+    const chestBoneNames = {
+      left: {
+        top2: "左胸上2",
+        transform: "左胸変形",
+        chest: "左胸",
+        tip: "左胸先",
+      },
+      right: {
+        top2: "右胸上2",
+        transform: "右胸変形",
+        chest: "右胸",
+        tip: "右胸先",
+      },
+    }
+
+    // Helper to get bone index, returning -1 if not found
+    const getIdx = (name: string): number => {
+      const idx = this.getBoneIndexByName(name)
+      if (idx < 0) {
+        console.warn(`[RZM] Chest bone not found: ${name}`)
+      }
+      return idx
+    }
+
+    // Helper to build chain from tip to root by following parent chain
+    const buildChain = (tipBoneIdx: number, rootBoneName: string): number[] => {
+      if (tipBoneIdx < 0) return []
+      const chain: number[] = []
+      let currentIdx = tipBoneIdx
+
+      // Follow parent chain until we reach the root bone
+      while (currentIdx >= 0) {
+        chain.unshift(currentIdx) // Add to beginning to maintain root->tip order
+        const bone = this.skeleton.bones[currentIdx]
+        if (bone.name === rootBoneName) {
+          break // Reached the root
+        }
+        if (bone.parentIndex < 0 || bone.parentIndex >= this.skeleton.bones.length) {
+          break // No parent, stop
+        }
+        currentIdx = bone.parentIndex
+      }
+
+      return chain
+    }
+
+    // Build left chest chain: tip -> root (will be reversed to root->tip)
+    const leftTipIdx = getIdx(chestBoneNames.left.tip)
+    const leftChain = buildChain(leftTipIdx, chestBoneNames.left.top2)
+    if (leftChain.length >= 2) {
+      const rootIdx = this.getBoneIndexByName(chestBoneNames.left.top2)
+      if (rootIdx < 0) {
+        console.warn(`[RZM] Left chest root bone not found: ${chestBoneNames.left.top2}`)
+      } else {
+        // Use 上2 as the anchor (root), exclude it from boneIndices
+        // Only the children bones (変形, 胸, 胸先) are affected by physics
+        // Also exclude any static bones to prevent dragging parent chain
+        const chainBones = leftChain.filter((idx) => idx !== rootIdx && !this.isStaticBone(idx))
+        if (chainBones.length > 0) {
+          this.addSpringBoneChain({
+            rootBoneIndex: rootIdx, // 上2 is the anchor
+            boneIndices: chainBones, // Only children bones affected by physics
+            stiffness: 0.5,
+            dragForce: 0.5,
+            hitRadius: 1.5, // Increased for better collision detection with body
+          })
+          console.log(
+            `[RZM] Left chest chain (root=${this.getBoneName(rootIdx)}): ${chainBones
+              .map((i) => this.getBoneName(i))
+              .join(" -> ")}`
+          )
+        }
+      }
+    }
+
+    // Build right chest chain
+    const rightTipIdx = getIdx(chestBoneNames.right.tip)
+    const rightChain = buildChain(rightTipIdx, chestBoneNames.right.top2)
+    if (rightChain.length >= 2) {
+      const rootIdx = this.getBoneIndexByName(chestBoneNames.right.top2)
+      if (rootIdx < 0) {
+        console.warn(`[RZM] Right chest root bone not found: ${chestBoneNames.right.top2}`)
+      } else {
+        // Use 上2 as the anchor (root), exclude it from boneIndices
+        // Only the children bones (変形, 胸, 胸先) are affected by physics
+        // Also exclude any static bones to prevent dragging parent chain
+        const chainBones = rightChain.filter((idx) => idx !== rootIdx && !this.isStaticBone(idx))
+        if (chainBones.length > 0) {
+          this.addSpringBoneChain({
+            rootBoneIndex: rootIdx, // 上2 is the anchor
+            boneIndices: chainBones, // Only children bones affected by physics
+            stiffness: 0.5,
+            dragForce: 0.5,
+            hitRadius: 0.3, // Increased for better collision detection with body
+          })
+          console.log(
+            `[RZM] Right chest chain (root=${this.getBoneName(rootIdx)}): ${chainBones
+              .map((i) => this.getBoneName(i))
+              .join(" -> ")}`
+          )
+        }
+      }
     }
   }
 
@@ -1001,6 +1221,38 @@ export class RzmModel {
   ): void {
     if (!this.springPhysics.chains || this.springPhysics.chains.length === 0) return
 
+    // Pre-compute collision sphere positions once (body bones don't move during spring bone physics)
+    // This avoids repeated matrix calculations in the collision loop
+    const collisionSpherePositions: Array<{ pos: Vec3; radius: number }> = []
+    if (this.springPhysics.collisionGroups.length > 0) {
+      for (const group of this.springPhysics.collisionGroups) {
+        for (const sphere of group.spheres) {
+          const boneMatIdx = sphere.boneIndex * 16
+
+          // Extract rotation quaternion from world matrix
+          const [qx, qy, qz, qw] = RzmModel.mat3ToQuat(
+            new Float32Array(
+              this.runtimeSkeleton.worldMatrices.buffer,
+              this.runtimeSkeleton.worldMatrices.byteOffset + boneMatIdx * 4,
+              16
+            )
+          )
+          const rotQuat = new Quat(qx, qy, qz, qw).normalize()
+          const offsetLocal = new Vec3(sphere.offset[0], sphere.offset[1], sphere.offset[2])
+          const offsetWorld = rotQuat.rotate(offsetLocal)
+
+          // Sphere position in world space = bone position + rotated offset
+          const spherePos = new Vec3(
+            this.runtimeSkeleton.worldMatrices[boneMatIdx + 12],
+            this.runtimeSkeleton.worldMatrices[boneMatIdx + 13],
+            this.runtimeSkeleton.worldMatrices[boneMatIdx + 14]
+          ).add(offsetWorld)
+
+          collisionSpherePositions.push({ pos: spherePos, radius: sphere.radius })
+        }
+      }
+    }
+
     // Process each chain
     for (let chainIdx = 0; chainIdx < this.springPhysics.chains.length; chainIdx++) {
       const chain = this.springPhysics.chains[chainIdx]
@@ -1172,6 +1424,24 @@ export class RzmModel {
           }
         }
 
+        // Collision detection with body collision groups (VRM-style)
+        // Use pre-computed sphere positions for performance
+        if (chain.hitRadius > 0 && collisionSpherePositions.length > 0) {
+          for (const sphereData of collisionSpherePositions) {
+            // Sphere-sphere collision between spring bone and body collision sphere
+            const toSphere = newPos.subtract(sphereData.pos)
+            const distToSphere = toSphere.length()
+            const combinedRadius = chain.hitRadius + sphereData.radius
+
+            if (distToSphere < combinedRadius && distToSphere > 0.001) {
+              const collisionDir = toSphere.normalize()
+              const pushDistance = combinedRadius - distToSphere
+              // Push spring bone away from body collider
+              newPos = newPos.add(collisionDir.scale(pushDistance))
+            }
+          }
+        }
+
         // Update Verlet state BEFORE smoothing (to maintain proper velocity)
         if (this.springPhysics.prevPositions) {
           this.springPhysics.prevPositions[posIdx] = currentPos.x
@@ -1233,18 +1503,41 @@ export class RzmModel {
   // Evaluate world and skin matrices from local TR and bind
   // If deltaTime is provided, also updates spring bone physics
   evaluatePose(deltaTime?: number): void {
-    // Evaluate spring bones before evaluating pose (if deltaTime provided)
-    if (deltaTime !== undefined) {
-      this.evaluateSpringBones(deltaTime)
-    }
-
     // Advance rotation tweens before composing matrices
     this.updateRotationTweens()
+
+    // Compute world matrices BEFORE spring bone physics (needed for collision detection)
+    // This gives us up-to-date matrices for body collider bones
+    this.computeWorldMatrices()
+
+    // Evaluate spring bones (if deltaTime provided) - uses the world matrices we just computed
+    if (deltaTime !== undefined) {
+      this.evaluateSpringBones(deltaTime)
+      // Spring bones update rotations, so recompute matrices after
+      this.computeWorldMatrices()
+    }
+
+    // Compute skin matrices from world matrices
     const bones = this.skeleton.bones
     const invBind = this.skeleton.inverseBindMatrices
-    const localRot = this.runtimeSkeleton.localRotations
     const worldBuf = this.runtimeSkeleton.worldMatrices
     const skinBuf = this.runtimeSkeleton.skinMatrices
+
+    // Compute skin matrices from world and inverse bind matrices
+    for (let i = 0; i < bones.length; i++) {
+      const worldSeg = worldBuf.subarray(i * 16, i * 16 + 16)
+      const invSeg = invBind.subarray(i * 16, i * 16 + 16)
+      const skinSeg = skinBuf.subarray(i * 16, i * 16 + 16)
+      const skinM = new Mat4(worldSeg).multiply(new Mat4(invSeg))
+      skinSeg.set(skinM.values)
+    }
+  }
+
+  // Compute world matrices from local rotations and translations
+  private computeWorldMatrices(): void {
+    const bones = this.skeleton.bones
+    const localRot = this.runtimeSkeleton.localRotations
+    const worldBuf = this.runtimeSkeleton.worldMatrices
 
     // compute recursively to respect parent-before-child regardless of file order
     const computed: boolean[] = new Array(bones.length).fill(false)
@@ -1326,11 +1619,6 @@ export class RzmModel {
       }
       worldSeg.set(worldM.values)
       computed[i] = true
-
-      const skinSeg = skinBuf.subarray(i * 16, i * 16 + 16)
-      const invSeg = invBind.subarray(i * 16, i * 16 + 16)
-      const skinM = new Mat4(worldSeg).multiply(new Mat4(invSeg))
-      skinSeg.set(skinM.values)
     }
 
     for (let i = 0; i < bones.length; i++) computeWorld(i)

@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
-  const [webgpuNotSupported, setWebgpuNotSupported] = useState(false)
+  const [engineError, setEngineError] = useState<string | null>(null)
   const [stats, setStats] = useState<EngineStats>({
     fps: 0,
     frameTime: 0,
@@ -28,8 +28,7 @@ export default function Home() {
           setStats(engine.getStats())
         })
       } catch (error) {
-        console.error("Error initializing engine:", error)
-        setWebgpuNotSupported(true)
+        setEngineError(error instanceof Error ? error.message : "Unknown error")
       }
     }
   }, [])
@@ -50,9 +49,9 @@ export default function Home() {
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
       <Header stats={stats} />
-      {webgpuNotSupported && (
+      {engineError && (
         <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white">
-          WebGPU not supported
+          Engine Error: {engineError}
         </div>
       )}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
