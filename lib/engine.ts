@@ -544,81 +544,18 @@ export class Engine {
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
+    model.rotateBones(
+      ["腰", "左腕", "左足"],
+      [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, -0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
+      2000
+    )
+
     await this.drawModel(model)
 
     // Test spring bones - find some bones that would benefit from spring physics
     // (e.g., hair, skirts, accessories)
     const boneNames = model.getBoneNames()
     console.log("Available bones:", boneNames)
-
-    model.rotateBones(
-      ["腰", "左腕", "左足"],
-      [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, -0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
-      3000
-    )
-
-    // Example: Add a test spring bone (you can customize this based on your model)
-    // This is a simple test - find parent-child bone pairs and add spring physics
-    this.setupTestSpringBones(model)
-  }
-
-  private setupTestSpringBones(model: RzmModel): void {
-    const boneNames = model.getBoneNames()
-    const skeleton = model.getSkeleton()
-    if (!skeleton) return
-
-    // Find bda1 through bda18 bones (exact names: bda1, bda2, ..., bda18)
-    const bdaBoneMap = new Map<number, number>() // bone number -> bone index
-
-    for (let i = 0; i < boneNames.length; i++) {
-      const boneName = boneNames[i]
-      // Match exactly "bda" followed by digits 1-18 (case insensitive)
-      const match = boneName.match(/^M-bda([1-9]|1[0-8])$/i)
-      if (match) {
-        const num = parseInt(match[1], 10)
-        if (num >= 1 && num <= 18) {
-          bdaBoneMap.set(num, i)
-        }
-      }
-    }
-
-    if (bdaBoneMap.size === 0) {
-      return
-    }
-
-    // Create spring chain: bda1 -> bda2 -> ... -> bda18 as a single VRM-like chain
-    const sortedNumbers = Array.from(bdaBoneMap.keys()).sort((a, b) => a - b)
-
-    if (sortedNumbers.length < 2) {
-      return
-    }
-
-    // Find root bone: parent of first bone in chain, or use first bone itself if no parent
-    const firstBoneIndex = bdaBoneMap.get(sortedNumbers[0])!
-    let rootBoneIndex = firstBoneIndex
-
-    // Try to find parent of first bone
-    if (skeleton && firstBoneIndex < skeleton.bones.length) {
-      const firstBone = skeleton.bones[firstBoneIndex]
-      if (firstBone.parentIndex >= 0 && firstBone.parentIndex < skeleton.bones.length) {
-        rootBoneIndex = firstBone.parentIndex
-      }
-    }
-
-    // Build chain of bone indices (all bones from bda1 onwards)
-    const boneIndices: number[] = []
-    for (const num of sortedNumbers) {
-      boneIndices.push(bdaBoneMap.get(num)!)
-    }
-
-    // Add spring chain with VRM-like parameters
-    model.addSpringBoneChain({
-      rootBoneIndex,
-      boneIndices,
-      stiffness: 0.6,
-      dragForce: 0.7,
-      hitRadius: 2,
-    })
   }
 
   private async drawModel(model: RzmModel) {

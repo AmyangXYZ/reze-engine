@@ -1,22 +1,5 @@
-import { RzmModel, RzmTexture, RzmMaterial, RzmBone, RzmSkeleton, RzmSkinning, RzmRigidbody } from "./rzm"
+import { RzmModel, RzmTexture, RzmMaterial, RzmBone, RzmSkeleton, RzmSkinning } from "./rzm"
 import { Mat4 } from "./math"
-
-// MMD joint (PMX format) - used for parsing only, not used in RZM (RZM uses spring bones instead)
-interface MmdJoint {
-  name: string
-  englishName: string
-  type: number // Joint type (uint8)
-  rigidbodyIndexA: number // Index of first rigidbody (-1 for none)
-  rigidbodyIndexB: number // Index of second rigidbody (-1 for none)
-  position: [number, number, number] // Position (world space)
-  rotation: [number, number, number] // Rotation (Euler angles)
-  positionMin: [number, number, number] // Position constraint minimum
-  positionMax: [number, number, number] // Position constraint maximum
-  rotationMin: [number, number, number] // Rotation constraint minimum (Euler)
-  rotationMax: [number, number, number] // Rotation constraint maximum (Euler)
-  springPosition: [number, number, number] // Spring position parameters
-  springRotation: [number, number, number] // Spring rotation parameters
-}
 
 export class PmxLoader {
   private view: DataView
@@ -33,8 +16,6 @@ export class PmxLoader {
   private textures: RzmTexture[] = []
   private materials: RzmMaterial[] = []
   private bones: RzmBone[] = []
-  private rigidbodies: RzmRigidbody[] = []
-  private joints: MmdJoint[] = [] // MMD joints (parsed but not used - RZM uses spring bones)
   private inverseBindMatrices: Float32Array | null = null
   private joints0: Uint16Array | null = null
   private weights0: Uint8Array | null = null
@@ -55,8 +36,11 @@ export class PmxLoader {
     this.parseTextures()
     this.parseMaterials()
     this.parseBones()
-    this.parseRigidbodies()
-    this.parseJoints()
+    // Skip morphs, display frames, rigidbodies, and joints
+    this.skipMorphs()
+    this.skipDisplayFrames()
+    this.skipRigidbodies()
+    this.skipJoints()
     this.computeInverseBind()
     return this.toRzmModel(positions, normals, uvs, indices)
   }
@@ -590,68 +574,36 @@ export class PmxLoader {
     }
   }
 
-  private parseRigidbodies() {
+  private skipRigidbodies(): boolean {
     try {
-      // Skip morphs and display frames sections that come between bones and rigidbodies
-      // If skipping fails, we can't safely parse rigidbodies
-      const morphsSkipped = this.skipMorphs()
-      if (!morphsSkipped) {
-        console.warn("Failed to skip morphs, aborting rigidbody parsing")
-        this.rigidbodies = []
-        return
-      }
-
-      const framesSkipped = this.skipDisplayFrames()
-      if (!framesSkipped) {
-        console.warn("Failed to skip display frames, aborting rigidbody parsing")
-        this.rigidbodies = []
-        return
-      }
-
-      // Check bounds before reading rigidbody count
+      // Check if we have enough bytes to read the count
       if (this.offset + 4 > this.view.buffer.byteLength) {
-        console.warn("Not enough bytes for rigidbody count")
-        this.rigidbodies = []
-        return
+        return false
       }
-
       const count = this.getInt32()
       if (count < 0 || count > 10000) {
-        // Suspicious count
-        console.warn(`Suspicious rigidbody count: ${count}`)
-        this.rigidbodies = []
-        return
+        // Suspicious count, likely corrupted - restore offset
+        this.offset -= 4
+        return false
       }
-
-      this.rigidbodies = []
-
       for (let i = 0; i < count; i++) {
+        // Check bounds before reading each rigidbody
+        if (this.offset >= this.view.buffer.byteLength) {
+          return false
+        }
         try {
-          // Check bounds before reading each rigidbody
-          if (this.offset >= this.view.buffer.byteLength) {
-            console.warn(`Reached end of buffer while reading rigidbody ${i} of ${count}`)
-            break
-          }
-
           this.getText() // name (skip)
           this.getText() // englishName (skip)
-          const boneIndex = this.getNonVertexIndex(this.boneIndexSize)
-          const group = this.getUint8()
-          const collisionMask = this.getUint16()
-
-          const shape = this.getUint8() // 0=sphere, 1=box, 2=capsule
-
-          // Size parameters (depends on shape)
-          const sizeX = this.getFloat32()
-          const sizeY = this.getFloat32()
-          const sizeZ = this.getFloat32()
-
-          // Position (convert Z for right-handed space)
-          const posX = this.getFloat32()
-          const posY = this.getFloat32()
-          const posZ = -this.getFloat32()
-
-          // Skip rotation and physical properties (not needed for collision-only spheres)
+          this.getNonVertexIndex(this.boneIndexSize) // boneIndex
+          this.getUint8() // group
+          this.getUint16() // collisionMask
+          this.getUint8() // shape type (skip, not used)
+          this.getFloat32() // sizeX
+          this.getFloat32() // sizeY
+          this.getFloat32() // sizeZ
+          this.getFloat32() // posX
+          this.getFloat32() // posY
+          this.getFloat32() // posZ
           this.getFloat32() // rotX
           this.getFloat32() // rotY
           this.getFloat32() // rotZ
@@ -661,140 +613,77 @@ export class PmxLoader {
           this.getFloat32() // restitution
           this.getFloat32() // friction
           this.getUint8() // type
-
-          // Convert all shapes to spheres for collision detection
-          let radius: number
-          if (shape === 0) {
-            // Sphere: radius is sizeX (or average of dimensions)
-            radius = sizeX
-          } else if (shape === 1) {
-            // Box: use largest dimension as sphere radius, or average
-            radius = Math.max(sizeX, sizeY, sizeZ) * 0.5
-          } else if (shape === 2) {
-            // Capsule: radius is sizeX, height is sizeY (sizeZ unused)
-            radius = sizeX
-          } else {
-            // Unknown shape: use average
-            radius = (sizeX + sizeY + sizeZ) / 3
-          }
-
-          this.rigidbodies.push({
-            boneIndex,
-            radius,
-            group,
-            collisionMask,
-            position: [posX, posY, posZ],
-          })
         } catch (e) {
-          console.warn(`Error reading rigidbody ${i} of ${count}:`, e)
-          // Stop parsing if we encounter an error
-          break
+          // If we fail to read a rigidbody, stop skipping
+          console.warn(`Error reading rigidbody ${i}:`, e)
+          return false
         }
       }
+      return true
     } catch (e) {
-      console.warn("Error parsing rigidbodies:", e)
-      this.rigidbodies = []
+      console.warn("Error skipping rigidbodies:", e)
+      return false
     }
   }
 
-  private parseJoints() {
+  private skipJoints(): boolean {
     try {
-      // Check bounds before reading joint count
+      // Check if we have enough bytes to read the count
       if (this.offset + 4 > this.view.buffer.byteLength) {
-        console.warn("Not enough bytes for joint count")
-        this.joints = []
-        return
+        return false
       }
-
       const count = this.getInt32()
       if (count < 0 || count > 10000) {
-        console.warn(`Suspicious joint count: ${count}`)
-        this.joints = []
-        return
+        // Suspicious count, likely corrupted - restore offset
+        this.offset -= 4
+        return false
       }
-
-      this.joints = []
-
       for (let i = 0; i < count; i++) {
+        // Check bounds before reading each joint
+        if (this.offset >= this.view.buffer.byteLength) {
+          return false
+        }
         try {
-          // Check bounds before reading each joint
-          if (this.offset >= this.view.buffer.byteLength) {
-            console.warn(`Reached end of buffer while reading joint ${i} of ${count}`)
-            break
-          }
-
-          const name = this.getText()
-          const englishName = this.getText()
-          const type = this.getUint8()
-
-          // Rigidbody indices use rigidBodyIndexSize (not boneIndexSize)
-          const rigidbodyIndexA = this.getNonVertexIndex(this.rigidBodyIndexSize)
-          const rigidbodyIndexB = this.getNonVertexIndex(this.rigidBodyIndexSize)
-
-          // Position (convert Z for right-handed space)
-          const posX = this.getFloat32()
-          const posY = this.getFloat32()
-          const posZ = -this.getFloat32()
-
-          // Rotation (convert Z for right-handed space)
-          const rotX = this.getFloat32()
-          const rotY = this.getFloat32()
-          const rotZ = -this.getFloat32()
-
-          // Position constraints (convert Z and swap min/max since we negated Z)
-          const posMinX = this.getFloat32()
-          const posMinY = this.getFloat32()
-          const posMinZRaw = this.getFloat32()
-
-          const posMaxX = this.getFloat32()
-          const posMaxY = this.getFloat32()
-          const posMaxZRaw = this.getFloat32()
-
-          // Rotation constraints (convert Z and swap min/max since we negated Z)
-          const rotMinX = this.getFloat32()
-          const rotMinY = this.getFloat32()
-          const rotMinZRaw = this.getFloat32()
-
-          const rotMaxX = this.getFloat32()
-          const rotMaxY = this.getFloat32()
-          const rotMaxZRaw = this.getFloat32()
-
-          // Spring parameters
-          const springPosX = this.getFloat32()
-          const springPosY = this.getFloat32()
-          const springPosZ = this.getFloat32()
-
-          const springRotX = this.getFloat32()
-          const springRotY = this.getFloat32()
-          const springRotZ = this.getFloat32()
-
-          this.joints.push({
-            name,
-            englishName,
-            type,
-            rigidbodyIndexA,
-            rigidbodyIndexB,
-            position: [posX, posY, posZ],
-            rotation: [rotX, rotY, rotZ],
-            // Swap min/max for Z since we negated it in coordinate conversion
-            positionMin: [posMinX, posMinY, -posMaxZRaw],
-            positionMax: [posMaxX, posMaxY, -posMinZRaw],
-            rotationMin: [rotMinX, rotMinY, -rotMaxZRaw],
-            rotationMax: [rotMaxX, rotMaxY, -rotMinZRaw],
-            springPosition: [springPosX, springPosY, springPosZ],
-            springRotation: [springRotX, springRotY, springRotZ],
-          })
+          this.getText() // name (skip)
+          this.getText() // englishName (skip)
+          this.getUint8() // type (skip)
+          this.getNonVertexIndex(this.rigidBodyIndexSize) // rigidbodyIndexA
+          this.getNonVertexIndex(this.rigidBodyIndexSize) // rigidbodyIndexB
+          this.getFloat32() // posX
+          this.getFloat32() // posY
+          this.getFloat32() // posZ
+          this.getFloat32() // rotX
+          this.getFloat32() // rotY
+          this.getFloat32() // rotZ
+          this.getFloat32() // posMinX
+          this.getFloat32() // posMinY
+          this.getFloat32() // posMinZ
+          this.getFloat32() // posMaxX
+          this.getFloat32() // posMaxY
+          this.getFloat32() // posMaxZ
+          this.getFloat32() // rotMinX
+          this.getFloat32() // rotMinY
+          this.getFloat32() // rotMinZ
+          this.getFloat32() // rotMaxX
+          this.getFloat32() // rotMaxY
+          this.getFloat32() // rotMaxZ
+          this.getFloat32() // springPosX
+          this.getFloat32() // springPosY
+          this.getFloat32() // springPosZ
+          this.getFloat32() // springRotX
+          this.getFloat32() // springRotY
+          this.getFloat32() // springRotZ
         } catch (e) {
-          console.warn(`Error reading joint ${i} of ${count}:`, e)
-          // Stop parsing if we encounter an error
-          break
+          // If we fail to read a joint, stop skipping
+          console.warn(`Error reading joint ${i}:`, e)
+          return false
         }
       }
+      return true
     } catch (e) {
-      console.warn("Error parsing joints:", e)
-      this.joints = []
+      console.warn("Error skipping joints:", e)
+      return false
     }
-    console.log("Joints parsed:", this.joints)
   }
 
   private computeInverseBind() {
@@ -903,7 +792,7 @@ export class PmxLoader {
       skinning = { joints, weights }
     }
 
-    return new RzmModel(vertexData, indexData, this.textures, this.materials, skeleton, skinning, this.rigidbodies)
+    return new RzmModel(vertexData, indexData, this.textures, this.materials, skeleton, skinning)
   }
 
   private getUint8() {

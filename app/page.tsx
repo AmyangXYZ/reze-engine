@@ -50,7 +50,11 @@ export default function Home() {
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
       <Header stats={stats} />
-      {webgpuNotSupported && <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white">WebGPU not supported</div>}
+      {webgpuNotSupported && (
+        <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white">
+          WebGPU not supported
+        </div>
+      )}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
     </div>
   )

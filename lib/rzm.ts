@@ -59,7 +59,6 @@ export interface RzmSkeletonRuntime {
 // Spring bone physics runtime state
 export interface RzmSpringPhysics {
   chains: SpringBoneChain[] // Spring bone chain definitions
-  rigidbodies: RzmRigidbody[] // Collision spheres for spring bone interaction
   currentPositions?: Float32Array // vec3 per bone in chains (current position)
   prevPositions?: Float32Array // vec3 per bone in chains (previous position)
   initialized: boolean // Whether spring positions have been initialized
@@ -78,17 +77,6 @@ export interface SpringBoneChain {
   hitRadius: number // Sphere collision radius for this chain (in cm, typically 0.5-5.0)
   // Optional center point for rotation (relative to root bone)
   center?: [number, number, number]
-}
-
-// Simplified rigidbody for collision detection with spring bones (sphere-based, similar to VRM)
-export interface RzmRigidbody {
-  boneIndex: number // -1 if not attached to a bone
-  radius: number // Sphere radius (all shapes converted to spheres)
-  // Collision groups (for filtering which rigidbodies interact)
-  group: number // Collision group (0-15)
-  collisionMask: number // Bitmask for collision groups this rigidbody collides with
-  // Transform relative to bone (will be transformed by bone's world matrix)
-  position: [number, number, number] // Position relative to bone (or world if boneIndex is -1)
 }
 
 // Rotation tween state per bone
@@ -125,8 +113,7 @@ export class RzmModel {
     textures: RzmTexture[],
     materials: RzmMaterial[],
     skeleton: RzmSkeleton,
-    skinning: RzmSkinning,
-    rigidbodies: RzmRigidbody[] = []
+    skinning: RzmSkinning
   ) {
     this.vertexData = vertexData
     this.vertexCount = vertexData.length / VERTEX_STRIDE
@@ -150,7 +137,6 @@ export class RzmModel {
     // Initialize spring physics state
     this.springPhysics = {
       chains: [],
-      rigidbodies: rigidbodies,
       initialized: false,
       timeAccumulator: 0,
     }
@@ -159,6 +145,7 @@ export class RzmModel {
       this.buildBoneLookups()
       this.initializeRuntimePose()
       this.initializeRotTweenBuffers()
+      this.autoDetectSpringBones()
     }
   }
 
@@ -379,7 +366,7 @@ export class RzmModel {
       skinning.joints[i * 4] = 0
       skinning.weights[i * 4] = 255
     }
-    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning, [])
+    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning)
   }
 
   // Get interleaved vertex data for GPU upload
@@ -465,7 +452,7 @@ export class RzmModel {
     for (let i = 0; i < vertexCount; i++) {
       indexData[i] = i
     }
-    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning, [])
+    return new RzmModel(vertexData, indexData, [], [], skeleton, skinning)
   }
 
   // Accessors for skeleton/skinning
@@ -678,6 +665,98 @@ export class RzmModel {
     this.springPhysics.currentPositions = undefined
     this.springPhysics.prevPositions = undefined
     this.springPhysics.initialized = false
+  }
+
+  // Automatically detect and group bones by pattern matching
+  // Uses the first number in the name as the varying index and the rest as a pattern key
+  // Creates spring bone chains for each group (e.g., hf_1_1, hf_2_1, hf_3_1 form one chain)
+  private autoDetectSpringBones(): void {
+    const boneNames = this.getBoneNames()
+    const bones = this.skeleton.bones
+
+    // Map: patternKey -> array of { boneIndex, firstNumber }
+    // patternKey has first number replaced with {} (e.g., "hf_{}_1")
+    const prefixGroups = new Map<string, Array<{ boneIndex: number; suffix: number }>>()
+
+    // Parse each bone name: find first number and create pattern key
+    for (let i = 0; i < boneNames.length; i++) {
+      const boneName = boneNames[i]
+
+      // Smart matching: use the first number as the varying index
+      // Pattern examples:
+      // - "hf_1_1", "hf_2_1", "hf_3_1" -> key: "hf_{}_1", index: 1/2/3 (group together)
+      // - "hf_1_0", "hf_2_0" -> key: "hf_{}_0", index: 1/2 (separate group)
+      // - "bda1", "bda2" -> key: "bda{}", index: 1/2
+
+      // Find the first number in the bone name
+      const firstNumberMatch = boneName.match(/(\d+)/)
+      if (firstNumberMatch) {
+        const firstNumber = parseInt(firstNumberMatch[1], 10)
+        const firstNumberStart = firstNumberMatch.index!
+        const firstNumberEnd = firstNumberStart + firstNumberMatch[1].length
+
+        // Create pattern key by replacing first number with {}
+        // This allows bones like hf_1_1, hf_2_1, hf_3_1 to share the same pattern key "hf_{}_1"
+        const patternKey = boneName.slice(0, firstNumberStart) + "{}" + boneName.slice(firstNumberEnd)
+
+        // Check if pattern key contains only ASCII characters (English, not Japanese)
+        const isEnglishOnly = /^[\x00-\x7F]*$/.test(patternKey)
+
+        // Only group if first number is valid and pattern key is English-only
+        if (!isNaN(firstNumber) && patternKey.length > 0 && isEnglishOnly) {
+          if (!prefixGroups.has(patternKey)) {
+            prefixGroups.set(patternKey, [])
+          }
+          // Store first number as "suffix" for sorting (though it's actually the varying index)
+          prefixGroups.get(patternKey)!.push({ boneIndex: i, suffix: firstNumber })
+        }
+      }
+    }
+
+    // Filter groups: only keep groups with at least 2 bones (need chain)
+    const validGroups: Array<{ prefix: string; bones: Array<{ boneIndex: number; suffix: number }> }> = []
+
+    for (const [patternKey, bones] of prefixGroups.entries()) {
+      if (bones.length >= 2) {
+        // Sort by first number (stored as "suffix" in the data structure)
+        // This ensures bones are ordered correctly in the chain (e.g., hf_1_1 -> hf_2_1 -> hf_3_1)
+        bones.sort((a, b) => a.suffix - b.suffix)
+        validGroups.push({ prefix: patternKey, bones })
+      }
+    }
+
+    if (validGroups.length === 0) {
+      return
+    }
+
+    // Log all group pattern keys in one line
+    const patternKeys = validGroups.map((g) => g.prefix).join(", ")
+    console.log(`[RZM] Spring bone groups: ${patternKeys}`)
+
+    // Create spring bone chains for each group
+    for (const group of validGroups) {
+      const boneIndices = group.bones.map((b) => b.boneIndex)
+
+      // Find root bone: parent of first bone in chain, or use first bone itself if no parent
+      const firstBoneIndex = boneIndices[0]
+      let rootBoneIndex = firstBoneIndex
+
+      if (firstBoneIndex < bones.length) {
+        const firstBone = bones[firstBoneIndex]
+        if (firstBone.parentIndex >= 0 && firstBone.parentIndex < bones.length) {
+          rootBoneIndex = firstBone.parentIndex
+        }
+      }
+
+      // Add spring chain with VRM-like parameters
+      this.addSpringBoneChain({
+        rootBoneIndex,
+        boneIndices,
+        stiffness: 0.5,
+        dragForce: 0.5,
+        hitRadius: 0.3,
+      })
+    }
   }
 
   // Helper: get bone's bind translation as Vec3
@@ -1056,44 +1135,39 @@ export class RzmModel {
           newPos = anchorPos.add(finalDir.normalize().scale(clampedDist))
         }
 
-        // 4. Collision detection with rigidbodies
-        if (this.springPhysics.rigidbodies && this.springPhysics.rigidbodies.length > 0 && chain.hitRadius > 0) {
-          for (const rigidbody of this.springPhysics.rigidbodies) {
-            if (rigidbody.collisionMask === 0) continue
+        // Collision detection with other spring bone chains using hitRadius
+        if (chain.hitRadius > 0 && this.springPhysics.chains.length > 1) {
+          for (let otherChainIdx = 0; otherChainIdx < this.springPhysics.chains.length; otherChainIdx++) {
+            const otherChain = this.springPhysics.chains[otherChainIdx]
 
-            // Get rigidbody world position
-            let rigidbodyPos: Vec3
-            if (rigidbody.boneIndex >= 0 && rigidbody.boneIndex < this.skeleton.bones.length) {
-              const boneMatIdx = rigidbody.boneIndex * 16
-              const boneMat = new Mat4(
-                new Float32Array(
-                  this.runtimeSkeleton.worldMatrices.buffer,
-                  this.runtimeSkeleton.worldMatrices.byteOffset + boneMatIdx * 4,
-                  16
-                )
+            // Skip same chain and chains with no hitRadius
+            if (otherChainIdx === chainIdx || otherChain.hitRadius <= 0) continue
+
+            const otherOffset = chainBoneOffsets[otherChainIdx]
+
+            // Check collision with each bone in the other chain
+            for (let otherBoneIdx = 0; otherBoneIdx < otherChain.boneIndices.length; otherBoneIdx++) {
+              const otherPosIdx = (otherOffset + otherBoneIdx) * 3
+              if (!this.springPhysics.currentPositions || otherPosIdx + 2 >= this.springPhysics.currentPositions.length)
+                continue
+
+              const otherPos = new Vec3(
+                this.springPhysics.currentPositions[otherPosIdx],
+                this.springPhysics.currentPositions[otherPosIdx + 1],
+                this.springPhysics.currentPositions[otherPosIdx + 2]
               )
-              const localPos = new Vec3(rigidbody.position[0], rigidbody.position[1], rigidbody.position[2])
-              const m = boneMat.values
-              const x = localPos.x
-              const y = localPos.y
-              const z = localPos.z
-              const wx = m[0] * x + m[4] * y + m[8] * z + m[12]
-              const wy = m[1] * x + m[5] * y + m[9] * z + m[13]
-              const wz = m[2] * x + m[6] * y + m[10] * z + m[14]
-              rigidbodyPos = new Vec3(wx, wy, wz)
-            } else {
-              rigidbodyPos = new Vec3(rigidbody.position[0], rigidbody.position[1], rigidbody.position[2])
-            }
 
-            // Sphere-sphere collision
-            const toRigidbody = newPos.subtract(rigidbodyPos)
-            const distToRigidbody = toRigidbody.length()
-            const combinedRadius = chain.hitRadius + rigidbody.radius
+              // Sphere-sphere collision
+              const toOther = newPos.subtract(otherPos)
+              const distToOther = toOther.length()
+              const combinedRadius = chain.hitRadius + otherChain.hitRadius
 
-            if (distToRigidbody < combinedRadius && distToRigidbody > 0.001) {
-              const collisionDir = toRigidbody.normalize()
-              const pushDistance = combinedRadius - distToRigidbody
-              newPos = newPos.add(collisionDir.scale(pushDistance))
+              if (distToOther < combinedRadius && distToOther > 0.001) {
+                const collisionDir = toOther.normalize()
+                const pushDistance = combinedRadius - distToOther
+                // Push away from the other spring bone
+                newPos = newPos.add(collisionDir.scale(pushDistance))
+              }
             }
           }
         }
