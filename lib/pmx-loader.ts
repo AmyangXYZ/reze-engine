@@ -1,31 +1,6 @@
-import { RzmModel, RzmTexture, RzmMaterial, RzmBone, RzmSkeleton, RzmSkinning } from "./rzm"
-import { Mat4 } from "./math"
-
-// PMX rigidbody structure
-interface RzmRigidbody {
-  boneIndex: number
-  radius: number
-  group: number
-  collisionMask: number
-  position: [number, number, number]
-}
-
-// MMD joint (PMX format) - used for parsing only, not used in RZM (RZM uses spring bones instead)
-interface MmdJoint {
-  name: string
-  englishName: string
-  type: number // Joint type (uint8)
-  rigidbodyIndexA: number // Index of first rigidbody (-1 for none)
-  rigidbodyIndexB: number // Index of second rigidbody (-1 for none)
-  position: [number, number, number] // Position (world space)
-  rotation: [number, number, number] // Rotation (Euler angles)
-  positionMin: [number, number, number] // Position constraint minimum
-  positionMax: [number, number, number] // Position constraint maximum
-  rotationMin: [number, number, number] // Rotation constraint minimum (Euler)
-  rotationMax: [number, number, number] // Rotation constraint maximum (Euler)
-  springPosition: [number, number, number] // Spring position parameters
-  springRotation: [number, number, number] // Spring rotation parameters
-}
+import { Model, Texture, Material, Bone, Skeleton, Skinning } from "./model"
+import { Mat4, Vec3, Quat } from "./math"
+import { Rigidbody, Joint } from "./physics"
 
 export class PmxLoader {
   private view: DataView
@@ -39,29 +14,29 @@ export class PmxLoader {
   private boneIndexSize = 0
   private morphIndexSize = 0
   private rigidBodyIndexSize = 0
-  private textures: RzmTexture[] = []
-  private materials: RzmMaterial[] = []
-  private bones: RzmBone[] = []
+  private textures: Texture[] = []
+  private materials: Material[] = []
+  private bones: Bone[] = []
   private inverseBindMatrices: Float32Array | null = null
   private joints0: Uint16Array | null = null
   private weights0: Uint8Array | null = null
-  public rigidbodies: RzmRigidbody[] = []
-  private joints: MmdJoint[] = [] // MMD joints (parsed but not used - RZM uses spring bones)
+  public rigidbodies: Rigidbody[] = []
+  private joints: Joint[] = []
 
   private constructor(buffer: ArrayBuffer) {
     this.view = new DataView(buffer)
   }
 
   static async load(url: string): Promise<{
-    model: RzmModel
-    rigidbodies: RzmRigidbody[]
+    model: Model
+    rigidbodies: Rigidbody[]
   }> {
     const loader = new PmxLoader(await fetch(url).then((r) => r.arrayBuffer()))
     const model = loader.parse()
     return { model, rigidbodies: loader.rigidbodies }
   }
 
-  private parse(): RzmModel {
+  private parse(): Model {
     this.parseHeader()
     const { positions, normals, uvs } = this.parseVertices()
     const indices = this.parseIndices()
@@ -317,7 +292,7 @@ export class PmxLoader {
   private parseBones() {
     try {
       const count = this.getInt32()
-      const bones: RzmBone[] = []
+      const bones: Bone[] = []
       // Collect absolute positions, then convert to parent-relative offsets
       type AbsBone = {
         name: string
@@ -685,7 +660,7 @@ export class PmxLoader {
             radius,
             group,
             collisionMask,
-            position: [posX, posY, posZ],
+            position: new Vec3(posX, posY, posZ),
           })
         } catch (e) {
           console.warn(`Error reading rigidbody ${i} of ${count}:`, e)
@@ -777,15 +752,15 @@ export class PmxLoader {
             type,
             rigidbodyIndexA,
             rigidbodyIndexB,
-            position: [posX, posY, posZ],
-            rotation: [rotX, rotY, rotZ],
+            position: new Vec3(posX, posY, posZ),
+            rotation: new Quat(rotX, rotY, rotZ, 0), // TODO: Convert Euler to quaternion
             // Swap min/max for Z since we negated it in coordinate conversion
-            positionMin: [posMinX, posMinY, -posMaxZRaw],
-            positionMax: [posMaxX, posMaxY, -posMinZRaw],
-            rotationMin: [rotMinX, rotMinY, -rotMaxZRaw],
-            rotationMax: [rotMaxX, rotMaxY, -rotMinZRaw],
-            springPosition: [springPosX, springPosY, springPosZ],
-            springRotation: [springRotX, springRotY, springRotZ],
+            positionMin: new Vec3(posMinX, posMinY, -posMaxZRaw),
+            positionMax: new Vec3(posMaxX, posMaxY, -posMinZRaw),
+            rotationMin: new Quat(rotMinX, rotMinY, -rotMaxZRaw, 0), // TODO: Convert Euler to quaternion
+            rotationMax: new Quat(rotMaxX, rotMaxY, -rotMinZRaw, 0), // TODO: Convert Euler to quaternion
+            springPosition: new Vec3(springPosX, springPosY, springPosZ),
+            springRotation: new Quat(springRotX, springRotY, springRotZ, 0), // TODO: Convert Euler to quaternion
           })
         } catch (e) {
           console.warn(`Error reading joint ${i} of ${count}:`, e)
@@ -835,7 +810,7 @@ export class PmxLoader {
     this.inverseBindMatrices = inv
   }
 
-  private toRzmModel(positions: number[], normals: number[], uvs: number[], indices: number[]): RzmModel {
+  private toRzmModel(positions: number[], normals: number[], uvs: number[], indices: number[]): Model {
     // Create indexed vertex buffer
     const vertexCount = positions.length / 3
     const vertexData = new Float32Array(vertexCount * 8)
@@ -859,12 +834,12 @@ export class PmxLoader {
     const indexData = new Uint32Array(indices)
 
     // Create skeleton (required)
-    const skeleton: RzmSkeleton = {
+    const skeleton: Skeleton = {
       bones: this.bones.length > 0 ? this.bones : [],
       inverseBindMatrices: this.inverseBindMatrices || new Float32Array(0),
     }
 
-    let skinning: RzmSkinning
+    let skinning: Skinning
     if (this.joints0 && this.weights0) {
       // Clamp joints to valid range now that we know bone count, and renormalize weights
       const boneCount = this.bones.length
@@ -906,7 +881,7 @@ export class PmxLoader {
       skinning = { joints, weights }
     }
 
-    return new RzmModel(vertexData, indexData, this.textures, this.materials, skeleton, skinning)
+    return new Model(vertexData, indexData, this.textures, this.materials, skeleton, skinning)
   }
 
   private getUint8() {

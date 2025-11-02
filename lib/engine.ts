@@ -1,6 +1,6 @@
 import { Camera } from "./camera"
 import { Quat, Vec3 } from "./math"
-import { RzmModel } from "./rzm"
+import { Model } from "./model"
 import { PmxLoader } from "./pmx-loader"
 
 export interface EngineStats {
@@ -43,7 +43,7 @@ export class Engine {
   private fallbackSkinMatrixBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
-  private currentModel: RzmModel | null = null
+  private currentModel: Model | null = null
   private modelDir: string = "" // Directory for loading model textures
   // Grid
   private gridVertexBuffer?: GPUBuffer
@@ -532,23 +532,13 @@ export class Engine {
     }
   }
 
-  // Load RZM model from URL
-  public async loadRzm(url: string) {
-    const model = await RzmModel.load(url)
-    this.drawModel(model)
-  }
-
   // Load PMX model from directory and filename
   public async loadPmx(dir: string, fileName: string) {
     // Ensure directory ends with /
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
-    const { model, rigidbodies } = await PmxLoader.load(url)
+    const { model } = await PmxLoader.load(url)
 
-    // Set up collision groups from PMX rigidbodies
-    if (rigidbodies.length > 0) {
-      model.setupCollisionGroupsFromRigidbodies(rigidbodies)
-    }
     model.rotateBones(
       ["腰", "左腕", "左足"],
       [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, -0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
@@ -563,7 +553,7 @@ export class Engine {
     console.log("Available bones:", boneNames)
   }
 
-  private async drawModel(model: RzmModel) {
+  private async drawModel(model: Model) {
     this.currentModel = model
     const vertices = model.getVertices()
 
@@ -639,7 +629,7 @@ export class Engine {
 
   private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup }[] = []
 
-  private async prepareMaterialDraws(model: RzmModel) {
+  private async prepareMaterialDraws(model: Model) {
     const materials = model.getMaterials()
     if (materials.length === 0) {
       // Fallback single bind group with default texture
