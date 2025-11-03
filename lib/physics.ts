@@ -45,21 +45,33 @@ export interface Joint {
   rotationMax: Quat
   springPosition: Vec3
   springRotation: Quat
+  initialTransform: Mat4 // Transform matrix in bind pose world space (position + rotation)
 }
 
 export class Physics {
-  private definitions: Rigidbody[]
+  private rigidbodies: Rigidbody[]
+  private joints: Joint[]
 
-  constructor(rigidbodies: Rigidbody[]) {
-    this.definitions = rigidbodies
+  constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
+    this.rigidbodies = rigidbodies
+    this.joints = joints
   }
 
-  getDefinitions(): Rigidbody[] {
-    return this.definitions
+  getRigidbodies(): Rigidbody[] {
+    return this.rigidbodies
   }
 
+  getJoints(): Joint[] {
+    return this.joints
+  }
+
+  // Update rigidbody transforms from bone animations
+  // Static/Kinematic: computed from bones (these are the constraints/collision geometry for solver)
+  // Dynamic: not updated here; solver will compute and update rb.position/rb.rotation
+  // Joints: position/rotation are world space; typically no updates needed as they bind to rigidbodies
+  //         via rigidbodyIndexA/B indices, and solver uses the connected rigidbodies' current transforms
   update(boneWorldMatrices: Float32Array, boneInverseBindMatrices: Float32Array, boneCount: number): void {
-    for (const rb of this.definitions) {
+    for (const rb of this.rigidbodies) {
       // Static and Kinematic both follow bones in MMD/PMX
       // Static: pure bone following, no physics
       // Kinematic: bone-driven but can interact with dynamic objects

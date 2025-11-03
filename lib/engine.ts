@@ -504,7 +504,7 @@ export class Engine {
     if (!this.physics) return
 
     this.rigidbodyMeshes = []
-    const definitions = this.physics.getDefinitions()
+    const rigidbodies = this.physics.getRigidbodies()
     const segments = 4
 
     const addLocalVertex = (
@@ -540,8 +540,8 @@ export class Engine {
     let globalIndexOffset = 0
     const meshIndexMap: number[] = [] // Map from definition index to mesh index
 
-    for (let defIdx = 0; defIdx < definitions.length; defIdx++) {
-      const rb = definitions[defIdx]
+    for (let rbIdx = 0; rbIdx < rigidbodies.length; rbIdx++) {
+      const rb = rigidbodies[rbIdx]
 
       // Skip kinematic rigidbodies without bone attachment (boneIndex=-1)
       if (rb.type === RigidbodyType.Kinematic && rb.boneIndex < 0) {
@@ -936,7 +936,7 @@ export class Engine {
           indexOffset: globalIndexOffset,
           color: color,
         })
-        meshIndexMap.push(defIdx) // Store mapping from mesh index to definition index
+        meshIndexMap.push(rbIdx) // Store mapping from mesh index to definition index
         globalVertexOffset += vertices.length / 9
         globalIndexOffset += indices.length
       }
@@ -974,7 +974,7 @@ export class Engine {
   private updateRigidbodyTransforms() {
     if (!this.physics || this.rigidbodyMeshes.length === 0 || !this.rigidbodyVertexBuffer) return
 
-    const definitions = this.physics.getDefinitions()
+    const definitions = this.physics.getRigidbodies()
     const allVertices: number[] = []
 
     for (let meshIdx = 0; meshIdx < this.rigidbodyMeshes.length; meshIdx++) {
@@ -1447,7 +1447,7 @@ export class Engine {
       }
     }
 
-    const definitions = this.physics.getDefinitions()
+    const definitions = this.physics.getRigidbodies()
     const segments = 4 // Minimal segments for debug visualization
 
     // Pre-compute rotation matrices once
@@ -1510,7 +1510,7 @@ export class Engine {
       }
 
       console.log(
-        `[Engine] Built rigidbody visualization: ${this.physics?.getDefinitions().length || 0} rigidbodies, ${
+        `[Engine] Built rigidbody visualization: ${this.physics?.getRigidbodies().length || 0} rigidbodies, ${
           this.rigidbodyVertexCount
         } vertices, ${this.rigidbodyIndexCount} indices`
       )
@@ -1688,16 +1688,16 @@ export class Engine {
   public async loadPmx(dir: string, fileName: string) {
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
-    const { model, rigidbodies } = await PmxLoader.load(url)
+    const model = await PmxLoader.load(url)
     model.rotateBones(
       ["腰", "左腕", "左足"],
       [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
       2000
     )
-    this.physics = new Physics(rigidbodies)
+    this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.drawModel(model)
 
-    if (this.physics.getDefinitions().length > 0) {
+    if (this.physics.getRigidbodies().length > 0) {
       this.buildRigidbodyBaseMeshes()
       this.buildRigidbodyVisualization()
     }

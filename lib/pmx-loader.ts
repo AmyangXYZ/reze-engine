@@ -20,20 +20,16 @@ export class PmxLoader {
   private inverseBindMatrices: Float32Array | null = null
   private joints0: Uint16Array | null = null
   private weights0: Uint8Array | null = null
-  public rigidbodies: Rigidbody[] = []
+  private rigidbodies: Rigidbody[] = []
   private joints: Joint[] = []
 
   private constructor(buffer: ArrayBuffer) {
     this.view = new DataView(buffer)
   }
 
-  static async load(url: string): Promise<{
-    model: Model
-    rigidbodies: Rigidbody[]
-  }> {
+  static async load(url: string): Promise<Model> {
     const loader = new PmxLoader(await fetch(url).then((r) => r.arrayBuffer()))
-    const model = loader.parse()
-    return { model, rigidbodies: loader.rigidbodies }
+    return loader.parse()
   }
 
   private parse(): Model {
@@ -49,7 +45,7 @@ export class PmxLoader {
     this.parseRigidbodies()
     this.parseJoints()
     this.computeInverseBind()
-    return this.toRzmModel(positions, normals, uvs, indices)
+    return this.toModel(positions, normals, uvs, indices)
   }
 
   private parseHeader() {
@@ -740,6 +736,9 @@ export class PmxLoader {
 
           // Convert Euler angles to quaternion using ZXY order (left-handed system)
           const rotQuat = Quat.fromEuler(rotX, rotY, rotZ)
+          const initialPos = new Vec3(posX, posY, posZ)
+          const initialRot = rotQuat
+          const initialTransform = Mat4.fromPositionRotation(initialPos, initialRot)
 
           this.joints.push({
             name,
@@ -747,8 +746,8 @@ export class PmxLoader {
             type,
             rigidbodyIndexA,
             rigidbodyIndexB,
-            position: new Vec3(posX, posY, posZ),
-            rotation: rotQuat,
+            position: initialPos.clone(),
+            rotation: initialRot.clone(),
             positionMin: new Vec3(posMinX, posMinY, posMinZ),
             positionMax: new Vec3(posMaxX, posMaxY, posMaxZ),
             // Convert rotation constraints from Euler to quaternion (left-handed system)
@@ -756,6 +755,7 @@ export class PmxLoader {
             rotationMax: Quat.fromEuler(rotMaxX, rotMaxY, rotMaxZ),
             springPosition: new Vec3(springPosX, springPosY, springPosZ),
             springRotation: Quat.fromEuler(springRotX, springRotY, springRotZ),
+            initialTransform,
           })
         } catch (e) {
           console.warn(`Error reading joint ${i} of ${count}:`, e)
@@ -805,7 +805,7 @@ export class PmxLoader {
     this.inverseBindMatrices = inv
   }
 
-  private toRzmModel(positions: number[], normals: number[], uvs: number[], indices: number[]): Model {
+  private toModel(positions: number[], normals: number[], uvs: number[], indices: number[]): Model {
     // Create indexed vertex buffer
     const vertexCount = positions.length / 3
     const vertexData = new Float32Array(vertexCount * 8)
@@ -876,7 +876,16 @@ export class PmxLoader {
       skinning = { joints, weights }
     }
 
-    return new Model(vertexData, indexData, this.textures, this.materials, skeleton, skinning)
+    return new Model(
+      vertexData,
+      indexData,
+      this.textures,
+      this.materials,
+      skeleton,
+      skinning,
+      this.rigidbodies,
+      this.joints
+    )
   }
 
   private getUint8() {

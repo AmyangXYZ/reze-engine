@@ -98,6 +98,7 @@ interface RotationTweenState {
 }
 
 import { Mat4, Vec3, Quat } from "./math"
+import { Rigidbody, Joint } from "./physics"
 
 export class Model {
   private vertexData: Float32Array<ArrayBuffer>
@@ -109,6 +110,10 @@ export class Model {
   // Static skeleton/skinning (not necessarily serialized yet)
   private skeleton: Skeleton
   private skinning: Skinning
+
+  // Physics data from PMX
+  private rigidbodies: Rigidbody[] = []
+  private joints: Joint[] = []
 
   // Runtime skeleton pose state (updated each frame)
   private runtimeSkeleton: SkeletonRuntime
@@ -122,7 +127,9 @@ export class Model {
     textures: Texture[],
     materials: Material[],
     skeleton: Skeleton,
-    skinning: Skinning
+    skinning: Skinning,
+    rigidbodies: Rigidbody[] = [],
+    joints: Joint[] = []
   ) {
     this.vertexData = vertexData
     this.vertexCount = vertexData.length / VERTEX_STRIDE
@@ -132,6 +139,8 @@ export class Model {
     this.materials = materials
     this.skeleton = skeleton
     this.skinning = skinning
+    this.rigidbodies = rigidbodies
+    this.joints = joints
 
     // Initialize runtime skeleton pose state
     const boneCount = skeleton.bones.length
@@ -404,7 +413,7 @@ export class Model {
     for (let i = 0; i < vertexCount; i++) {
       indexData[i] = i
     }
-    return new Model(vertexData, indexData, [], [], skeleton, skinning)
+    return new Model(vertexData, indexData, [], [], skeleton, skinning, [], [])
   }
 
   // Accessors for skeleton/skinning
@@ -414,6 +423,15 @@ export class Model {
 
   getSkinning(): Skinning {
     return this.skinning
+  }
+
+  // Accessors for physics data
+  getRigidbodies(): Rigidbody[] {
+    return this.rigidbodies
+  }
+
+  getJoints(): Joint[] {
+    return this.joints
   }
 
   getSkinMatrices(): Float32Array {
