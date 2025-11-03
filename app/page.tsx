@@ -25,7 +25,7 @@ export default function Home() {
         const engine = new Engine(canvasRef.current)
         engineRef.current = engine
         await engine.init()
-        await engine.loadPmx("/models/梵天/", "梵天-m.pmx")
+        await engine.loadPmx("/models/梵天/", "梵天-o.pmx")
         engine.runRenderLoop(() => {
           setStats(engine.getStats())
         })
@@ -68,11 +68,10 @@ export default function Home() {
           <Button
             size="sm"
             onClick={handleToggleRigidbodies}
-            className={`w-full font-medium ${
-              showRigidbodies
+            className={`w-full font-medium ${showRigidbodies
                 ? "bg-yellow-500 text-black hover:bg-yellow-600"
                 : "bg-gray-700 text-white hover:bg-gray-600"
-            }`}
+              }`}
           >
             {showRigidbodies ? "Hide Rigidbodies" : "Show Rigidbodies"}
           </Button>

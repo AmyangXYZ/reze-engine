@@ -147,11 +147,7 @@ export class Quat {
     return [this.x, this.y, this.z, this.w]
   }
 
-  // Convert Euler angles (ZXY order) to quaternion for LEFT-HANDED coordinate system
-  // PMX/MMD format uses ZXY rotation order in left-handed coordinate system
-  // Parameters are rotation angles in radians: rotX (pitch/rotation around X), rotY (roll/rotation around Y), rotZ (yaw/rotation around Z)
-  // ZXY order means: first rotate around Z (yaw), then X (pitch), then Y (roll)
-  // Result: q = qz(yaw) * qx(pitch) * qy(roll)
+  // Convert Euler angles to quaternion (ZXY order, left-handed, PMX format)
   static fromEulerZXY(rotX: number, rotY: number, rotZ: number): Quat {
     const cx = Math.cos(rotX * 0.5)
     const sx = Math.sin(rotX * 0.5)
@@ -160,41 +156,10 @@ export class Quat {
     const cz = Math.cos(rotZ * 0.5)
     const sz = Math.sin(rotZ * 0.5)
 
-    // ZXY order quaternion multiplication: qz * qx * qy
-    // qz = (0, 0, sz, cz) for rotation around Z
-    // qx = (sx, 0, 0, cx) for rotation around X
-    // qy = (0, sy, 0, cy) for rotation around Y
-    // qz * qx * qy computed:
-    const w = cz * cx * cy - sz * sx * sy
-    const x = cz * sx * cy + sz * cx * sy
-    const y = cz * cx * sy - sz * sx * cy
-    const z = sz * cx * cy + cz * sx * sy
-
-    return new Quat(x, y, z, w).normalize()
-  }
-
-  // Convert Euler angles (YXZ order) to quaternion for LEFT-HANDED coordinate system
-  // Babylon.js FromEulerAngles uses YXZ order (yaw-pitch-roll)
-  // Parameters: rotX (pitch), rotY (yaw), rotZ (roll)
-  // YXZ order means: first rotate around Y (yaw), then X (pitch), then Z (roll)
-  // Result: q = qy(yaw) * qx(pitch) * qz(roll)
-  static fromEulerYXZ(rotX: number, rotY: number, rotZ: number): Quat {
-    const cx = Math.cos(rotX * 0.5)
-    const sx = Math.sin(rotX * 0.5)
-    const cy = Math.cos(rotY * 0.5)
-    const sy = Math.sin(rotY * 0.5)
-    const cz = Math.cos(rotZ * 0.5)
-    const sz = Math.sin(rotZ * 0.5)
-
-    // YXZ order quaternion multiplication: qy * qx * qz
-    // qy = (0, sy, 0, cy) for rotation around Y
-    // qx = (sx, 0, 0, cx) for rotation around X
-    // qz = (0, 0, sz, cz) for rotation around Z
-    // qy * qx * qz computed:
-    const w = cy * cx * cz - sy * sx * sz
+    const w = cy * cx * cz + sy * sx * sz
     const x = cy * sx * cz + sy * cx * sz
     const y = sy * cx * cz - cy * sx * sz
-    const z = cy * cx * sz + sy * sx * cz
+    const z = cy * cx * sz - sy * sx * cz
 
     return new Quat(x, y, z, w).normalize()
   }

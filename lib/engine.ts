@@ -58,7 +58,7 @@ export class Engine {
   private rigidbodyIndexCount: number = 0
   private rigidbodyBindGroup?: GPUBindGroup
   private rigidbodies: Rigidbody[] = []
-  private showRigidbodies: boolean = false // Default: hidden
+  private showRigidbodies: boolean = false
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -120,11 +120,11 @@ export class Engine {
     this.setAmbient(0.65) // Reduced ambient to make lights more visible
     this.clearLights()
     // Key light (main, bright from front-right)
-    this.addLight(new Vec3(0.5, -0.8, -0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
     // Fill light (softer from left)`
-    this.addLight(new Vec3(-0.7, -0.5, -0.4).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
     // Rim light (from behind for edge highlighting)
-    this.addLight(new Vec3(-0.3, -0.5, 1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1.0)
 
     // Create render pass descriptor (view will be updated each frame)
     this.renderPassColorAttachment = {
@@ -428,8 +428,8 @@ export class Engine {
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: {
         format: "depth24plus",
-        depthWriteEnabled: true,
-        depthCompare: "less", // Proper depth testing to occlude model
+        depthWriteEnabled: false,
+        depthCompare: "less-equal",
       },
       multisample: { count: this.sampleCount },
     })
@@ -469,54 +469,37 @@ export class Engine {
   private buildRigidbodyVisualization() {
     if (!this.currentModel) return
 
-    // For visualization, we want to show rigidbodies at bind pose (not animated)
-    // Reset all bones to bind pose (identity rotation, zero translation) before evaluating
-    // This ensures we see rigidbodies in their bind pose configuration
     const boneCount = this.currentModel.getSkeleton().bones.length
     for (let i = 0; i < boneCount; i++) {
-      this.currentModel.setBoneRotation(i, new Quat(0, 0, 0, 1)) // Identity rotation
-      this.currentModel.setBoneTranslation(i, new Vec3(0, 0, 0)) // Zero translation
+      this.currentModel.setBoneRotation(i, new Quat(0, 0, 0, 1))
+      this.currentModel.setBoneTranslation(i, new Vec3(0, 0, 0))
     }
-
-    // Now evaluate pose to compute world matrices at bind pose
     this.currentModel.evaluatePose()
 
-    // Generate solid triangle meshes for each rigidbody
     const vertices: number[] = []
     const indices: number[] = []
     let vertexOffset = 0
-    const color = [1.0, 1.0, 0.0] // Pure yellow for debug rigidbodies
+    const color = [1.0, 1.0, 0.0]
 
-    // Helper function to transform a point and normal by rotation matrix
-    // Point is already centered at origin, so we rotate it and then translate by center
     const transformPoint = (point: Vec3, rotationMatrix: Mat4, center: Vec3): Vec3 => {
-      const x = point.x
-      const y = point.y
-      const z = point.z
       const m = rotationMatrix.values
-      // Column-major format: columns are [0-3]=X, [4-7]=Y, [8-11]=Z
-      // Matrix * point: result = column0*x + column1*y + column2*z
       const rotated = new Vec3(
-        m[0] * x + m[4] * y + m[8] * z, // X component: col0.x*x + col1.x*y + col2.x*z
-        m[1] * x + m[5] * y + m[9] * z, // Y component: col0.y*x + col1.y*y + col2.y*z
-        m[2] * x + m[6] * y + m[10] * z // Z component: col0.z*x + col1.z*y + col2.z*z
+        m[0] * point.x + m[4] * point.y + m[8] * point.z,
+        m[1] * point.x + m[5] * point.y + m[9] * point.z,
+        m[2] * point.x + m[6] * point.y + m[10] * point.z
       )
       return rotated.add(center)
     }
 
     const transformNormal = (normal: Vec3, rotationMatrix: Mat4): Vec3 => {
-      const x = normal.x
-      const y = normal.y
-      const z = normal.z
       const m = rotationMatrix.values
       return new Vec3(
-        m[0] * x + m[4] * y + m[8] * z,
-        m[1] * x + m[5] * y + m[9] * z,
-        m[2] * x + m[6] * y + m[10] * z
+        m[0] * normal.x + m[4] * normal.y + m[8] * normal.z,
+        m[1] * normal.x + m[5] * normal.y + m[9] * normal.z,
+        m[2] * normal.x + m[6] * normal.y + m[10] * normal.z
       ).normalize()
     }
 
-    // Helper function to add a vertex
     const addVertex = (pos: Vec3, normal: Vec3, center: Vec3, rotationMatrix?: Mat4) => {
       let worldPos: Vec3
       let worldNormal: Vec3
@@ -542,7 +525,6 @@ export class Engine {
       )
     }
 
-    // Helper function to add a triangle
     const addTriangle = (v0: Vec3, v1: Vec3, v2: Vec3, normal: Vec3, center: Vec3, rotationMatrix?: Mat4) => {
       const i0 = vertexOffset
       addVertex(v0, normal, center, rotationMatrix)
@@ -556,9 +538,7 @@ export class Engine {
       indices.push(i0, i1, i2)
     }
 
-    // Helper function to generate a solid sphere
     const addSphere = (center: Vec3, radius: number, segments: number, rotationMatrix?: Mat4) => {
-      // Generate sphere using latitude/longitude method
       const rings = segments
       const sectors = segments
 
@@ -602,21 +582,12 @@ export class Engine {
       }
     }
 
-    // Helper function to add a solid box
-    // IMPORTANT: PMX stores box dimensions as HALF-EXTENTS (confirmed by reference code that multiplies by 2)
-    // NOTE: Visual testing shows boxes need Y/Z dimension swap to appear correct
-    // This suggests PMX box rotation or coordinate system differs from capsules
-    // Capsules work correctly without swap, boxes need swap - likely due to how rotations apply
     const addBox = (center: Vec3, size: Vec3, rotationMatrix?: Mat4) => {
-      // PMX stores half-extents, use directly (no * 0.5 needed, values are already half-size)
-      // Swap Y and Z dimensions for boxes to match visual expectations
-      const halfWidth = size.x // PMX x = width
-      const halfHeight = size.y // PMX z = height (swapped)
-      const halfDepth = size.z // PMX y = depth (swapped)
+      const halfWidth = size.x
+      const halfHeight = size.y
+      const halfDepth = size.z
 
-      // 6 faces of the box - X=width, Y=height, Z=depth
       const faces = [
-        // Front face (Z+ = depth forward)
         {
           corners: [
             new Vec3(-halfWidth, -halfHeight, halfDepth),
@@ -626,7 +597,6 @@ export class Engine {
           ],
           normal: new Vec3(0, 0, 1),
         },
-        // Back face (Z- = depth backward)
         {
           corners: [
             new Vec3(halfWidth, -halfHeight, -halfDepth),
@@ -636,7 +606,6 @@ export class Engine {
           ],
           normal: new Vec3(0, 0, -1),
         },
-        // Top face (Y+ = height up)
         {
           corners: [
             new Vec3(-halfWidth, halfHeight, -halfDepth),
@@ -646,7 +615,6 @@ export class Engine {
           ],
           normal: new Vec3(0, 1, 0),
         },
-        // Bottom face (Y- = height down)
         {
           corners: [
             new Vec3(-halfWidth, -halfHeight, -halfDepth),
@@ -656,7 +624,6 @@ export class Engine {
           ],
           normal: new Vec3(0, -1, 0),
         },
-        // Right face (X+ = width right)
         {
           corners: [
             new Vec3(halfWidth, -halfHeight, -halfDepth),
@@ -666,7 +633,6 @@ export class Engine {
           ],
           normal: new Vec3(1, 0, 0),
         },
-        // Left face (X- = width left)
         {
           corners: [
             new Vec3(-halfWidth, -halfHeight, -halfDepth),
@@ -784,63 +750,32 @@ export class Engine {
       }
     }
 
-    // For each rigidbody, create appropriate solid visualization
     const segments = 32
     for (let rigidbodyIndex = 0; rigidbodyIndex < this.rigidbodies.length; rigidbodyIndex++) {
       const rb = this.rigidbodies[rigidbodyIndex]
-      // PMX rigidbody positions are stored in WORLD SPACE, not bone-local space
-      // So we use the position directly without bone transformation
       const center = rb.position
       let rotationMatrix: Mat4 | undefined = undefined
 
-      // Geometry is correct - problem is rotation conversion
-      // Try using bone's world rotation from evaluatePose()
       if (Math.abs(rb.rotation.x) > 0.0001 || Math.abs(rb.rotation.y) > 0.0001 || Math.abs(rb.rotation.z) > 0.0001) {
-        // Convert rigidbody Euler angles to quaternion (ZXY order, PMX format)
         const rbRotQuat = Quat.fromEulerZXY(rb.rotation.x, rb.rotation.y, rb.rotation.z)
-
-        // Get bone's world rotation if bone exists
         let finalRotQuat = rbRotQuat
         if (rb.boneIndex >= 0 && rb.boneIndex < this.currentModel.getSkeleton().bones.length) {
-          // Get bone's world matrix (after evaluatePose, at bind pose this is identity rotation)
           const boneWorldMatrixBuf = this.currentModel.getBoneWorldMatrix(rb.boneIndex)
           if (boneWorldMatrixBuf) {
-            // Convert to Mat4 and extract rotation using Mat4.toQuat()
             const boneWorldMatrix = new Mat4(boneWorldMatrixBuf)
             const boneWorldRot = boneWorldMatrix.toQuat()
-            // TEST: Try reverse order - maybe rigidbody * bone instead of bone * rigidbody
-            // Some rigidbodies work with bone*rigidbody, some (hair bones) might need rigidbody*bone
             finalRotQuat = rbRotQuat.multiply(boneWorldRot).normalize()
           }
         }
-
         rotationMatrix = Mat4.fromQuat(finalRotQuat.x, finalRotQuat.y, finalRotQuat.z, finalRotQuat.w)
       }
 
-      // Debug: Log rotation info for first few rigidbodies
-      if (rigidbodyIndex < 3) {
-        console.log(
-          `Rigidbody ${rigidbodyIndex} "${rb.name}": bone=${rb.boneIndex}, ` +
-            `euler=(${rb.rotation.x.toFixed(3)}, ${rb.rotation.y.toFixed(3)}, ${rb.rotation.z.toFixed(3)}), ` +
-            `shape=${rb.shape}`
-        )
-      }
-
-      // Debug: Log rotation matrix for boxes to diagnose coordinate system issues
-      // (Disabled since rotationMatrix is undefined for testing)
-
       if (rb.shape === RigidbodyShape.Sphere) {
-        // Sphere (shape 0): solid sphere mesh
         const radius = rb.size.x
         addSphere(center, radius, segments, rotationMatrix)
       } else if (rb.shape === RigidbodyShape.Box) {
-        // Box (shape 1): solid box - used for rectangular collision volumes (e.g., torso, hips)
-        // PMX stores as (width, height, depth) = (x, y, z) - standard convention
-        // If boxes appear rotated, the issue may be in rotation matrix or coordinate system
         addBox(center, rb.size, rotationMatrix)
       } else if (rb.shape === RigidbodyShape.Capsule) {
-        // Capsule (shape 2): solid capsule - used for elongated collision volumes (e.g., limbs, arms, legs)
-        // radius is size.x, height is size.y (size.z is unused)
         const radius = rb.size.x
         const height = rb.size.y
         addCapsule(center, radius, height, segments, rotationMatrix)
@@ -1050,7 +985,7 @@ export class Engine {
 
     // model.rotateBones(
     //   ["腰", "左腕", "左足"],
-    //   [new Quat(0.5, 0.3, 0, 1), new Quat(0.3, -0.3, 0.3, 1), new Quat(0.3, 0.3, 0.3, 1)],
+    //   [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
     //   2000
     // )
 
@@ -1406,7 +1341,7 @@ export class Engine {
       pass.draw(this.gridVertexCount)
       this.drawCallCount++
     }
-    // Draw model first (so rigidbodies render on top)
+    // Draw model first
     pass.setPipeline(this.pipeline)
     pass.setVertexBuffer(0, this.vertexBuffer)
     if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
@@ -1449,7 +1384,7 @@ export class Engine {
       pass.draw(this.vertexCount)
       this.drawCallCount++
     }
-    // Draw rigidbodies last (highest render priority - appears on top)
+    // Draw rigidbodies last (always on top)
     if (
       this.showRigidbodies &&
       this.rigidbodyPipeline &&
