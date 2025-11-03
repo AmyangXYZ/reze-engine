@@ -664,6 +664,10 @@ export class Model {
     return new Mat4(this.skeleton.inverseBindMatrices.subarray(start, start + 16))
   }
 
+  getLocalRotations(): Float32Array {
+    return this.runtimeSkeleton.localRotations
+  }
+
   // Evaluate world and skin matrices from local TR and bind
   // If deltaTime is provided, also updates spring bone physics
   evaluatePose(deltaTime?: number): void {

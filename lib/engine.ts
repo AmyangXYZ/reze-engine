@@ -1,5 +1,5 @@
 import { Camera } from "./camera"
-import { Vec3, Mat4 } from "./math"
+import { Vec3, Mat4, Quat } from "./math"
 import { Model } from "./model"
 import { PmxLoader } from "./pmx-loader"
 import { Physics, Rigidbody, RigidbodyType, RigidbodyShape } from "./physics"
@@ -1689,12 +1689,20 @@ export class Engine {
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
-    // model.rotateBones(
-    //   ["腰", "左腕", "左足"],
-    //   [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
-    //   2000
-    // )
-    this.physics = new Physics(model.getRigidbodies(), model.getJoints())
+    model.rotateBones(
+      ["腰", "左腕", "左足"],
+      [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
+      2000
+    )
+    // Pass empty joints array to force auto-detection, and pass skeleton bones
+    const skeleton = model.getSkeleton()
+    const bones = skeleton.bones.map((b) => ({
+      name: b.name,
+      parentIndex: b.parentIndex,
+      bindTranslation: b.bindTranslation,
+      children: b.children || [],
+    }))
+    this.physics = new Physics(model.getRigidbodies(), [], bones)
     await this.drawModel(model)
 
     if (this.physics.getRigidbodies().length > 0) {
@@ -2054,8 +2062,15 @@ export class Engine {
         const boneWorldMatrices = this.currentModel.getBoneWorldMatrices()
         const boneInverseBindMatrices = skeleton.inverseBindMatrices
 
-        // Physics step modifies boneWorldMatrices in-place for dynamic rigidbodies
-        this.physics.step(deltaTime, boneWorldMatrices, boneInverseBindMatrices, boneCount)
+        // Physics step modifies boneWorldMatrices in-place for spring bone chains
+        const bones = skeleton.bones.map((b) => ({
+          name: b.name,
+          parentIndex: b.parentIndex,
+          bindTranslation: b.bindTranslation,
+          children: b.children || [],
+        }))
+        const localRotations = this.currentModel.getLocalRotations()
+        this.physics.step(deltaTime, boneWorldMatrices, boneInverseBindMatrices, boneCount, bones, localRotations)
 
         // Recompute skin matrices from the (potentially modified) world matrices
         // This is more efficient than re-evaluating the entire pose
