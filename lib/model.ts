@@ -253,52 +253,6 @@ export class Model {
     return [x, y, z, w]
   }
 
-  // Extract unit quaternion (x,y,z,w) from a column-major rotation matrix (upper-left 3x3 of mat4)
-  private static mat3ToQuat(m: Float32Array): [number, number, number, number] {
-    const m00 = m[0],
-      m01 = m[4],
-      m02 = m[8]
-    const m10 = m[1],
-      m11 = m[5],
-      m12 = m[9]
-    const m20 = m[2],
-      m21 = m[6],
-      m22 = m[10]
-    const trace = m00 + m11 + m22
-    let x = 0,
-      y = 0,
-      z = 0,
-      w = 1
-    if (trace > 0) {
-      const s = Math.sqrt(trace + 1.0) * 2 // s = 4w
-      w = 0.25 * s
-      x = (m21 - m12) / s
-      y = (m02 - m20) / s
-      z = (m10 - m01) / s
-    } else if (m00 > m11 && m00 > m22) {
-      const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2 // s = 4x
-      w = (m21 - m12) / s
-      x = 0.25 * s
-      y = (m01 + m10) / s
-      z = (m02 + m20) / s
-    } else if (m11 > m22) {
-      const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2 // s = 4y
-      w = (m02 - m20) / s
-      x = (m01 + m10) / s
-      y = 0.25 * s
-      z = (m12 + m21) / s
-    } else {
-      const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2 // s = 4z
-      w = (m10 - m01) / s
-      x = (m02 + m20) / s
-      y = (m12 + m21) / s
-      z = 0.25 * s
-    }
-    // Normalize to be safe
-    const invLen = 1 / Math.hypot(x, y, z, w)
-    return [x * invLen, y * invLen, z * invLen, w * invLen]
-  }
-
   private updateRotationTweens(): void {
     const state = this.rotTweenState
     const now = performance.now()
@@ -367,53 +321,6 @@ export class Model {
   // Get index count
   getIndexCount(): number {
     return this.indexCount
-  }
-
-  // Create RZM model from position-only data
-  // Generates dummy normals and UVs
-  static fromPositions(positions: Float32Array): Model {
-    const vertexCount = positions.length / 3
-    const vertexData = new Float32Array(vertexCount * VERTEX_STRIDE)
-
-    for (let i = 0; i < vertexCount; i++) {
-      const posIdx = i * 3
-      const vertIdx = i * VERTEX_STRIDE
-
-      // Position
-      vertexData[vertIdx + 0] = positions[posIdx + 0]
-      vertexData[vertIdx + 1] = positions[posIdx + 1]
-      vertexData[vertIdx + 2] = positions[posIdx + 2]
-
-      // Normal (dummy, pointing up)
-      vertexData[vertIdx + 3] = 0
-      vertexData[vertIdx + 4] = 1
-      vertexData[vertIdx + 5] = 0
-
-      // UV (dummy)
-      vertexData[vertIdx + 6] = 0
-      vertexData[vertIdx + 7] = 0
-    }
-
-    // Create minimal skeleton and skinning for static model
-    const skeleton: Skeleton = {
-      bones: [],
-      inverseBindMatrices: new Float32Array(0),
-    }
-    const skinning: Skinning = {
-      joints: new Uint16Array(vertexCount * 4),
-      weights: new Uint8Array(vertexCount * 4),
-    }
-    // Initialize weights to single bone (index 0, weight 255) per vertex
-    for (let i = 0; i < vertexCount; i++) {
-      skinning.joints[i * 4] = 0
-      skinning.weights[i * 4] = 255
-    }
-    // Create sequential indices (0, 1, 2, ...)
-    const indexData = new Uint32Array(vertexCount)
-    for (let i = 0; i < vertexCount; i++) {
-      indexData[i] = i
-    }
-    return new Model(vertexData, indexData, [], [], skeleton, skinning, [], [])
   }
 
   // Accessors for skeleton/skinning
@@ -723,26 +630,6 @@ export class Model {
     }
   }
 
-  // Helper: get parent's world transform (position and rotation)
-  private getParentWorldTransform(parentBoneIdx: number): { pos: Vec3; quat: Quat } {
-    const parentMatIdx = parentBoneIdx * 16
-    const parentM = new Mat4(
-      new Float32Array(
-        this.runtimeSkeleton.worldMatrices!.buffer,
-        this.runtimeSkeleton.worldMatrices!.byteOffset + parentMatIdx * 4,
-        16
-      )
-    )
-    const pos = new Vec3(
-      this.runtimeSkeleton.worldMatrices![parentMatIdx + 12],
-      this.runtimeSkeleton.worldMatrices![parentMatIdx + 13],
-      this.runtimeSkeleton.worldMatrices![parentMatIdx + 14]
-    )
-    const [px, py, pz, pw] = Model.mat3ToQuat(parentM.values)
-    const quat = new Quat(px, py, pz, pw).normalize()
-    return { pos, quat }
-  }
-
   getBoneWorldMatrix(index: number): Float32Array | undefined {
     this.evaluatePose()
     const start = index * 16
@@ -791,6 +678,12 @@ export class Model {
     this.computeWorldMatrices()
 
     // Compute skin matrices from world matrices
+    this.updateSkinMatrices()
+  }
+
+  // Update skin matrices from current world matrices
+  // Called after physics modifies world matrices in-place to update skinning
+  updateSkinMatrices(): void {
     const bones = this.skeleton.bones
     const invBind = this.skeleton.inverseBindMatrices
     const worldBuf = this.runtimeSkeleton.worldMatrices

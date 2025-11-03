@@ -357,4 +357,38 @@ export class Mat4 {
     this.values[14] += tz
     return this
   }
+
+  // Invert a transform matrix (rotation + translation)
+  // For a matrix M = [R|t] (rotation R and translation t), the inverse is [R^T|-R^T*t]
+  inverse(): Mat4 {
+    const m = this.values
+    // Extract rotation part (upper-left 3x3) - transpose for inverse rotation
+    // Extract translation part (last column, first 3 elements)
+    const tx = m[12]
+    const ty = m[13]
+    const tz = m[14]
+
+    // Transpose rotation (inverse for rotation matrices)
+    const out = new Float32Array(16)
+    out[0] = m[0]
+    out[1] = m[4]
+    out[2] = m[8]
+    out[3] = 0
+    out[4] = m[1]
+    out[5] = m[5]
+    out[6] = m[9]
+    out[7] = 0
+    out[8] = m[2]
+    out[9] = m[6]
+    out[10] = m[10]
+    out[11] = 0
+
+    // Invert translation: -R^T * t
+    out[12] = -(out[0] * tx + out[4] * ty + out[8] * tz)
+    out[13] = -(out[1] * tx + out[5] * ty + out[9] * tz)
+    out[14] = -(out[2] * tx + out[6] * ty + out[10] * tz)
+    out[15] = 1
+
+    return new Mat4(out)
+  }
 }

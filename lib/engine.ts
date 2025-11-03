@@ -1,5 +1,5 @@
 import { Camera } from "./camera"
-import { Vec3, Mat4, Quat } from "./math"
+import { Vec3, Mat4 } from "./math"
 import { Model } from "./model"
 import { PmxLoader } from "./pmx-loader"
 import { Physics, Rigidbody, RigidbodyType, RigidbodyShape } from "./physics"
@@ -1689,11 +1689,11 @@ export class Engine {
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
-    model.rotateBones(
-      ["腰", "左腕", "左足"],
-      [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
-      2000
-    )
+    // model.rotateBones(
+    //   ["腰", "左腕", "左足"],
+    //   [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
+    //   2000
+    // )
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.drawModel(model)
 
@@ -2035,6 +2035,48 @@ export class Engine {
     // Reset draw call counter for this frame
     this.drawCallCount = 0
 
+    // Calculate delta time once at the start of the frame
+    const currentTime = performance.now()
+    const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000.0 : 0.016 // Default to ~60fps if first frame
+    this.lastFrameTime = currentTime
+
+    // Update pose and physics before rendering
+    if (this.currentModel) {
+      // Evaluate pose (handles rotation tweens, computes world/skin matrices)
+      this.currentModel.evaluatePose(deltaTime)
+
+      // Update physics (rigidbody states) if enabled
+      if (this.physics) {
+        // Step physics: syncs bone-driven rigidbodies and simulates dynamics
+        // Physics modifies bone world matrices in-place, so we need to recompute skin matrices
+        const skeleton = this.currentModel.getSkeleton()
+        const boneCount = skeleton.bones.length
+        const boneWorldMatrices = this.currentModel.getBoneWorldMatrices()
+        const boneInverseBindMatrices = skeleton.inverseBindMatrices
+
+        // Physics step modifies boneWorldMatrices in-place for dynamic rigidbodies
+        this.physics.step(deltaTime, boneWorldMatrices, boneInverseBindMatrices, boneCount)
+
+        // Recompute skin matrices from the (potentially modified) world matrices
+        // This is more efficient than re-evaluating the entire pose
+        this.currentModel.updateSkinMatrices()
+
+        // Update rigidbody visualization if enabled
+        if (this.showRigidbodies) {
+          this.updateRigidbodyTransforms()
+        }
+      }
+
+      // Update skin matrices buffer after all pose evaluation is complete
+      if (this.skinMatrixBuffer) {
+        const mats = this.currentModel.getSkinMatrices()
+        if (mats) {
+          this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+        }
+      }
+    }
+
+    // Begin render pass
     const encoder = this.device.createCommandEncoder({ label: "our encoder" })
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     // Draw grid (if created)
@@ -2050,32 +2092,6 @@ export class Engine {
     pass.setVertexBuffer(0, this.vertexBuffer)
     if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
     if (this.weightsBuffer) pass.setVertexBuffer(2, this.weightsBuffer)
-
-    // Update spring bone physics and skin matrices if present
-    if (this.skinMatrixBuffer && this.currentModel) {
-      const currentTime = performance.now()
-      const deltaTime = (currentTime - this.lastFrameTime) / 1000.0
-      this.lastFrameTime = currentTime
-
-      if (this.currentModel) {
-        this.currentModel.evaluatePose(deltaTime)
-        const mats = this.currentModel.getSkinMatrices()
-        if (mats) this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
-      }
-    }
-
-    // Update physics (rigidbody states)
-    if (this.physics && this.currentModel) {
-      // Ensure pose is evaluated once before physics update
-      this.currentModel.evaluatePose()
-      const boneCount = this.currentModel.getSkeleton().bones.length
-      const boneWorldMatrices = this.currentModel.getBoneWorldMatrices()
-      const boneInverseBindMatrices = this.currentModel.getSkeleton().inverseBindMatrices
-      this.physics.update(boneWorldMatrices, boneInverseBindMatrices, boneCount)
-      if (this.showRigidbodies) {
-        this.updateRigidbodyTransforms()
-      }
-    }
 
     // Use indexed rendering if index buffer exists
     if (this.indexBuffer) {
