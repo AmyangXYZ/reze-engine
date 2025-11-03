@@ -705,16 +705,6 @@ export class Model {
     }
   }
 
-  // Helper: extract world position from bone matrix
-  private getBoneWorldPosition(boneIndex: number): Vec3 {
-    const matIdx = boneIndex * 16
-    return new Vec3(
-      this.runtimeSkeleton.worldMatrices![matIdx + 12],
-      this.runtimeSkeleton.worldMatrices![matIdx + 13],
-      this.runtimeSkeleton.worldMatrices![matIdx + 14]
-    )
-  }
-
   // Helper: get parent's world transform (position and rotation)
   private getParentWorldTransform(parentBoneIdx: number): { pos: Vec3; quat: Quat } {
     const parentMatIdx = parentBoneIdx * 16
@@ -739,6 +729,34 @@ export class Model {
     this.evaluatePose()
     const start = index * 16
     return this.runtimeSkeleton.worldMatrices.slice(start, start + 16)
+  }
+
+  getBoneWorldMatrices(): Float32Array {
+    this.evaluatePose()
+    return this.runtimeSkeleton.worldMatrices
+  }
+
+  getBoneWorldPosition(index: number): Vec3 {
+    this.evaluatePose()
+    const matIdx = index * 16
+    return new Vec3(
+      this.runtimeSkeleton.worldMatrices[matIdx + 12],
+      this.runtimeSkeleton.worldMatrices[matIdx + 13],
+      this.runtimeSkeleton.worldMatrices[matIdx + 14]
+    )
+  }
+
+  getBoneWorldRotation(index: number): Quat {
+    this.evaluatePose()
+    const start = index * 16
+    const matrix = new Mat4(this.runtimeSkeleton.worldMatrices.subarray(start, start + 16))
+    return matrix.toQuat()
+  }
+
+  getBoneInverseBindMatrix(index: number): Mat4 | undefined {
+    if (index < 0 || index >= this.skeleton.bones.length) return undefined
+    const start = index * 16
+    return new Mat4(this.skeleton.inverseBindMatrices.subarray(start, start + 16))
   }
 
   // Evaluate world and skin matrices from local TR and bind

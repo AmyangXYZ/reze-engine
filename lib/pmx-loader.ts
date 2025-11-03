@@ -633,6 +633,9 @@ export class PmxLoader {
           const friction = this.getFloat32()
           const type = this.getUint8() // 0=static, 1=dynamic, 2=kinematic
 
+          const initialRot = Quat.fromEuler(rotX, rotY, rotZ)
+          const initialPos = new Vec3(posX, posY, posZ)
+          const initialTransform = Mat4.fromPositionRotation(initialPos, initialRot)
           this.rigidbodies.push({
             name,
             englishName,
@@ -641,14 +644,15 @@ export class PmxLoader {
             collisionMask,
             shape: shape as RigidbodyShape,
             size: new Vec3(sizeX, sizeY, sizeZ),
-            position: new Vec3(posX, posY, posZ),
-            rotation: new Vec3(rotX, rotY, rotZ),
+            position: initialPos,
+            rotation: initialRot,
             mass,
             linearDamping,
             angularDamping,
             restitution,
             friction,
             type: type as RigidbodyType,
+            initialTransform,
           })
         } catch (e) {
           console.warn(`Error reading rigidbody ${i} of ${count}:`, e)
@@ -735,7 +739,7 @@ export class PmxLoader {
           const springRotZ = this.getFloat32()
 
           // Convert Euler angles to quaternion using ZXY order (left-handed system)
-          const rotQuat = Quat.fromEulerZXY(rotX, rotY, rotZ)
+          const rotQuat = Quat.fromEuler(rotX, rotY, rotZ)
 
           this.joints.push({
             name,
@@ -748,10 +752,10 @@ export class PmxLoader {
             positionMin: new Vec3(posMinX, posMinY, posMinZ),
             positionMax: new Vec3(posMaxX, posMaxY, posMaxZ),
             // Convert rotation constraints from Euler to quaternion (left-handed system)
-            rotationMin: Quat.fromEulerZXY(rotMinX, rotMinY, rotMinZ),
-            rotationMax: Quat.fromEulerZXY(rotMaxX, rotMaxY, rotMaxZ),
+            rotationMin: Quat.fromEuler(rotMinX, rotMinY, rotMinZ),
+            rotationMax: Quat.fromEuler(rotMaxX, rotMaxY, rotMaxZ),
             springPosition: new Vec3(springPosX, springPosY, springPosZ),
-            springRotation: Quat.fromEulerZXY(springRotX, springRotY, springRotZ),
+            springRotation: Quat.fromEuler(springRotX, springRotY, springRotZ),
           })
         } catch (e) {
           console.warn(`Error reading joint ${i} of ${count}:`, e)

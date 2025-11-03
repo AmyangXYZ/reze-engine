@@ -1,4 +1,4 @@
-import { Quat, Vec3 } from "./math"
+import { Quat, Vec3, Mat4 } from "./math"
 
 export enum RigidbodyShape {
   Sphere = 0,
@@ -7,9 +7,9 @@ export enum RigidbodyShape {
 }
 
 export enum RigidbodyType {
-  Static = 0, // Follows bone transform, no physics
-  Dynamic = 1, // Full physics simulation
-  Kinematic = 2, // Follows bone but can be moved by physics
+  Static = 0,
+  Dynamic = 1,
+  Kinematic = 2,
 }
 
 export interface Rigidbody {
@@ -19,36 +19,73 @@ export interface Rigidbody {
   group: number
   collisionMask: number
   shape: RigidbodyShape
-  size: Vec3 // Size parameters (PMX stores as HALF-EXTENTS, confirmed by reference code):
-  //   - Sphere: x=radius (half-extent)
-  //   - Box: PMX stores as (width/2, height/2, depth/2) = (x, y, z)
-  //   - Capsule: x=radius (half-extent), y=height (full height)
-  position: Vec3 // Position relative to bone or world space
-  rotation: Vec3 // Rotation in Euler angles (radians)
+  size: Vec3
+  position: Vec3
+  rotation: Quat
   mass: number
   linearDamping: number
   angularDamping: number
-  restitution: number // Bounciness (0-1)
+  restitution: number
   friction: number
   type: RigidbodyType
+  initialTransform: Mat4 // Transform matrix in bind pose world space
 }
 
 export interface Joint {
   name: string
   englishName: string
-  type: number // Joint type (uint8)
-  rigidbodyIndexA: number // Index of first rigidbody (-1 for none)
-  rigidbodyIndexB: number // Index of second rigidbody (-1 for none)
-  position: Vec3 // Position (world space)
-  rotation: Quat // Rotation (Euler angles)
-  positionMin: Vec3 // Position constraint minimum
-  positionMax: Vec3 // Position constraint maximum
-  rotationMin: Quat // Rotation constraint minimum (Euler)
-  rotationMax: Quat // Rotation constraint maximum (Euler)
-  springPosition: Vec3 // Spring position parameters
-  springRotation: Quat // Spring rotation parameters
+  type: number
+  rigidbodyIndexA: number
+  rigidbodyIndexB: number
+  position: Vec3
+  rotation: Quat
+  positionMin: Vec3
+  positionMax: Vec3
+  rotationMin: Quat
+  rotationMax: Quat
+  springPosition: Vec3
+  springRotation: Quat
 }
 
 export class Physics {
-  constructor() {}
+  private definitions: Rigidbody[]
+
+  constructor(rigidbodies: Rigidbody[]) {
+    this.definitions = rigidbodies
+  }
+
+  getDefinitions(): Rigidbody[] {
+    return this.definitions
+  }
+
+  update(boneWorldMatrices: Float32Array, boneInverseBindMatrices: Float32Array, boneCount: number): void {
+    for (const rb of this.definitions) {
+      // Static and Kinematic both follow bones in MMD/PMX
+      // Static: pure bone following, no physics
+      // Kinematic: bone-driven but can interact with dynamic objects
+      if (
+        (rb.type === RigidbodyType.Static || rb.type === RigidbodyType.Kinematic) &&
+        rb.boneIndex >= 0 &&
+        rb.boneIndex < boneCount
+      ) {
+        const boneIdx = rb.boneIndex
+        const worldMatIdx = boneIdx * 16
+        const invBindIdx = boneIdx * 16
+
+        // Get bone world matrix and inverse bind matrix
+        const worldMat = new Mat4(boneWorldMatrices.subarray(worldMatIdx, worldMatIdx + 16))
+        const invBindMat = new Mat4(boneInverseBindMatrices.subarray(invBindIdx, invBindIdx + 16))
+
+        // Compute offset transform: worldMatrix * inverseBindMatrix (bind pose to current pose)
+        const offsetMat = worldMat.multiply(invBindMat)
+
+        // Transform initial transform to current world space
+        const currentTransform = offsetMat.multiply(rb.initialTransform)
+
+        // Extract position and rotation from current transform
+        rb.position = currentTransform.getPosition()
+        rb.rotation = currentTransform.toQuat()
+      }
+    }
+  }
 }

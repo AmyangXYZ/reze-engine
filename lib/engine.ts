@@ -1,8 +1,8 @@
 import { Camera } from "./camera"
-import { Quat, Vec3, Mat4 } from "./math"
+import { Vec3, Mat4, Quat } from "./math"
 import { Model } from "./model"
 import { PmxLoader } from "./pmx-loader"
-import { Rigidbody, RigidbodyShape } from "./physics"
+import { Physics, Rigidbody, RigidbodyType, RigidbodyShape } from "./physics"
 
 export interface EngineStats {
   fps: number
@@ -57,8 +57,16 @@ export class Engine {
   private rigidbodyVertexCount: number = 0
   private rigidbodyIndexCount: number = 0
   private rigidbodyBindGroup?: GPUBindGroup
-  private rigidbodies: Rigidbody[] = []
+  private physics: Physics | null = null
   private showRigidbodies: boolean = false
+  private rigidbodyMeshes: Array<{
+    baseVertices: Float32Array // Local space vertices (pos3 + color3 + normal3 = 9 floats per vertex)
+    indices: Uint32Array
+    vertexOffset: number // Starting vertex index in combined buffer
+    indexOffset: number // Starting index in combined buffer
+    color: [number, number, number] // RGB color for this rigidbody
+  }> = []
+  private rigidbodyMeshIndexMap: number[] = [] // Map from mesh index to definition index
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -378,14 +386,16 @@ export class Engine {
 
         @vertex fn vs(@location(0) position: vec3f, @location(1) color: vec3f, @location(2) normal: vec3f) -> VSOut {
           var o: VSOut;
-          o.pos = camera.projection * camera.view * vec4f(position, 1.0);
+          var clipPos = camera.projection * camera.view * vec4f(position, 1.0);
+          // Push depth forward to ensure rigidbodies render above model parts
+          clipPos.z = clipPos.z - clipPos.w * 0.05;
+          o.pos = clipPos;
           o.color = color;
           return o;
         }
 
         @fragment fn fs(i: VSOut) -> @location(0) vec4f { 
-          // Pure yellow color, no lighting, half transparent
-          return vec4f(i.color, 0.5); // 50% opacity pure yellow
+          return vec4f(i.color, 0.7); // Semi-transparent with per-rigidbody color
         }
       `,
     })
@@ -428,8 +438,8 @@ export class Engine {
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: {
         format: "depth24plus",
-        depthWriteEnabled: false,
-        depthCompare: "less-equal",
+        depthWriteEnabled: true,
+        depthCompare: "less-equal", // Allow depth ordering among rigidbodies while still rendering above model
       },
       multisample: { count: this.sampleCount },
     })
@@ -466,193 +476,780 @@ export class Engine {
     this.device.queue.writeBuffer(this.gridVertexBuffer, 0, data)
   }
 
-  private buildRigidbodyVisualization() {
-    if (!this.currentModel) return
-
-    const boneCount = this.currentModel.getSkeleton().bones.length
-    for (let i = 0; i < boneCount; i++) {
-      this.currentModel.setBoneRotation(i, new Quat(0, 0, 0, 1))
-      this.currentModel.setBoneTranslation(i, new Vec3(0, 0, 0))
+  // Get color for rigidbody based on type and group (common physics engine practice)
+  private getRigidbodyColor(rb: Rigidbody): [number, number, number] {
+    if (rb.type === RigidbodyType.Static) {
+      return [0.9, 0.1, 0.1] // Red
+    } else if (rb.type === RigidbodyType.Kinematic) {
+      return [0.2, 0.6, 1.0] // Light blue (more visible than white)
+    } else {
+      // Dynamic: use green as default, vary by collision group for differentiation
+      const groupColors: [number, number, number][] = [
+        [0.2, 0.9, 0.2], // Group 0: Green (active dynamic)
+        [1.0, 0.9, 0.2], // Group 1: Yellow
+        [0.2, 0.8, 0.9], // Group 2: Cyan
+        [0.9, 0.2, 0.9], // Group 3: Magenta
+        [1.0, 0.6, 0.2], // Group 4: Orange
+        [0.6, 0.2, 0.9], // Group 5: Purple
+        [0.9, 0.9, 0.2], // Group 6: Yellow-green
+        [0.2, 0.7, 1.0], // Group 7: Light blue
+      ]
+      const groupIdx = rb.group % groupColors.length
+      return groupColors[groupIdx]
     }
-    this.currentModel.evaluatePose()
+  }
 
+  // Build base meshes in local space once (called on load)
+  private buildRigidbodyBaseMeshes() {
+    if (!this.physics) return
+
+    this.rigidbodyMeshes = []
+    const definitions = this.physics.getDefinitions()
+    const segments = 4
+
+    const addLocalVertex = (
+      vertices: number[],
+      pos: [number, number, number],
+      normal: [number, number, number],
+      color: [number, number, number]
+    ) => {
+      vertices.push(pos[0], pos[1], pos[2], color[0], color[1], color[2], normal[0], normal[1], normal[2])
+    }
+
+    const addLocalTriangle = (
+      vertices: number[],
+      indices: number[],
+      v0: [number, number, number],
+      v1: [number, number, number],
+      v2: [number, number, number],
+      normal: [number, number, number],
+      vertexOffset: number,
+      color: [number, number, number]
+    ) => {
+      const i0 = vertexOffset
+      addLocalVertex(vertices, v0, normal, color)
+      const i1 = vertexOffset + 1
+      addLocalVertex(vertices, v1, normal, color)
+      const i2 = vertexOffset + 2
+      addLocalVertex(vertices, v2, normal, color)
+      indices.push(i0, i1, i2)
+      return vertexOffset + 3
+    }
+
+    let globalVertexOffset = 0
+    let globalIndexOffset = 0
+    const meshIndexMap: number[] = [] // Map from definition index to mesh index
+
+    for (let defIdx = 0; defIdx < definitions.length; defIdx++) {
+      const rb = definitions[defIdx]
+
+      // Skip kinematic rigidbodies without bone attachment (boneIndex=-1)
+      if (rb.type === RigidbodyType.Kinematic && rb.boneIndex < 0) {
+        continue
+      }
+
+      const vertices: number[] = []
+      const indices: number[] = []
+      let localVertexOffset = 0
+      const color = this.getRigidbodyColor(rb)
+
+      if (rb.shape === RigidbodyShape.Sphere) {
+        const radius = rb.size.x
+        const rings = segments
+        const sectors = segments
+
+        for (let i = 0; i < rings; i++) {
+          const theta1 = (i / rings) * Math.PI
+          const theta2 = ((i + 1) / rings) * Math.PI
+          const sinT1 = Math.sin(theta1)
+          const cosT1 = Math.cos(theta1)
+          const sinT2 = Math.sin(theta2)
+          const cosT2 = Math.cos(theta2)
+
+          for (let j = 0; j < sectors; j++) {
+            const phi1 = (j / sectors) * Math.PI * 2
+            const phi2 = ((j + 1) / sectors) * Math.PI * 2
+            const cosP1 = Math.cos(phi1)
+            const sinP1 = Math.sin(phi1)
+            const cosP2 = Math.cos(phi2)
+            const sinP2 = Math.sin(phi2)
+
+            const p1x = radius * sinT1 * cosP1
+            const p1y = radius * cosT1
+            const p1z = radius * sinT1 * sinP1
+            const p2x = radius * sinT1 * cosP2
+            const p2y = radius * cosT1
+            const p2z = radius * sinT1 * sinP2
+            const p3x = radius * sinT2 * cosP2
+            const p3y = radius * cosT2
+            const p3z = radius * sinT2 * sinP2
+            const p4x = radius * sinT2 * cosP1
+            const p4y = radius * cosT2
+            const p4z = radius * sinT2 * sinP1
+
+            const len3 = Math.sqrt(p3x * p3x + p3y * p3y + p3z * p3z)
+            const len4 = Math.sqrt(p4x * p4x + p4y * p4y + p4z * p4z)
+            const invLen3 = len3 > 0 ? 1 / len3 : 1
+            const invLen4 = len4 > 0 ? 1 / len4 : 1
+
+            localVertexOffset = addLocalTriangle(
+              vertices,
+              indices,
+              [p1x, p1y, p1z],
+              [p2x, p2y, p2z],
+              [p3x, p3y, p3z],
+              [p3x * invLen3, p3y * invLen3, p3z * invLen3],
+              localVertexOffset,
+              color
+            )
+            localVertexOffset = addLocalTriangle(
+              vertices,
+              indices,
+              [p1x, p1y, p1z],
+              [p3x, p3y, p3z],
+              [p4x, p4y, p4z],
+              [p4x * invLen4, p4y * invLen4, p4z * invLen4],
+              localVertexOffset,
+              color
+            )
+          }
+        }
+      } else if (rb.shape === RigidbodyShape.Box) {
+        const hw = rb.size.x
+        const hh = rb.size.y
+        const hd = rb.size.z
+
+        // Box faces: +Z, -Z, +Y, -Y, +X, -X
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, -hh, hd],
+          [hw, -hh, hd],
+          [hw, hh, hd],
+          [0, 0, 1],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, -hh, hd],
+          [hw, hh, hd],
+          [-hw, hh, hd],
+          [0, 0, 1],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [hw, -hh, -hd],
+          [-hw, -hh, -hd],
+          [-hw, hh, -hd],
+          [0, 0, -1],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [hw, -hh, -hd],
+          [-hw, hh, -hd],
+          [hw, hh, -hd],
+          [0, 0, -1],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, hh, -hd],
+          [-hw, hh, hd],
+          [hw, hh, hd],
+          [0, 1, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, hh, -hd],
+          [hw, hh, hd],
+          [hw, hh, -hd],
+          [0, 1, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, -hh, -hd],
+          [hw, -hh, -hd],
+          [hw, -hh, hd],
+          [0, -1, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, -hh, -hd],
+          [hw, -hh, hd],
+          [-hw, -hh, hd],
+          [0, -1, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [hw, -hh, -hd],
+          [hw, hh, -hd],
+          [hw, hh, hd],
+          [1, 0, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [hw, -hh, -hd],
+          [hw, hh, hd],
+          [hw, -hh, hd],
+          [1, 0, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, -hh, -hd],
+          [-hw, -hh, hd],
+          [-hw, hh, hd],
+          [-1, 0, 0],
+          localVertexOffset,
+          color
+        )
+        localVertexOffset = addLocalTriangle(
+          vertices,
+          indices,
+          [-hw, -hh, -hd],
+          [-hw, hh, hd],
+          [-hw, hh, -hd],
+          [-1, 0, 0],
+          localVertexOffset,
+          color
+        )
+      } else if (rb.shape === RigidbodyShape.Capsule) {
+        const radius = rb.size.x
+        const height = rb.size.y
+        const halfHeight = height * 0.5
+        const rings = segments / 2
+        const sectors = segments
+
+        // Top hemisphere
+        for (let i = 0; i < rings / 2; i++) {
+          const theta1 = (i / rings) * Math.PI
+          const theta2 = ((i + 1) / rings) * Math.PI
+          const sinT1 = Math.sin(theta1)
+          const cosT1 = Math.cos(theta1)
+          const sinT2 = Math.sin(theta2)
+          const cosT2 = Math.cos(theta2)
+
+          for (let j = 0; j < sectors; j++) {
+            const phi1 = (j / sectors) * Math.PI * 2
+            const phi2 = ((j + 1) / sectors) * Math.PI * 2
+            const cosP1 = Math.cos(phi1)
+            const sinP1 = Math.sin(phi1)
+            const cosP2 = Math.cos(phi2)
+            const sinP2 = Math.sin(phi2)
+
+            const p1x = radius * sinT1 * cosP1
+            const p1y = radius * cosT1 + halfHeight
+            const p1z = radius * sinT1 * sinP1
+            const p2x = radius * sinT1 * cosP2
+            const p2y = radius * cosT1 + halfHeight
+            const p2z = radius * sinT1 * sinP2
+            const p3x = radius * sinT2 * cosP2
+            const p3y = radius * cosT2 + halfHeight
+            const p3z = radius * sinT2 * sinP2
+            const p4x = radius * sinT2 * cosP1
+            const p4y = radius * cosT2 + halfHeight
+            const p4z = radius * sinT2 * sinP1
+
+            const n3x = Math.sin(theta2) * cosP2
+            const n3y = Math.cos(theta2)
+            const n3z = Math.sin(theta2) * sinP2
+            const len3 = Math.sqrt(n3x * n3x + n3y * n3y + n3z * n3z)
+            const invLen3 = len3 > 0 ? 1 / len3 : 1
+
+            const n4x = Math.sin(theta2) * cosP1
+            const n4y = Math.cos(theta2)
+            const n4z = Math.sin(theta2) * sinP1
+            const len4 = Math.sqrt(n4x * n4x + n4y * n4y + n4z * n4z)
+            const invLen4 = len4 > 0 ? 1 / len4 : 1
+
+            localVertexOffset = addLocalTriangle(
+              vertices,
+              indices,
+              [p1x, p1y, p1z],
+              [p2x, p2y, p2z],
+              [p3x, p3y, p3z],
+              [n3x * invLen3, n3y * invLen3, n3z * invLen3],
+              localVertexOffset,
+              color
+            )
+            localVertexOffset = addLocalTriangle(
+              vertices,
+              indices,
+              [p1x, p1y, p1z],
+              [p3x, p3y, p3z],
+              [p4x, p4y, p4z],
+              [n4x * invLen4, n4y * invLen4, n4z * invLen4],
+              localVertexOffset,
+              color
+            )
+          }
+        }
+
+        // Cylindrical middle
+        for (let j = 0; j < sectors; j++) {
+          const phi1 = (j / sectors) * Math.PI * 2
+          const phi2 = ((j + 1) / sectors) * Math.PI * 2
+          const cosP1 = Math.cos(phi1)
+          const sinP1 = Math.sin(phi1)
+          const cosP2 = Math.cos(phi2)
+          const sinP2 = Math.sin(phi2)
+
+          const p1x = radius * cosP1
+          const p1y = halfHeight
+          const p1z = radius * sinP1
+          const p2x = radius * cosP2
+          const p2y = halfHeight
+          const p2z = radius * sinP2
+          const p3x = radius * cosP2
+          const p3y = -halfHeight
+          const p3z = radius * sinP2
+          const p4x = radius * cosP1
+          const p4y = -halfHeight
+          const p4z = radius * sinP1
+
+          const nx = cosP1
+          const ny = 0
+          const nz = sinP1
+
+          localVertexOffset = addLocalTriangle(
+            vertices,
+            indices,
+            [p1x, p1y, p1z],
+            [p2x, p2y, p2z],
+            [p3x, p3y, p3z],
+            [nx, ny, nz],
+            localVertexOffset,
+            color
+          )
+          localVertexOffset = addLocalTriangle(
+            vertices,
+            indices,
+            [p1x, p1y, p1z],
+            [p3x, p3y, p3z],
+            [p4x, p4y, p4z],
+            [nx, ny, nz],
+            localVertexOffset,
+            color
+          )
+        }
+
+        // Bottom hemisphere
+        for (let i = rings / 2; i < rings; i++) {
+          const theta1 = (i / rings) * Math.PI
+          const theta2 = ((i + 1) / rings) * Math.PI
+          const sinT1 = Math.sin(theta1)
+          const cosT1 = Math.cos(theta1)
+          const sinT2 = Math.sin(theta2)
+          const cosT2 = Math.cos(theta2)
+
+          for (let j = 0; j < sectors; j++) {
+            const phi1 = (j / sectors) * Math.PI * 2
+            const phi2 = ((j + 1) / sectors) * Math.PI * 2
+            const cosP1 = Math.cos(phi1)
+            const sinP1 = Math.sin(phi1)
+            const cosP2 = Math.cos(phi2)
+            const sinP2 = Math.sin(phi2)
+
+            const p1x = radius * sinT1 * cosP1
+            const p1y = radius * cosT1 - halfHeight
+            const p1z = radius * sinT1 * sinP1
+            const p2x = radius * sinT1 * cosP2
+            const p2y = radius * cosT1 - halfHeight
+            const p2z = radius * sinT1 * sinP2
+            const p3x = radius * sinT2 * cosP2
+            const p3y = radius * cosT2 - halfHeight
+            const p3z = radius * sinT2 * sinP2
+            const p4x = radius * sinT2 * cosP1
+            const p4y = radius * cosT2 - halfHeight
+            const p4z = radius * sinT2 * sinP1
+
+            const n3x = Math.sin(theta2) * cosP2
+            const n3y = Math.cos(theta2)
+            const n3z = Math.sin(theta2) * sinP2
+            const len3 = Math.sqrt(n3x * n3x + n3y * n3y + n3z * n3z)
+            const invLen3 = len3 > 0 ? 1 / len3 : 1
+
+            const n4x = Math.sin(theta2) * cosP1
+            const n4y = Math.cos(theta2)
+            const n4z = Math.sin(theta2) * sinP1
+            const len4 = Math.sqrt(n4x * n4x + n4y * n4y + n4z * n4z)
+            const invLen4 = len4 > 0 ? 1 / len4 : 1
+
+            localVertexOffset = addLocalTriangle(
+              vertices,
+              indices,
+              [p1x, p1y, p1z],
+              [p2x, p2y, p2z],
+              [p3x, p3y, p3z],
+              [n3x * invLen3, n3y * invLen3, n3z * invLen3],
+              localVertexOffset,
+              color
+            )
+            localVertexOffset = addLocalTriangle(
+              vertices,
+              indices,
+              [p1x, p1y, p1z],
+              [p3x, p3y, p3z],
+              [p4x, p4y, p4z],
+              [n4x * invLen4, n4y * invLen4, n4z * invLen4],
+              localVertexOffset,
+              color
+            )
+          }
+        }
+      }
+
+      if (vertices.length > 0 && indices.length > 0) {
+        // Adjust indices for global offset
+        const adjustedIndices = indices.map((idx) => idx + globalVertexOffset)
+        this.rigidbodyMeshes.push({
+          baseVertices: new Float32Array(vertices),
+          indices: new Uint32Array(adjustedIndices),
+          vertexOffset: globalVertexOffset,
+          indexOffset: globalIndexOffset,
+          color: color,
+        })
+        meshIndexMap.push(defIdx) // Store mapping from mesh index to definition index
+        globalVertexOffset += vertices.length / 9
+        globalIndexOffset += indices.length
+      }
+    }
+
+    // Store mesh index map for transform updates
+    this.rigidbodyMeshIndexMap = meshIndexMap
+
+    // Create combined index buffer once
+    if (this.rigidbodyMeshes.length > 0) {
+      const allIndices: number[] = []
+      for (const mesh of this.rigidbodyMeshes) {
+        allIndices.push(...mesh.indices)
+      }
+      const indexData = new Uint32Array(allIndices)
+      this.rigidbodyIndexCount = indexData.length
+
+      if (this.rigidbodyIndexBuffer && this.rigidbodyIndexBuffer.size >= indexData.byteLength) {
+        this.device.queue.writeBuffer(this.rigidbodyIndexBuffer, 0, indexData)
+      } else {
+        if (this.rigidbodyIndexBuffer) {
+          this.rigidbodyIndexBuffer.destroy()
+        }
+        this.rigidbodyIndexBuffer = this.device.createBuffer({
+          label: "rigidbody visualization indices",
+          size: indexData.byteLength,
+          usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        })
+        this.device.queue.writeBuffer(this.rigidbodyIndexBuffer, 0, indexData)
+      }
+    }
+  }
+
+  // Update transforms each frame (transforms cached base vertices)
+  private updateRigidbodyTransforms() {
+    if (!this.physics || this.rigidbodyMeshes.length === 0 || !this.rigidbodyVertexBuffer) return
+
+    const definitions = this.physics.getDefinitions()
+    const allVertices: number[] = []
+
+    for (let meshIdx = 0; meshIdx < this.rigidbodyMeshes.length; meshIdx++) {
+      const defIdx = this.rigidbodyMeshIndexMap[meshIdx]
+      const rb = definitions[defIdx]
+      const mesh = this.rigidbodyMeshes[meshIdx]
+      const baseVertices = mesh.baseVertices
+      const color = mesh.color
+      const rotMat = Mat4.fromQuat(rb.rotation.x, rb.rotation.y, rb.rotation.z, rb.rotation.w)
+      const m = rotMat.values
+      const cx = rb.position.x
+      const cy = rb.position.y
+      const cz = rb.position.z
+
+      // Transform each vertex
+      for (let j = 0; j < baseVertices.length; j += 9) {
+        const px = baseVertices[j]
+        const py = baseVertices[j + 1]
+        const pz = baseVertices[j + 2]
+        const nx = baseVertices[j + 6]
+        const ny = baseVertices[j + 7]
+        const nz = baseVertices[j + 8]
+
+        // Transform position
+        const wx = m[0] * px + m[4] * py + m[8] * pz + cx
+        const wy = m[1] * px + m[5] * py + m[9] * pz + cy
+        const wz = m[2] * px + m[6] * py + m[10] * pz + cz
+
+        // Transform normal
+        const tnx = m[0] * nx + m[4] * ny + m[8] * nz
+        const tny = m[1] * nx + m[5] * ny + m[9] * nz
+        const tnz = m[2] * nx + m[6] * ny + m[10] * nz
+        const len = Math.sqrt(tnx * tnx + tny * tny + tnz * tnz)
+        const invLen = len > 0 ? 1 / len : 1
+
+        allVertices.push(wx, wy, wz, color[0], color[1], color[2], tnx * invLen, tny * invLen, tnz * invLen)
+      }
+    }
+
+    if (allVertices.length > 0) {
+      const vertexData = new Float32Array(allVertices)
+      this.rigidbodyVertexCount = vertexData.length / 9
+      this.device.queue.writeBuffer(this.rigidbodyVertexBuffer, 0, vertexData)
+    }
+  }
+
+  private buildRigidbodyVisualization() {
+    if (!this.currentModel || !this.physics) return
+
+    // If meshes are already cached, just create the vertex buffer
+    if (this.rigidbodyMeshes.length > 0) {
+      const totalVertices = this.rigidbodyMeshes.reduce((sum, mesh) => sum + mesh.baseVertices.length / 9, 0)
+      const vertexDataSize = totalVertices * 9 * 4 // 9 floats per vertex, 4 bytes per float
+
+      if (!this.rigidbodyVertexBuffer || this.rigidbodyVertexBuffer.size < vertexDataSize) {
+        if (this.rigidbodyVertexBuffer) {
+          this.rigidbodyVertexBuffer.destroy()
+        }
+        this.rigidbodyVertexBuffer = this.device.createBuffer({
+          label: "rigidbody visualization vertices",
+          size: vertexDataSize,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        })
+      }
+
+      // Initial transform update
+      this.updateRigidbodyTransforms()
+      return
+    }
+
+    // Fallback: old code path if meshes not built
     const vertices: number[] = []
     const indices: number[] = []
     let vertexOffset = 0
     const color = [1.0, 1.0, 0.0]
 
-    const transformPoint = (point: Vec3, rotationMatrix: Mat4, center: Vec3): Vec3 => {
-      const m = rotationMatrix.values
-      const rotated = new Vec3(
-        m[0] * point.x + m[4] * point.y + m[8] * point.z,
-        m[1] * point.x + m[5] * point.y + m[9] * point.z,
-        m[2] * point.x + m[6] * point.y + m[10] * point.z
-      )
-      return rotated.add(center)
+    // Optimized transform functions using direct array operations to avoid object creation
+    const transformPointAndNormal = (
+      px: number,
+      py: number,
+      pz: number,
+      nx: number,
+      ny: number,
+      nz: number,
+      m: Float32Array,
+      cx: number,
+      cy: number,
+      cz: number
+    ) => {
+      // Transform position
+      const wx = m[0] * px + m[4] * py + m[8] * pz + cx
+      const wy = m[1] * px + m[5] * py + m[9] * pz + cy
+      const wz = m[2] * px + m[6] * py + m[10] * pz + cz
+
+      // Transform normal
+      const tnx = m[0] * nx + m[4] * ny + m[8] * nz
+      const tny = m[1] * nx + m[5] * ny + m[9] * nz
+      const tnz = m[2] * nx + m[6] * ny + m[10] * nz
+      const len = Math.sqrt(tnx * tnx + tny * tny + tnz * tnz)
+      const invLen = len > 0 ? 1 / len : 1
+
+      vertices.push(wx, wy, wz, color[0], color[1], color[2], tnx * invLen, tny * invLen, tnz * invLen)
     }
 
-    const transformNormal = (normal: Vec3, rotationMatrix: Mat4): Vec3 => {
-      const m = rotationMatrix.values
-      return new Vec3(
-        m[0] * normal.x + m[4] * normal.y + m[8] * normal.z,
-        m[1] * normal.x + m[5] * normal.y + m[9] * normal.z,
-        m[2] * normal.x + m[6] * normal.y + m[10] * normal.z
-      ).normalize()
+    const addVertexSimple = (
+      px: number,
+      py: number,
+      pz: number,
+      nx: number,
+      ny: number,
+      nz: number,
+      cx: number,
+      cy: number,
+      cz: number
+    ) => {
+      vertices.push(px + cx, py + cy, pz + cz, color[0], color[1], color[2], nx, ny, nz)
     }
 
-    const addVertex = (pos: Vec3, normal: Vec3, center: Vec3, rotationMatrix?: Mat4) => {
-      let worldPos: Vec3
-      let worldNormal: Vec3
-
-      if (rotationMatrix) {
-        worldPos = transformPoint(pos, rotationMatrix, center)
-        worldNormal = transformNormal(normal, rotationMatrix)
-      } else {
-        worldPos = pos.add(center)
-        worldNormal = normal
-      }
-
-      vertices.push(
-        worldPos.x,
-        worldPos.y,
-        worldPos.z,
-        color[0],
-        color[1],
-        color[2],
-        worldNormal.x,
-        worldNormal.y,
-        worldNormal.z
-      )
-    }
-
-    const addTriangle = (v0: Vec3, v1: Vec3, v2: Vec3, normal: Vec3, center: Vec3, rotationMatrix?: Mat4) => {
+    const addTriangle = (
+      v0x: number,
+      v0y: number,
+      v0z: number,
+      v1x: number,
+      v1y: number,
+      v1z: number,
+      v2x: number,
+      v2y: number,
+      v2z: number,
+      nx: number,
+      ny: number,
+      nz: number,
+      cx: number,
+      cy: number,
+      cz: number,
+      m?: Float32Array
+    ) => {
       const i0 = vertexOffset
-      addVertex(v0, normal, center, rotationMatrix)
+      if (m) {
+        transformPointAndNormal(v0x, v0y, v0z, nx, ny, nz, m, cx, cy, cz)
+      } else {
+        addVertexSimple(v0x, v0y, v0z, nx, ny, nz, cx, cy, cz)
+      }
       vertexOffset++
       const i1 = vertexOffset
-      addVertex(v1, normal, center, rotationMatrix)
+      if (m) {
+        transformPointAndNormal(v1x, v1y, v1z, nx, ny, nz, m, cx, cy, cz)
+      } else {
+        addVertexSimple(v1x, v1y, v1z, nx, ny, nz, cx, cy, cz)
+      }
       vertexOffset++
       const i2 = vertexOffset
-      addVertex(v2, normal, center, rotationMatrix)
+      if (m) {
+        transformPointAndNormal(v2x, v2y, v2z, nx, ny, nz, m, cx, cy, cz)
+      } else {
+        addVertexSimple(v2x, v2y, v2z, nx, ny, nz, cx, cy, cz)
+      }
       vertexOffset++
       indices.push(i0, i1, i2)
     }
 
-    const addSphere = (center: Vec3, radius: number, segments: number, rotationMatrix?: Mat4) => {
+    const addSphere = (cx: number, cy: number, cz: number, radius: number, segments: number, m?: Float32Array) => {
       const rings = segments
       const sectors = segments
 
       for (let i = 0; i < rings; i++) {
         const theta1 = (i / rings) * Math.PI
         const theta2 = ((i + 1) / rings) * Math.PI
+        const sinT1 = Math.sin(theta1)
+        const cosT1 = Math.cos(theta1)
+        const sinT2 = Math.sin(theta2)
+        const cosT2 = Math.cos(theta2)
 
         for (let j = 0; j < sectors; j++) {
           const phi1 = (j / sectors) * Math.PI * 2
           const phi2 = ((j + 1) / sectors) * Math.PI * 2
+          const cosP1 = Math.cos(phi1)
+          const sinP1 = Math.sin(phi1)
+          const cosP2 = Math.cos(phi2)
+          const sinP2 = Math.sin(phi2)
 
-          // Generate 4 points for a quad
-          const p1 = new Vec3(
-            radius * Math.sin(theta1) * Math.cos(phi1),
-            radius * Math.cos(theta1),
-            radius * Math.sin(theta1) * Math.sin(phi1)
-          )
-          const p2 = new Vec3(
-            radius * Math.sin(theta1) * Math.cos(phi2),
-            radius * Math.cos(theta1),
-            radius * Math.sin(theta1) * Math.sin(phi2)
-          )
-          const p3 = new Vec3(
-            radius * Math.sin(theta2) * Math.cos(phi2),
-            radius * Math.cos(theta2),
-            radius * Math.sin(theta2) * Math.sin(phi2)
-          )
-          const p4 = new Vec3(
-            radius * Math.sin(theta2) * Math.cos(phi1),
-            radius * Math.cos(theta2),
-            radius * Math.sin(theta2) * Math.sin(phi1)
-          )
+          // Generate 4 points for a quad (avoid Vec3 creation)
+          const p1x = radius * sinT1 * cosP1
+          const p1y = radius * cosT1
+          const p1z = radius * sinT1 * sinP1
+          const p2x = radius * sinT1 * cosP2
+          const p2y = radius * cosT1
+          const p2z = radius * sinT1 * sinP2
+          const p3x = radius * sinT2 * cosP2
+          const p3y = radius * cosT2
+          const p3z = radius * sinT2 * sinP2
+          const p4x = radius * sinT2 * cosP1
+          const p4y = radius * cosT2
+          const p4z = radius * sinT2 * sinP1
 
-          // Split quad into two triangles
-          const n3 = p3.normalize()
-          const n4 = p4.normalize()
+          // Normals (same as positions for sphere, normalized)
+          const len3 = Math.sqrt(p3x * p3x + p3y * p3y + p3z * p3z)
+          const len4 = Math.sqrt(p4x * p4x + p4y * p4y + p4z * p4z)
+          const invLen3 = len3 > 0 ? 1 / len3 : 1
+          const invLen4 = len4 > 0 ? 1 / len4 : 1
 
-          addTriangle(p1, p2, p3, n3, center, rotationMatrix)
-          addTriangle(p1, p3, p4, n4, center, rotationMatrix)
+          addTriangle(
+            p1x,
+            p1y,
+            p1z,
+            p2x,
+            p2y,
+            p2z,
+            p3x,
+            p3y,
+            p3z,
+            p3x * invLen3,
+            p3y * invLen3,
+            p3z * invLen3,
+            cx,
+            cy,
+            cz,
+            m
+          )
+          addTriangle(
+            p1x,
+            p1y,
+            p1z,
+            p3x,
+            p3y,
+            p3z,
+            p4x,
+            p4y,
+            p4z,
+            p4x * invLen4,
+            p4y * invLen4,
+            p4z * invLen4,
+            cx,
+            cy,
+            cz,
+            m
+          )
         }
       }
     }
 
-    const addBox = (center: Vec3, size: Vec3, rotationMatrix?: Mat4) => {
-      const halfWidth = size.x
-      const halfHeight = size.y
-      const halfDepth = size.z
+    const addBox = (cx: number, cy: number, cz: number, sx: number, sy: number, sz: number, m?: Float32Array) => {
+      const hw = sx,
+        hh = sy,
+        hd = sz
 
-      const faces = [
-        {
-          corners: [
-            new Vec3(-halfWidth, -halfHeight, halfDepth),
-            new Vec3(halfWidth, -halfHeight, halfDepth),
-            new Vec3(halfWidth, halfHeight, halfDepth),
-            new Vec3(-halfWidth, halfHeight, halfDepth),
-          ],
-          normal: new Vec3(0, 0, 1),
-        },
-        {
-          corners: [
-            new Vec3(halfWidth, -halfHeight, -halfDepth),
-            new Vec3(-halfWidth, -halfHeight, -halfDepth),
-            new Vec3(-halfWidth, halfHeight, -halfDepth),
-            new Vec3(halfWidth, halfHeight, -halfDepth),
-          ],
-          normal: new Vec3(0, 0, -1),
-        },
-        {
-          corners: [
-            new Vec3(-halfWidth, halfHeight, -halfDepth),
-            new Vec3(-halfWidth, halfHeight, halfDepth),
-            new Vec3(halfWidth, halfHeight, halfDepth),
-            new Vec3(halfWidth, halfHeight, -halfDepth),
-          ],
-          normal: new Vec3(0, 1, 0),
-        },
-        {
-          corners: [
-            new Vec3(-halfWidth, -halfHeight, -halfDepth),
-            new Vec3(halfWidth, -halfHeight, -halfDepth),
-            new Vec3(halfWidth, -halfHeight, halfDepth),
-            new Vec3(-halfWidth, -halfHeight, halfDepth),
-          ],
-          normal: new Vec3(0, -1, 0),
-        },
-        {
-          corners: [
-            new Vec3(halfWidth, -halfHeight, -halfDepth),
-            new Vec3(halfWidth, halfHeight, -halfDepth),
-            new Vec3(halfWidth, halfHeight, halfDepth),
-            new Vec3(halfWidth, -halfHeight, halfDepth),
-          ],
-          normal: new Vec3(1, 0, 0),
-        },
-        {
-          corners: [
-            new Vec3(-halfWidth, -halfHeight, -halfDepth),
-            new Vec3(-halfWidth, -halfHeight, halfDepth),
-            new Vec3(-halfWidth, halfHeight, halfDepth),
-            new Vec3(-halfWidth, halfHeight, -halfDepth),
-          ],
-          normal: new Vec3(-1, 0, 0),
-        },
-      ]
-
-      for (const face of faces) {
-        // Split quad into two triangles
-        addTriangle(face.corners[0], face.corners[1], face.corners[2], face.normal, center, rotationMatrix)
-        addTriangle(face.corners[0], face.corners[2], face.corners[3], face.normal, center, rotationMatrix)
-      }
+      // Face 1: +Z
+      addTriangle(-hw, -hh, hd, hw, -hh, hd, hw, hh, hd, 0, 0, 1, cx, cy, cz, m)
+      addTriangle(-hw, -hh, hd, hw, hh, hd, -hw, hh, hd, 0, 0, 1, cx, cy, cz, m)
+      // Face 2: -Z
+      addTriangle(hw, -hh, -hd, -hw, -hh, -hd, -hw, hh, -hd, 0, 0, -1, cx, cy, cz, m)
+      addTriangle(hw, -hh, -hd, -hw, hh, -hd, hw, hh, -hd, 0, 0, -1, cx, cy, cz, m)
+      // Face 3: +Y
+      addTriangle(-hw, hh, -hd, -hw, hh, hd, hw, hh, hd, 0, 1, 0, cx, cy, cz, m)
+      addTriangle(-hw, hh, -hd, hw, hh, hd, hw, hh, -hd, 0, 1, 0, cx, cy, cz, m)
+      // Face 4: -Y
+      addTriangle(-hw, -hh, -hd, hw, -hh, -hd, hw, -hh, hd, 0, -1, 0, cx, cy, cz, m)
+      addTriangle(-hw, -hh, -hd, hw, -hh, hd, -hw, -hh, hd, 0, -1, 0, cx, cy, cz, m)
+      // Face 5: +X
+      addTriangle(hw, -hh, -hd, hw, hh, -hd, hw, hh, hd, 1, 0, 0, cx, cy, cz, m)
+      addTriangle(hw, -hh, -hd, hw, hh, hd, hw, -hh, hd, 1, 0, 0, cx, cy, cz, m)
+      // Face 6: -X
+      addTriangle(-hw, -hh, -hd, -hw, -hh, hd, -hw, hh, hd, -1, 0, 0, cx, cy, cz, m)
+      addTriangle(-hw, -hh, -hd, -hw, hh, hd, -hw, hh, -hd, -1, 0, 0, cx, cy, cz, m)
     }
 
-    // Helper function to add a solid capsule
-    const addCapsule = (center: Vec3, radius: number, height: number, segments: number, rotationMatrix?: Mat4) => {
+    // Helper function to add a solid capsule (optimized)
+    const addCapsule = (
+      cx: number,
+      cy: number,
+      cz: number,
+      radius: number,
+      height: number,
+      segments: number,
+      m?: Float32Array
+    ) => {
       const halfHeight = height * 0.5
       const rings = segments / 2
       const sectors = segments
@@ -661,37 +1258,80 @@ export class Engine {
       for (let i = 0; i < rings / 2; i++) {
         const theta1 = (i / rings) * Math.PI
         const theta2 = ((i + 1) / rings) * Math.PI
+        const sinT1 = Math.sin(theta1)
+        const cosT1 = Math.cos(theta1)
+        const sinT2 = Math.sin(theta2)
+        const cosT2 = Math.cos(theta2)
 
         for (let j = 0; j < sectors; j++) {
           const phi1 = (j / sectors) * Math.PI * 2
           const phi2 = ((j + 1) / sectors) * Math.PI * 2
+          const cosP1 = Math.cos(phi1)
+          const sinP1 = Math.sin(phi1)
+          const cosP2 = Math.cos(phi2)
+          const sinP2 = Math.sin(phi2)
 
-          const p1 = new Vec3(
-            radius * Math.sin(theta1) * Math.cos(phi1),
-            radius * Math.cos(theta1) + halfHeight,
-            radius * Math.sin(theta1) * Math.sin(phi1)
-          )
-          const p2 = new Vec3(
-            radius * Math.sin(theta1) * Math.cos(phi2),
-            radius * Math.cos(theta1) + halfHeight,
-            radius * Math.sin(theta1) * Math.sin(phi2)
-          )
-          const p3 = new Vec3(
-            radius * Math.sin(theta2) * Math.cos(phi2),
-            radius * Math.cos(theta2) + halfHeight,
-            radius * Math.sin(theta2) * Math.sin(phi2)
-          )
-          const p4 = new Vec3(
-            radius * Math.sin(theta2) * Math.cos(phi1),
-            radius * Math.cos(theta2) + halfHeight,
-            radius * Math.sin(theta2) * Math.sin(phi1)
-          )
+          const p1x = radius * sinT1 * cosP1
+          const p1y = radius * cosT1 + halfHeight
+          const p1z = radius * sinT1 * sinP1
+          const p2x = radius * sinT1 * cosP2
+          const p2y = radius * cosT1 + halfHeight
+          const p2z = radius * sinT1 * sinP2
+          const p3x = radius * sinT2 * cosP2
+          const p3y = radius * cosT2 + halfHeight
+          const p3z = radius * sinT2 * sinP2
+          const p4x = radius * sinT2 * cosP1
+          const p4y = radius * cosT2 + halfHeight
+          const p4z = radius * sinT2 * sinP1
 
-          const n3 = new Vec3(Math.sin(theta2) * Math.cos(phi2), Math.cos(theta2), Math.sin(theta2) * Math.sin(phi2))
-          const n4 = new Vec3(Math.sin(theta2) * Math.cos(phi1), Math.cos(theta2), Math.sin(theta2) * Math.sin(phi1))
+          const n3x = Math.sin(theta2) * cosP2
+          const n3y = Math.cos(theta2)
+          const n3z = Math.sin(theta2) * sinP2
+          const len3 = Math.sqrt(n3x * n3x + n3y * n3y + n3z * n3z)
+          const invLen3 = len3 > 0 ? 1 / len3 : 1
 
-          addTriangle(p1, p2, p3, n3, center, rotationMatrix)
-          addTriangle(p1, p3, p4, n4, center, rotationMatrix)
+          const n4x = Math.sin(theta2) * cosP1
+          const n4y = Math.cos(theta2)
+          const n4z = Math.sin(theta2) * sinP1
+          const len4 = Math.sqrt(n4x * n4x + n4y * n4y + n4z * n4z)
+          const invLen4 = len4 > 0 ? 1 / len4 : 1
+
+          addTriangle(
+            p1x,
+            p1y,
+            p1z,
+            p2x,
+            p2y,
+            p2z,
+            p3x,
+            p3y,
+            p3z,
+            n3x * invLen3,
+            n3y * invLen3,
+            n3z * invLen3,
+            cx,
+            cy,
+            cz,
+            m
+          )
+          addTriangle(
+            p1x,
+            p1y,
+            p1z,
+            p3x,
+            p3y,
+            p3z,
+            p4x,
+            p4y,
+            p4z,
+            n4x * invLen4,
+            n4y * invLen4,
+            n4z * invLen4,
+            cx,
+            cy,
+            cz,
+            m
+          )
         }
       }
 
@@ -699,86 +1339,138 @@ export class Engine {
       for (let j = 0; j < sectors; j++) {
         const phi1 = (j / sectors) * Math.PI * 2
         const phi2 = ((j + 1) / sectors) * Math.PI * 2
+        const cosP1 = Math.cos(phi1)
+        const sinP1 = Math.sin(phi1)
+        const cosP2 = Math.cos(phi2)
+        const sinP2 = Math.sin(phi2)
 
-        const p1 = new Vec3(radius * Math.cos(phi1), halfHeight, radius * Math.sin(phi1))
-        const p2 = new Vec3(radius * Math.cos(phi2), halfHeight, radius * Math.sin(phi2))
-        const p3 = new Vec3(radius * Math.cos(phi2), -halfHeight, radius * Math.sin(phi2))
-        const p4 = new Vec3(radius * Math.cos(phi1), -halfHeight, radius * Math.sin(phi1))
+        const p1x = radius * cosP1
+        const p1y = halfHeight
+        const p1z = radius * sinP1
+        const p2x = radius * cosP2
+        const p2y = halfHeight
+        const p2z = radius * sinP2
+        const p3x = radius * cosP2
+        const p3y = -halfHeight
+        const p3z = radius * sinP2
+        const p4x = radius * cosP1
+        const p4y = -halfHeight
+        const p4z = radius * sinP1
 
-        const normal = new Vec3(Math.cos(phi1), 0, Math.sin(phi1)).normalize()
+        const nx = cosP1
+        const ny = 0
+        const nz = sinP1
 
-        addTriangle(p1, p2, p3, normal, center, rotationMatrix)
-        addTriangle(p1, p3, p4, normal, center, rotationMatrix)
+        addTriangle(p1x, p1y, p1z, p2x, p2y, p2z, p3x, p3y, p3z, nx, ny, nz, cx, cy, cz, m)
+        addTriangle(p1x, p1y, p1z, p3x, p3y, p3z, p4x, p4y, p4z, nx, ny, nz, cx, cy, cz, m)
       }
 
       // Bottom hemisphere
       for (let i = rings / 2; i < rings; i++) {
         const theta1 = (i / rings) * Math.PI
         const theta2 = ((i + 1) / rings) * Math.PI
+        const sinT1 = Math.sin(theta1)
+        const cosT1 = Math.cos(theta1)
+        const sinT2 = Math.sin(theta2)
+        const cosT2 = Math.cos(theta2)
 
         for (let j = 0; j < sectors; j++) {
           const phi1 = (j / sectors) * Math.PI * 2
           const phi2 = ((j + 1) / sectors) * Math.PI * 2
+          const cosP1 = Math.cos(phi1)
+          const sinP1 = Math.sin(phi1)
+          const cosP2 = Math.cos(phi2)
+          const sinP2 = Math.sin(phi2)
 
-          const p1 = new Vec3(
-            radius * Math.sin(theta1) * Math.cos(phi1),
-            radius * Math.cos(theta1) - halfHeight,
-            radius * Math.sin(theta1) * Math.sin(phi1)
-          )
-          const p2 = new Vec3(
-            radius * Math.sin(theta1) * Math.cos(phi2),
-            radius * Math.cos(theta1) - halfHeight,
-            radius * Math.sin(theta1) * Math.sin(phi2)
-          )
-          const p3 = new Vec3(
-            radius * Math.sin(theta2) * Math.cos(phi2),
-            radius * Math.cos(theta2) - halfHeight,
-            radius * Math.sin(theta2) * Math.sin(phi2)
-          )
-          const p4 = new Vec3(
-            radius * Math.sin(theta2) * Math.cos(phi1),
-            radius * Math.cos(theta2) - halfHeight,
-            radius * Math.sin(theta2) * Math.sin(phi1)
-          )
+          const p1x = radius * sinT1 * cosP1
+          const p1y = radius * cosT1 - halfHeight
+          const p1z = radius * sinT1 * sinP1
+          const p2x = radius * sinT1 * cosP2
+          const p2y = radius * cosT1 - halfHeight
+          const p2z = radius * sinT1 * sinP2
+          const p3x = radius * sinT2 * cosP2
+          const p3y = radius * cosT2 - halfHeight
+          const p3z = radius * sinT2 * sinP2
+          const p4x = radius * sinT2 * cosP1
+          const p4y = radius * cosT2 - halfHeight
+          const p4z = radius * sinT2 * sinP1
 
-          const n3 = new Vec3(Math.sin(theta2) * Math.cos(phi2), Math.cos(theta2), Math.sin(theta2) * Math.sin(phi2))
-          const n4 = new Vec3(Math.sin(theta2) * Math.cos(phi1), Math.cos(theta2), Math.sin(theta2) * Math.sin(phi1))
+          const n3x = Math.sin(theta2) * cosP2
+          const n3y = Math.cos(theta2)
+          const n3z = Math.sin(theta2) * sinP2
+          const len3 = Math.sqrt(n3x * n3x + n3y * n3y + n3z * n3z)
+          const invLen3 = len3 > 0 ? 1 / len3 : 1
 
-          addTriangle(p1, p2, p3, n3, center, rotationMatrix)
-          addTriangle(p1, p3, p4, n4, center, rotationMatrix)
+          const n4x = Math.sin(theta2) * cosP1
+          const n4y = Math.cos(theta2)
+          const n4z = Math.sin(theta2) * sinP1
+          const len4 = Math.sqrt(n4x * n4x + n4y * n4y + n4z * n4z)
+          const invLen4 = len4 > 0 ? 1 / len4 : 1
+
+          addTriangle(
+            p1x,
+            p1y,
+            p1z,
+            p2x,
+            p2y,
+            p2z,
+            p3x,
+            p3y,
+            p3z,
+            n3x * invLen3,
+            n3y * invLen3,
+            n3z * invLen3,
+            cx,
+            cy,
+            cz,
+            m
+          )
+          addTriangle(
+            p1x,
+            p1y,
+            p1z,
+            p3x,
+            p3y,
+            p3z,
+            p4x,
+            p4y,
+            p4z,
+            n4x * invLen4,
+            n4y * invLen4,
+            n4z * invLen4,
+            cx,
+            cy,
+            cz,
+            m
+          )
         }
       }
     }
 
-    const segments = 32
-    for (let rigidbodyIndex = 0; rigidbodyIndex < this.rigidbodies.length; rigidbodyIndex++) {
-      const rb = this.rigidbodies[rigidbodyIndex]
-      const center = rb.position
-      let rotationMatrix: Mat4 | undefined = undefined
+    const definitions = this.physics.getDefinitions()
+    const segments = 4 // Minimal segments for debug visualization
 
-      if (Math.abs(rb.rotation.x) > 0.0001 || Math.abs(rb.rotation.y) > 0.0001 || Math.abs(rb.rotation.z) > 0.0001) {
-        const rbRotQuat = Quat.fromEulerZXY(rb.rotation.x, rb.rotation.y, rb.rotation.z)
-        let finalRotQuat = rbRotQuat
-        if (rb.boneIndex >= 0 && rb.boneIndex < this.currentModel.getSkeleton().bones.length) {
-          const boneWorldMatrixBuf = this.currentModel.getBoneWorldMatrix(rb.boneIndex)
-          if (boneWorldMatrixBuf) {
-            const boneWorldMatrix = new Mat4(boneWorldMatrixBuf)
-            const boneWorldRot = boneWorldMatrix.toQuat()
-            finalRotQuat = rbRotQuat.multiply(boneWorldRot).normalize()
-          }
-        }
-        rotationMatrix = Mat4.fromQuat(finalRotQuat.x, finalRotQuat.y, finalRotQuat.z, finalRotQuat.w)
-      }
+    // Pre-compute rotation matrices once
+    const rotationMatrices: (Float32Array | undefined)[] = []
+    for (let i = 0; i < definitions.length; i++) {
+      const rb = definitions[i]
+      const rotMat = Mat4.fromQuat(rb.rotation.x, rb.rotation.y, rb.rotation.z, rb.rotation.w)
+      rotationMatrices.push(rotMat.values)
+    }
+
+    for (let i = 0; i < definitions.length; i++) {
+      const rb = definitions[i]
+      const cx = rb.position.x
+      const cy = rb.position.y
+      const cz = rb.position.z
+      const m = rotationMatrices[i]
 
       if (rb.shape === RigidbodyShape.Sphere) {
-        const radius = rb.size.x
-        addSphere(center, radius, segments, rotationMatrix)
+        addSphere(cx, cy, cz, rb.size.x, segments, m)
       } else if (rb.shape === RigidbodyShape.Box) {
-        addBox(center, rb.size, rotationMatrix)
+        addBox(cx, cy, cz, rb.size.x, rb.size.y, rb.size.z, m)
       } else if (rb.shape === RigidbodyShape.Capsule) {
-        const radius = rb.size.x
-        const height = rb.size.y
-        addCapsule(center, radius, height, segments, rotationMatrix)
+        addCapsule(cx, cy, cz, rb.size.x, rb.size.y, segments, m)
       }
     }
 
@@ -788,22 +1480,39 @@ export class Engine {
       this.rigidbodyVertexCount = vertexData.length / 9
       this.rigidbodyIndexCount = indexData.length
 
-      this.rigidbodyVertexBuffer = this.device.createBuffer({
-        label: "rigidbody visualization vertices",
-        size: vertexData.byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      })
-      this.device.queue.writeBuffer(this.rigidbodyVertexBuffer, 0, vertexData)
+      // Reuse buffers if they exist and are the right size, otherwise recreate
+      if (this.rigidbodyVertexBuffer && this.rigidbodyVertexBuffer.size >= vertexData.byteLength) {
+        this.device.queue.writeBuffer(this.rigidbodyVertexBuffer, 0, vertexData)
+      } else {
+        if (this.rigidbodyVertexBuffer) {
+          this.rigidbodyVertexBuffer.destroy()
+        }
+        this.rigidbodyVertexBuffer = this.device.createBuffer({
+          label: "rigidbody visualization vertices",
+          size: vertexData.byteLength,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        })
+        this.device.queue.writeBuffer(this.rigidbodyVertexBuffer, 0, vertexData)
+      }
 
-      this.rigidbodyIndexBuffer = this.device.createBuffer({
-        label: "rigidbody visualization indices",
-        size: indexData.byteLength,
-        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-      })
-      this.device.queue.writeBuffer(this.rigidbodyIndexBuffer, 0, indexData)
+      if (this.rigidbodyIndexBuffer && this.rigidbodyIndexBuffer.size >= indexData.byteLength) {
+        this.device.queue.writeBuffer(this.rigidbodyIndexBuffer, 0, indexData)
+      } else {
+        if (this.rigidbodyIndexBuffer) {
+          this.rigidbodyIndexBuffer.destroy()
+        }
+        this.rigidbodyIndexBuffer = this.device.createBuffer({
+          label: "rigidbody visualization indices",
+          size: indexData.byteLength,
+          usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        })
+        this.device.queue.writeBuffer(this.rigidbodyIndexBuffer, 0, indexData)
+      }
 
       console.log(
-        `[Engine] Built rigidbody visualization: ${this.rigidbodies.length} rigidbodies, ${this.rigidbodyVertexCount} vertices, ${this.rigidbodyIndexCount} indices`
+        `[Engine] Built rigidbody visualization: ${this.physics?.getDefinitions().length || 0} rigidbodies, ${
+          this.rigidbodyVertexCount
+        } vertices, ${this.rigidbodyIndexCount} indices`
       )
     }
   }
@@ -977,27 +1686,22 @@ export class Engine {
 
   // Load PMX model from directory and filename
   public async loadPmx(dir: string, fileName: string) {
-    // Ensure directory ends with /
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
     const { model, rigidbodies } = await PmxLoader.load(url)
-    this.rigidbodies = rigidbodies
-
-    // model.rotateBones(
-    //   ["腰", "左腕", "左足"],
-    //   [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
-    //   2000
-    // )
-
+    model.rotateBones(
+      ["腰", "左腕", "左足"],
+      [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
+      2000
+    )
+    this.physics = new Physics(rigidbodies)
     await this.drawModel(model)
 
-    // Build rigidbody visualization
-    if (this.rigidbodies.length > 0) {
+    if (this.physics.getDefinitions().length > 0) {
+      this.buildRigidbodyBaseMeshes()
       this.buildRigidbodyVisualization()
     }
 
-    // Test spring bones - find some bones that would benefit from spring physics
-    // (e.g., hair, skirts, accessories)
     const boneNames = model.getBoneNames()
     console.log("Available bones:", boneNames)
   }
@@ -1349,16 +2053,27 @@ export class Engine {
 
     // Update spring bone physics and skin matrices if present
     if (this.skinMatrixBuffer && this.currentModel) {
-      // Calculate deltaTime for physics (convert from ms to seconds)
       const currentTime = performance.now()
-      const deltaTime = (currentTime - this.lastFrameTime) / 1000.0 // Convert to seconds
+      const deltaTime = (currentTime - this.lastFrameTime) / 1000.0
       this.lastFrameTime = currentTime
 
-      // Evaluate pose (includes spring bone physics update if spring bones exist)
       if (this.currentModel) {
         this.currentModel.evaluatePose(deltaTime)
         const mats = this.currentModel.getSkinMatrices()
         if (mats) this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+      }
+    }
+
+    // Update physics (rigidbody states)
+    if (this.physics && this.currentModel) {
+      // Ensure pose is evaluated once before physics update
+      this.currentModel.evaluatePose()
+      const boneCount = this.currentModel.getSkeleton().bones.length
+      const boneWorldMatrices = this.currentModel.getBoneWorldMatrices()
+      const boneInverseBindMatrices = this.currentModel.getSkeleton().inverseBindMatrices
+      this.physics.update(boneWorldMatrices, boneInverseBindMatrices, boneCount)
+      if (this.showRigidbodies) {
+        this.updateRigidbodyTransforms()
       }
     }
 

@@ -148,7 +148,7 @@ export class Quat {
   }
 
   // Convert Euler angles to quaternion (ZXY order, left-handed, PMX format)
-  static fromEulerZXY(rotX: number, rotY: number, rotZ: number): Quat {
+  static fromEuler(rotX: number, rotY: number, rotZ: number): Quat {
     const cx = Math.cos(rotX * 0.5)
     const sx = Math.sin(rotX * 0.5)
     const cy = Math.cos(rotY * 0.5)
@@ -289,6 +289,20 @@ export class Mat4 {
     out[14] = 0
     out[15] = 1
     return new Mat4(out)
+  }
+
+  // Create transform matrix from position and rotation
+  static fromPositionRotation(position: Vec3, rotation: Quat): Mat4 {
+    const rotMat = Mat4.fromQuat(rotation.x, rotation.y, rotation.z, rotation.w)
+    rotMat.values[12] = position.x
+    rotMat.values[13] = position.y
+    rotMat.values[14] = position.z
+    return rotMat
+  }
+
+  // Extract position from transform matrix
+  getPosition(): Vec3 {
+    return new Vec3(this.values[12], this.values[13], this.values[14])
   }
 
   // Extract quaternion rotation from this matrix (upper-left 3x3 rotation part)
