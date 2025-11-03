@@ -413,53 +413,6 @@ export class Physics {
     }
   }
 
-  // Extract unit quaternion (x,y,z,w) from a column-major rotation matrix (upper-left 3x3 of mat4)
-  // Matches reference code exactly
-  private static mat3ToQuat(m: Float32Array): [number, number, number, number] {
-    const m00 = m[0],
-      m01 = m[4],
-      m02 = m[8]
-    const m10 = m[1],
-      m11 = m[5],
-      m12 = m[9]
-    const m20 = m[2],
-      m21 = m[6],
-      m22 = m[10]
-    const trace = m00 + m11 + m22
-    let x = 0,
-      y = 0,
-      z = 0,
-      w = 1
-    if (trace > 0) {
-      const s = Math.sqrt(trace + 1.0) * 2 // s = 4w
-      w = 0.25 * s
-      x = (m21 - m12) / s
-      y = (m02 - m20) / s
-      z = (m10 - m01) / s
-    } else if (m00 > m11 && m00 > m22) {
-      const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2 // s = 4x
-      w = (m21 - m12) / s
-      x = 0.25 * s
-      y = (m01 + m10) / s
-      z = (m02 + m20) / s
-    } else if (m11 > m22) {
-      const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2 // s = 4y
-      w = (m02 - m20) / s
-      x = (m01 + m10) / s
-      y = 0.25 * s
-      z = (m12 + m21) / s
-    } else {
-      const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2 // s = 4z
-      w = (m10 - m01) / s
-      x = (m02 + m20) / s
-      y = (m12 + m21) / s
-      z = 0.25 * s
-    }
-    // Normalize to be safe
-    const invLen = 1 / Math.hypot(x, y, z, w)
-    return [x * invLen, y * invLen, z * invLen, w * invLen]
-  }
-
   // Helper: get bone's bind translation as Vec3
   private getBindTranslation(boneIndex: number, bones: Bone[]): Vec3 {
     const bone = bones[boneIndex]
@@ -483,8 +436,7 @@ export class Physics {
       boneWorldMatrices[parentMatIdx + 13],
       boneWorldMatrices[parentMatIdx + 14]
     )
-    const [px, py, pz, pw] = Physics.mat3ToQuat(parentM.values)
-    const quat = new Quat(px, py, pz, pw).normalize()
+    const quat = parentM.toQuat().normalize()
     return { pos, quat }
   }
 
@@ -598,8 +550,7 @@ export class Physics {
             const prevBoneMat = new Mat4(
               new Float32Array(boneWorldMatrices.buffer, boneWorldMatrices.byteOffset + prevBoneMatIdx * 4, 16)
             )
-            const [px, py, pz, pw] = Physics.mat3ToQuat(prevBoneMat.values)
-            parentWorldQuat = new Quat(px, py, pz, pw).normalize()
+            parentWorldQuat = prevBoneMat.toQuat().normalize()
 
             const bindTrans = this.getBindTranslation(boneIndex, bones)
             const bindTransWorld = parentWorldQuat.rotate(bindTrans)
@@ -874,6 +825,47 @@ export class Physics {
       const offset = chainBoneOffsets[chainIdx]
       const gravityDir = new Vec3(0, -1, 0) // Gravity always points downward
 
+      // Cache parent transforms at START of chain (before any modifications)
+      // This prevents instability from reading modified matrices
+      const parentTransforms = new Map<number, { pos: Vec3; quat: Quat; mat: Mat4 }>()
+
+      // Cache root bone if needed
+      if (chain.rootBoneIndex >= 0 && chain.rootBoneIndex < boneCount) {
+        const rootMatIdx = chain.rootBoneIndex * 16
+        const rootMat = new Mat4(
+          new Float32Array(boneWorldMatrices.buffer, boneWorldMatrices.byteOffset + rootMatIdx * 4, 16)
+        )
+        const rootPos = new Vec3(
+          boneWorldMatrices[rootMatIdx + 12],
+          boneWorldMatrices[rootMatIdx + 13],
+          boneWorldMatrices[rootMatIdx + 14]
+        )
+        parentTransforms.set(chain.rootBoneIndex, {
+          pos: rootPos,
+          quat: rootMat.toQuat().normalize(),
+          mat: rootMat,
+        })
+      }
+
+      // Cache all bones in chain at START
+      for (let boneIdx = 0; boneIdx < chain.boneIndices.length; boneIdx++) {
+        const boneIndex = chain.boneIndices[boneIdx]
+        const boneMatIdx = boneIndex * 16
+        const boneMat = new Mat4(
+          new Float32Array(boneWorldMatrices.buffer, boneWorldMatrices.byteOffset + boneMatIdx * 4, 16)
+        )
+        const bonePos = new Vec3(
+          boneWorldMatrices[boneMatIdx + 12],
+          boneWorldMatrices[boneMatIdx + 13],
+          boneWorldMatrices[boneMatIdx + 14]
+        )
+        parentTransforms.set(boneIndex, {
+          pos: bonePos,
+          quat: boneMat.toQuat().normalize(),
+          mat: boneMat,
+        })
+      }
+
       // Process each bone in the chain sequentially
       for (let boneIdx = 0; boneIdx < chain.boneIndices.length; boneIdx++) {
         const boneIndex = chain.boneIndices[boneIdx]
@@ -895,27 +887,26 @@ export class Physics {
         let anchorPos: Vec3
         let parentWorldQuat: Quat | null = null
 
+        // Use cached transforms from START of step (stable reference)
         if (boneIdx === 0) {
           // First bone in chain: anchor to root bone
           if (chain.rootBoneIndex >= 0) {
-            const { anchor, parentQuat } = this.computeAnchorPositionForChainBone(
-              boneIndex,
-              chain.rootBoneIndex,
-              boneWorldMatrices,
-              bones
-            )
-            anchorPos = anchor
-            parentWorldQuat = parentQuat
+            const rootTransform = parentTransforms.get(chain.rootBoneIndex)!
+            const bindTrans = this.getBindTranslation(boneIndex, bones)
+            const bindTransWorld = rootTransform.quat.rotate(bindTrans)
+            anchorPos = rootTransform.pos.add(bindTransWorld)
+            parentWorldQuat = rootTransform.quat
           } else {
             const { anchor, parentQuat } = this.computeAnchorPosition(boneIndex, boneWorldMatrices, bones)
             anchorPos = anchor
             parentWorldQuat = parentQuat
           }
         } else {
-          // Subsequent bones: anchor to previous bone using its world matrix position
+          // Subsequent bones: anchor to previous bone's CURRENT transform (after spring physics)
           const prevBoneIdx = boneIdx - 1
           const prevBoneIndex = chain.boneIndices[prevBoneIdx]
 
+          // Get CURRENT transform (updated by spring physics)
           const prevBoneMatIdx = prevBoneIndex * 16
           const prevBoneWorldPos = new Vec3(
             boneWorldMatrices[prevBoneMatIdx + 12],
@@ -926,8 +917,7 @@ export class Physics {
           const prevBoneMat = new Mat4(
             new Float32Array(boneWorldMatrices.buffer, boneWorldMatrices.byteOffset + prevBoneMatIdx * 4, 16)
           )
-          const [px, py, pz, pw] = Physics.mat3ToQuat(prevBoneMat.values)
-          parentWorldQuat = new Quat(px, py, pz, pw).normalize()
+          parentWorldQuat = prevBoneMat.toQuat().normalize()
 
           const bindTrans = this.getBindTranslation(boneIndex, bones)
           const bindTransWorld = parentWorldQuat.rotate(bindTrans)
@@ -1008,22 +998,36 @@ export class Physics {
           this.springBoneCurrentPositions[posIdx + 2] = newPos.z
         }
 
-        // Update bone rotation to point from anchor toward newPos
-        // We update the WORLD matrix directly, but we also need to ensure it persists
-        // by not being overwritten by evaluatePose() next frame
+        // Update bone rotation: point from anchor toward newPos
+        // Simple, stable approach: always rotate from bind direction to target direction in parent's local space
         if (parentWorldQuat !== null) {
-          const targetDirWorld = newPos.subtract(anchorPos).normalize()
+          // Bone's bind direction in local space (stable reference, never changes)
+          const bindDirLocal = bindTrans.length() > 0.001 ? bindTrans.normalize() : new Vec3(0, 1, 0)
 
-          const bindDirLocal = bindTrans.normalize()
+          // Target direction in world space
+          const toTarget = newPos.subtract(anchorPos)
+          const targetDirWorld = toTarget.length() > 0.001 ? toTarget.normalize() : bindDirLocal
 
+          // Transform target direction to parent's CURRENT local space
           const invParentQuat = parentWorldQuat.conjugate().normalize()
           const targetDirLocal = invParentQuat.rotate(targetDirWorld)
 
+          // Compute rotation from bind direction to target direction (both in parent's local space)
+          // This ensures we always rotate from the original bind pose, preventing twist accumulation
+          // This is the stable approach - it may have some surface cracks but won't cause instability
           const localRotation = Quat.fromTo(bindDirLocal, targetDirLocal)
+          const localRotationNorm = localRotation.length() > 0.001 ? localRotation.normalize() : new Quat(0, 0, 0, 1)
 
           // Compute world matrix from local rotation
+          // Use the same parent that we used for anchor computation (parentWorldQuat source)
+          // This ensures consistency between rotation computation and world matrix computation
           const boneMatIdx = boneIndex * 16
-          const rotateM = Mat4.fromQuat(localRotation.x, localRotation.y, localRotation.z, localRotation.w)
+          const rotateM = Mat4.fromQuat(
+            localRotationNorm.x,
+            localRotationNorm.y,
+            localRotationNorm.z,
+            localRotationNorm.w
+          )
           const translateBind = Mat4.identity().translateInPlace(
             bones[boneIndex].bindTranslation[0],
             bones[boneIndex].bindTranslation[1],
@@ -1031,25 +1035,36 @@ export class Physics {
           )
           const localM = translateBind.multiply(rotateM)
 
-          if (bones[boneIndex].parentIndex >= 0 && bones[boneIndex].parentIndex < bones.length) {
+          // Get parent world matrix: use CURRENT parent matrix (for position) but build from cached rotation
+          // This ensures world matrix reflects current position but stable rotation
+          let parentWorldMat: Mat4
+          if (boneIdx === 0 && chain.rootBoneIndex >= 0) {
+            // First bone: use root bone's cached matrix
+            parentWorldMat = parentTransforms.get(chain.rootBoneIndex)!.mat
+          } else if (boneIdx > 0) {
+            // Subsequent bone: use previous bone's CURRENT matrix (updated position)
+            const prevBoneIndex = chain.boneIndices[boneIdx - 1]
+            const prevBoneMatIdx = prevBoneIndex * 16
+            parentWorldMat = new Mat4(
+              new Float32Array(boneWorldMatrices.buffer, boneWorldMatrices.byteOffset + prevBoneMatIdx * 4, 16)
+            )
+          } else {
+            // Fallback: use skeleton parent (read current)
             const parentMatIdx = bones[boneIndex].parentIndex * 16
-            const parentM = new Mat4(
+            parentWorldMat = new Mat4(
               new Float32Array(boneWorldMatrices.buffer, boneWorldMatrices.byteOffset + parentMatIdx * 4, 16)
             )
-            const boneWorldM = parentM.multiply(localM)
-            boneWorldMatrices.set(boneWorldM.values, boneMatIdx)
-          } else {
-            boneWorldMatrices.set(localM.values, boneMatIdx)
           }
+          const boneWorldM = parentWorldMat.multiply(localM)
+          boneWorldMatrices.set(boneWorldM.values, boneMatIdx)
 
-          // CRITICAL: Also update local rotation so evaluatePose() doesn't overwrite this
-          // Extract local rotation from the computed world matrix
+          // Update local rotation so evaluatePose() doesn't overwrite this
           if (localRotations) {
             const qi = boneIndex * 4
-            localRotations[qi] = localRotation.x
-            localRotations[qi + 1] = localRotation.y
-            localRotations[qi + 2] = localRotation.z
-            localRotations[qi + 3] = localRotation.w
+            localRotations[qi] = localRotationNorm.x
+            localRotations[qi + 1] = localRotationNorm.y
+            localRotations[qi + 2] = localRotationNorm.z
+            localRotations[qi + 3] = localRotationNorm.w
           }
         }
       }
