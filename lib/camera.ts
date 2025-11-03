@@ -1,5 +1,7 @@
 import { Mat4, Vec3 } from "./math"
 
+const FAR = 1000
+
 export class Camera {
   alpha: number
   beta: number
@@ -8,7 +10,7 @@ export class Camera {
   fov: number
   aspect: number = 1
   near: number = 0.05
-  far: number = 1000
+  far: number = FAR
 
   // Input state
   private canvas: HTMLCanvasElement | null = null
@@ -24,7 +26,7 @@ export class Camera {
   wheelPrecision: number = 0.005
   pinchPrecision: number = 0.05
   minZ: number = 0.1
-  maxZ: number = 1000
+  maxZ: number = FAR
   lowerBetaLimit: number = 0.001
   upperBetaLimit: number = Math.PI - 0.001
 
@@ -72,7 +74,7 @@ export class Camera {
     this.canvas.addEventListener("mousedown", this.onMouseDown)
     window.addEventListener("mousemove", this.onMouseMove)
     window.addEventListener("mouseup", this.onMouseUp)
-    this.canvas.addEventListener("wheel", this.onWheel)
+    this.canvas.addEventListener("wheel", this.onWheel, { passive: false })
     this.canvas.addEventListener("contextmenu", this.onContextMenu)
 
     // Attach touch event listeners for mobile
@@ -110,7 +112,7 @@ export class Camera {
     const deltaX = e.clientX - this.lastMousePos.x
     const deltaY = e.clientY - this.lastMousePos.y
 
-    this.alpha -= deltaX * this.angularSensitivity
+    this.alpha += deltaX * this.angularSensitivity
     this.beta -= deltaY * this.angularSensitivity
 
     // Clamp beta to prevent flipping
@@ -132,7 +134,7 @@ export class Camera {
     // Clamp radius to reasonable bounds
     this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
     // Expand far plane to keep scene visible when zooming out
-    this.far = Math.max(500, this.radius * 4)
+    this.far = Math.max(FAR, this.radius * 4)
   }
 
   private onContextMenu(e: Event) {
@@ -178,7 +180,7 @@ export class Camera {
       // Clamp radius to reasonable bounds
       this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
       // Expand far plane for pinch zoom as well
-      this.far = Math.max(500, this.radius * 4)
+      this.far = Math.max(FAR, this.radius * 4)
 
       this.lastPinchDistance = distance
     } else if (this.isDragging && this.touchIdentifier !== null) {
@@ -197,7 +199,7 @@ export class Camera {
       const deltaX = touch.clientX - this.lastTouchPos.x
       const deltaY = touch.clientY - this.lastTouchPos.y
 
-      this.alpha -= deltaX * this.angularSensitivity
+      this.alpha += deltaX * this.angularSensitivity
       this.beta -= deltaY * this.angularSensitivity
 
       // Clamp beta to prevent flipping

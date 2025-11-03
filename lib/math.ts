@@ -146,6 +146,58 @@ export class Quat {
   toArray(): [number, number, number, number] {
     return [this.x, this.y, this.z, this.w]
   }
+
+  // Convert Euler angles (ZXY order) to quaternion for LEFT-HANDED coordinate system
+  // PMX/MMD format uses ZXY rotation order in left-handed coordinate system
+  // Parameters are rotation angles in radians: rotX (pitch/rotation around X), rotY (roll/rotation around Y), rotZ (yaw/rotation around Z)
+  // ZXY order means: first rotate around Z (yaw), then X (pitch), then Y (roll)
+  // Result: q = qz(yaw) * qx(pitch) * qy(roll)
+  static fromEulerZXY(rotX: number, rotY: number, rotZ: number): Quat {
+    const cx = Math.cos(rotX * 0.5)
+    const sx = Math.sin(rotX * 0.5)
+    const cy = Math.cos(rotY * 0.5)
+    const sy = Math.sin(rotY * 0.5)
+    const cz = Math.cos(rotZ * 0.5)
+    const sz = Math.sin(rotZ * 0.5)
+
+    // ZXY order quaternion multiplication: qz * qx * qy
+    // qz = (0, 0, sz, cz) for rotation around Z
+    // qx = (sx, 0, 0, cx) for rotation around X
+    // qy = (0, sy, 0, cy) for rotation around Y
+    // qz * qx * qy computed:
+    const w = cz * cx * cy - sz * sx * sy
+    const x = cz * sx * cy + sz * cx * sy
+    const y = cz * cx * sy - sz * sx * cy
+    const z = sz * cx * cy + cz * sx * sy
+
+    return new Quat(x, y, z, w).normalize()
+  }
+
+  // Convert Euler angles (YXZ order) to quaternion for LEFT-HANDED coordinate system
+  // Babylon.js FromEulerAngles uses YXZ order (yaw-pitch-roll)
+  // Parameters: rotX (pitch), rotY (yaw), rotZ (roll)
+  // YXZ order means: first rotate around Y (yaw), then X (pitch), then Z (roll)
+  // Result: q = qy(yaw) * qx(pitch) * qz(roll)
+  static fromEulerYXZ(rotX: number, rotY: number, rotZ: number): Quat {
+    const cx = Math.cos(rotX * 0.5)
+    const sx = Math.sin(rotX * 0.5)
+    const cy = Math.cos(rotY * 0.5)
+    const sy = Math.sin(rotY * 0.5)
+    const cz = Math.cos(rotZ * 0.5)
+    const sz = Math.sin(rotZ * 0.5)
+
+    // YXZ order quaternion multiplication: qy * qx * qz
+    // qy = (0, sy, 0, cy) for rotation around Y
+    // qx = (sx, 0, 0, cx) for rotation around X
+    // qz = (0, 0, sz, cz) for rotation around Z
+    // qy * qx * qz computed:
+    const w = cy * cx * cz - sy * sx * sz
+    const x = cy * sx * cz + sy * cx * sz
+    const y = sy * cx * cz - cy * sx * sz
+    const z = cy * cx * sz + sy * sx * cz
+
+    return new Quat(x, y, z, w).normalize()
+  }
 }
 
 export class Mat4 {
@@ -159,9 +211,11 @@ export class Mat4 {
     return new Mat4(new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]))
   }
 
+  // Perspective matrix for LEFT-HANDED coordinate system (Z+ forward)
+  // For left-handed: Z goes from 0 (near) to 1 (far), +Z is forward
   static perspective(fov: number, aspect: number, near: number, far: number): Mat4 {
     const f = 1.0 / Math.tan(fov / 2)
-    const rangeInv = 1.0 / (near - far)
+    const rangeInv = 1.0 / (far - near) // Positive for left-handed
 
     return new Mat4(
       new Float32Array([
@@ -175,38 +229,41 @@ export class Mat4 {
         0,
         0,
         0,
-        (near + far) * rangeInv,
-        -1,
+        (far + near) * rangeInv,
+        1, // Positive for left-handed (Z+ forward)
         0,
         0,
-        near * far * rangeInv * 2,
+        -near * far * rangeInv * 2, // Negated for left-handed
         0,
       ])
     )
   }
 
+  // LookAt matrix for LEFT-HANDED coordinate system (Z+ forward)
+  // For left-handed: camera looks along +Z direction
   static lookAt(eye: Vec3, target: Vec3, up: Vec3): Mat4 {
-    const zAxis = eye.subtract(target).normalize()
-    const xAxis = up.cross(zAxis).normalize()
-    const yAxis = zAxis.cross(xAxis)
+    // In left-handed: forward = target - eye (Z+ direction)
+    const forward = target.subtract(eye).normalize()
+    const right = up.cross(forward).normalize() // X+ is right
+    const upVec = forward.cross(right).normalize() // Y+ is up
 
     return new Mat4(
       new Float32Array([
-        xAxis.x,
-        yAxis.x,
-        zAxis.x,
+        right.x,
+        upVec.x,
+        forward.x,
         0,
-        xAxis.y,
-        yAxis.y,
-        zAxis.y,
+        right.y,
+        upVec.y,
+        forward.y,
         0,
-        xAxis.z,
-        yAxis.z,
-        zAxis.z,
+        right.z,
+        upVec.z,
+        forward.z,
         0,
-        -xAxis.dot(eye),
-        -yAxis.dot(eye),
-        -zAxis.dot(eye),
+        -right.dot(eye),
+        -upVec.dot(eye),
+        -forward.dot(eye),
         1,
       ])
     )
@@ -267,6 +324,52 @@ export class Mat4 {
     out[14] = 0
     out[15] = 1
     return new Mat4(out)
+  }
+
+  // Extract quaternion rotation from this matrix (upper-left 3x3 rotation part)
+  toQuat(): Quat {
+    const m = this.values
+    const m00 = m[0],
+      m01 = m[4],
+      m02 = m[8]
+    const m10 = m[1],
+      m11 = m[5],
+      m12 = m[9]
+    const m20 = m[2],
+      m21 = m[6],
+      m22 = m[10]
+    const trace = m00 + m11 + m22
+    let x = 0,
+      y = 0,
+      z = 0,
+      w = 1
+    if (trace > 0) {
+      const s = Math.sqrt(trace + 1.0) * 2
+      w = 0.25 * s
+      x = (m21 - m12) / s
+      y = (m02 - m20) / s
+      z = (m10 - m01) / s
+    } else if (m00 > m11 && m00 > m22) {
+      const s = Math.sqrt(1.0 + m00 - m11 - m22) * 2
+      w = (m21 - m12) / s
+      x = 0.25 * s
+      y = (m01 + m10) / s
+      z = (m02 + m20) / s
+    } else if (m11 > m22) {
+      const s = Math.sqrt(1.0 + m11 - m00 - m22) * 2
+      w = (m02 - m20) / s
+      x = (m01 + m10) / s
+      y = 0.25 * s
+      z = (m12 + m21) / s
+    } else {
+      const s = Math.sqrt(1.0 + m22 - m00 - m11) * 2
+      w = (m10 - m01) / s
+      x = (m02 + m20) / s
+      y = (m12 + m21) / s
+      z = 0.25 * s
+    }
+    const invLen = 1 / Math.hypot(x, y, z, w)
+    return new Quat(x * invLen, y * invLen, z * invLen, w * invLen)
   }
 
   translateInPlace(tx: number, ty: number, tz: number): this {

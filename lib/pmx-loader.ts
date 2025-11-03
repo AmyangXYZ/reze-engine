@@ -1,6 +1,6 @@
 import { Model, Texture, Material, Bone, Skeleton, Skinning } from "./model"
 import { Mat4, Vec3, Quat } from "./math"
-import { Rigidbody, Joint } from "./physics"
+import { Rigidbody, Joint, RigidbodyShape, RigidbodyType } from "./physics"
 
 export class PmxLoader {
   private view: DataView
@@ -109,17 +109,15 @@ export class PmxLoader {
     const weights = new Uint8Array(count * 4) // UNORM8, will be normalized to 255
 
     for (let i = 0; i < count; i++) {
-      // Convert from PMX (left-handed, +Z forward) to engine (right-handed) by negating Z
       const px = this.getFloat32()
       const py = this.getFloat32()
       const pz = this.getFloat32()
-      // Convert PMX (LH, +Z forward) to engine (RH, -Z forward): flip Z only
-      positions.push(px, py, -pz)
+      positions.push(px, py, pz)
 
       const nx = this.getFloat32()
       const ny = this.getFloat32()
       const nz = this.getFloat32()
-      normals.push(nx, ny, -nz)
+      normals.push(nx, ny, nz)
 
       const u = this.getFloat32()
       const v = this.getFloat32()
@@ -202,11 +200,6 @@ export class PmxLoader {
 
     for (let i = 0; i < count; i++) {
       indices.push(this.getIndex(this.vertexIndexSize))
-    }
-
-    // After flipping Z to change handedness, triangle winding is inverted; fix it
-    for (let i = 0; i < indices.length; i += 3) {
-      ;[indices[i + 1], indices[i + 2]] = [indices[i + 2], indices[i + 1]]
     }
 
     return indices
@@ -317,10 +310,10 @@ export class PmxLoader {
       for (let i = 0; i < count; i++) {
         const name = this.getText()
         this.getText() // englishName (skip)
-        // Convert to right-handed space by negating Z
+        // PMX is left-handed, engine is now left-handed - no conversion needed
         const x = this.getFloat32()
         const y = this.getFloat32()
-        const z = -this.getFloat32()
+        const z = this.getFloat32()
         const parentIndex = this.getNonVertexIndex(this.boneIndexSize)
         this.getInt32() // transform order (skip)
         const flags = this.getUint16()
@@ -609,8 +602,8 @@ export class PmxLoader {
             break
           }
 
-          this.getText() // name (skip)
-          this.getText() // englishName (skip)
+          const name = this.getText()
+          const englishName = this.getText()
           const boneIndex = this.getNonVertexIndex(this.boneIndexSize)
           const group = this.getUint8()
           const collisionMask = this.getUint16()
@@ -622,45 +615,40 @@ export class PmxLoader {
           const sizeY = this.getFloat32()
           const sizeZ = this.getFloat32()
 
-          // Position (convert Z for right-handed space)
           const posX = this.getFloat32()
           const posY = this.getFloat32()
-          const posZ = -this.getFloat32()
+          const posZ = this.getFloat32()
 
-          // Skip rotation and physical properties (not needed for collision-only spheres)
-          this.getFloat32() // rotX
-          this.getFloat32() // rotY
-          this.getFloat32() // rotZ
-          this.getFloat32() // mass
-          this.getFloat32() // linearDamping
-          this.getFloat32() // angularDamping
-          this.getFloat32() // restitution
-          this.getFloat32() // friction
-          this.getUint8() // type
+          // Rotation (Euler angles in RADIANS in PMX file - PMX Editor displays them as degrees for convenience)
+          // ZXY order (left-handed system)
+          const rotX = this.getFloat32()
+          const rotY = this.getFloat32()
+          const rotZ = this.getFloat32()
 
-          // Convert all shapes to spheres for collision detection
-          let radius: number
-
-          if (shape === 0) {
-            // Sphere: radius is sizeX (or average of dimensions)
-            radius = sizeX
-          } else if (shape === 1) {
-            // Box: use largest dimension as sphere radius, or average
-            radius = Math.max(sizeX, sizeY, sizeZ) * 0.5
-          } else if (shape === 2) {
-            // Capsule: radius is sizeX, height is sizeY (sizeZ unused)
-            radius = sizeX
-          } else {
-            // Unknown shape: use average
-            radius = (sizeX + sizeY + sizeZ) / 3
-          }
+          // Physical properties
+          const mass = this.getFloat32()
+          const linearDamping = this.getFloat32()
+          const angularDamping = this.getFloat32()
+          const restitution = this.getFloat32()
+          const friction = this.getFloat32()
+          const type = this.getUint8() // 0=static, 1=dynamic, 2=kinematic
 
           this.rigidbodies.push({
+            name,
+            englishName,
             boneIndex,
-            radius,
             group,
             collisionMask,
+            shape: shape as RigidbodyShape,
+            size: new Vec3(sizeX, sizeY, sizeZ),
             position: new Vec3(posX, posY, posZ),
+            rotation: new Vec3(rotX, rotY, rotZ),
+            mass,
+            linearDamping,
+            angularDamping,
+            restitution,
+            friction,
+            type: type as RigidbodyType,
           })
         } catch (e) {
           console.warn(`Error reading rigidbody ${i} of ${count}:`, e)
@@ -709,42 +697,45 @@ export class PmxLoader {
           const rigidbodyIndexA = this.getNonVertexIndex(this.rigidBodyIndexSize)
           const rigidbodyIndexB = this.getNonVertexIndex(this.rigidBodyIndexSize)
 
-          // Position (convert Z for right-handed space)
           const posX = this.getFloat32()
           const posY = this.getFloat32()
-          const posZ = -this.getFloat32()
+          const posZ = this.getFloat32()
 
-          // Rotation (convert Z for right-handed space)
+          // Rotation (Euler angles in RADIANS in PMX file - PMX Editor displays them as degrees for convenience)
+          // ZXY order (left-handed system)
           const rotX = this.getFloat32()
           const rotY = this.getFloat32()
-          const rotZ = -this.getFloat32()
+          const rotZ = this.getFloat32()
 
-          // Position constraints (convert Z and swap min/max since we negated Z)
           const posMinX = this.getFloat32()
           const posMinY = this.getFloat32()
-          const posMinZRaw = this.getFloat32()
+          const posMinZ = this.getFloat32()
 
           const posMaxX = this.getFloat32()
           const posMaxY = this.getFloat32()
-          const posMaxZRaw = this.getFloat32()
+          const posMaxZ = this.getFloat32()
 
-          // Rotation constraints (convert Z and swap min/max since we negated Z)
+          // Rotation constraints (in RADIANS in PMX file)
           const rotMinX = this.getFloat32()
           const rotMinY = this.getFloat32()
-          const rotMinZRaw = this.getFloat32()
+          const rotMinZ = this.getFloat32()
 
           const rotMaxX = this.getFloat32()
           const rotMaxY = this.getFloat32()
-          const rotMaxZRaw = this.getFloat32()
+          const rotMaxZ = this.getFloat32()
 
           // Spring parameters
           const springPosX = this.getFloat32()
           const springPosY = this.getFloat32()
           const springPosZ = this.getFloat32()
 
+          // Spring rotation (in RADIANS in PMX file)
           const springRotX = this.getFloat32()
           const springRotY = this.getFloat32()
           const springRotZ = this.getFloat32()
+
+          // Convert Euler angles to quaternion using ZXY order (left-handed system)
+          const rotQuat = Quat.fromEulerZXY(rotX, rotY, rotZ)
 
           this.joints.push({
             name,
@@ -753,14 +744,14 @@ export class PmxLoader {
             rigidbodyIndexA,
             rigidbodyIndexB,
             position: new Vec3(posX, posY, posZ),
-            rotation: new Quat(rotX, rotY, rotZ, 0), // TODO: Convert Euler to quaternion
-            // Swap min/max for Z since we negated it in coordinate conversion
-            positionMin: new Vec3(posMinX, posMinY, -posMaxZRaw),
-            positionMax: new Vec3(posMaxX, posMaxY, -posMinZRaw),
-            rotationMin: new Quat(rotMinX, rotMinY, -rotMaxZRaw, 0), // TODO: Convert Euler to quaternion
-            rotationMax: new Quat(rotMaxX, rotMaxY, -rotMinZRaw, 0), // TODO: Convert Euler to quaternion
+            rotation: rotQuat,
+            positionMin: new Vec3(posMinX, posMinY, posMinZ),
+            positionMax: new Vec3(posMaxX, posMaxY, posMaxZ),
+            // Convert rotation constraints from Euler to quaternion (left-handed system)
+            rotationMin: Quat.fromEulerZXY(rotMinX, rotMinY, rotMinZ),
+            rotationMax: Quat.fromEulerZXY(rotMaxX, rotMaxY, rotMaxZ),
             springPosition: new Vec3(springPosX, springPosY, springPosZ),
-            springRotation: new Quat(springRotX, springRotY, springRotZ, 0), // TODO: Convert Euler to quaternion
+            springRotation: Quat.fromEulerZXY(springRotX, springRotY, springRotZ),
           })
         } catch (e) {
           console.warn(`Error reading joint ${i} of ${count}:`, e)

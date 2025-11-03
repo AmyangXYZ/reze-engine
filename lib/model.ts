@@ -744,6 +744,9 @@ export class Model {
   // Evaluate world and skin matrices from local TR and bind
   // If deltaTime is provided, also updates spring bone physics
   evaluatePose(deltaTime?: number): void {
+    if (!deltaTime && false) {
+      return
+    }
     // Advance rotation tweens before composing matrices
     this.updateRotationTweens()
 
