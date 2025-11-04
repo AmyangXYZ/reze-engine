@@ -1,5 +1,5 @@
 import { Camera } from "./camera"
-import { Quat, Vec3 } from "./math"
+import { Quat, Vec3, Mat4 } from "./math"
 import { Model } from "./model"
 import { PmxLoader } from "./pmx-loader"
 import { Physics, Rigidbody, RigidbodyType, RigidbodyShape } from "./physics"
@@ -58,7 +58,7 @@ export class Engine {
   private rigidbodyIndexCount: number = 0
   private rigidbodyBindGroup?: GPUBindGroup
   private physics: Physics | null = null
-  private showRigidbodies: boolean = false
+  private showRigidbodies: boolean = true
   private rigidbodyMeshes: Array<{
     baseVertices: Float32Array // Local space vertices (pos3 + color3 + normal3 = 9 floats per vertex)
     indices: Uint32Array
@@ -505,7 +505,8 @@ export class Engine {
 
     this.rigidbodyMeshes = []
     const rigidbodies = this.physics.getRigidbodies()
-    const segments = 4
+    const sphereSegments = 16 // Higher detail for spheres to make them round
+    const capsuleSegments = 16 // Higher detail for capsules to make them smooth
 
     const addLocalVertex = (
       vertices: number[],
@@ -554,9 +555,9 @@ export class Engine {
       const color = this.getRigidbodyColor(rb)
 
       if (rb.shape === RigidbodyShape.Sphere) {
-        const radius = rb.size.x
-        const rings = segments
-        const sectors = segments
+        const radius = rb.size.x / 2
+        const rings = sphereSegments // Use higher detail for smooth spheres
+        const sectors = sphereSegments
 
         for (let i = 0; i < rings; i++) {
           const theta1 = (i / rings) * Math.PI
@@ -742,13 +743,18 @@ export class Engine {
         )
       } else if (rb.shape === RigidbodyShape.Capsule) {
         const radius = rb.size.x
-        const height = rb.size.y
-        const halfHeight = height * 0.5
-        const rings = segments / 2
-        const sectors = segments
+        // Ammo btCapsuleShape uses halfHeight, so the full height is size.y
+        // But we need to match: halfHeight = size.y / 2 (which is what Ammo expects)
+        const halfHeight = rb.size.y / 2
+        const rings = capsuleSegments // Use more rings for smoother hemispheres
+        const sectors = capsuleSegments // Use more sectors for smoother around the axis
 
-        // Top hemisphere
-        for (let i = 0; i < rings / 2; i++) {
+        // Number of rings for each hemisphere (upper and lower half of sphere)
+        const hemisphereRings = Math.ceil(rings / 2)
+
+        // Top hemisphere: generate from theta = 0 (top) to theta = π/2 (equator)
+        // This should cover the upper half of the sphere
+        for (let i = 0; i < hemisphereRings; i++) {
           const theta1 = (i / rings) * Math.PI
           const theta2 = ((i + 1) / rings) * Math.PI
           const sinT1 = Math.sin(theta1)
@@ -860,8 +866,9 @@ export class Engine {
           )
         }
 
-        // Bottom hemisphere
-        for (let i = rings / 2; i < rings; i++) {
+        // Bottom hemisphere: generate from theta = π/2 (equator) to theta = π (bottom)
+        // This should cover the lower half of the sphere
+        for (let i = hemisphereRings; i < rings; i++) {
           const theta1 = (i / rings) * Math.PI
           const theta2 = ((i + 1) / rings) * Math.PI
           const sinT1 = Math.sin(theta1)
@@ -967,7 +974,115 @@ export class Engine {
         })
         this.device.queue.writeBuffer(this.rigidbodyIndexBuffer, 0, indexData)
       }
+
+      // Create vertex buffer for transformed vertices
+      const totalVertices = this.rigidbodyMeshes.reduce((sum, mesh) => sum + mesh.baseVertices.length / 9, 0)
+      const vertexDataSize = totalVertices * 9 * 4 // 9 floats per vertex, 4 bytes per float
+      if (!this.rigidbodyVertexBuffer || this.rigidbodyVertexBuffer.size < vertexDataSize) {
+        if (this.rigidbodyVertexBuffer) {
+          this.rigidbodyVertexBuffer.destroy()
+        }
+        this.rigidbodyVertexBuffer = this.device.createBuffer({
+          label: "rigidbody visualization vertices",
+          size: vertexDataSize,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        })
+      }
+
+      // Initial transform update to populate the buffer
+      this.updateRigidbodyTransforms()
     }
+  }
+
+  // Update transforms each frame (transforms cached base vertices)
+  // Optimized: pre-allocates arrays and uses direct writes instead of push
+  private updateRigidbodyTransforms() {
+    if (!this.physics || this.rigidbodyMeshes.length === 0 || !this.rigidbodyVertexBuffer) return
+
+    const transforms = this.physics.getRigidbodyTransforms()
+
+    // Calculate total vertex count for pre-allocation
+    let totalVertexCount = 0
+    for (const mesh of this.rigidbodyMeshes) {
+      totalVertexCount += mesh.baseVertices.length / 9
+    }
+
+    if (totalVertexCount === 0) return
+
+    // Pre-allocate Float32Array for better performance
+    const vertexData = new Float32Array(totalVertexCount * 9)
+    let vertexOffset = 0
+
+    for (let meshIdx = 0; meshIdx < this.rigidbodyMeshes.length; meshIdx++) {
+      const defIdx = this.rigidbodyMeshIndexMap[meshIdx]
+      if (defIdx >= transforms.length) continue
+
+      const transform = transforms[defIdx]
+      const mesh = this.rigidbodyMeshes[meshIdx]
+      const baseVertices = mesh.baseVertices
+      const color = mesh.color
+
+      // Compute rotation matrix once per rigidbody
+      const rotMat = Mat4.fromQuat(
+        transform.rotation.x,
+        transform.rotation.y,
+        transform.rotation.z,
+        transform.rotation.w
+      )
+      const m = rotMat.values
+      const cx = transform.position.x
+      const cy = transform.position.y
+      const cz = transform.position.z
+
+      // Transform each vertex - use direct array writes for better performance
+      for (let j = 0; j < baseVertices.length; j += 9) {
+        const px = baseVertices[j]
+        const py = baseVertices[j + 1]
+        const pz = baseVertices[j + 2]
+        const nx = baseVertices[j + 6]
+        const ny = baseVertices[j + 7]
+        const nz = baseVertices[j + 8]
+
+        // Transform position
+        const wx = m[0] * px + m[4] * py + m[8] * pz + cx
+        const wy = m[1] * px + m[5] * py + m[9] * pz + cy
+        const wz = m[2] * px + m[6] * py + m[10] * pz + cz
+
+        // Transform normal (use 3x3 rotation part only)
+        const tnx = m[0] * nx + m[4] * ny + m[8] * nz
+        const tny = m[1] * nx + m[5] * ny + m[9] * nz
+        const tnz = m[2] * nx + m[6] * ny + m[10] * nz
+
+        // Normalize normal (optimized: avoid sqrt when possible)
+        const lenSq = tnx * tnx + tny * tny + tnz * tnz
+        if (lenSq > 0) {
+          const invLen = 1 / Math.sqrt(lenSq)
+          vertexData[vertexOffset++] = wx
+          vertexData[vertexOffset++] = wy
+          vertexData[vertexOffset++] = wz
+          vertexData[vertexOffset++] = color[0]
+          vertexData[vertexOffset++] = color[1]
+          vertexData[vertexOffset++] = color[2]
+          vertexData[vertexOffset++] = tnx * invLen
+          vertexData[vertexOffset++] = tny * invLen
+          vertexData[vertexOffset++] = tnz * invLen
+        } else {
+          // Fallback for zero-length normals
+          vertexData[vertexOffset++] = wx
+          vertexData[vertexOffset++] = wy
+          vertexData[vertexOffset++] = wz
+          vertexData[vertexOffset++] = color[0]
+          vertexData[vertexOffset++] = color[1]
+          vertexData[vertexOffset++] = color[2]
+          vertexData[vertexOffset++] = nx
+          vertexData[vertexOffset++] = ny
+          vertexData[vertexOffset++] = nz
+        }
+      }
+    }
+
+    this.rigidbodyVertexCount = totalVertexCount
+    this.device.queue.writeBuffer(this.rigidbodyVertexBuffer, 0, vertexData)
   }
 
   private initResizeObserver() {
@@ -1142,14 +1257,19 @@ export class Engine {
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
-    model.rotateBones(
-      ["腰", "左腕", "左足"],
-      [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
-      2000
-    )
+    console.log(new Quat(-0.5, -0.3, 0, 1).toArray())
+    // model.rotateBones(
+    //   ["腰", "左腕", "左足"],
+    //   [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
+    //   2000
+    // )
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
-    this.physics = null
     await this.drawModel(model)
+
+    // Build rigidbody visualization meshes if rigidbodies exist
+    if (this.physics.getRigidbodies().length > 0) {
+      this.buildRigidbodyBaseMeshes()
+    }
   }
 
   private async drawModel(model: Model) {
@@ -1506,6 +1626,11 @@ export class Engine {
         // Recompute skin matrices from the (potentially modified) world matrices
         // This is more efficient than re-evaluating the entire pose
         this.currentModel.updateSkinMatrices()
+
+        // Update rigidbody visualization if enabled
+        if (this.showRigidbodies) {
+          this.updateRigidbodyTransforms()
+        }
       }
 
       // Update skin matrices buffer after all pose evaluation is complete

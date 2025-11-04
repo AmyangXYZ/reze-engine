@@ -57,7 +57,7 @@ export class Physics {
   private rigidbodies: Rigidbody[]
   private joints: Joint[]
   // Gravity acceleration vector (cm/s²) - Default to MMD-style gravity
-  private gravity: Vec3 = new Vec3(0, -980, 0)
+  private gravity: Vec3 = new Vec3(0, -98, 0)
   // Track if Ammo has been initialized
   private ammoInitialized = false
   private ammoPromise: Promise<AmmoInstance> | null = null
@@ -75,6 +75,8 @@ export class Physics {
   private jointsCreated = false
   // Track if this is the first frame (needed to reposition bodies before creating joints)
   private firstFrame = true
+  // Force disable offset for constraint frame (MMD compatibility - Bullet 2.75 behavior)
+  private forceDisableOffsetForConstraintFrame = true
 
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
@@ -96,7 +98,7 @@ export class Physics {
     }
   }
 
-  // Set gravity acceleration (default: -980 cm/s² on Y axis for MMD-style physics)
+  // Set gravity acceleration (default: -98 cm/s² on Y axis for MMD-style physics)
   setGravity(gravity: Vec3): void {
     this.gravity = gravity
     if (this.dynamicsWorld && this.ammo) {
@@ -117,6 +119,56 @@ export class Physics {
 
   getJoints(): Joint[] {
     return this.joints
+  }
+
+  // Get current world transforms from Ammo bodies for visualization
+  // Returns array of {position: Vec3, rotation: Quat} for each rigidbody
+  getRigidbodyTransforms(): Array<{ position: Vec3; rotation: Quat }> {
+    const transforms: Array<{ position: Vec3; rotation: Quat }> = []
+
+    if (!this.ammo || !this.ammoRigidbodies.length) {
+      // Return empty transforms if Ammo not initialized
+      for (let i = 0; i < this.rigidbodies.length; i++) {
+        transforms.push({
+          position: new Vec3(
+            this.rigidbodies[i].shapePosition.x,
+            this.rigidbodies[i].shapePosition.y,
+            this.rigidbodies[i].shapePosition.z
+          ),
+          rotation: Quat.fromEuler(
+            this.rigidbodies[i].shapeRotation.x,
+            this.rigidbodies[i].shapeRotation.y,
+            this.rigidbodies[i].shapeRotation.z
+          ),
+        })
+      }
+      return transforms
+    }
+
+    for (let i = 0; i < this.ammoRigidbodies.length; i++) {
+      const ammoBody = this.ammoRigidbodies[i]
+      if (!ammoBody) {
+        // Fallback to shape position/rotation if body doesn't exist
+        const rb = this.rigidbodies[i]
+        transforms.push({
+          position: new Vec3(rb.shapePosition.x, rb.shapePosition.y, rb.shapePosition.z),
+          rotation: Quat.fromEuler(rb.shapeRotation.x, rb.shapeRotation.y, rb.shapeRotation.z),
+        })
+        continue
+      }
+
+      // Get current world transform from Ammo body
+      const transform = ammoBody.getWorldTransform()
+      const origin = transform.getOrigin()
+      const rotQuat = transform.getRotation()
+
+      transforms.push({
+        position: new Vec3(origin.x(), origin.y(), origin.z()),
+        rotation: new Quat(rotQuat.x(), rotQuat.y(), rotQuat.z(), rotQuat.w()),
+      })
+    }
+
+    return transforms
   }
 
   // Create Ammo physics world and rigidbodies
@@ -169,25 +221,25 @@ export class Physics {
       switch (rb.shape) {
         case RigidbodyShape.Sphere:
           // Use the largest dimension as radius
-          const radius = Math.max(size.x, size.y, size.z)
+          const radius = size.x / 4
           shape = new Ammo.btSphereShape(radius)
           break
         case RigidbodyShape.Box:
           // btBoxShape expects half extents
           // PMX size values are already in the correct format
-          const halfExtents = new Ammo.btVector3(size.x, size.y, size.z)
+          const halfExtents = new Ammo.btVector3(size.x / 2, size.y / 2, size.z / 2)
           shape = new Ammo.btBoxShape(halfExtents)
           Ammo.destroy(halfExtents)
           break
         case RigidbodyShape.Capsule:
           // Capsule: radius = max(x, z), height = y
-          const capsuleRadius = Math.max(size.x, size.z)
-          const capsuleHeight = size.y
+          const capsuleRadius = size.x / 4
+          const capsuleHeight = size.y / 2
           shape = new Ammo.btCapsuleShape(capsuleRadius, capsuleHeight)
           break
         default:
           // Default to box
-          const defaultHalfExtents = new Ammo.btVector3(size.x, size.y, size.z)
+          const defaultHalfExtents = new Ammo.btVector3(size.x / 2, size.y / 2, size.z / 2)
           shape = new Ammo.btBoxShape(defaultHalfExtents)
           Ammo.destroy(defaultHalfExtents)
           break
@@ -378,13 +430,35 @@ export class Physics {
 
       // Use btGeneric6DofSpringConstraint for spring support
       // useLinearReferenceFrameA = true (matches reference code)
-      const constraint = new Ammo.btGeneric6DofSpringConstraint(bodyA, bodyB, frameInA, frameInB, true)
+      const useLinearReferenceFrameA = true
+      const constraint = new Ammo.btGeneric6DofSpringConstraint(
+        bodyA,
+        bodyB,
+        frameInA,
+        frameInB,
+        useLinearReferenceFrameA
+      )
 
       // CRITICAL: Disable offset for constraint frame for MMD compatibility
       // The reference code sets m_useOffsetForConstraintFrame = false via heap manipulation
       // This is needed to match MMD physics behavior (Bullet 2.75 style)
-      // We'll try to access this via Ammo API if available, otherwise we may need heap manipulation
-      // For now, the constraint should work, but MMD compatibility may require this setting
+      // Bullet 2.75 didn't have m_useOffsetForConstraintFrame, Bullet 2.76+ added it
+      // Setting it to false restores Bullet 2.75 behavior for MMD compatibility
+      if (this.forceDisableOffsetForConstraintFrame) {
+        // Get pointer to the constraint object
+        // In Ammo.js (Emscripten), objects have a 'ptr' property
+        const constraintWithPtr = constraint as { ptr?: number }
+        const jointPtr = constraintWithPtr.ptr
+
+        if (jointPtr && Ammo.HEAP8) {
+          const heap8 = Ammo.HEAP8 as Uint8Array
+          // Check bullet binary layout - verify m_useLinearReferenceFrameA matches what we set
+          if (heap8[jointPtr + 1300] === (useLinearReferenceFrameA ? 1 : 0) && heap8[jointPtr + 1301] === 1) {
+            // ptr + 1301 = m_useOffsetForConstraintFrame
+            heap8[jointPtr + 1301] = 0 // m_useOffsetForConstraintFrame = false
+          }
+        }
+      }
 
       // Set ERP parameter (like reference code)
       for (let i = 0; i < 6; ++i) {
