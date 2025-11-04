@@ -1257,15 +1257,13 @@ export class Engine {
     this.modelDir = dir.endsWith("/") ? dir : dir + "/"
     const url = this.modelDir + fileName
     const model = await PmxLoader.load(url)
-    console.log(new Quat(-0.5, -0.3, 0, 1).toArray())
-    // model.rotateBones(
-    //   ["腰", "左腕", "左足"],
-    //   [new Quat(-0.5, -0.3, 0, 1), new Quat(-0.3, 0.3, -0.3, 1), new Quat(-0.3, -0.3, 0.3, 1)],
-    //   2000
-    // )
+
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.drawModel(model)
 
+    setTimeout(() => {
+      model.rotateBones(["腰"], [new Quat(-0.0, 0, 0, 1)], 1000)
+    }, 1000)
     // Build rigidbody visualization meshes if rigidbodies exist
     if (this.physics.getRigidbodies().length > 0) {
       this.buildRigidbodyBaseMeshes()

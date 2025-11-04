@@ -221,21 +221,24 @@ export class Physics {
       switch (rb.shape) {
         case RigidbodyShape.Sphere:
           // Use the largest dimension as radius
-          const radius = size.x / 4
+          const radius = size.x
           shape = new Ammo.btSphereShape(radius)
           break
         case RigidbodyShape.Box:
           // btBoxShape expects half extents
           // PMX size values are already in the correct format
-          const halfExtents = new Ammo.btVector3(size.x / 2, size.y / 2, size.z / 2)
-          shape = new Ammo.btBoxShape(halfExtents)
-          Ammo.destroy(halfExtents)
+          const sizeVector = new Ammo.btVector3(size.x, size.y, size.z)
+          shape = new Ammo.btBoxShape(sizeVector)
+          Ammo.destroy(sizeVector)
           break
         case RigidbodyShape.Capsule:
-          // Capsule: radius = max(x, z), height = y
-          const capsuleRadius = size.x / 4
-          const capsuleHeight = size.y / 2
-          shape = new Ammo.btCapsuleShape(capsuleRadius, capsuleHeight)
+          // Reference code: x = shapeSize[0] * scalingFactor, y = shapeSize[1] / 2 * scalingFactor + x (for bounding box)
+          // PMX format: shapeSize[0] = radius, shapeSize[1] = full cylinder height
+          // btCapsuleShape(radius, halfHeight) expects halfHeight = half the cylinder height
+          // Visualization uses: radius = size.x, halfHeight = size.y / 2
+          const capsuleRadius = size.x
+          const capsuleHalfHeight = size.y
+          shape = new Ammo.btCapsuleShape(capsuleRadius, capsuleHalfHeight)
           break
         default:
           // Default to box
@@ -316,18 +319,20 @@ export class Physics {
 
       // Set collision groups and masks
       // PMX stores group as an index (0-15), convert to bit flag like reference code
+      // Reference code: group: 1 << rigidBody.collisionGroup, mask: rigidBody.collisionMask
       // collisionMask is already a bitmask in PMX
       const collisionGroup = 1 << rb.group
-      body.getBroadphaseProxy().set_m_collisionFilterGroup(collisionGroup)
-      body.getBroadphaseProxy().set_m_collisionFilterMask(rb.collisionMask)
+      const collisionMask = rb.collisionMask
 
       // Set CF_NO_CONTACT_RESPONSE if collision mask is 0 (like reference code)
-      if (rb.collisionMask === 0) {
+      if (collisionMask === 0) {
         body.setCollisionFlags(body.getCollisionFlags() | 4) // CF_NO_CONTACT_RESPONSE
       }
 
-      // Add to world
-      this.dynamicsWorld.addRigidBody(body)
+      // Add to world with collision group and mask
+      // In Ammo.js/Bullet, addRigidBody(body, group, mask) sets collision filters
+      // This matches the reference code which passes group/mask to PhysicsImpostor
+      this.dynamicsWorld.addRigidBody(body, collisionGroup, collisionMask)
 
       // Store reference
       this.ammoRigidbodies.push(body)
@@ -446,13 +451,22 @@ export class Physics {
       // Setting it to false restores Bullet 2.75 behavior for MMD compatibility
       if (this.forceDisableOffsetForConstraintFrame) {
         // Get pointer to the constraint object
-        // In Ammo.js (Emscripten), objects have a 'ptr' property
-        const constraintWithPtr = constraint as { ptr?: number }
-        const jointPtr = constraintWithPtr.ptr
+        // Reference code uses: this.bjsAMMO.getPointer(joint)
+        // Try getPointer method first, fallback to ptr property if it exists
+        let jointPtr: number | undefined
+        if (typeof Ammo.getPointer === "function") {
+          jointPtr = Ammo.getPointer(constraint)
+        } else {
+          // Fallback: try accessing ptr property directly
+          const constraintWithPtr = constraint as { ptr?: number }
+          jointPtr = constraintWithPtr.ptr
+        }
 
-        if (jointPtr && Ammo.HEAP8) {
+        if (jointPtr !== undefined && Ammo.HEAP8) {
           const heap8 = Ammo.HEAP8 as Uint8Array
           // Check bullet binary layout - verify m_useLinearReferenceFrameA matches what we set
+          // jointPtr + 1300 = m_useLinearReferenceFrameA
+          // jointPtr + 1301 = m_useOffsetForConstraintFrame
           if (heap8[jointPtr + 1300] === (useLinearReferenceFrameA ? 1 : 0) && heap8[jointPtr + 1301] === 1) {
             // ptr + 1301 = m_useOffsetForConstraintFrame
             heap8[jointPtr + 1301] = 0 // m_useOffsetForConstraintFrame = false
