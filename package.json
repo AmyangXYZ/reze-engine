@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@fred3d/ammo": "^1.0.0",
     "@radix-ui/react-slot": "^1.2.3",
     "@webgpu/types": "^0.1.66",
     "class-variance-authority": "^0.7.1",

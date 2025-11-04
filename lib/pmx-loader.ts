@@ -1,5 +1,5 @@
 import { Model, Texture, Material, Bone, Skeleton, Skinning } from "./model"
-import { Mat4, Vec3, Quat } from "./math"
+import { Mat4, Vec3 } from "./math"
 import { Rigidbody, Joint, RigidbodyShape, RigidbodyType } from "./physics"
 
 export class PmxLoader {
@@ -629,9 +629,6 @@ export class PmxLoader {
           const friction = this.getFloat32()
           const type = this.getUint8() // 0=static, 1=dynamic, 2=kinematic
 
-          const initialRot = Quat.fromEuler(rotX, rotY, rotZ)
-          const initialPos = new Vec3(posX, posY, posZ)
-          const initialTransform = Mat4.fromPositionRotation(initialPos, initialRot)
           this.rigidbodies.push({
             name,
             englishName,
@@ -640,15 +637,15 @@ export class PmxLoader {
             collisionMask,
             shape: shape as RigidbodyShape,
             size: new Vec3(sizeX, sizeY, sizeZ),
-            position: initialPos,
-            rotation: initialRot,
+            shapePosition: new Vec3(posX, posY, posZ),
+            shapeRotation: new Vec3(rotX, rotY, rotZ),
             mass,
             linearDamping,
             angularDamping,
             restitution,
             friction,
             type: type as RigidbodyType,
-            initialTransform,
+            bodyOffsetMatrixInverse: Mat4.identity(),
           })
         } catch (e) {
           console.warn(`Error reading rigidbody ${i} of ${count}:`, e)
@@ -660,7 +657,6 @@ export class PmxLoader {
       console.warn("Error parsing rigidbodies:", e)
       this.rigidbodies = []
     }
-    console.log("Rigidbodies parsed:", this.rigidbodies)
   }
 
   private parseJoints(): void {
@@ -729,33 +725,26 @@ export class PmxLoader {
           const springPosY = this.getFloat32()
           const springPosZ = this.getFloat32()
 
-          // Spring rotation (in RADIANS in PMX file)
+          // Spring rotation (stiffness values in PMX file)
           const springRotX = this.getFloat32()
           const springRotY = this.getFloat32()
           const springRotZ = this.getFloat32()
 
-          // Convert Euler angles to quaternion using ZXY order (left-handed system)
-          const rotQuat = Quat.fromEuler(rotX, rotY, rotZ)
-          const initialPos = new Vec3(posX, posY, posZ)
-          const initialRot = rotQuat
-          const initialTransform = Mat4.fromPositionRotation(initialPos, initialRot)
-
+          // Store rotations and springs as Vec3 (Euler angles), not Quat
           this.joints.push({
             name,
             englishName,
             type,
             rigidbodyIndexA,
             rigidbodyIndexB,
-            position: initialPos.clone(),
-            rotation: initialRot.clone(),
+            position: new Vec3(posX, posY, posZ),
+            rotation: new Vec3(rotX, rotY, rotZ), // Store as Vec3 (Euler angles)
             positionMin: new Vec3(posMinX, posMinY, posMinZ),
             positionMax: new Vec3(posMaxX, posMaxY, posMaxZ),
-            // Convert rotation constraints from Euler to quaternion (left-handed system)
-            rotationMin: Quat.fromEuler(rotMinX, rotMinY, rotMinZ),
-            rotationMax: Quat.fromEuler(rotMaxX, rotMaxY, rotMaxZ),
+            rotationMin: new Vec3(rotMinX, rotMinY, rotMinZ), // Store as Vec3 (Euler angles)
+            rotationMax: new Vec3(rotMaxX, rotMaxY, rotMaxZ), // Store as Vec3 (Euler angles)
             springPosition: new Vec3(springPosX, springPosY, springPosZ),
-            springRotation: Quat.fromEuler(springRotX, springRotY, springRotZ),
-            initialTransform,
+            springRotation: new Vec3(springRotX, springRotY, springRotZ), // Store as Vec3 (stiffness values)
           })
         } catch (e) {
           console.warn(`Error reading joint ${i} of ${count}:`, e)
@@ -767,7 +756,6 @@ export class PmxLoader {
       console.warn("Error parsing joints:", e)
       this.joints = []
     }
-    console.log("Joints parsed:", this.joints)
   }
 
   private computeInverseBind() {

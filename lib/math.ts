@@ -163,6 +163,31 @@ export class Quat {
 
     return new Quat(x, y, z, w).normalize()
   }
+
+  // Convert quaternion to Euler angles (ZXY order, inverse of fromEuler)
+  toEuler(): Vec3 {
+    const qx = this.x
+    const qy = this.y
+    const qz = this.z
+    const qw = this.w
+
+    // ZXY order (left-handed)
+    // Roll (X): rotation around X axis
+    const sinr_cosp = 2 * (qw * qx + qy * qz)
+    const cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+    const rotX = Math.atan2(sinr_cosp, cosr_cosp)
+
+    // Pitch (Y): rotation around Y axis
+    const sinp = 2 * (qw * qy - qz * qx)
+    const rotY = Math.abs(sinp) >= 1 ? (sinp >= 0 ? Math.PI / 2 : -Math.PI / 2) : Math.asin(sinp)
+
+    // Yaw (Z): rotation around Z axis
+    const siny_cosp = 2 * (qw * qz + qx * qy)
+    const cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+    const rotZ = Math.atan2(siny_cosp, cosy_cosp)
+
+    return new Vec3(rotX, rotY, rotZ)
+  }
 }
 
 export class Mat4 {
@@ -358,36 +383,70 @@ export class Mat4 {
     return this
   }
 
-  // Invert a transform matrix (rotation + translation)
-  // For a matrix M = [R|t] (rotation R and translation t), the inverse is [R^T|-R^T*t]
+  // Full 4x4 matrix inverse using adjugate method
+  // This works for any invertible matrix, not just orthonormal transforms
+  // The previous implementation assumed orthonormal rotation matrices, which fails
+  // when matrices have scaling or are not perfectly orthonormal (e.g., after
+  // bone hierarchy transformations)
   inverse(): Mat4 {
     const m = this.values
-    // Extract rotation part (upper-left 3x3) - transpose for inverse rotation
-    // Extract translation part (last column, first 3 elements)
-    const tx = m[12]
-    const ty = m[13]
-    const tz = m[14]
-
-    // Transpose rotation (inverse for rotation matrices)
     const out = new Float32Array(16)
-    out[0] = m[0]
-    out[1] = m[4]
-    out[2] = m[8]
-    out[3] = 0
-    out[4] = m[1]
-    out[5] = m[5]
-    out[6] = m[9]
-    out[7] = 0
-    out[8] = m[2]
-    out[9] = m[6]
-    out[10] = m[10]
-    out[11] = 0
 
-    // Invert translation: -R^T * t
-    out[12] = -(out[0] * tx + out[4] * ty + out[8] * tz)
-    out[13] = -(out[1] * tx + out[5] * ty + out[9] * tz)
-    out[14] = -(out[2] * tx + out[6] * ty + out[10] * tz)
-    out[15] = 1
+    const a00 = m[0],
+      a01 = m[1],
+      a02 = m[2],
+      a03 = m[3]
+    const a10 = m[4],
+      a11 = m[5],
+      a12 = m[6],
+      a13 = m[7]
+    const a20 = m[8],
+      a21 = m[9],
+      a22 = m[10],
+      a23 = m[11]
+    const a30 = m[12],
+      a31 = m[13],
+      a32 = m[14],
+      a33 = m[15]
+
+    const b00 = a00 * a11 - a01 * a10
+    const b01 = a00 * a12 - a02 * a10
+    const b02 = a00 * a13 - a03 * a10
+    const b03 = a01 * a12 - a02 * a11
+    const b04 = a01 * a13 - a03 * a11
+    const b05 = a02 * a13 - a03 * a12
+    const b06 = a20 * a31 - a21 * a30
+    const b07 = a20 * a32 - a22 * a30
+    const b08 = a20 * a33 - a23 * a30
+    const b09 = a21 * a32 - a22 * a31
+    const b10 = a21 * a33 - a23 * a31
+    const b11 = a22 * a33 - a23 * a32
+
+    let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06
+
+    if (Math.abs(det) < 1e-10) {
+      console.warn("Matrix is not invertible (determinant near zero)")
+      return Mat4.identity()
+    }
+
+    det = 1.0 / det
+
+    out[0] = (a11 * b11 - a12 * b10 + a13 * b09) * det
+    out[1] = (a02 * b10 - a01 * b11 - a03 * b09) * det
+    out[2] = (a31 * b05 - a32 * b04 + a33 * b03) * det
+    out[3] = (a22 * b04 - a21 * b05 - a23 * b03) * det
+    out[4] = (a12 * b08 - a10 * b11 - a13 * b07) * det
+    out[5] = (a00 * b11 - a02 * b08 + a03 * b07) * det
+    out[6] = (a32 * b02 - a30 * b05 - a33 * b01) * det
+    out[7] = (a20 * b05 - a22 * b02 + a23 * b01) * det
+    out[8] = (a10 * b10 - a11 * b08 + a13 * b06) * det
+    out[9] = (a01 * b08 - a00 * b10 - a03 * b06) * det
+    out[10] = (a30 * b04 - a31 * b02 + a33 * b00) * det
+    out[11] = (a21 * b02 - a20 * b04 - a23 * b00) * det
+    out[12] = (a11 * b07 - a10 * b09 - a12 * b06) * det
+    out[13] = (a00 * b09 - a01 * b07 + a02 * b06) * det
+    out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det
+    out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det
 
     return new Mat4(out)
   }
