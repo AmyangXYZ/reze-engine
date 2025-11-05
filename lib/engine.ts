@@ -1262,8 +1262,11 @@ export class Engine {
     await this.drawModel(model)
 
     setTimeout(() => {
-      model.rotateBones(["腰"], [new Quat(-0.0, 0, 0, 1)], 1000)
+      model.rotateBones(["腰"], [new Quat(-0.7, -0.0, 0, 1)], 500)
     }, 1000)
+    setTimeout(() => {
+      model.rotateBones(["腰"], [new Quat(-0.0, 0.0, 0, 1)], 500)
+    }, 2000)
     // Build rigidbody visualization meshes if rigidbodies exist
     if (this.physics.getRigidbodies().length > 0) {
       this.buildRigidbodyBaseMeshes()

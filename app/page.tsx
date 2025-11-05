@@ -25,7 +25,7 @@ export default function Home() {
         const engine = new Engine(canvasRef.current)
         engineRef.current = engine
         await engine.init()
-        await engine.loadPmx("/models/梵天/", "梵天-o.pmx")
+        await engine.loadPmx("/models/梵天/", "梵天.pmx")
 
         engine.runRenderLoop(() => {
           setStats(engine.getStats())
