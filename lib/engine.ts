@@ -56,6 +56,7 @@ export class Engine {
   private lastFpsUpdate = performance.now()
   private framesSinceLastUpdate = 0
   private frameTimeSamples: number[] = []
+  private frameTimeSum: number = 0 // Running sum for faster average calculation
   private drawCallCount: number = 0 // Per-frame draw call counter
   private lastFrameTime = performance.now() // For spring bone deltaTime calculation
   private stats: EngineStats = {
@@ -970,10 +971,12 @@ export class Engine {
     // Update frame time (smoothed average over last 60 frames)
     const maxSamples = 60
     this.frameTimeSamples.push(frameTime)
+    this.frameTimeSum += frameTime
     if (this.frameTimeSamples.length > maxSamples) {
-      this.frameTimeSamples.shift()
+      const removed = this.frameTimeSamples.shift()!
+      this.frameTimeSum -= removed
     }
-    const avgFrameTime = this.frameTimeSamples.reduce((a, b) => a + b, 0) / this.frameTimeSamples.length
+    const avgFrameTime = this.frameTimeSum / this.frameTimeSamples.length
     this.stats.frameTime = Math.round(avgFrameTime * 100) / 100
 
     const now = performance.now()

@@ -31,6 +31,7 @@ export interface Rigidbody {
   friction: number
   type: RigidbodyType
   bodyOffsetMatrixInverse: Mat4 // Inverse of body offset matrix, used to sync rigidbody to bone
+  bodyOffsetMatrix?: Mat4 // Cached non-inverse for performance (computed once during initialization)
 }
 
 export interface Joint {
@@ -66,6 +67,8 @@ export class Physics {
   private jointsCreated = false // Joints delayed until after rigidbodies are positioned
   private firstFrame = true // Needed to reposition bodies before creating joints
   private forceDisableOffsetForConstraintFrame = true // MMD compatibility (Bullet 2.75 behavior)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private zeroVector: any = null // Cached zero vector for velocity clearing
 
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
@@ -520,8 +523,10 @@ export class Physics {
         // shapeLocal = boneInverseBind × shapeWorldBind (not shapeWorldBind × boneInverseBind)
         const bodyOffsetMatrix = invBindMat.multiply(shapeWorldBind)
         rb.bodyOffsetMatrixInverse = bodyOffsetMatrix.inverse()
+        rb.bodyOffsetMatrix = bodyOffsetMatrix // Cache non-inverse to avoid expensive inverse() calls
       } else {
         rb.bodyOffsetMatrixInverse = Mat4.identity()
+        rb.bodyOffsetMatrix = Mat4.identity() // Cache non-inverse
       }
     }
   }
@@ -543,7 +548,7 @@ export class Physics {
       const boneWorldMat = new Mat4(boneWorldMatrices.subarray(worldMatIdx, worldMatIdx + 16))
 
       // nodeWorld = boneWorld × shapeLocal (not shapeLocal × boneWorld)
-      const bodyOffsetMatrix = rb.bodyOffsetMatrixInverse.inverse()
+      const bodyOffsetMatrix = rb.bodyOffsetMatrix || rb.bodyOffsetMatrixInverse.inverse()
       const nodeWorldMatrix = boneWorldMat.multiply(bodyOffsetMatrix)
 
       const worldPos = nodeWorldMatrix.getPosition()
@@ -564,13 +569,14 @@ export class Physics {
       ammoBody.setWorldTransform(transform)
       ammoBody.getMotionState().setWorldTransform(transform)
 
-      const zeroVec = new Ammo.btVector3(0, 0, 0)
-      ammoBody.setLinearVelocity(zeroVec)
-      ammoBody.setAngularVelocity(zeroVec)
+      if (!this.zeroVector) {
+        this.zeroVector = new Ammo.btVector3(0, 0, 0)
+      }
+      ammoBody.setLinearVelocity(this.zeroVector)
+      ammoBody.setAngularVelocity(this.zeroVector)
 
       Ammo.destroy(pos)
       Ammo.destroy(quat)
-      Ammo.destroy(zeroVec)
       Ammo.destroy(transform)
     }
   }
@@ -602,7 +608,7 @@ export class Physics {
         const boneWorldMat = new Mat4(boneWorldMatrices.subarray(worldMatIdx, worldMatIdx + 16))
 
         // nodeWorld = boneWorld × shapeLocal (not shapeLocal × boneWorld)
-        const bodyOffsetMatrix = rb.bodyOffsetMatrixInverse.inverse()
+        const bodyOffsetMatrix = rb.bodyOffsetMatrix || rb.bodyOffsetMatrixInverse.inverse()
         const nodeWorldMatrix = boneWorldMat.multiply(bodyOffsetMatrix)
 
         const worldPos = nodeWorldMatrix.getPosition()
@@ -618,13 +624,14 @@ export class Physics {
         ammoBody.setWorldTransform(transform)
         ammoBody.getMotionState().setWorldTransform(transform)
 
-        const zeroVec = new Ammo.btVector3(0, 0, 0)
-        ammoBody.setLinearVelocity(zeroVec)
-        ammoBody.setAngularVelocity(zeroVec)
+        if (!this.zeroVector) {
+          this.zeroVector = new Ammo.btVector3(0, 0, 0)
+        }
+        ammoBody.setLinearVelocity(this.zeroVector)
+        ammoBody.setAngularVelocity(this.zeroVector)
 
         Ammo.destroy(pos)
         Ammo.destroy(quat)
-        Ammo.destroy(zeroVec)
         Ammo.destroy(transform)
       }
     }

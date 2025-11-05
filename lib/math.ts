@@ -278,6 +278,32 @@ export class Mat4 {
     return new Mat4(out)
   }
 
+  // Static method to multiply two matrix array segments directly into output array (no object creation)
+  // Column-major multiplication: result = a * b
+  static multiplyArrays(
+    a: Float32Array,
+    aOffset: number,
+    b: Float32Array,
+    bOffset: number,
+    out: Float32Array,
+    outOffset: number
+  ): void {
+    for (let c = 0; c < 4; c++) {
+      const b0 = b[bOffset + c * 4 + 0]
+      const b1 = b[bOffset + c * 4 + 1]
+      const b2 = b[bOffset + c * 4 + 2]
+      const b3 = b[bOffset + c * 4 + 3]
+      out[outOffset + c * 4 + 0] =
+        a[aOffset + 0] * b0 + a[aOffset + 4] * b1 + a[aOffset + 8] * b2 + a[aOffset + 12] * b3
+      out[outOffset + c * 4 + 1] =
+        a[aOffset + 1] * b0 + a[aOffset + 5] * b1 + a[aOffset + 9] * b2 + a[aOffset + 13] * b3
+      out[outOffset + c * 4 + 2] =
+        a[aOffset + 2] * b0 + a[aOffset + 6] * b1 + a[aOffset + 10] * b2 + a[aOffset + 14] * b3
+      out[outOffset + c * 4 + 3] =
+        a[aOffset + 3] * b0 + a[aOffset + 7] * b1 + a[aOffset + 11] * b2 + a[aOffset + 15] * b3
+    }
+  }
+
   clone(): Mat4 {
     return new Mat4(this.values.slice())
   }

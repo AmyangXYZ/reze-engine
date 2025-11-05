@@ -693,13 +693,12 @@ export class Model {
     const worldBuf = this.runtimeSkeleton.worldMatrices
     const skinBuf = this.runtimeSkeleton.skinMatrices
 
-    // Compute skin matrices from world and inverse bind matrices
+    // Compute skin matrices from world and inverse bind matrices (direct array multiplication for performance)
     for (let i = 0; i < bones.length; i++) {
-      const worldSeg = worldBuf.subarray(i * 16, i * 16 + 16)
-      const invSeg = invBind.subarray(i * 16, i * 16 + 16)
-      const skinSeg = skinBuf.subarray(i * 16, i * 16 + 16)
-      const skinM = new Mat4(worldSeg).multiply(new Mat4(invSeg))
-      skinSeg.set(skinM.values)
+      const worldOffset = i * 16
+      const invOffset = i * 16
+      const skinOffset = i * 16
+      Mat4.multiplyArrays(worldBuf, worldOffset, invBind, invOffset, skinBuf, skinOffset)
     }
   }
 
