@@ -36,6 +36,8 @@ export class Engine {
   private weightsBuffer?: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
+  private multisampleTextureView!: GPUTextureView
+  private depthTextureView!: GPUTextureView
   private readonly sampleCount = 4 // MSAA 4x
   private currentModel: Model | null = null
   private modelDir: string = ""
@@ -315,9 +317,13 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
+      // Cache texture views (recreate on resize)
+      this.multisampleTextureView = this.multisampleTexture.createView()
+      this.depthTextureView = this.depthTexture.createView()
+
       // Update depth attachment on the render pass descriptor
       this.renderPassDescriptor.depthStencilAttachment = {
-        view: this.depthTexture.createView(),
+        view: this.depthTextureView,
         depthClearValue: 1.0,
         depthLoadOp: "clear",
         depthStoreOp: "store",
@@ -629,14 +635,11 @@ export class Engine {
     this.cameraMatrixData[34] = cameraPos.z
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
-    this.renderPassColorAttachment.view = this.multisampleTexture.createView()
+    this.renderPassColorAttachment.view = this.multisampleTextureView
     this.renderPassColorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
-    if (this.renderPassDescriptor.depthStencilAttachment) {
-      this.renderPassDescriptor.depthStencilAttachment.view = this.depthTexture.createView()
-    }
 
     this.drawCallCount = 0
-    this.currentModel.evaluatePose(deltaTime)
+    this.currentModel.evaluatePose()
 
     if (this.physics) {
       const skeleton = this.currentModel.getSkeleton()

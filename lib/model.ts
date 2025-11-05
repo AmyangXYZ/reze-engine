@@ -1,4 +1,4 @@
-const VERTEX_STRIDE = 8 // floats per vertex: position(3) + normal(3) + uv(2) = 8
+const VERTEX_STRIDE = 8
 
 export interface Texture {
   path: string
@@ -121,6 +121,10 @@ export class Model {
   // Spring bone physics runtime state
   private springPhysics: RzmSpringPhysics
 
+  // Cached identity matrices to avoid allocations in computeWorldMatrices
+  private cachedIdentityMat1 = Mat4.identity()
+  private cachedIdentityMat2 = Mat4.identity()
+
   constructor(
     vertexData: Float32Array<ArrayBuffer>,
     indexData: Uint32Array<ArrayBuffer>,
@@ -190,7 +194,6 @@ export class Model {
     this.runtimeSkeleton.nameIndex = nameToIndex
   }
 
-  // Rotation tween state (runtime only, initialized during construction)
   private rotTweenState!: RotationTweenState
 
   private initializeRotTweenBuffers(): void {
@@ -219,7 +222,6 @@ export class Model {
     bW: number,
     t: number
   ): [number, number, number, number] {
-    // Robust basic slerp with shortest path
     let cos = aX * bX + aY * bY + aZ * bZ + aW * bW
     let bx = bX,
       by = bY,
@@ -233,7 +235,6 @@ export class Model {
       bw = -bw
     }
     if (cos > 0.9995) {
-      // Linear fallback
       const x = aX + t * (bx - aX)
       const y = aY + t * (by - aY)
       const z = aZ + t * (bz - aZ)
@@ -246,41 +247,41 @@ export class Model {
     const theta = theta0 * t
     const s0 = Math.sin(theta0 - theta) / sinTheta0
     const s1 = Math.sin(theta) / sinTheta0
-    const x = s0 * aX + s1 * bx
-    const y = s0 * aY + s1 * by
-    const z = s0 * aZ + s1 * bz
-    const w = s0 * aW + s1 * bw
-    return [x, y, z, w]
+    return [s0 * aX + s1 * bx, s0 * aY + s1 * by, s0 * aZ + s1 * bz, s0 * aW + s1 * bw]
   }
 
   private updateRotationTweens(): void {
     const state = this.rotTweenState
     const now = performance.now()
-    const n = this.skeleton.bones.length
+    const rotations = this.runtimeSkeleton.localRotations
 
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < this.skeleton.bones.length; i++) {
       if (state.active[i] !== 1) continue
+
       const startMs = state.startTimeMs[i]
       const durMs = Math.max(1, state.durationMs[i])
       const t = Math.max(0, Math.min(1, (now - startMs) / durMs))
       const e = Model.easeInOut(t)
+
       const qi = i * 4
-      const a0 = state.startQuat[qi]
-      const a1 = state.startQuat[qi + 1]
-      const a2 = state.startQuat[qi + 2]
-      const a3 = state.startQuat[qi + 3]
-      const b0 = state.targetQuat[qi]
-      const b1 = state.targetQuat[qi + 1]
-      const b2 = state.targetQuat[qi + 2]
-      const b3 = state.targetQuat[qi + 3]
-      const [x, y, z, w] = Model.slerp(a0, a1, a2, a3, b0, b1, b2, b3, e)
-      this.runtimeSkeleton.localRotations[qi] = x
-      this.runtimeSkeleton.localRotations[qi + 1] = y
-      this.runtimeSkeleton.localRotations[qi + 2] = z
-      this.runtimeSkeleton.localRotations[qi + 3] = w
-      if (t >= 1) {
-        state.active[i] = 0
-      }
+      const [x, y, z, w] = Model.slerp(
+        state.startQuat[qi],
+        state.startQuat[qi + 1],
+        state.startQuat[qi + 2],
+        state.startQuat[qi + 3],
+        state.targetQuat[qi],
+        state.targetQuat[qi + 1],
+        state.targetQuat[qi + 2],
+        state.targetQuat[qi + 3],
+        e
+      )
+
+      rotations[qi] = x
+      rotations[qi + 1] = y
+      rotations[qi + 2] = z
+      rotations[qi + 3] = w
+
+      if (t >= 1) state.active[i] = 0
     }
   }
 
@@ -345,17 +346,15 @@ export class Model {
     return this.runtimeSkeleton.skinMatrices
   }
 
-  // Initialize runtime pose buffers (called once during construction)
   private initializeRuntimePose(): void {
-    // Initialize rotations to identity (0,0,0,1). Translations default to zero
-    const boneCount = this.skeleton.bones.length
-    for (let i = 0; i < boneCount; i++) {
+    const rotations = this.runtimeSkeleton.localRotations
+    for (let i = 0; i < this.skeleton.bones.length; i++) {
       const qi = i * 4
-      if (this.runtimeSkeleton.localRotations[qi + 3] === 0) {
-        this.runtimeSkeleton.localRotations[qi] = 0
-        this.runtimeSkeleton.localRotations[qi + 1] = 0
-        this.runtimeSkeleton.localRotations[qi + 2] = 0
-        this.runtimeSkeleton.localRotations[qi + 3] = 1
+      if (rotations[qi + 3] === 0) {
+        rotations[qi] = 0
+        rotations[qi + 1] = 0
+        rotations[qi + 2] = 0
+        rotations[qi + 3] = 1
       }
     }
   }
@@ -382,81 +381,72 @@ export class Model {
     if (index < 0 || index >= this.skeleton.bones.length) return undefined
     const qi = index * 4
     const ti = index * 3
+    const rot = this.runtimeSkeleton.localRotations
+    const trans = this.runtimeSkeleton.localTranslations
     return {
-      rotation: new Quat(
-        this.runtimeSkeleton.localRotations[qi],
-        this.runtimeSkeleton.localRotations[qi + 1],
-        this.runtimeSkeleton.localRotations[qi + 2],
-        this.runtimeSkeleton.localRotations[qi + 3]
-      ),
-      translation: new Vec3(
-        this.runtimeSkeleton.localTranslations[ti],
-        this.runtimeSkeleton.localTranslations[ti + 1],
-        this.runtimeSkeleton.localTranslations[ti + 2]
-      ),
+      rotation: new Quat(rot[qi], rot[qi + 1], rot[qi + 2], rot[qi + 3]),
+      translation: new Vec3(trans[ti], trans[ti + 1], trans[ti + 2]),
     }
   }
 
-  // Batched rotation with optional interpolation and retargeting.
   rotateBones(indicesOrNames: Array<number | string>, quats: Quat[], durationMs?: number): void {
     const state = this.rotTweenState
-    quats = quats.map((q) => q.normalize())
-
-    // Resolve indices
-    const indices: number[] = new Array(indicesOrNames.length)
-    for (let i = 0; i < indicesOrNames.length; i++) {
-      const v = indicesOrNames[i]
-      const idx = typeof v === "number" ? v : this.getBoneIndexByName(v)
-      if (idx < 0 || idx >= this.skeleton.bones.length) continue
-      indices[i] = idx
-    }
-
+    const normalized = quats.map((q) => q.normalize())
     const now = performance.now()
     const dur = durationMs && durationMs > 0 ? durationMs : 0
 
-    for (let i = 0; i < indices.length; i++) {
-      const bi = indices[i]
-      if (bi === undefined) continue
-      const qi = bi * 4
-      const [tx, ty, tz, tw] = quats[i].toArray()
+    for (let i = 0; i < indicesOrNames.length; i++) {
+      const input = indicesOrNames[i]
+      let idx: number
+      if (typeof input === "number") {
+        idx = input
+      } else {
+        const resolved = this.getBoneIndexByName(input)
+        if (resolved < 0) continue
+        idx = resolved
+      }
+      if (idx < 0 || idx >= this.skeleton.bones.length) continue
+
+      const qi = idx * 4
+      const rotations = this.runtimeSkeleton.localRotations
+      const [tx, ty, tz, tw] = normalized[i].toArray()
 
       if (dur === 0) {
-        // Immediate set, cancel any tween
-        this.runtimeSkeleton.localRotations[qi] = tx
-        this.runtimeSkeleton.localRotations[qi + 1] = ty
-        this.runtimeSkeleton.localRotations[qi + 2] = tz
-        this.runtimeSkeleton.localRotations[qi + 3] = tw
-        state.active[bi] = 0
+        rotations[qi] = tx
+        rotations[qi + 1] = ty
+        rotations[qi + 2] = tz
+        rotations[qi + 3] = tw
+        state.active[idx] = 0
         continue
       }
 
-      // Retarget: if active, compute current pose as new start; else start from current local
-      let sx = this.runtimeSkeleton.localRotations[qi]
-      let sy = this.runtimeSkeleton.localRotations[qi + 1]
-      let sz = this.runtimeSkeleton.localRotations[qi + 2]
-      let sw = this.runtimeSkeleton.localRotations[qi + 3]
+      let sx = rotations[qi]
+      let sy = rotations[qi + 1]
+      let sz = rotations[qi + 2]
+      let sw = rotations[qi + 3]
 
-      if (state.active[bi] === 1) {
-        const startMs = state.startTimeMs[bi]
-        const prevDur = Math.max(1, state.durationMs[bi])
+      if (state.active[idx] === 1) {
+        const startMs = state.startTimeMs[idx]
+        const prevDur = Math.max(1, state.durationMs[idx])
         const t = Math.max(0, Math.min(1, (now - startMs) / prevDur))
         const e = Model.easeInOut(t)
-        const a0 = state.startQuat[qi]
-        const a1 = state.startQuat[qi + 1]
-        const a2 = state.startQuat[qi + 2]
-        const a3 = state.startQuat[qi + 3]
-        const b0 = state.targetQuat[qi]
-        const b1 = state.targetQuat[qi + 1]
-        const b2 = state.targetQuat[qi + 2]
-        const b3 = state.targetQuat[qi + 3]
-        const cur = Model.slerp(a0, a1, a2, a3, b0, b1, b2, b3, e)
-        sx = cur[0]
-        sy = cur[1]
-        sz = cur[2]
-        sw = cur[3]
+        const [cx, cy, cz, cw] = Model.slerp(
+          state.startQuat[qi],
+          state.startQuat[qi + 1],
+          state.startQuat[qi + 2],
+          state.startQuat[qi + 3],
+          state.targetQuat[qi],
+          state.targetQuat[qi + 1],
+          state.targetQuat[qi + 2],
+          state.targetQuat[qi + 3],
+          e
+        )
+        sx = cx
+        sy = cy
+        sz = cz
+        sw = cw
       }
 
-      // Write start and target, mark active
       state.startQuat[qi] = sx
       state.startQuat[qi + 1] = sy
       state.startQuat[qi + 2] = sz
@@ -465,9 +455,9 @@ export class Model {
       state.targetQuat[qi + 1] = ty
       state.targetQuat[qi + 2] = tz
       state.targetQuat[qi + 3] = tw
-      state.startTimeMs[bi] = now
-      state.durationMs[bi] = dur
-      state.active[bi] = 1
+      state.startTimeMs[idx] = now
+      state.durationMs[idx] = dur
+      state.active[idx] = 1
     }
   }
 
@@ -475,31 +465,35 @@ export class Model {
     const index = typeof indexOrName === "number" ? indexOrName : this.getBoneIndexByName(indexOrName)
     if (index < 0 || index >= this.skeleton.bones.length) return
     const qi = index * 4
-    this.runtimeSkeleton.localRotations[qi] = quat.x
-    this.runtimeSkeleton.localRotations[qi + 1] = quat.y
-    this.runtimeSkeleton.localRotations[qi + 2] = quat.z
-    this.runtimeSkeleton.localRotations[qi + 3] = quat.w
+    const rot = this.runtimeSkeleton.localRotations
+    rot[qi] = quat.x
+    rot[qi + 1] = quat.y
+    rot[qi + 2] = quat.z
+    rot[qi + 3] = quat.w
   }
 
   setBoneTranslation(indexOrName: number | string, t: Vec3): void {
     const index = typeof indexOrName === "number" ? indexOrName : this.getBoneIndexByName(indexOrName)
     if (index < 0 || index >= this.skeleton.bones.length) return
     const ti = index * 3
-    this.runtimeSkeleton.localTranslations[ti] = t.x
-    this.runtimeSkeleton.localTranslations[ti + 1] = t.y
-    this.runtimeSkeleton.localTranslations[ti + 2] = t.z
+    const trans = this.runtimeSkeleton.localTranslations
+    trans[ti] = t.x
+    trans[ti + 1] = t.y
+    trans[ti + 2] = t.z
   }
 
   resetBone(index: number): void {
     const qi = index * 4
     const ti = index * 3
-    this.runtimeSkeleton.localRotations[qi] = 0
-    this.runtimeSkeleton.localRotations[qi + 1] = 0
-    this.runtimeSkeleton.localRotations[qi + 2] = 0
-    this.runtimeSkeleton.localRotations[qi + 3] = 1
-    this.runtimeSkeleton.localTranslations[ti] = 0
-    this.runtimeSkeleton.localTranslations[ti + 1] = 0
-    this.runtimeSkeleton.localTranslations[ti + 2] = 0
+    const rot = this.runtimeSkeleton.localRotations
+    const trans = this.runtimeSkeleton.localTranslations
+    rot[qi] = 0
+    rot[qi + 1] = 0
+    rot[qi + 2] = 0
+    rot[qi + 3] = 1
+    trans[ti] = 0
+    trans[ti + 1] = 0
+    trans[ti + 2] = 0
   }
 
   resetAllBones(): void {
@@ -637,18 +631,14 @@ export class Model {
   }
 
   getBoneWorldMatrices(): Float32Array {
-    this.evaluatePose()
     return this.runtimeSkeleton.worldMatrices
   }
 
   getBoneWorldPosition(index: number): Vec3 {
     this.evaluatePose()
     const matIdx = index * 16
-    return new Vec3(
-      this.runtimeSkeleton.worldMatrices[matIdx + 12],
-      this.runtimeSkeleton.worldMatrices[matIdx + 13],
-      this.runtimeSkeleton.worldMatrices[matIdx + 14]
-    )
+    const mat = this.runtimeSkeleton.worldMatrices
+    return new Vec3(mat[matIdx + 12], mat[matIdx + 13], mat[matIdx + 14])
   }
 
   getBoneWorldRotation(index: number): Quat {
@@ -668,47 +658,28 @@ export class Model {
     return this.runtimeSkeleton.localRotations
   }
 
-  // Evaluate world and skin matrices from local TR and bind
-  // If deltaTime is provided, also updates spring bone physics
-  evaluatePose(deltaTime?: number): void {
-    if (!deltaTime && false) {
-      return
-    }
-    // Advance rotation tweens before composing matrices
+  evaluatePose(): void {
     this.updateRotationTweens()
-
-    // Compute world matrices BEFORE spring bone physics (needed for collision detection)
-    // This gives us up-to-date matrices for body collider bones
     this.computeWorldMatrices()
-
-    // Compute skin matrices from world matrices
     this.updateSkinMatrices()
   }
 
-  // Update skin matrices from current world matrices
-  // Called after physics modifies world matrices in-place to update skinning
   updateSkinMatrices(): void {
-    const bones = this.skeleton.bones
     const invBind = this.skeleton.inverseBindMatrices
     const worldBuf = this.runtimeSkeleton.worldMatrices
     const skinBuf = this.runtimeSkeleton.skinMatrices
 
-    // Compute skin matrices from world and inverse bind matrices (direct array multiplication for performance)
-    for (let i = 0; i < bones.length; i++) {
-      const worldOffset = i * 16
-      const invOffset = i * 16
-      const skinOffset = i * 16
-      Mat4.multiplyArrays(worldBuf, worldOffset, invBind, invOffset, skinBuf, skinOffset)
+    for (let i = 0; i < this.skeleton.bones.length; i++) {
+      const offset = i * 16
+      Mat4.multiplyArrays(worldBuf, offset, invBind, offset, skinBuf, offset)
     }
   }
 
-  // Compute world matrices from local rotations and translations
   private computeWorldMatrices(): void {
     const bones = this.skeleton.bones
     const localRot = this.runtimeSkeleton.localRotations
+    const localTrans = this.runtimeSkeleton.localTranslations
     const worldBuf = this.runtimeSkeleton.worldMatrices
-
-    // compute recursively to respect parent-before-child regardless of file order
     const computed: boolean[] = new Array(bones.length).fill(false)
 
     const computeWorld = (i: number): void => {
@@ -716,15 +687,13 @@ export class Model {
       if (bones[i].parentIndex >= bones.length) {
         console.warn(`[RZM] bone ${i} parent out of range: ${bones[i].parentIndex}`)
       }
-      const qi = i * 4
-      // Start from bone's local rotation
-      let rotateM = Mat4.fromQuat(localRot[qi], localRot[qi + 1], localRot[qi + 2], localRot[qi + 3])
-      // Accumulated local translation from append move
-      let addLocalTx = 0
-      let addLocalTy = 0
-      let addLocalTz = 0
 
-      // Apply PMX append/inherit rotation with decoded ratio
+      const qi = i * 4
+      let rotateM = Mat4.fromQuat(localRot[qi], localRot[qi + 1], localRot[qi + 2], localRot[qi + 3])
+      let addLocalTx = 0,
+        addLocalTy = 0,
+        addLocalTz = 0
+
       const b = bones[i]
       if (
         b.appendRotate &&
@@ -734,59 +703,51 @@ export class Model {
         (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)
       ) {
         const ap = b.appendParentIndex
-        // Use append parent's LOCAL rotation/translation with ratio, as per PMX
         const apQi = ap * 4
         const apTi = ap * 3
         let ratio = b.appendRatio === undefined ? 1 : b.appendRatio
         ratio = Math.max(-1, Math.min(1, ratio))
-        // Rotation append
+
         if (b.appendRotate) {
           let ax = localRot[apQi]
           let ay = localRot[apQi + 1]
           let az = localRot[apQi + 2]
           const aw = localRot[apQi + 3]
           if (ratio < 0) {
-            // inverse (conjugate) for negative ratios
             ax = -ax
             ay = -ay
             az = -az
             ratio = -ratio
           }
           const [rx, ry, rz, rw] = Model.slerp(0, 0, 0, 1, ax, ay, az, aw, ratio)
-          const ratioM = Mat4.fromQuat(rx, ry, rz, rw)
-          rotateM = ratioM.multiply(rotateM)
+          rotateM = Mat4.fromQuat(rx, ry, rz, rw).multiply(rotateM)
         }
-        // Move append
-        if (b.appendMove && (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)) {
-          const apTx = this.runtimeSkeleton.localTranslations![apTi]
-          const apTy = this.runtimeSkeleton.localTranslations![apTi + 1]
-          const apTz = this.runtimeSkeleton.localTranslations![apTi + 2]
-          addLocalTx += apTx * (b.appendRatio ?? 1)
-          addLocalTy += apTy * (b.appendRatio ?? 1)
-          addLocalTz += apTz * (b.appendRatio ?? 1)
-        }
-      }
-      const translateBind = Mat4.identity().translateInPlace(
-        bones[i].bindTranslation[0],
-        bones[i].bindTranslation[1],
-        bones[i].bindTranslation[2]
-      )
-      // Apply additional local translation due to appendMove
-      const translateLocal = Mat4.identity().translateInPlace(addLocalTx, addLocalTy, addLocalTz)
-      // Local: move from parent to joint, then rotate around joint, then local translation
-      const localM = translateBind.multiply(rotateM).multiply(translateLocal)
 
-      const worldSeg = worldBuf.subarray(i * 16, i * 16 + 16)
-      let worldM: Mat4
-      if (bones[i].parentIndex >= 0) {
-        const p = bones[i].parentIndex
-        if (!computed[p]) computeWorld(p)
-        const parentSeg = worldBuf.subarray(p * 16, p * 16 + 16)
-        worldM = new Mat4(parentSeg).multiply(localM)
-      } else {
-        worldM = localM
+        if (b.appendMove && (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)) {
+          addLocalTx += localTrans[apTi] * (b.appendRatio ?? 1)
+          addLocalTy += localTrans[apTi + 1] * (b.appendRatio ?? 1)
+          addLocalTz += localTrans[apTi + 2] * (b.appendRatio ?? 1)
+        }
       }
-      worldSeg.set(worldM.values)
+
+      // Reset cached matrices to identity and apply translations
+      this.cachedIdentityMat1.values.set([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+      this.cachedIdentityMat1.translateInPlace(b.bindTranslation[0], b.bindTranslation[1], b.bindTranslation[2])
+      this.cachedIdentityMat2.values.set([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+      this.cachedIdentityMat2.translateInPlace(addLocalTx, addLocalTy, addLocalTz)
+      const localM = this.cachedIdentityMat1.multiply(rotateM).multiply(this.cachedIdentityMat2)
+
+      const worldOffset = i * 16
+      if (b.parentIndex >= 0) {
+        const p = b.parentIndex
+        if (!computed[p]) computeWorld(p)
+        const parentOffset = p * 16
+        // Use cachedIdentityMat2 as temporary buffer for parent * local multiplication
+        Mat4.multiplyArrays(worldBuf, parentOffset, localM.values, 0, this.cachedIdentityMat2.values, 0)
+        worldBuf.subarray(worldOffset, worldOffset + 16).set(this.cachedIdentityMat2.values)
+      } else {
+        worldBuf.subarray(worldOffset, worldOffset + 16).set(localM.values)
+      }
       computed[i] = true
     }
 
