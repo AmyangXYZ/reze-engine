@@ -15,14 +15,18 @@ export class Camera {
   // Input state
   private canvas: HTMLCanvasElement | null = null
   private isDragging: boolean = false
+  private mouseButton: number | null = null // Track which mouse button is pressed (0 = left, 2 = right)
   private lastMousePos = { x: 0, y: 0 }
   private lastTouchPos = { x: 0, y: 0 }
   private touchIdentifier: number | null = null
   private isPinching: boolean = false
   private lastPinchDistance: number = 0
+  private lastPinchMidpoint = { x: 0, y: 0 } // Midpoint of two fingers for panning
+  private initialPinchDistance: number = 0 // Initial distance when pinch started
 
   // Camera settings
   angularSensitivity: number = 0.005
+  panSensitivity: number = 0.0002 // Sensitivity for right-click panning
   wheelPrecision: number = 0.005
   pinchPrecision: number = 0.05
   minZ: number = 0.1
@@ -60,6 +64,67 @@ export class Camera {
     const eye = this.getPosition()
     const up = new Vec3(0, 1, 0)
     return Mat4.lookAt(eye, this.target, up)
+  }
+
+  // Get camera's right and up vectors for panning
+  // Uses a more robust calculation similar to BabylonJS
+  private getCameraVectors(): { right: Vec3; up: Vec3 } {
+    const eye = this.getPosition()
+    const forward = this.target.subtract(eye)
+    const forwardLen = forward.length()
+
+    // Handle edge case where camera is at target
+    if (forwardLen < 0.0001) {
+      return { right: new Vec3(1, 0, 0), up: new Vec3(0, 1, 0) }
+    }
+
+    const forwardNorm = forward.scale(1 / forwardLen)
+    const worldUp = new Vec3(0, 1, 0)
+
+    // Calculate right vector: right = worldUp × forward
+    // Use a more stable calculation that handles parallel vectors
+    let right = worldUp.cross(forwardNorm)
+    const rightLen = right.length()
+
+    // If forward is parallel to worldUp, use a fallback
+    if (rightLen < 0.0001) {
+      // Camera is looking straight up or down, use X-axis as right
+      right = new Vec3(1, 0, 0)
+    } else {
+      right = right.scale(1 / rightLen)
+    }
+
+    // Calculate camera up vector: up = forward × right (ensures orthogonality)
+    let up = forwardNorm.cross(right)
+    const upLen = up.length()
+
+    if (upLen < 0.0001) {
+      // Fallback to world up
+      up = new Vec3(0, 1, 0)
+    } else {
+      up = up.scale(1 / upLen)
+    }
+
+    return { right, up }
+  }
+
+  // Pan the camera target based on mouse movement
+  // Uses screen-space to world-space translation similar to BabylonJS
+  private panCamera(deltaX: number, deltaY: number) {
+    const { right, up } = this.getCameraVectors()
+
+    // Calculate pan distance based on camera distance
+    // The pan amount is proportional to the camera distance (radius) for consistent feel
+    // This makes panning feel natural at all zoom levels
+    const panDistance = this.radius * this.panSensitivity
+
+    // Horizontal movement: drag right pans left (opposite direction)
+    // Vertical movement: drag up pans up (positive up vector)
+    const panRight = right.scale(-deltaX * panDistance)
+    const panUp = up.scale(deltaY * panDistance)
+
+    // Update target position smoothly
+    this.target = this.target.add(panRight).add(panUp)
   }
 
   getProjectionMatrix(): Mat4 {
@@ -103,6 +168,7 @@ export class Camera {
 
   private onMouseDown(e: MouseEvent) {
     this.isDragging = true
+    this.mouseButton = e.button
     this.lastMousePos = { x: e.clientX, y: e.clientY }
   }
 
@@ -112,17 +178,24 @@ export class Camera {
     const deltaX = e.clientX - this.lastMousePos.x
     const deltaY = e.clientY - this.lastMousePos.y
 
-    this.alpha += deltaX * this.angularSensitivity
-    this.beta -= deltaY * this.angularSensitivity
+    if (this.mouseButton === 2) {
+      // Right-click: pan the camera target
+      this.panCamera(deltaX, deltaY)
+    } else {
+      // Left-click (or default): rotate the camera
+      this.alpha += deltaX * this.angularSensitivity
+      this.beta -= deltaY * this.angularSensitivity
 
-    // Clamp beta to prevent flipping
-    this.beta = Math.max(this.lowerBetaLimit, Math.min(this.upperBetaLimit, this.beta))
+      // Clamp beta to prevent flipping
+      this.beta = Math.max(this.lowerBetaLimit, Math.min(this.upperBetaLimit, this.beta))
+    }
 
     this.lastMousePos = { x: e.clientX, y: e.clientY }
   }
 
   private onMouseUp() {
     this.isDragging = false
+    this.mouseButton = null
   }
 
   private onWheel(e: WheelEvent) {
@@ -152,7 +225,7 @@ export class Camera {
       this.touchIdentifier = touch.identifier
       this.lastTouchPos = { x: touch.clientX, y: touch.clientY }
     } else if (e.touches.length === 2) {
-      // Two touches - pinch zoom
+      // Two touches - can be pinch zoom or pan
       this.isDragging = false
       this.isPinching = true
       const touch1 = e.touches[0]
@@ -160,6 +233,13 @@ export class Camera {
       const dx = touch2.clientX - touch1.clientX
       const dy = touch2.clientY - touch1.clientY
       this.lastPinchDistance = Math.sqrt(dx * dx + dy * dy)
+      this.initialPinchDistance = this.lastPinchDistance
+
+      // Calculate initial midpoint for panning
+      this.lastPinchMidpoint = {
+        x: (touch1.clientX + touch2.clientX) / 2,
+        y: (touch1.clientY + touch2.clientY) / 2,
+      }
     }
   }
 
@@ -167,22 +247,57 @@ export class Camera {
     e.preventDefault()
 
     if (this.isPinching && e.touches.length === 2) {
-      // Two-finger pinch zoom
+      // Two-finger gesture: can be pinch zoom or pan
       const touch1 = e.touches[0]
       const touch2 = e.touches[1]
       const dx = touch2.clientX - touch1.clientX
       const dy = touch2.clientY - touch1.clientY
       const distance = Math.sqrt(dx * dx + dy * dy)
 
-      const delta = this.lastPinchDistance - distance
-      this.radius += delta * this.pinchPrecision
+      // Calculate current midpoint
+      const currentMidpoint = {
+        x: (touch1.clientX + touch2.clientX) / 2,
+        y: (touch1.clientY + touch2.clientY) / 2,
+      }
 
-      // Clamp radius to reasonable bounds
-      this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
-      // Expand far plane for pinch zoom as well
-      this.far = Math.max(FAR, this.radius * 4)
+      // Calculate distance change and midpoint movement
+      const distanceDelta = Math.abs(distance - this.lastPinchDistance)
+      const midpointDeltaX = currentMidpoint.x - this.lastPinchMidpoint.x
+      const midpointDeltaY = currentMidpoint.y - this.lastPinchMidpoint.y
+      const midpointDelta = Math.sqrt(midpointDeltaX * midpointDeltaX + midpointDeltaY * midpointDeltaY)
 
+      // Determine gesture type based on relative changes
+      // Calculate relative change in distance (as percentage of initial distance)
+      const distanceChangeRatio = distanceDelta / Math.max(this.initialPinchDistance, 10.0)
+
+      // Threshold: if distance changes more than 3% of initial, it's primarily a zoom gesture
+      // Otherwise, if midpoint moves significantly, it's a pan gesture
+      const ZOOM_THRESHOLD = 0.03
+      const PAN_THRESHOLD = 2.0 // Minimum pixels of midpoint movement for pan
+
+      const isZoomGesture = distanceChangeRatio > ZOOM_THRESHOLD
+      const isPanGesture = midpointDelta > PAN_THRESHOLD && distanceChangeRatio < ZOOM_THRESHOLD * 2
+
+      if (isZoomGesture) {
+        // Primary gesture is zoom (pinch)
+        const delta = this.lastPinchDistance - distance
+        this.radius += delta * this.pinchPrecision
+
+        // Clamp radius to reasonable bounds
+        this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+        // Expand far plane for pinch zoom as well
+        this.far = Math.max(FAR, this.radius * 4)
+      }
+
+      if (isPanGesture) {
+        // Primary gesture is pan (two-finger drag)
+        // Use panning similar to right-click pan
+        this.panCamera(midpointDeltaX, midpointDeltaY)
+      }
+
+      // Update tracking values
       this.lastPinchDistance = distance
+      this.lastPinchMidpoint = currentMidpoint
     } else if (this.isDragging && this.touchIdentifier !== null) {
       // Single-finger rotation
       // Find the touch we're tracking
@@ -215,6 +330,7 @@ export class Camera {
       this.isDragging = false
       this.isPinching = false
       this.touchIdentifier = null
+      this.initialPinchDistance = 0
     } else if (e.touches.length === 1 && this.isPinching) {
       // Went from 2 fingers to 1 - switch to rotation
       const touch = e.touches[0]
@@ -222,6 +338,7 @@ export class Camera {
       this.isDragging = true
       this.touchIdentifier = touch.identifier
       this.lastTouchPos = { x: touch.clientX, y: touch.clientY }
+      this.initialPinchDistance = 0
     } else if (this.touchIdentifier !== null) {
       // Check if our tracked touch ended
       let touchStillActive = false
