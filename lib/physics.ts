@@ -498,8 +498,7 @@ export class Physics {
     // Step order: 1) Sync Static/Kinematic from bones, 2) Step physics, 3) Apply dynamic to bones
     this.syncFromBones(boneWorldMatrices, boneInverseBindMatrices, boneCount)
 
-    const clampedDt = Math.min(dt, 0.017) // Cap at ~60fps minimum
-    this.stepAmmoPhysics(clampedDt)
+    this.stepAmmoPhysics(dt)
 
     this.applyAmmoRigidbodiesToBones(boneWorldMatrices, boneInverseBindMatrices, boneCount)
   }
@@ -637,11 +636,11 @@ export class Physics {
     }
   }
 
-  // Step Ammo physics simulation (120 steps per second for better MMD physics reproduction)
+  // Step Ammo physics simulation
   private stepAmmoPhysics(dt: number): void {
     if (!this.ammo || !this.dynamicsWorld) return
 
-    const fixedTimeStep = 1 / 120 // 120 steps per second
+    const fixedTimeStep = 1 / 75
     const maxSubSteps = 10
 
     this.dynamicsWorld.stepSimulation(dt, maxSubSteps, fixedTimeStep)
