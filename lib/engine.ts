@@ -172,15 +172,14 @@ export class Engine {
           @location(4) weights0: vec4<f32>
         ) -> VertexOutput {
           var output: VertexOutput;
-          // GPU skinning (LBS4)
+          let pos4 = vec4f(position, 1.0);
           var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
           var skinnedNrm = vec3f(0.0, 0.0, 0.0);
           for (var i = 0u; i < 4u; i++) {
             let j = joints0[i];
             let w = weights0[i];
             let m = skinMats[j];
-            skinnedPos += (m * vec4f(position, 1.0)) * w;
-            // normal (upper-left 3x3)
+            skinnedPos += (m * pos4) * w;
             let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
             skinnedNrm += (r3 * normal) * w;
           }
@@ -192,6 +191,11 @@ export class Engine {
           return output;
         }
 
+        const INV_PI: f32 = 0.31830988618379067154;
+        const SPEC_POWER: f32 = 24.0;
+        const SPEC_INTENSITY: f32 = 0.06;
+        const TONE_MAP_K: f32 = 0.15;
+
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
           let n = normalize(input.normal);
           let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
@@ -199,26 +203,25 @@ export class Engine {
           // Ambient term
           var color = albedo * vec3f(light.ambient);
 
-          // View direction for subtle specular
-          let v = normalize(camera.viewPos - input.worldPos);
+          let toView = camera.viewPos - input.worldPos;
+          let v = normalize(toView);
 
-          // Lambert diffuse with 1/pi plus a gentle Blinn-Phong highlight
-          let diffuse = albedo / 3.14159265;
+          let diffuse = albedo * INV_PI;
           let numLights = u32(light.lightCount);
           for (var i = 0u; i < numLights; i++) {
-            let l = normalize(-light.lights[i].direction);
+            let l = -light.lights[i].direction;
             let nDotL = max(dot(n, l), 0.0);
             if (nDotL > 0.0) {
               let radiance = light.lights[i].color * light.lights[i].intensity;
-              // subtle specular
               let h = normalize(l + v);
-              let spec = pow(max(dot(n, h), 0.0), 24.0) * 0.06;
+              let nh = max(dot(n, h), 0.0);
+              let spec = pow(nh, SPEC_POWER) * SPEC_INTENSITY;
               color += diffuse * radiance * nDotL + vec3f(spec) * radiance;
             }
           }
 
-          // Soft rolloff to keep brightness natural without looking flat
-          color = color / (vec3f(1.0) + color * 0.15);
+          // Soft rolloff tone mapping
+          color = color / (vec3f(1.0) + color * TONE_MAP_K);
           color = clamp(color, vec3f(0.0), vec3f(1.0));
           return vec4f(color, 1.0);
         }
