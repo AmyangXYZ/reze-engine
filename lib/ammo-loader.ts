@@ -20,7 +20,6 @@ export async function loadAmmo(): Promise<AmmoInstance> {
     try {
       const { Ammo } = await import("@fred3d/ammo")
       ammoInstance = await Ammo()
-      console.log("[Ammo] Loaded successfully")
       return ammoInstance
     } catch (error) {
       console.error("[Ammo] Failed to load:", error)
