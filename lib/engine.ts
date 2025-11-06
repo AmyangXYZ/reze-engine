@@ -28,21 +28,17 @@ export class Engine {
   private indexBuffer?: GPUBuffer
   private indexCount: number = 0
   private resizeObserver: ResizeObserver | null = null
-  private renderPassDescriptor!: GPURenderPassDescriptor
-  private renderPassColorAttachment!: GPURenderPassColorAttachment
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
-  private jointsBuffer?: GPUBuffer
-  private weightsBuffer?: GPUBuffer
+  private jointsBuffer!: GPUBuffer
+  private weightsBuffer!: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
-  private multisampleTextureView!: GPUTextureView
-  private depthTextureView!: GPUTextureView
   private readonly sampleCount = 4 // MSAA 4x
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
-  private textureSampler?: GPUSampler
+  private textureSampler!: GPUSampler
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -99,22 +95,17 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
+    this.textureSampler = this.device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "repeat",
+      addressModeV: "repeat",
+    })
+
     this.setAmbient(0.65)
     this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
     this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1.0)
-
-    this.renderPassColorAttachment = {
-      view: this.context.getCurrentTexture().createView(),
-      clearValue: { r: 0.05, g: 0.066, b: 0.086, a: 1.0 },
-      loadOp: "clear",
-      storeOp: "store",
-    }
-
-    this.renderPassDescriptor = {
-      label: "renderPass",
-      colorAttachments: [this.renderPassColorAttachment],
-    }
 
     // Create shader and pipeline
     this.initPipeline()
@@ -319,22 +310,8 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
-      // Cache texture views (recreate on resize)
-      this.multisampleTextureView = this.multisampleTexture.createView()
-      this.depthTextureView = this.depthTexture.createView()
-
-      // Update depth attachment on the render pass descriptor
-      this.renderPassDescriptor.depthStencilAttachment = {
-        view: this.depthTextureView,
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
-      }
-
       // Update camera aspect ratio
       this.camera.aspect = width / height
-
-      // No need to trigger render - continuous loop handles it
     }
   }
 
@@ -514,93 +491,52 @@ export class Engine {
       throw new Error("Model has no materials")
     }
 
-    if (!this.textureSampler) {
-      this.textureSampler = this.device.createSampler({
-        magFilter: "linear",
-        minFilter: "linear",
-        addressModeU: "repeat",
-        addressModeV: "repeat",
-      })
-    }
-
     const textures = model.getTextures()
-    const textureCache = new Map<number, GPUTexture>()
 
     const loadTextureByIndex = async (texIndex: number): Promise<GPUTexture> => {
       if (texIndex < 0 || texIndex >= textures.length) {
         throw new Error(`Invalid texture index: ${texIndex}`)
       }
-      const cached = textureCache.get(texIndex)
-      if (cached) return cached
 
       const path = this.modelDir + textures[texIndex].path
       const texture = await this.createTextureFromPath(path)
       if (!texture) {
         throw new Error(`Failed to load texture: ${path}`)
       }
-      textureCache.set(texIndex, texture)
       return texture
     }
 
-    // Preload unique textures
-    const textureIndices = new Set<number>()
-    for (const mat of materials) {
-      if (mat.diffuseTextureIndex >= 0) textureIndices.add(mat.diffuseTextureIndex)
-    }
-    await Promise.all(Array.from(textureIndices).map(loadTextureByIndex))
-
-    // Build material draw batches
+    // Create one draw call per material
     this.materialDraws = []
     const bindGroupLayout = this.pipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
-    let currentTexture: GPUTexture | null = null
-    let currentBindGroup: GPUBindGroup | null = null
-    let batchedCount = 0
-    let batchedFirstIndex = 0
-    let totalIndexCount = 0
 
-    for (let i = 0; i < materials.length; i++) {
-      const mat = materials[i]
+    for (const mat of materials) {
       const matCount = mat.vertexCount | 0
       if (matCount === 0) continue
 
       const texture = await loadTextureByIndex(mat.diffuseTextureIndex)
       if (!texture) throw new Error(`Material "${mat.name}" has no texture`)
 
-      if (currentTexture !== texture || currentBindGroup === null) {
-        if (currentBindGroup !== null && batchedCount > 0) {
-          this.materialDraws.push({ count: batchedCount, firstIndex: batchedFirstIndex, bindGroup: currentBindGroup })
-        }
+      const bindGroup = this.device.createBindGroup({
+        label: `material bind group: ${mat.name}`,
+        layout: bindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+          { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+          { binding: 2, resource: texture.createView() },
+          { binding: 3, resource: this.textureSampler },
+          { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
+        ],
+      })
 
-        currentBindGroup = this.device.createBindGroup({
-          label: "material bind group",
-          layout: bindGroupLayout,
-          entries: [
-            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
-            { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-            { binding: 2, resource: texture.createView() },
-            { binding: 3, resource: this.textureSampler },
-            { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
-          ],
-        })
-
-        currentTexture = texture
-        batchedFirstIndex = runningFirstIndex
-        batchedCount = matCount
-      } else {
-        batchedCount += matCount
-      }
+      this.materialDraws.push({
+        count: matCount,
+        firstIndex: runningFirstIndex,
+        bindGroup,
+      })
 
       runningFirstIndex += matCount
-      totalIndexCount += matCount
-    }
-
-    if (currentBindGroup !== null && batchedCount > 0) {
-      this.materialDraws.push({ count: batchedCount, firstIndex: batchedFirstIndex, bindGroup: currentBindGroup })
-    }
-
-    if (this.indexCount && totalIndexCount !== this.indexCount) {
-      console.warn(`[PMX] material index sum ${totalIndexCount} != indexCount ${this.indexCount}`)
     }
   }
 
@@ -646,9 +582,27 @@ export class Engine {
     this.cameraMatrixData[34] = cameraPos.z
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
-    // Update render targets
-    this.renderPassColorAttachment.view = this.multisampleTextureView
-    this.renderPassColorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
+    // Create render pass descriptor
+    const multisampleTextureView = this.multisampleTexture.createView()
+    const depthTextureView = this.depthTexture.createView()
+    const renderPassDescriptor: GPURenderPassDescriptor = {
+      label: "renderPass",
+      colorAttachments: [
+        {
+          view: multisampleTextureView,
+          resolveTarget: this.context.getCurrentTexture().createView(),
+          clearValue: { r: 0.05, g: 0.066, b: 0.086, a: 1.0 },
+          loadOp: "clear",
+          storeOp: "store",
+        },
+      ],
+      depthStencilAttachment: {
+        view: depthTextureView,
+        depthClearValue: 1.0,
+        depthLoadOp: "clear",
+        depthStoreOp: "store",
+      },
+    }
 
     // Update pose and physics
     this.currentModel.evaluatePose()
@@ -669,11 +623,11 @@ export class Engine {
 
     // Render
     const encoder = this.device.createCommandEncoder()
-    const pass = encoder.beginRenderPass(this.renderPassDescriptor)
+    const pass = encoder.beginRenderPass(renderPassDescriptor)
     pass.setPipeline(this.pipeline)
     pass.setVertexBuffer(0, this.vertexBuffer)
-    if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
-    if (this.weightsBuffer) pass.setVertexBuffer(2, this.weightsBuffer)
+    pass.setVertexBuffer(1, this.jointsBuffer)
+    pass.setVertexBuffer(2, this.weightsBuffer)
     pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
     this.drawCallCount = 0
