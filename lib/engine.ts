@@ -102,10 +102,10 @@ export class Engine {
       addressModeV: "repeat",
     })
 
-    this.setAmbient(0.65)
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
-    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1.0)
+    this.setAmbient(0.7)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.25)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.2)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.15)
 
     // Create shader and pipeline
     this.initPipeline()
@@ -153,6 +153,8 @@ export class Engine {
         @group(0) @binding(2) var diffuseTexture: texture_2d<f32>;
         @group(0) @binding(3) var diffuseSampler: sampler;
         @group(0) @binding(4) var<storage, read> skinMats: array<mat4x4f>;
+        @group(0) @binding(5) var toonTexture: texture_2d<f32>;
+        @group(0) @binding(6) var toonSampler: sampler;
 
         @vertex fn vs(
           @location(0) position: vec3f,
@@ -181,39 +183,31 @@ export class Engine {
           return output;
         }
 
-        const INV_PI: f32 = 0.31830988618379067154;
-        const SPEC_POWER: f32 = 24.0;
-        const SPEC_INTENSITY: f32 = 0.06;
-        const TONE_MAP_K: f32 = 0.15;
-
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
           let n = normalize(input.normal);
           let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
 
-          // Ambient term
-          var color = albedo * vec3f(light.ambient);
-
-          let toView = camera.viewPos - input.worldPos;
-          let v = normalize(toView);
-
-          let diffuse = albedo * INV_PI;
+          // Accumulate light contribution
+          var lightAccum = vec3f(light.ambient);
           let numLights = u32(light.lightCount);
           for (var i = 0u; i < numLights; i++) {
             let l = -light.lights[i].direction;
             let nDotL = max(dot(n, l), 0.0);
-            if (nDotL > 0.0) {
-              let radiance = light.lights[i].color * light.lights[i].intensity;
-              let h = normalize(l + v);
-              let nh = max(dot(n, h), 0.0);
-              let spec = pow(nh, SPEC_POWER) * SPEC_INTENSITY;
-              color += diffuse * radiance * nDotL + vec3f(spec) * radiance;
-            }
+            
+            // Sample toon texture: use N·L as U coordinate, 0.5 as V (middle of texture)
+            // Must sample outside conditional for uniform control flow
+            let toonUV = vec2f(nDotL, 0.5);
+            let toonFactor = textureSample(toonTexture, toonSampler, toonUV).rgb;
+            
+            // Accumulate light contribution through toon factor
+            let radiance = light.lights[i].color * light.lights[i].intensity;
+            lightAccum += toonFactor * radiance * nDotL;
           }
-
-          // Soft rolloff tone mapping
-          color = color / (vec3f(1.0) + color * TONE_MAP_K);
-          color = clamp(color, vec3f(0.0), vec3f(1.0));
-          return vec4f(color, 1.0);
+          
+          // Multiply albedo with accumulated lighting
+          var color = albedo * lightAccum;
+          
+          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), 1.0);
         }
       `,
     })
@@ -493,17 +487,52 @@ export class Engine {
 
     const textures = model.getTextures()
 
-    const loadTextureByIndex = async (texIndex: number): Promise<GPUTexture> => {
+    const loadTextureByIndex = async (texIndex: number): Promise<GPUTexture | null> => {
       if (texIndex < 0 || texIndex >= textures.length) {
-        throw new Error(`Invalid texture index: ${texIndex}`)
+        return null
       }
 
       const path = this.modelDir + textures[texIndex].path
       const texture = await this.createTextureFromPath(path)
-      if (!texture) {
-        throw new Error(`Failed to load texture: ${path}`)
-      }
       return texture
+    }
+
+    // Load default toon texture (shared toon textures are typically in "toon" folder)
+    // If material has toonTextureIndex >= 0, use that; otherwise use a default
+    const loadToonTexture = async (toonTextureIndex: number): Promise<GPUTexture> => {
+      if (toonTextureIndex >= 0 && toonTextureIndex < textures.length) {
+        const texture = await loadTextureByIndex(toonTextureIndex)
+        if (texture) return texture
+      }
+      // Fallback: create a simple default toon gradient (white to gray)
+      // In practice, PMX models usually have toon textures, but this is a safe fallback
+      const defaultToonData = new Uint8Array(256 * 2 * 4) // 256x2 RGBA
+      for (let i = 0; i < 256; i++) {
+        const factor = i / 255.0
+        const gray = Math.floor(128 + factor * 127) // 128 to 255
+        defaultToonData[i * 4] = gray
+        defaultToonData[i * 4 + 1] = gray
+        defaultToonData[i * 4 + 2] = gray
+        defaultToonData[i * 4 + 3] = 255
+        // Second row same as first
+        defaultToonData[(256 + i) * 4] = gray
+        defaultToonData[(256 + i) * 4 + 1] = gray
+        defaultToonData[(256 + i) * 4 + 2] = gray
+        defaultToonData[(256 + i) * 4 + 3] = 255
+      }
+      const defaultToonTexture = this.device.createTexture({
+        label: "default toon texture",
+        size: [256, 2],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      this.device.queue.writeTexture(
+        { texture: defaultToonTexture },
+        defaultToonData,
+        { bytesPerRow: 256 * 4 },
+        [256, 2]
+      )
+      return defaultToonTexture
     }
 
     // Create one draw call per material
@@ -515,8 +544,10 @@ export class Engine {
       const matCount = mat.vertexCount | 0
       if (matCount === 0) continue
 
-      const texture = await loadTextureByIndex(mat.diffuseTextureIndex)
-      if (!texture) throw new Error(`Material "${mat.name}" has no texture`)
+      const diffuseTexture = await loadTextureByIndex(mat.diffuseTextureIndex)
+      if (!diffuseTexture) throw new Error(`Material "${mat.name}" has no diffuse texture`)
+
+      const toonTexture = await loadToonTexture(mat.toonTextureIndex)
 
       const bindGroup = this.device.createBindGroup({
         label: `material bind group: ${mat.name}`,
@@ -524,9 +555,11 @@ export class Engine {
         entries: [
           { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-          { binding: 2, resource: texture.createView() },
+          { binding: 2, resource: diffuseTexture.createView() },
           { binding: 3, resource: this.textureSampler },
           { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
+          { binding: 5, resource: toonTexture.createView() },
+          { binding: 6, resource: this.textureSampler },
         ],
       })
 
