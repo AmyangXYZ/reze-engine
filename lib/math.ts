@@ -358,16 +358,20 @@ export class Mat4 {
 
   // Extract quaternion rotation from this matrix (upper-left 3x3 rotation part)
   toQuat(): Quat {
-    const m = this.values
-    const m00 = m[0],
-      m01 = m[4],
-      m02 = m[8]
-    const m10 = m[1],
-      m11 = m[5],
-      m12 = m[9]
-    const m20 = m[2],
-      m21 = m[6],
-      m22 = m[10]
+    return Mat4.toQuatFromArray(this.values, 0)
+  }
+
+  // Static method to extract quaternion from matrix array (avoids creating Mat4 object)
+  static toQuatFromArray(m: Float32Array, offset: number): Quat {
+    const m00 = m[offset + 0],
+      m01 = m[offset + 4],
+      m02 = m[offset + 8]
+    const m10 = m[offset + 1],
+      m11 = m[offset + 5],
+      m12 = m[offset + 9]
+    const m20 = m[offset + 2],
+      m21 = m[offset + 6],
+      m22 = m[offset + 10]
     const trace = m00 + m11 + m22
     let x = 0,
       y = 0,
@@ -400,6 +404,28 @@ export class Mat4 {
     }
     const invLen = 1 / Math.hypot(x, y, z, w)
     return new Quat(x * invLen, y * invLen, z * invLen, w * invLen)
+  }
+
+  // Reset matrix to identity in place
+  setIdentity(): this {
+    const v = this.values
+    v[0] = 1
+    v[1] = 0
+    v[2] = 0
+    v[3] = 0
+    v[4] = 0
+    v[5] = 1
+    v[6] = 0
+    v[7] = 0
+    v[8] = 0
+    v[9] = 0
+    v[10] = 1
+    v[11] = 0
+    v[12] = 0
+    v[13] = 0
+    v[14] = 0
+    v[15] = 1
+    return this
   }
 
   translateInPlace(tx: number, ty: number, tz: number): this {

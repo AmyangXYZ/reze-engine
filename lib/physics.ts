@@ -228,22 +228,10 @@ export class Physics {
       transform.setRotation(quat)
       Ammo.destroy(quat)
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let motionState: any = null
-      let mass = 0
-      let isDynamic = false
-
-      if (rb.type === RigidbodyType.Dynamic) {
-        mass = rb.mass
-        isDynamic = true
-        motionState = new Ammo.btDefaultMotionState(transform)
-      } else if (rb.type === RigidbodyType.Kinematic) {
-        mass = 0
-        motionState = new Ammo.btDefaultMotionState(transform)
-      } else {
-        mass = 0
-        motionState = new Ammo.btDefaultMotionState(transform)
-      }
+      // All types use the same motionState constructor
+      const motionState = new Ammo.btDefaultMotionState(transform)
+      const mass = rb.type === RigidbodyType.Dynamic ? rb.mass : 0
+      const isDynamic = rb.type === RigidbodyType.Dynamic
 
       const localInertia = new Ammo.btVector3(0, 0, 0)
       if (isDynamic && mass > 0) {
@@ -261,10 +249,7 @@ export class Physics {
       body.setSleepingThresholds(0.0, 0.0)
 
       // Static (FollowBone) should be kinematic, not static - must follow bones
-      if (rb.type === RigidbodyType.Static) {
-        body.setCollisionFlags(body.getCollisionFlags() | 2) // CF_KINEMATIC_OBJECT
-        body.setActivationState(4) // DISABLE_DEACTIVATION
-      } else if (rb.type === RigidbodyType.Kinematic) {
+      if (rb.type === RigidbodyType.Static || rb.type === RigidbodyType.Kinematic) {
         body.setCollisionFlags(body.getCollisionFlags() | 2) // CF_KINEMATIC_OBJECT
         body.setActivationState(4) // DISABLE_DEACTIVATION
       }
@@ -272,7 +257,12 @@ export class Physics {
       const collisionGroup = 1 << rb.group
       const collisionMask = rb.collisionMask
 
-      if (collisionMask === 0) {
+      const isZeroVolume =
+        (rb.shape === RigidbodyShape.Sphere && rb.size.x === 0) ||
+        (rb.shape === RigidbodyShape.Box && (rb.size.x === 0 || rb.size.y === 0 || rb.size.z === 0)) ||
+        (rb.shape === RigidbodyShape.Capsule && (rb.size.x === 0 || rb.size.y === 0))
+
+      if (collisionMask === 0 || isZeroVolume) {
         body.setCollisionFlags(body.getCollisionFlags() | 4) // CF_NO_CONTACT_RESPONSE
       }
 
@@ -399,27 +389,15 @@ export class Physics {
       constraint.setLinearLowerLimit(lowerLinear)
       constraint.setLinearUpperLimit(upperLinear)
 
-      const normalizeAngle = (angle: number): number => {
-        const pi = Math.PI
-        const twoPi = 2 * pi
-        angle = angle % twoPi
-        if (angle < -pi) {
-          angle += twoPi
-        } else if (angle > pi) {
-          angle -= twoPi
-        }
-        return angle
-      }
-
       const lowerAngular = new Ammo.btVector3(
-        normalizeAngle(joint.rotationMin.x),
-        normalizeAngle(joint.rotationMin.y),
-        normalizeAngle(joint.rotationMin.z)
+        this.normalizeAngle(joint.rotationMin.x),
+        this.normalizeAngle(joint.rotationMin.y),
+        this.normalizeAngle(joint.rotationMin.z)
       )
       const upperAngular = new Ammo.btVector3(
-        normalizeAngle(joint.rotationMax.x),
-        normalizeAngle(joint.rotationMax.y),
-        normalizeAngle(joint.rotationMax.z)
+        this.normalizeAngle(joint.rotationMax.x),
+        this.normalizeAngle(joint.rotationMax.y),
+        this.normalizeAngle(joint.rotationMax.z)
       )
       constraint.setAngularLowerLimit(lowerAngular)
       constraint.setAngularUpperLimit(upperAngular)
@@ -464,6 +442,19 @@ export class Physics {
       Ammo.destroy(lowerAngular)
       Ammo.destroy(upperAngular)
     }
+  }
+
+  // Normalize angle to [-π, π] range
+  private normalizeAngle(angle: number): number {
+    const pi = Math.PI
+    const twoPi = 2 * pi
+    angle = angle % twoPi
+    if (angle < -pi) {
+      angle += twoPi
+    } else if (angle > pi) {
+      angle -= twoPi
+    }
+    return angle
   }
 
   // Syncs bones to rigidbodies, simulates dynamics, solves constraints

@@ -51,43 +51,6 @@ export interface SkeletonRuntime {
   skinMatrices: Float32Array // mat4 per bone length = boneCount*16
 }
 
-// VRM-like collision sphere attached to a bone
-export interface CollisionSphere {
-  boneIndex: number // Bone this sphere is attached to
-  radius: number // Sphere radius in cm
-  offset: [number, number, number] // Offset from bone position (in bone's local space, converted to world)
-}
-
-// Collision group - collection of spheres for body parts (chest, hips, etc.)
-export interface CollisionGroup {
-  name: string // Optional name for debugging
-  spheres: CollisionSphere[]
-}
-
-// Spring bone physics runtime state
-export interface RzmSpringPhysics {
-  chains: SpringBoneChain[] // Spring bone chain definitions
-  collisionGroups: CollisionGroup[] // Body collision groups for spring bone collision
-  currentPositions?: Float32Array // vec3 per bone in chains (current position)
-  prevPositions?: Float32Array // vec3 per bone in chains (previous position)
-  initialized: boolean // Whether spring positions have been initialized
-  timeAccumulator: number // Accumulate time between frames for fixed timestep physics
-}
-
-// VRM-like spring bone chain
-export interface SpringBoneChain {
-  // Root bone (anchor point - this bone is not affected by physics)
-  rootBoneIndex: number
-  // Chain of bones to apply spring physics to (ordered from root to tip)
-  boneIndices: number[] // Array of bone indices in the chain
-  // Spring parameters (applied to each bone in the chain)
-  stiffness: number // Spring stiffness (higher = stiffer, typical range: 0.01-1.0)
-  dragForce: number // Damping factor (higher = less oscillation, typical range: 0.1-0.9)
-  hitRadius: number // Sphere collision radius for this chain (in cm, typically 0.5-5.0)
-  // Optional center point for rotation (relative to root bone)
-  center?: [number, number, number]
-}
-
 // Rotation tween state per bone
 interface RotationTweenState {
   active: Uint8Array // 0/1 per bone
@@ -118,12 +81,11 @@ export class Model {
   // Runtime skeleton pose state (updated each frame)
   private runtimeSkeleton: SkeletonRuntime
 
-  // Spring bone physics runtime state
-  private springPhysics: RzmSpringPhysics
-
   // Cached identity matrices to avoid allocations in computeWorldMatrices
   private cachedIdentityMat1 = Mat4.identity()
   private cachedIdentityMat2 = Mat4.identity()
+  // Reused computed flags array (reallocated in constructor, cleared each frame)
+  private computedBones: boolean[] = []
 
   constructor(
     vertexData: Float32Array<ArrayBuffer>,
@@ -156,18 +118,12 @@ export class Model {
       nameIndex: {}, // Will be populated by buildBoneLookups()
     }
 
-    // Initialize spring physics state
-    this.springPhysics = {
-      chains: [],
-      collisionGroups: [],
-      initialized: false,
-      timeAccumulator: 0,
-    }
-
     if (this.skeleton.bones.length > 0) {
       this.buildBoneLookups()
       this.initializeRuntimePose()
       this.initializeRotTweenBuffers()
+      // Pre-allocate computed array for computeWorldMatrices
+      this.computedBones = new Array(this.skeleton.bones.length)
     }
   }
 
@@ -497,137 +453,27 @@ export class Model {
   }
 
   resetAllBones(): void {
+    const rot = this.runtimeSkeleton.localRotations
+    const trans = this.runtimeSkeleton.localTranslations
     const count = this.getBoneCount()
-    for (let i = 0; i < count; i++) this.resetBone(i)
-  }
 
-  // --- Spring Bone Physics (VRM-like chains) ---
-
-  // Add a spring bone chain
-  addSpringBoneChain(chain: SpringBoneChain): void {
-    // Validate bone indices
-    const boneCount = this.skeleton.bones.length
-    if (chain.rootBoneIndex < 0 || chain.rootBoneIndex >= boneCount) {
-      console.warn(`[RZM] Invalid spring chain root bone index: ${chain.rootBoneIndex}`)
-      return
-    }
-    for (const boneIdx of chain.boneIndices) {
-      if (boneIdx < 0 || boneIdx >= boneCount) {
-        console.warn(`[RZM] Invalid spring chain bone index: ${boneIdx}`)
-        return
-      }
-    }
-    if (chain.boneIndices.length === 0) {
-      console.warn(`[RZM] Spring chain must have at least one bone`)
-      return
-    }
-    this.springPhysics.chains.push(chain)
-    this.springPhysics.initialized = false // Will reinitialize on next update
-  }
-
-  // Get all spring chains
-  getSpringChains(): SpringBoneChain[] {
-    return [...this.springPhysics.chains]
-  }
-
-  // Clear all spring chains
-  clearSpringBones(): void {
-    this.springPhysics.chains = []
-    this.springPhysics.currentPositions = undefined
-    this.springPhysics.prevPositions = undefined
-    this.springPhysics.initialized = false
-  }
-
-  // Add a collision group (body colliders)
-  addCollisionGroup(group: CollisionGroup): void {
-    // Validate bone indices
-    for (const sphere of group.spheres) {
-      if (sphere.boneIndex < 0 || sphere.boneIndex >= this.skeleton.bones.length) {
-        console.warn(`[RZM] Invalid collision sphere bone index: ${sphere.boneIndex}`)
-        return
-      }
-      if (sphere.radius <= 0) {
-        console.warn(`[RZM] Invalid collision sphere radius: ${sphere.radius}`)
-        return
-      }
-    }
-    this.springPhysics.collisionGroups.push(group)
-  }
-
-  // Get all collision groups
-  getCollisionGroups(): CollisionGroup[] {
-    return [...this.springPhysics.collisionGroups]
-  }
-
-  // Clear all collision groups
-  clearCollisionGroups(): void {
-    this.springPhysics.collisionGroups = []
-  }
-
-  // Set up collision groups from PMX rigidbodies
-  // Converts PMX rigidbody data into collision spheres for spring bone collision
-  setupCollisionGroupsFromRigidbodies(
-    rigidbodies: Array<{
-      boneIndex: number
-      radius: number
-      group: number
-      collisionMask: number
-      position: [number, number, number]
-    }>
-  ): void {
-    if (rigidbodies.length === 0) return
-
-    // Group rigidbodies by their group number for better organization
-    const groupsByCollisionGroup = new Map<
-      number,
-      Array<{ boneIndex: number; radius: number; position: [number, number, number] }>
-    >()
-
-    for (const rb of rigidbodies) {
-      // Only use rigidbodies with valid bone indices
-      if (rb.boneIndex < 0 || rb.boneIndex >= this.skeleton.bones.length) {
-        console.warn(`[RZM] Skipping rigidbody with invalid bone index: ${rb.boneIndex}`)
-        continue
-      }
-
-      if (!groupsByCollisionGroup.has(rb.group)) {
-        groupsByCollisionGroup.set(rb.group, [])
-      }
-
-      groupsByCollisionGroup.get(rb.group)!.push({
-        boneIndex: rb.boneIndex,
-        radius: rb.radius,
-        position: rb.position,
-      })
-    }
-
-    // Create collision groups from PMX rigidbody data
-    for (const [groupNum, spheres] of groupsByCollisionGroup.entries()) {
-      const collisionSpheres: CollisionSphere[] = spheres.map((s) => ({
-        boneIndex: s.boneIndex,
-        radius: s.radius,
-        offset: s.position, // PMX position is already in bone's local space
-      }))
-
-      this.addCollisionGroup({
-        name: `pmx_group_${groupNum}`,
-        spheres: collisionSpheres,
-      })
-    }
-
-    if (this.springPhysics.collisionGroups.length > 0) {
-      const groupNames = this.springPhysics.collisionGroups.map((g) => g.name).join(", ")
-      const totalSpheres = this.springPhysics.collisionGroups.reduce((sum, g) => sum + g.spheres.length, 0)
-      console.log(`[RZM] Collision groups from PMX rigidbodies: ${groupNames} (${totalSpheres} spheres total)`)
-    } else {
-      console.warn(`[RZM] No collision groups created from ${rigidbodies.length} rigidbodies`)
+    for (let i = 0; i < count; i++) {
+      const qi = i * 4
+      const ti = i * 3
+      rot[qi] = 0
+      rot[qi + 1] = 0
+      rot[qi + 2] = 0
+      rot[qi + 3] = 1
+      trans[ti] = 0
+      trans[ti + 1] = 0
+      trans[ti + 2] = 0
     }
   }
 
   getBoneWorldMatrix(index: number): Float32Array | undefined {
     this.evaluatePose()
     const start = index * 16
-    return this.runtimeSkeleton.worldMatrices.slice(start, start + 16)
+    return this.runtimeSkeleton.worldMatrices.subarray(start, start + 16)
   }
 
   getBoneWorldMatrices(): Float32Array {
@@ -644,8 +490,7 @@ export class Model {
   getBoneWorldRotation(index: number): Quat {
     this.evaluatePose()
     const start = index * 16
-    const matrix = new Mat4(this.runtimeSkeleton.worldMatrices.subarray(start, start + 16))
-    return matrix.toQuat()
+    return Mat4.toQuatFromArray(this.runtimeSkeleton.worldMatrices, start)
   }
 
   getBoneInverseBindMatrix(index: number): Mat4 | undefined {
@@ -661,7 +506,6 @@ export class Model {
   evaluatePose(): void {
     this.updateRotationTweens()
     this.computeWorldMatrices()
-    this.updateSkinMatrices()
   }
 
   updateSkinMatrices(): void {
@@ -680,12 +524,20 @@ export class Model {
     const localRot = this.runtimeSkeleton.localRotations
     const localTrans = this.runtimeSkeleton.localTranslations
     const worldBuf = this.runtimeSkeleton.worldMatrices
-    const computed: boolean[] = new Array(bones.length).fill(false)
+    const computed = this.computedBones
+    const boneCount = bones.length
+
+    if (boneCount === 0) return
+
+    // Clear computed flags (faster than fill(false))
+    for (let i = 0; i < boneCount; i++) computed[i] = false
 
     const computeWorld = (i: number): void => {
       if (computed[i]) return
-      if (bones[i].parentIndex >= bones.length) {
-        console.warn(`[RZM] bone ${i} parent out of range: ${bones[i].parentIndex}`)
+
+      const b = bones[i]
+      if (b.parentIndex >= boneCount) {
+        console.warn(`[RZM] bone ${i} parent out of range: ${b.parentIndex}`)
       }
 
       const qi = i * 4
@@ -694,47 +546,48 @@ export class Model {
         addLocalTy = 0,
         addLocalTz = 0
 
-      const b = bones[i]
-      if (
-        b.appendRotate &&
-        b.appendParentIndex !== undefined &&
-        b.appendParentIndex >= 0 &&
-        b.appendParentIndex < bones.length &&
-        (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)
-      ) {
-        const ap = b.appendParentIndex
-        const apQi = ap * 4
-        const apTi = ap * 3
-        let ratio = b.appendRatio === undefined ? 1 : b.appendRatio
-        ratio = Math.max(-1, Math.min(1, ratio))
+      // Optimized append rotation check - only check necessary conditions
+      const appendParentIdx = b.appendParentIndex
+      const hasAppend =
+        b.appendRotate && appendParentIdx !== undefined && appendParentIdx >= 0 && appendParentIdx < boneCount
 
-        if (b.appendRotate) {
-          let ax = localRot[apQi]
-          let ay = localRot[apQi + 1]
-          let az = localRot[apQi + 2]
-          const aw = localRot[apQi + 3]
-          if (ratio < 0) {
-            ax = -ax
-            ay = -ay
-            az = -az
-            ratio = -ratio
+      if (hasAppend) {
+        const ratio = b.appendRatio === undefined ? 1 : Math.max(-1, Math.min(1, b.appendRatio))
+        const hasRatio = Math.abs(ratio) > 1e-6
+
+        if (hasRatio) {
+          const apQi = appendParentIdx * 4
+          const apTi = appendParentIdx * 3
+
+          if (b.appendRotate) {
+            let ax = localRot[apQi]
+            let ay = localRot[apQi + 1]
+            let az = localRot[apQi + 2]
+            const aw = localRot[apQi + 3]
+            const absRatio = ratio < 0 ? -ratio : ratio
+            if (ratio < 0) {
+              ax = -ax
+              ay = -ay
+              az = -az
+            }
+            const [rx, ry, rz, rw] = Model.slerp(0, 0, 0, 1, ax, ay, az, aw, absRatio)
+            rotateM = Mat4.fromQuat(rx, ry, rz, rw).multiply(rotateM)
           }
-          const [rx, ry, rz, rw] = Model.slerp(0, 0, 0, 1, ax, ay, az, aw, ratio)
-          rotateM = Mat4.fromQuat(rx, ry, rz, rw).multiply(rotateM)
-        }
 
-        if (b.appendMove && (b.appendRatio === undefined || Math.abs(b.appendRatio) > 1e-6)) {
-          addLocalTx += localTrans[apTi] * (b.appendRatio ?? 1)
-          addLocalTy += localTrans[apTi + 1] * (b.appendRatio ?? 1)
-          addLocalTz += localTrans[apTi + 2] * (b.appendRatio ?? 1)
+          if (b.appendMove) {
+            const appendRatio = b.appendRatio ?? 1
+            addLocalTx = localTrans[apTi] * appendRatio
+            addLocalTy = localTrans[apTi + 1] * appendRatio
+            addLocalTz = localTrans[apTi + 2] * appendRatio
+          }
         }
       }
 
-      // Reset cached matrices to identity and apply translations
-      this.cachedIdentityMat1.values.set([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
-      this.cachedIdentityMat1.translateInPlace(b.bindTranslation[0], b.bindTranslation[1], b.bindTranslation[2])
-      this.cachedIdentityMat2.values.set([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
-      this.cachedIdentityMat2.translateInPlace(addLocalTx, addLocalTy, addLocalTz)
+      // Build local matrix: identity + bind translation, then rotation, then append translation
+      this.cachedIdentityMat1
+        .setIdentity()
+        .translateInPlace(b.bindTranslation[0], b.bindTranslation[1], b.bindTranslation[2])
+      this.cachedIdentityMat2.setIdentity().translateInPlace(addLocalTx, addLocalTy, addLocalTz)
       const localM = this.cachedIdentityMat1.multiply(rotateM).multiply(this.cachedIdentityMat2)
 
       const worldOffset = i * 16
@@ -751,6 +604,7 @@ export class Model {
       computed[i] = true
     }
 
-    for (let i = 0; i < bones.length; i++) computeWorld(i)
+    // Process all bones (recursion handles dependencies automatically)
+    for (let i = 0; i < boneCount; i++) computeWorld(i)
   }
 }

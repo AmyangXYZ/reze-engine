@@ -100,7 +100,6 @@ export class Engine {
     })
 
     this.setAmbient(0.65)
-    this.clearLights()
     this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 1.2)
     this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 1.1)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 1.0)
@@ -531,7 +530,8 @@ export class Engine {
       if (texIndex < 0 || texIndex >= textures.length) {
         throw new Error(`Invalid texture index: ${texIndex}`)
       }
-      if (textureCache.has(texIndex)) return textureCache.get(texIndex)!
+      const cached = textureCache.get(texIndex)
+      if (cached) return cached
 
       const path = this.modelDir + textures[texIndex].path
       const texture = await this.createTextureFromPath(path)
@@ -542,38 +542,45 @@ export class Engine {
       return texture
     }
 
-    const uniqueDiffuse = Array.from(new Set(materials.map((m) => m.diffuseTextureIndex).filter((i) => i >= 0)))
-    await Promise.all(uniqueDiffuse.map(loadTextureByIndex))
+    // Preload unique textures
+    const textureIndices = new Set<number>()
+    for (const mat of materials) {
+      if (mat.diffuseTextureIndex >= 0) textureIndices.add(mat.diffuseTextureIndex)
+    }
+    await Promise.all(Array.from(textureIndices).map(loadTextureByIndex))
 
+    // Build material draw batches
     this.materialDraws = []
+    const bindGroupLayout = this.pipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
     let currentTexture: GPUTexture | null = null
     let currentBindGroup: GPUBindGroup | null = null
     let batchedCount = 0
-    let batchedFirstIndex = runningFirstIndex
+    let batchedFirstIndex = 0
+    let totalIndexCount = 0
 
     for (let i = 0; i < materials.length; i++) {
       const mat = materials[i]
-      const texture = await loadTextureByIndex(mat.diffuseTextureIndex)
       const matCount = mat.vertexCount | 0
+      if (matCount === 0) continue
 
-      if (currentTexture !== texture || currentBindGroup === null || matCount === 0) {
+      const texture = await loadTextureByIndex(mat.diffuseTextureIndex)
+      if (!texture) throw new Error(`Material "${mat.name}" has no texture`)
+
+      if (currentTexture !== texture || currentBindGroup === null) {
         if (currentBindGroup !== null && batchedCount > 0) {
           this.materialDraws.push({ count: batchedCount, firstIndex: batchedFirstIndex, bindGroup: currentBindGroup })
         }
 
-        if (!this.skinMatrixBuffer) throw new Error("Skin matrix buffer not initialized")
-        if (!texture) throw new Error(`Material "${mat.name}" has no texture`)
-
         currentBindGroup = this.device.createBindGroup({
           label: "material bind group",
-          layout: this.pipeline.getBindGroupLayout(0),
+          layout: bindGroupLayout,
           entries: [
             { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
             { binding: 1, resource: { buffer: this.lightUniformBuffer } },
             { binding: 2, resource: texture.createView() },
             { binding: 3, resource: this.textureSampler },
-            { binding: 4, resource: { buffer: this.skinMatrixBuffer } },
+            { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
           ],
         })
 
@@ -585,14 +592,15 @@ export class Engine {
       }
 
       runningFirstIndex += matCount
+      totalIndexCount += matCount
     }
 
     if (currentBindGroup !== null && batchedCount > 0) {
       this.materialDraws.push({ count: batchedCount, firstIndex: batchedFirstIndex, bindGroup: currentBindGroup })
     }
-    const total = this.materialDraws.reduce((a, d) => a + d.count, 0)
-    if (this.indexCount && total !== this.indexCount) {
-      console.warn(`[PMX] material index sum ${total} != indexCount ${this.indexCount}`)
+
+    if (this.indexCount && totalIndexCount !== this.indexCount) {
+      console.warn(`[PMX] material index sum ${totalIndexCount} != indexCount ${this.indexCount}`)
     }
   }
 
@@ -623,11 +631,11 @@ export class Engine {
   public render() {
     if (!this.multisampleTexture || !this.camera || !this.device || !this.currentModel) return
 
-    const frameStart = performance.now()
     const currentTime = performance.now()
     const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
     this.lastFrameTime = currentTime
 
+    // Update camera uniforms
     const viewMatrix = this.camera.getViewMatrix()
     const projectionMatrix = this.camera.getProjectionMatrix()
     const cameraPos = this.camera.getPosition()
@@ -638,12 +646,12 @@ export class Engine {
     this.cameraMatrixData[34] = cameraPos.z
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
+    // Update render targets
     this.renderPassColorAttachment.view = this.multisampleTextureView
     this.renderPassColorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
 
-    this.drawCallCount = 0
+    // Update pose and physics
     this.currentModel.evaluatePose()
-
     if (this.physics) {
       const skeleton = this.currentModel.getSkeleton()
       this.physics.step(
@@ -655,27 +663,23 @@ export class Engine {
       this.currentModel.updateSkinMatrices()
     }
 
-    if (this.skinMatrixBuffer) {
-      const mats = this.currentModel.getSkinMatrices()
-      if (mats) {
-        this.device.queue.writeBuffer(this.skinMatrixBuffer, 0, mats.buffer, mats.byteOffset, mats.byteLength)
-      }
-    }
+    // Update skin matrices buffer
+    const mats = this.currentModel.getSkinMatrices()
+    this.device.queue.writeBuffer(this.skinMatrixBuffer!, 0, mats.buffer, mats.byteOffset, mats.byteLength)
 
+    // Render
     const encoder = this.device.createCommandEncoder()
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     pass.setPipeline(this.pipeline)
     pass.setVertexBuffer(0, this.vertexBuffer)
     if (this.jointsBuffer) pass.setVertexBuffer(1, this.jointsBuffer)
     if (this.weightsBuffer) pass.setVertexBuffer(2, this.weightsBuffer)
+    pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
-    if (!this.indexBuffer) throw new Error("Index buffer required")
-    if (this.materialDraws.length === 0) throw new Error("No material draws available")
-
-    pass.setIndexBuffer(this.indexBuffer, "uint32")
+    this.drawCallCount = 0
     for (const draw of this.materialDraws) {
-      pass.setBindGroup(0, draw.bindGroup)
       if (draw.count > 0) {
+        pass.setBindGroup(0, draw.bindGroup)
         pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
         this.drawCallCount++
       }
@@ -683,7 +687,7 @@ export class Engine {
 
     pass.end()
     this.device.queue.submit([encoder.finish()])
-    this.updateStats(performance.now() - frameStart)
+    this.updateStats(performance.now() - currentTime)
   }
 
   private updateStats(frameTime: number) {
@@ -710,7 +714,7 @@ export class Engine {
         memory?: { usedJSHeapSize: number; totalJSHeapSize: number }
       }
       if (perf.memory) {
-        this.stats.memoryUsed = Math.round(perf.memory.usedJSHeapSize / 1048576)
+        this.stats.memoryUsed = Math.round(perf.memory.usedJSHeapSize / 1024 / 1024)
       }
     }
 
