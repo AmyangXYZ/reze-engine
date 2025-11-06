@@ -39,6 +39,7 @@ export class Engine {
   private modelDir: string = ""
   private physics: Physics | null = null
   private textureSampler!: GPUSampler
+  private textureCache = new Map<string, GPUTexture>() // Cache for loaded textures by path
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -574,6 +575,12 @@ export class Engine {
   }
 
   private async createTextureFromPath(path: string): Promise<GPUTexture | null> {
+    // Check cache first
+    const cached = this.textureCache.get(path)
+    if (cached) {
+      return cached
+    }
+
     try {
       const response = await fetch(path)
       if (!response.ok) {
@@ -590,6 +597,9 @@ export class Engine {
         imageBitmap.width,
         imageBitmap.height,
       ])
+
+      // Cache the texture
+      this.textureCache.set(path, texture)
       return texture
     } catch (e) {
       console.warn(`Failed to load texture: ${path}`, e)
