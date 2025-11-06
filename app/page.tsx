@@ -23,7 +23,7 @@ export default function Home() {
         const engine = new Engine(canvasRef.current)
         engineRef.current = engine
         await engine.init()
-        await engine.loadPmx("/models/梵天/", "梵天.pmx")
+        await engine.loadPmx("/models/塞尔凯特/", "塞尔凯特.pmx")
 
         engine.runRenderLoop(() => {
           setStats(engine.getStats())

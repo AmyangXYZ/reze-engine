@@ -328,9 +328,9 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.setAmbient(0.7)
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.28)
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.24)
+    this.setAmbient(0.72)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.3)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.25)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.2)
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
