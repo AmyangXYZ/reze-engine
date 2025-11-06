@@ -459,11 +459,13 @@ export class Physics {
 
   // Syncs bones to rigidbodies, simulates dynamics, solves constraints
   // Modifies boneWorldMatrices in-place for dynamic rigidbodies that drive bones
-  step(dt: number, boneWorldMatrices: Float32Array, boneInverseBindMatrices: Float32Array, boneCount: number): void {
+  step(dt: number, boneWorldMatrices: Float32Array, boneInverseBindMatrices: Float32Array): void {
     // Wait for Ammo to initialize
     if (!this.ammoInitialized || !this.ammo || !this.dynamicsWorld) {
       return
     }
+
+    const boneCount = boneWorldMatrices.length / 16
 
     if (this.firstFrame) {
       if (!this.rigidbodiesInitialized) {

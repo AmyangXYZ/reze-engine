@@ -25,7 +25,6 @@ export interface Bone {
   parentIndex: number // -1 if no parent
   bindTranslation: [number, number, number]
   children: number[] // child bone indices (built on skeleton creation)
-  // Optional PMX append/inherit transform
   appendParentIndex?: number // index of the bone to inherit from
   appendRatio?: number // 0..1
   appendRotate?: boolean
@@ -49,6 +48,7 @@ export interface SkeletonRuntime {
   localTranslations: Float32Array // vec3 per bone length = boneCount*3
   worldMatrices: Float32Array // mat4 per bone length = boneCount*16
   skinMatrices: Float32Array // mat4 per bone length = boneCount*16
+  computedBones: boolean[] // length = boneCount
 }
 
 // Rotation tween state per bone
@@ -67,7 +67,6 @@ export class Model {
   private vertexData: Float32Array<ArrayBuffer>
   private vertexCount: number
   private indexData: Uint32Array<ArrayBuffer>
-  private indexCount: number
   private textures: Texture[] = []
   private materials: Material[] = []
   // Static skeleton/skinning (not necessarily serialized yet)
@@ -84,8 +83,6 @@ export class Model {
   // Cached identity matrices to avoid allocations in computeWorldMatrices
   private cachedIdentityMat1 = Mat4.identity()
   private cachedIdentityMat2 = Mat4.identity()
-  // Reused computed flags array (reallocated in constructor, cleared each frame)
-  private computedBones: boolean[] = []
 
   constructor(
     vertexData: Float32Array<ArrayBuffer>,
@@ -100,7 +97,6 @@ export class Model {
     this.vertexData = vertexData
     this.vertexCount = vertexData.length / VERTEX_STRIDE
     this.indexData = indexData
-    this.indexCount = indexData.length
     this.textures = textures
     this.materials = materials
     this.skeleton = skeleton
@@ -116,14 +112,13 @@ export class Model {
       worldMatrices: new Float32Array(boneCount * 16),
       skinMatrices: new Float32Array(boneCount * 16),
       nameIndex: {}, // Will be populated by buildBoneLookups()
+      computedBones: new Array(boneCount).fill(false),
     }
 
     if (this.skeleton.bones.length > 0) {
       this.buildBoneLookups()
       this.initializeRuntimePose()
       this.initializeRotTweenBuffers()
-      // Pre-allocate computed array for computeWorldMatrices
-      this.computedBones = new Array(this.skeleton.bones.length)
     }
   }
 
@@ -273,11 +268,6 @@ export class Model {
   // Get index data for GPU upload
   getIndices(): Uint32Array<ArrayBuffer> {
     return this.indexData
-  }
-
-  // Get index count
-  getIndexCount(): number {
-    return this.indexCount
   }
 
   // Accessors for skeleton/skinning
@@ -480,6 +470,10 @@ export class Model {
     return this.runtimeSkeleton.worldMatrices
   }
 
+  getBoneInverseBindMatrices(): Float32Array {
+    return this.skeleton.inverseBindMatrices
+  }
+
   getBoneWorldPosition(index: number): Vec3 {
     this.evaluatePose()
     const matIdx = index * 16
@@ -524,13 +518,10 @@ export class Model {
     const localRot = this.runtimeSkeleton.localRotations
     const localTrans = this.runtimeSkeleton.localTranslations
     const worldBuf = this.runtimeSkeleton.worldMatrices
-    const computed = this.computedBones
+    const computed = this.runtimeSkeleton.computedBones.fill(false)
     const boneCount = bones.length
 
     if (boneCount === 0) return
-
-    // Clear computed flags (faster than fill(false))
-    for (let i = 0; i < boneCount; i++) computed[i] = false
 
     const computeWorld = (i: number): void => {
       if (computed[i]) return

@@ -26,7 +26,6 @@ export class Engine {
   private vertexBuffer!: GPUBuffer
   private vertexCount: number = 0
   private indexBuffer?: GPUBuffer
-  private indexCount: number = 0
   private resizeObserver: ResizeObserver | null = null
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
@@ -35,11 +34,12 @@ export class Engine {
   private skinMatrixBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
+  private renderPassDescriptor!: GPURenderPassDescriptor
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
   private textureSampler!: GPUSampler
-  private textureCache = new Map<string, GPUTexture>() // Cache for loaded textures by path
+  private textureCache = new Map<string, GPUTexture>()
 
   // Stats tracking
   private lastFpsUpdate = performance.now()
@@ -84,18 +84,14 @@ export class Engine {
       format: this.presentationFormat,
     })
 
-    this.cameraUniformBuffer = this.device.createBuffer({
-      label: "camera uniforms",
-      size: 40 * 4,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
+    // Initialize systems (each creates its own buffers/resources)
+    this.initCamera()
+    this.initLighting()
+    this.initPipeline()
+    this.initResizeObserver()
+  }
 
-    this.lightUniformBuffer = this.device.createBuffer({
-      label: "light uniforms",
-      size: 64 * 4,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
-
+  private initPipeline() {
     this.textureSampler = this.device.createSampler({
       magFilter: "linear",
       minFilter: "linear",
@@ -103,20 +99,6 @@ export class Engine {
       addressModeV: "repeat",
     })
 
-    this.setAmbient(0.7)
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.28)
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.24)
-    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.2)
-
-    // Create shader and pipeline
-    this.initPipeline()
-
-    // Setup camera and resize observer
-    this.initCamera()
-    this.initResizeObserver()
-  }
-
-  private initPipeline() {
     const shaderModule = this.device.createShaderModule({
       label: "model shaders",
       code: /* wgsl */ `
@@ -223,17 +205,17 @@ export class Engine {
             arrayStride: 8 * 4, // 8 floats per vertex * 4 bytes per float = 32 bytes
             attributes: [
               {
-                shaderLocation: 0, // position
+                shaderLocation: 0,
                 offset: 0,
                 format: "float32x3" as GPUVertexFormat,
               },
               {
-                shaderLocation: 1, // normal
+                shaderLocation: 1,
                 offset: 3 * 4,
                 format: "float32x3" as GPUVertexFormat,
               },
               {
-                shaderLocation: 2, // uv
+                shaderLocation: 2,
                 offset: 6 * 4,
                 format: "float32x2" as GPUVertexFormat,
               },
@@ -272,22 +254,17 @@ export class Engine {
   }
 
   private handleResize() {
-    // Get the display size from CSS
     const displayWidth = this.canvas.clientWidth
     const displayHeight = this.canvas.clientHeight
 
-    // Update canvas resolution to match display size
-    // Using devicePixelRatio for crisp rendering on high-DPI displays
     const dpr = window.devicePixelRatio || 1
     const width = Math.floor(displayWidth * dpr)
     const height = Math.floor(displayHeight * dpr)
 
-    // Only resize if dimensions actually changed
-    if (this.canvas.width !== width || this.canvas.height !== height) {
+    if (!this.multisampleTexture || this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width
       this.canvas.height = height
 
-      // Recreate multisample texture with new size
       this.multisampleTexture = this.device.createTexture({
         label: "multisample render target",
         size: [width, height],
@@ -296,7 +273,6 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
-      // Recreate depth texture
       this.depthTexture = this.device.createTexture({
         label: "depth texture",
         size: [width, height],
@@ -305,32 +281,58 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
-      // Update camera aspect ratio
+      const multisampleTextureView = this.multisampleTexture.createView()
+      const depthTextureView = this.depthTexture.createView()
+      this.renderPassDescriptor = {
+        label: "renderPass",
+        colorAttachments: [
+          {
+            view: multisampleTextureView,
+            resolveTarget: this.context.getCurrentTexture().createView(),
+            clearValue: { r: 0.05, g: 0.066, b: 0.086, a: 1.0 },
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+        depthStencilAttachment: {
+          view: depthTextureView,
+          depthClearValue: 1.0,
+          depthLoadOp: "clear",
+          depthStoreOp: "store",
+        },
+      }
+
       this.camera.aspect = width / height
     }
   }
 
   private initCamera() {
-    // Create camera with default settings for character viewing
-    this.camera = new Camera(
-      Math.PI, // alpha
-      Math.PI / 2.5, // beta
-      27, // radius
-      new Vec3(0, 12.5, 0) // target
-    )
+    this.cameraUniformBuffer = this.device.createBuffer({
+      label: "camera uniforms",
+      size: 40 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
 
-    // Set aspect ratio
-    const aspect = this.canvas.width / this.canvas.height
-    this.camera.aspect = aspect
+    this.camera = new Camera(Math.PI, Math.PI / 2.5, 27, new Vec3(0, 12.5, 0))
 
-    // Attach controls
+    this.camera.aspect = this.canvas.width / this.canvas.height
     this.camera.attachControl(this.canvas)
   }
 
-  public clearLights() {
+  private initLighting() {
+    this.lightUniformBuffer = this.device.createBuffer({
+      label: "light uniforms",
+      size: 64 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
     this.lightCount = 0
-    this.lightData[1] = 0
-    this.updateLightBuffer()
+
+    this.setAmbient(0.7)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.28)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.24)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.2)
+    this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
   public addLight(direction: Vec3, color: Vec3, intensity: number = 1.0): boolean {
@@ -349,17 +351,11 @@ export class Engine {
 
     this.lightCount++
     this.lightData[1] = this.lightCount
-    this.updateLightBuffer()
     return true
   }
 
   public setAmbient(intensity: number) {
     this.lightData[0] = intensity
-    this.updateLightBuffer()
-  }
-
-  private updateLightBuffer() {
-    this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
   public getStats(): EngineStats {
@@ -470,7 +466,6 @@ export class Engine {
         usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
       })
       this.device.queue.writeBuffer(this.indexBuffer, 0, indices)
-      this.indexCount = model.getIndexCount()
     } else {
       throw new Error("Model must have index buffer")
     }
@@ -498,24 +493,19 @@ export class Engine {
       return texture
     }
 
-    // Load default toon texture (shared toon textures are typically in "toon" folder)
-    // If material has toonTextureIndex >= 0, use that; otherwise use a default
     const loadToonTexture = async (toonTextureIndex: number): Promise<GPUTexture> => {
-      if (toonTextureIndex >= 0 && toonTextureIndex < textures.length) {
-        const texture = await loadTextureByIndex(toonTextureIndex)
-        if (texture) return texture
-      }
-      // Fallback: create a simple default toon gradient (white to gray)
-      // In practice, PMX models usually have toon textures, but this is a safe fallback
-      const defaultToonData = new Uint8Array(256 * 2 * 4) // 256x2 RGBA
+      const texture = await loadTextureByIndex(toonTextureIndex)
+      if (texture) return texture
+
+      // Fallback: white-to-gray gradient (MMD-style default toon)
+      const defaultToonData = new Uint8Array(256 * 2 * 4)
       for (let i = 0; i < 256; i++) {
         const factor = i / 255.0
-        const gray = Math.floor(128 + factor * 127) // 128 to 255
+        const gray = Math.floor(128 + factor * 127)
         defaultToonData[i * 4] = gray
         defaultToonData[i * 4 + 1] = gray
         defaultToonData[i * 4 + 2] = gray
         defaultToonData[i * 4 + 3] = 255
-        // Second row same as first
         defaultToonData[(256 + i) * 4] = gray
         defaultToonData[(256 + i) * 4 + 1] = gray
         defaultToonData[(256 + i) * 4 + 2] = gray
@@ -536,7 +526,6 @@ export class Engine {
       return defaultToonTexture
     }
 
-    // Create one draw call per material
     this.materialDraws = []
     const bindGroupLayout = this.pipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
@@ -575,7 +564,6 @@ export class Engine {
   }
 
   private async createTextureFromPath(path: string): Promise<GPUTexture | null> {
-    // Check cache first
     const cached = this.textureCache.get(path)
     if (cached) {
       return cached
@@ -598,7 +586,6 @@ export class Engine {
         imageBitmap.height,
       ])
 
-      // Cache the texture
       this.textureCache.set(path, texture)
       return texture
     } catch (e) {
@@ -608,83 +595,60 @@ export class Engine {
   }
 
   public render() {
-    if (!this.multisampleTexture || !this.camera || !this.device || !this.currentModel) return
+    if (this.multisampleTexture && this.camera && this.device && this.currentModel) {
+      const currentTime = performance.now()
+      const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
+      this.lastFrameTime = currentTime
 
-    const currentTime = performance.now()
-    const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
-    this.lastFrameTime = currentTime
+      const viewMatrix = this.camera.getViewMatrix()
+      const projectionMatrix = this.camera.getProjectionMatrix()
+      const cameraPos = this.camera.getPosition()
+      this.cameraMatrixData.set(viewMatrix.values, 0)
+      this.cameraMatrixData.set(projectionMatrix.values, 16)
+      this.cameraMatrixData[32] = cameraPos.x
+      this.cameraMatrixData[33] = cameraPos.y
+      this.cameraMatrixData[34] = cameraPos.z
+      this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
-    // Update camera uniforms
-    const viewMatrix = this.camera.getViewMatrix()
-    const projectionMatrix = this.camera.getProjectionMatrix()
-    const cameraPos = this.camera.getPosition()
-    this.cameraMatrixData.set(viewMatrix.values, 0)
-    this.cameraMatrixData.set(projectionMatrix.values, 16)
-    this.cameraMatrixData[32] = cameraPos.x
-    this.cameraMatrixData[33] = cameraPos.y
-    this.cameraMatrixData[34] = cameraPos.z
-    this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
+      // Update resolve target
+      ;(this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0].resolveTarget = this.context
+        .getCurrentTexture()
+        .createView()
 
-    // Create render pass descriptor
-    const multisampleTextureView = this.multisampleTexture.createView()
-    const depthTextureView = this.depthTexture.createView()
-    const renderPassDescriptor: GPURenderPassDescriptor = {
-      label: "renderPass",
-      colorAttachments: [
-        {
-          view: multisampleTextureView,
-          resolveTarget: this.context.getCurrentTexture().createView(),
-          clearValue: { r: 0.05, g: 0.066, b: 0.086, a: 1.0 },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
-      depthStencilAttachment: {
-        view: depthTextureView,
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
-      },
-    }
-
-    // Update pose and physics
-    this.currentModel.evaluatePose()
-    if (this.physics) {
-      const skeleton = this.currentModel.getSkeleton()
-      this.physics.step(
-        deltaTime,
-        this.currentModel.getBoneWorldMatrices(),
-        skeleton.inverseBindMatrices,
-        skeleton.bones.length
-      )
-      this.currentModel.updateSkinMatrices()
-    }
-
-    // Update skin matrices buffer
-    const mats = this.currentModel.getSkinMatrices()
-    this.device.queue.writeBuffer(this.skinMatrixBuffer!, 0, mats.buffer, mats.byteOffset, mats.byteLength)
-
-    // Render
-    const encoder = this.device.createCommandEncoder()
-    const pass = encoder.beginRenderPass(renderPassDescriptor)
-    pass.setPipeline(this.pipeline)
-    pass.setVertexBuffer(0, this.vertexBuffer)
-    pass.setVertexBuffer(1, this.jointsBuffer)
-    pass.setVertexBuffer(2, this.weightsBuffer)
-    pass.setIndexBuffer(this.indexBuffer!, "uint32")
-
-    this.drawCallCount = 0
-    for (const draw of this.materialDraws) {
-      if (draw.count > 0) {
-        pass.setBindGroup(0, draw.bindGroup)
-        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-        this.drawCallCount++
+      this.currentModel.evaluatePose()
+      if (this.physics) {
+        this.physics.step(
+          deltaTime,
+          this.currentModel.getBoneWorldMatrices(),
+          this.currentModel.getBoneInverseBindMatrices()
+        )
+        this.currentModel.updateSkinMatrices()
       }
-    }
 
-    pass.end()
-    this.device.queue.submit([encoder.finish()])
-    this.updateStats(performance.now() - currentTime)
+      const mats = this.currentModel.getSkinMatrices()
+      this.device.queue.writeBuffer(this.skinMatrixBuffer!, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+
+      const encoder = this.device.createCommandEncoder()
+      const pass = encoder.beginRenderPass(this.renderPassDescriptor)
+      pass.setPipeline(this.pipeline)
+      pass.setVertexBuffer(0, this.vertexBuffer)
+      pass.setVertexBuffer(1, this.jointsBuffer)
+      pass.setVertexBuffer(2, this.weightsBuffer)
+      pass.setIndexBuffer(this.indexBuffer!, "uint32")
+
+      this.drawCallCount = 0
+      for (const draw of this.materialDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      pass.end()
+      this.device.queue.submit([encoder.finish()])
+      this.updateStats(performance.now() - currentTime)
+    }
   }
 
   private updateStats(frameTime: number) {
