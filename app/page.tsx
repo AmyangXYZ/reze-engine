@@ -48,7 +48,13 @@ export default function Home() {
   }, [initEngine])
 
   return (
-    <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
+    <div
+      className="fixed inset-0 w-full h-full overflow-hidden touch-none"
+      style={{
+        background:
+          "radial-gradient(ellipse at center, rgba(20, 20, 25, 0.8) 0%, rgba(20, 20, 25, 0.8) 30%, rgba(8, 8, 12, 0.95) 65%, rgba(0, 0, 0, 1) 100%)",
+      }}
+    >
       <Header stats={stats} />
 
       {engineError && (

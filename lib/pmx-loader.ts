@@ -239,13 +239,15 @@ export class PmxLoader {
         const ambient = [this.getFloat32(), this.getFloat32(), this.getFloat32()] as [number, number, number]
 
         const flag = this.getUint8()
-        // edgeColor vec4 (skip 4 floats)
-        this.getFloat32()
-        this.getFloat32()
-        this.getFloat32()
-        this.getFloat32()
-        // edgeSize float (skip 1 float)
-        this.getFloat32()
+        // edgeColor vec4
+        const edgeColor: [number, number, number, number] = [
+          this.getFloat32(),
+          this.getFloat32(),
+          this.getFloat32(),
+          this.getFloat32(),
+        ]
+        // edgeSize float
+        const edgeSize = this.getFloat32()
 
         const textureIndex = this.getNonVertexIndex(this.textureIndexSize)
         const sphereTextureIndex = this.getNonVertexIndex(this.textureIndexSize)
@@ -269,6 +271,8 @@ export class PmxLoader {
           sphereMode: sphereTextureMode,
           toonTextureIndex,
           edgeFlag: flag,
+          edgeColor,
+          edgeSize,
           vertexCount,
         })
       }

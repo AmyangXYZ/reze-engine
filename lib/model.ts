@@ -17,6 +17,8 @@ export interface Material {
   sphereMode: number
   toonTextureIndex: number
   edgeFlag: number
+  edgeColor: [number, number, number, number]
+  edgeSize: number
   vertexCount: number
 }
 

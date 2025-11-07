@@ -27,7 +27,7 @@ export class Camera {
   // Camera settings
   angularSensitivity: number = 0.005
   panSensitivity: number = 0.0002 // Sensitivity for right-click panning
-  wheelPrecision: number = 0.005
+  wheelPrecision: number = 0.01
   pinchPrecision: number = 0.05
   minZ: number = 0.1
   maxZ: number = FAR

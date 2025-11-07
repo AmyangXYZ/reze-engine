@@ -29,6 +29,7 @@ export class Engine {
   private resizeObserver: ResizeObserver | null = null
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
+  private outlinePipeline!: GPURenderPipeline
   private jointsBuffer!: GPUBuffer
   private weightsBuffer!: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
@@ -82,12 +83,13 @@ export class Engine {
     this.context.configure({
       device: this.device,
       format: this.presentationFormat,
+      alphaMode: "premultiplied", // Enable transparency for CSS gradient background
     })
 
-    // Initialize systems (each creates its own buffers/resources)
     this.initCamera()
     this.initLighting()
     this.initPipeline()
+    this.initOutline()
     this.initResizeObserver()
   }
 
@@ -247,6 +249,121 @@ export class Engine {
     })
   }
 
+  private initOutline() {
+    const outlineShaderModule = this.device.createShaderModule({
+      label: "outline shaders",
+      code: /* wgsl */ `
+        struct CameraUniforms {
+          view: mat4x4f,
+          projection: mat4x4f,
+          viewPos: vec3f,
+          _padding: f32,
+        };
+
+        struct MaterialUniforms {
+          edgeColor: vec4f,
+          edgeSize: f32,
+          _padding1: f32,
+          _padding2: f32,
+          _padding3: f32,
+        };
+
+        @group(0) @binding(0) var<uniform> camera: CameraUniforms;
+        @group(0) @binding(1) var<uniform> material: MaterialUniforms;
+        @group(0) @binding(2) var<storage, read> skinMats: array<mat4x4f>;
+
+        struct VertexOutput {
+          @builtin(position) position: vec4f,
+        };
+
+        @vertex fn vs(
+          @location(0) position: vec3f,
+          @location(1) normal: vec3f,
+          @location(2) uv: vec2f,
+          @location(3) joints0: vec4<u32>,
+          @location(4) weights0: vec4<f32>
+        ) -> VertexOutput {
+          var output: VertexOutput;
+          let pos4 = vec4f(position, 1.0);
+          var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
+          var skinnedNrm = vec3f(0.0, 0.0, 0.0);
+          for (var i = 0u; i < 4u; i++) {
+            let j = joints0[i];
+            let w = weights0[i];
+            let m = skinMats[j];
+            skinnedPos += (m * pos4) * w;
+            let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
+            skinnedNrm += (r3 * normal) * w;
+          }
+          let worldPos = skinnedPos.xyz;
+          let worldNormal = normalize(skinnedNrm);
+          
+          let scaleFactor = 0.01;
+          let expandedPos = worldPos + worldNormal * material.edgeSize * scaleFactor;
+          output.position = camera.projection * camera.view * vec4f(expandedPos, 1.0);
+          return output;
+        }
+
+        @fragment fn fs() -> @location(0) vec4f {
+          return material.edgeColor;
+        }
+      `,
+    })
+
+    this.outlinePipeline = this.device.createRenderPipeline({
+      label: "outline pipeline",
+      layout: "auto",
+      vertex: {
+        module: outlineShaderModule,
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [
+              {
+                shaderLocation: 0,
+                offset: 0,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 1,
+                offset: 3 * 4,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 2,
+                offset: 6 * 4,
+                format: "float32x2" as GPUVertexFormat,
+              },
+            ],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: outlineShaderModule,
+        targets: [{ format: this.presentationFormat }],
+      },
+      primitive: {
+        cullMode: "back",
+      },
+      depthStencil: {
+        format: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      },
+      multisample: {
+        count: this.sampleCount,
+      },
+    })
+  }
+
   private initResizeObserver() {
     this.resizeObserver = new ResizeObserver(() => this.handleResize())
     this.resizeObserver.observe(this.canvas)
@@ -289,7 +406,8 @@ export class Engine {
           {
             view: multisampleTextureView,
             resolveTarget: this.context.getCurrentTexture().createView(),
-            clearValue: { r: 0.05, g: 0.066, b: 0.086, a: 1.0 },
+            // Transparent clear color - background gradient handled by CSS
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
             loadOp: "clear",
             storeOp: "store",
           },
@@ -313,7 +431,7 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
-    this.camera = new Camera(Math.PI, Math.PI / 2.5, 27, new Vec3(0, 12.5, 0))
+    this.camera = new Camera(Math.PI, Math.PI / 2.5, 26.6, new Vec3(0, 12.5, 0))
 
     this.camera.aspect = this.canvas.width / this.canvas.height
     this.camera.attachControl(this.canvas)
@@ -328,7 +446,7 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.setAmbient(0.72)
+    this.setAmbient(0.75)
     this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.3)
     this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.25)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.2)
@@ -474,6 +592,7 @@ export class Engine {
   }
 
   private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup }[] = []
+  private outlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup }[] = []
 
   private async prepareMaterialDraws(model: Model) {
     const materials = model.getMaterials()
@@ -527,7 +646,9 @@ export class Engine {
     }
 
     this.materialDraws = []
+    this.outlineDraws = []
     const bindGroupLayout = this.pipeline.getBindGroupLayout(0)
+    const outlineBindGroupLayout = this.outlinePipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
 
     for (const mat of materials) {
@@ -558,6 +679,38 @@ export class Engine {
         firstIndex: runningFirstIndex,
         bindGroup,
       })
+
+      if ((mat.edgeFlag & 0x01) !== 0 || mat.edgeSize > 0) {
+        const materialUniformData = new Float32Array(8)
+        materialUniformData[0] = mat.edgeColor[0]
+        materialUniformData[1] = mat.edgeColor[1]
+        materialUniformData[2] = mat.edgeColor[2]
+        materialUniformData[3] = mat.edgeColor[3]
+        materialUniformData[4] = mat.edgeSize
+
+        const materialUniformBuffer = this.device.createBuffer({
+          label: `outline material uniform: ${mat.name}`,
+          size: materialUniformData.byteLength,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+        this.device.queue.writeBuffer(materialUniformBuffer, 0, materialUniformData)
+
+        const outlineBindGroup = this.device.createBindGroup({
+          label: `outline bind group: ${mat.name}`,
+          layout: outlineBindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+            { binding: 1, resource: { buffer: materialUniformBuffer } },
+            { binding: 2, resource: { buffer: this.skinMatrixBuffer! } },
+          ],
+        })
+
+        this.outlineDraws.push({
+          count: matCount,
+          firstIndex: runningFirstIndex,
+          bindGroup: outlineBindGroup,
+        })
+      }
 
       runningFirstIndex += matCount
     }
@@ -630,12 +783,23 @@ export class Engine {
 
       const encoder = this.device.createCommandEncoder()
       const pass = encoder.beginRenderPass(this.renderPassDescriptor)
-      pass.setPipeline(this.pipeline)
+
       pass.setVertexBuffer(0, this.vertexBuffer)
       pass.setVertexBuffer(1, this.jointsBuffer)
       pass.setVertexBuffer(2, this.weightsBuffer)
       pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
+      if (this.outlineDraws.length > 0) {
+        pass.setPipeline(this.outlinePipeline)
+        for (const draw of this.outlineDraws) {
+          if (draw.count > 0) {
+            pass.setBindGroup(0, draw.bindGroup)
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          }
+        }
+      }
+
+      pass.setPipeline(this.pipeline)
       this.drawCallCount = 0
       for (const draw of this.materialDraws) {
         if (draw.count > 0) {
