@@ -80,10 +80,11 @@ export class Engine {
     this.context = context
 
     this.presentationFormat = navigator.gpu.getPreferredCanvasFormat()
+
     this.context.configure({
       device: this.device,
       format: this.presentationFormat,
-      alphaMode: "premultiplied", // Enable transparency for CSS gradient background
+      alphaMode: "premultiplied",
     })
 
     this.initCamera()
@@ -126,6 +127,13 @@ export class Engine {
           lights: array<Light, 4>,
         };
 
+        struct MaterialUniforms {
+          alpha: f32,
+          _padding1: f32,
+          _padding2: f32,
+          _padding3: f32,
+        };
+
         struct VertexOutput {
           @builtin(position) position: vec4f,
           @location(0) normal: vec3f,
@@ -140,6 +148,7 @@ export class Engine {
         @group(0) @binding(4) var<storage, read> skinMats: array<mat4x4f>;
         @group(0) @binding(5) var toonTexture: texture_2d<f32>;
         @group(0) @binding(6) var toonSampler: sampler;
+        @group(0) @binding(7) var<uniform> material: MaterialUniforms;
 
         @vertex fn vs(
           @location(0) position: vec3f,
@@ -172,31 +181,29 @@ export class Engine {
           let n = normalize(input.normal);
           let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
 
-          // Accumulate light contribution
           var lightAccum = vec3f(light.ambient);
           let numLights = u32(light.lightCount);
           for (var i = 0u; i < numLights; i++) {
             let l = -light.lights[i].direction;
             let nDotL = max(dot(n, l), 0.0);
-            
-            // Sample toon texture: use N·L as U coordinate, 0.5 as V (middle of texture)
-            // Must sample outside conditional for uniform control flow
             let toonUV = vec2f(nDotL, 0.5);
             let toonFactor = textureSample(toonTexture, toonSampler, toonUV).rgb;
-            
-            // Accumulate light contribution through toon factor
             let radiance = light.lights[i].color * light.lights[i].intensity;
             lightAccum += toonFactor * radiance * nDotL;
           }
           
-          // Multiply albedo with accumulated lighting
-          var color = albedo * lightAccum;
+          let color = albedo * lightAccum;
+          let finalAlpha = material.alpha;
+          if (finalAlpha < 0.001) {
+            discard;
+          }
           
-          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), 1.0);
+          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), finalAlpha);
         }
       `,
     })
 
+    // Single pipeline for all materials with alpha blending
     this.pipeline = this.device.createRenderPipeline({
       label: "model pipeline",
       layout: "auto",
@@ -204,38 +211,42 @@ export class Engine {
         module: shaderModule,
         buffers: [
           {
-            arrayStride: 8 * 4, // 8 floats per vertex * 4 bytes per float = 32 bytes
+            arrayStride: 8 * 4,
             attributes: [
-              {
-                shaderLocation: 0,
-                offset: 0,
-                format: "float32x3" as GPUVertexFormat,
-              },
-              {
-                shaderLocation: 1,
-                offset: 3 * 4,
-                format: "float32x3" as GPUVertexFormat,
-              },
-              {
-                shaderLocation: 2,
-                offset: 6 * 4,
-                format: "float32x2" as GPUVertexFormat,
-              },
+              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
             ],
           },
           {
-            arrayStride: 4 * 2, // 4 * uint16
+            arrayStride: 4 * 2,
             attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
           },
           {
-            arrayStride: 4, // 4 * unorm8 packed
+            arrayStride: 4,
             attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
           },
         ],
       },
       fragment: {
         module: shaderModule,
-        targets: [{ format: this.presentationFormat }],
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+            },
+          },
+        ],
       },
       primitive: { cullMode: "none" },
       depthStencil: {
@@ -298,6 +309,7 @@ export class Engine {
           let worldPos = skinnedPos.xyz;
           let worldNormal = normalize(skinnedNrm);
           
+          // MMD invert hull: expand vertices outward along normals
           let scaleFactor = 0.01;
           let expandedPos = worldPos + worldNormal * material.edgeSize * scaleFactor;
           output.position = camera.projection * camera.view * vec4f(expandedPos, 1.0);
@@ -398,20 +410,27 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
-      const multisampleTextureView = this.multisampleTexture.createView()
       const depthTextureView = this.depthTexture.createView()
+
+      const colorAttachment: GPURenderPassColorAttachment =
+        this.sampleCount > 1
+          ? {
+              view: this.multisampleTexture.createView(),
+              resolveTarget: this.context.getCurrentTexture().createView(),
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
+              loadOp: "clear",
+              storeOp: "store",
+            }
+          : {
+              view: this.context.getCurrentTexture().createView(),
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
+              loadOp: "clear",
+              storeOp: "store",
+            }
+
       this.renderPassDescriptor = {
         label: "renderPass",
-        colorAttachments: [
-          {
-            view: multisampleTextureView,
-            resolveTarget: this.context.getCurrentTexture().createView(),
-            // Transparent clear color - background gradient handled by CSS
-            clearValue: { r: 0, g: 0, b: 0, a: 0 },
-            loadOp: "clear",
-            storeOp: "store",
-          },
-        ],
+        colorAttachments: [colorAttachment],
         depthStencilAttachment: {
           view: depthTextureView,
           depthClearValue: 1.0,
@@ -616,7 +635,7 @@ export class Engine {
       const texture = await loadTextureByIndex(toonTextureIndex)
       if (texture) return texture
 
-      // Fallback: white-to-gray gradient (MMD-style default toon)
+      // Default toon texture fallback
       const defaultToonData = new Uint8Array(256 * 2 * 4)
       for (let i = 0; i < 256; i++) {
         const factor = i / 255.0
@@ -647,7 +666,6 @@ export class Engine {
 
     this.materialDraws = []
     this.outlineDraws = []
-    const bindGroupLayout = this.pipeline.getBindGroupLayout(0)
     const outlineBindGroupLayout = this.outlinePipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
 
@@ -660,9 +678,26 @@ export class Engine {
 
       const toonTexture = await loadToonTexture(mat.toonTextureIndex)
 
+      const materialAlpha = mat.diffuse[3]
+      const EPSILON = 0.001
+      const isTransparent = materialAlpha < 1.0 - EPSILON
+
+      const materialUniformData = new Float32Array(4)
+      materialUniformData[0] = materialAlpha
+      materialUniformData[1] = 0.0
+      materialUniformData[2] = 0.0
+      materialUniformData[3] = 0.0
+
+      const materialUniformBuffer = this.device.createBuffer({
+        label: `material uniform: ${mat.name}`,
+        size: materialUniformData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(materialUniformBuffer, 0, materialUniformData)
+
       const bindGroup = this.device.createBindGroup({
         label: `material bind group: ${mat.name}`,
-        layout: bindGroupLayout,
+        layout: this.pipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
@@ -671,6 +706,7 @@ export class Engine {
           { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
           { binding: 5, resource: toonTexture.createView() },
           { binding: 6, resource: this.textureSampler },
+          { binding: 7, resource: { buffer: materialUniformBuffer } },
         ],
       })
 
@@ -680,7 +716,8 @@ export class Engine {
         bindGroup,
       })
 
-      if ((mat.edgeFlag & 0x01) !== 0 || mat.edgeSize > 0) {
+      // Outline only for opaque materials
+      if (!isTransparent && ((mat.edgeFlag & 0x01) !== 0 || mat.edgeSize > 0)) {
         const materialUniformData = new Float32Array(8)
         materialUniformData[0] = mat.edgeColor[0]
         materialUniformData[1] = mat.edgeColor[1]
@@ -727,7 +764,10 @@ export class Engine {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-      const imageBitmap = await createImageBitmap(await response.blob())
+      const imageBitmap = await createImageBitmap(await response.blob(), {
+        premultiplyAlpha: "none",
+        colorSpaceConversion: "none",
+      })
       const texture = this.device.createTexture({
         label: `texture: ${path}`,
         size: [imageBitmap.width, imageBitmap.height],
@@ -741,8 +781,7 @@ export class Engine {
 
       this.textureCache.set(path, texture)
       return texture
-    } catch (e) {
-      console.warn(`Failed to load texture: ${path}`, e)
+    } catch {
       return null
     }
   }
@@ -763,10 +802,12 @@ export class Engine {
       this.cameraMatrixData[34] = cameraPos.z
       this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
-      // Update resolve target
-      ;(this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0].resolveTarget = this.context
-        .getCurrentTexture()
-        .createView()
+      const colorAttachment = (this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
+      if (this.sampleCount > 1) {
+        colorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
+      } else {
+        colorAttachment.view = this.context.getCurrentTexture().createView()
+      }
 
       this.currentModel.evaluatePose()
       if (this.physics) {
@@ -789,6 +830,9 @@ export class Engine {
       pass.setVertexBuffer(2, this.weightsBuffer)
       pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
+      this.drawCallCount = 0
+
+      // Render outline first (MMD invert hull method)
       if (this.outlineDraws.length > 0) {
         pass.setPipeline(this.outlinePipeline)
         for (const draw of this.outlineDraws) {
@@ -799,8 +843,8 @@ export class Engine {
         }
       }
 
+      // Render all materials
       pass.setPipeline(this.pipeline)
-      this.drawCallCount = 0
       for (const draw of this.materialDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
