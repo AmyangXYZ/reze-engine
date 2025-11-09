@@ -360,7 +360,23 @@ export class Engine {
       },
       fragment: {
         module: outlineShaderModule,
-        targets: [{ format: this.presentationFormat }],
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+            },
+          },
+        ],
       },
       primitive: {
         cullMode: "back",
@@ -610,8 +626,8 @@ export class Engine {
     await this.prepareMaterialDraws(model)
   }
 
-  private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup }[] = []
-  private outlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup }[] = []
+  private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private outlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
 
   private async prepareMaterialDraws(model: Model) {
     const materials = model.getMaterials()
@@ -710,14 +726,16 @@ export class Engine {
         ],
       })
 
+      // All materials use the same pipeline
       this.materialDraws.push({
         count: matCount,
         firstIndex: runningFirstIndex,
         bindGroup,
+        isTransparent,
       })
 
-      // Outline only for opaque materials
-      if (!isTransparent && ((mat.edgeFlag & 0x01) !== 0 || mat.edgeSize > 0)) {
+      // Outline for all materials (including transparent)
+      if ((mat.edgeFlag & 0x01) !== 0 || mat.edgeSize > 0) {
         const materialUniformData = new Float32Array(8)
         materialUniformData[0] = mat.edgeColor[0]
         materialUniformData[1] = mat.edgeColor[1]
@@ -742,10 +760,12 @@ export class Engine {
           ],
         })
 
+        // All outlines use the same pipeline
         this.outlineDraws.push({
           count: matCount,
           firstIndex: runningFirstIndex,
           bindGroup: outlineBindGroup,
+          isTransparent,
         })
       }
 
@@ -832,24 +852,44 @@ export class Engine {
 
       this.drawCallCount = 0
 
-      // Render outline first (MMD invert hull method)
+      // Render opaque outlines first (MMD invert hull method)
       if (this.outlineDraws.length > 0) {
         pass.setPipeline(this.outlinePipeline)
         for (const draw of this.outlineDraws) {
-          if (draw.count > 0) {
+          if (draw.count > 0 && !draw.isTransparent) {
             pass.setBindGroup(0, draw.bindGroup)
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
           }
         }
       }
 
-      // Render all materials
+      // Render opaque materials
       pass.setPipeline(this.pipeline)
       for (const draw of this.materialDraws) {
-        if (draw.count > 0) {
+        if (draw.count > 0 && !draw.isTransparent) {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
           this.drawCallCount++
+        }
+      }
+
+      // Render transparent materials
+      for (const draw of this.materialDraws) {
+        if (draw.count > 0 && draw.isTransparent) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      // Render transparent outlines after their materials
+      if (this.outlineDraws.length > 0) {
+        pass.setPipeline(this.outlinePipeline)
+        for (const draw of this.outlineDraws) {
+          if (draw.count > 0 && draw.isTransparent) {
+            pass.setBindGroup(0, draw.bindGroup)
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          }
         }
       }
 
