@@ -1,6 +1,7 @@
 "use client"
 
 import Header from "@/components/header"
+import { Progress } from "@/components/ui/progress"
 import { Engine, EngineStats } from "@/lib/engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 
@@ -8,6 +9,7 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
   const [engineError, setEngineError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats>({
     fps: 0,
     frameTime: 0,
@@ -15,6 +17,7 @@ export default function Home() {
     drawCalls: 0,
     vertices: 0,
   })
+  const [progress, setProgress] = useState(0)
 
   const initEngine = useCallback(async () => {
     if (canvasRef.current) {
@@ -24,6 +27,7 @@ export default function Home() {
         engineRef.current = engine
         await engine.init()
         await engine.loadPmx("/models/塞尔凯特/", "塞尔凯特.pmx")
+        setLoading(false)
 
         engine.runRenderLoop(() => {
           setStats(engine.getStats())
@@ -47,6 +51,21 @@ export default function Home() {
     }
   }, [initEngine])
 
+  useEffect(() => {
+    if (loading) {
+      const interval = setInterval(() => {
+        setProgress((prev) => {
+          if (prev >= 100) {
+            return 0
+          }
+          return prev + 1
+        })
+      }, 50) // Update every 50ms for smooth animation
+
+      return () => clearInterval(interval)
+    }
+  }, [loading])
+
   return (
     <div
       className="fixed inset-0 w-full h-full overflow-hidden touch-none"
@@ -60,6 +79,11 @@ export default function Home() {
       {engineError && (
         <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white p-6">
           Engine Error: {engineError}
+        </div>
+      )}
+      {loading && !engineError && (
+        <div className="absolute inset-0 max-w-xs mx-auto w-full h-full flex items-center justify-center text-white p-6">
+          <Progress value={progress} className="rounded-none" />
         </div>
       )}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
