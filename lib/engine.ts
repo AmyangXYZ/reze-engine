@@ -159,11 +159,21 @@ export class Engine {
         ) -> VertexOutput {
           var output: VertexOutput;
           let pos4 = vec4f(position, 1.0);
+          
+          // Normalize weights to ensure they sum to 1.0 (handles floating-point precision issues)
+          let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
+          var normalizedWeights: vec4f;
+          if (weightSum > 0.0001) {
+            normalizedWeights = weights0 / weightSum;
+          } else {
+            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
+          }
+          
           var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
           var skinnedNrm = vec3f(0.0, 0.0, 0.0);
           for (var i = 0u; i < 4u; i++) {
             let j = joints0[i];
-            let w = weights0[i];
+            let w = normalizedWeights[i];
             let m = skinMats[j];
             skinnedPos += (m * pos4) * w;
             let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
@@ -296,11 +306,21 @@ export class Engine {
         ) -> VertexOutput {
           var output: VertexOutput;
           let pos4 = vec4f(position, 1.0);
+          
+          // Normalize weights to ensure they sum to 1.0 (handles floating-point precision issues)
+          let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
+          var normalizedWeights: vec4f;
+          if (weightSum > 0.0001) {
+            normalizedWeights = weights0 / weightSum;
+          } else {
+            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
+          }
+          
           var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
           var skinnedNrm = vec3f(0.0, 0.0, 0.0);
           for (var i = 0u; i < 4u; i++) {
             let j = joints0[i];
-            let w = weights0[i];
+            let w = normalizedWeights[i];
             let m = skinMats[j];
             skinnedPos += (m * pos4) * w;
             let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
@@ -310,7 +330,7 @@ export class Engine {
           let worldNormal = normalize(skinnedNrm);
           
           // MMD invert hull: expand vertices outward along normals
-          let scaleFactor = 0.01;
+          let scaleFactor = 0.008;
           let expandedPos = worldPos + worldNormal * material.edgeSize * scaleFactor;
           output.position = camera.projection * camera.view * vec4f(expandedPos, 1.0);
           return output;

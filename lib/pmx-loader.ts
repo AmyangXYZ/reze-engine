@@ -833,26 +833,82 @@ export class PmxLoader {
       const joints = this.joints0
       const weights = this.weights0
       for (let i = 0; i < joints.length; i += 4) {
-        let sum = 0
+        // First pass: identify and zero out invalid joints, collect valid weight sum
+        let validWeightSum = 0
+        let validCount = 0
         for (let k = 0; k < 4; k++) {
           const j = joints[i + k]
-          if (j >= boneCount) {
+          if (j < 0 || j >= boneCount) {
+            // Invalid joint: zero the weight but keep joint index for debugging
             weights[i + k] = 0
-            joints[i + k] = 0
+            // Optionally clamp to valid range
+            if (j < 0) {
+              joints[i + k] = 0
+            } else {
+              joints[i + k] = boneCount > 0 ? boneCount - 1 : 0
+            }
+          } else {
+            validWeightSum += weights[i + k]
+            validCount++
           }
-          sum += weights[i + k]
         }
-        if (sum === 0) {
+
+        // If no valid weights, assign all weight to first bone (bone 0)
+        if (validWeightSum === 0 || validCount === 0) {
           weights[i] = 255
-        } else if (sum !== 255) {
-          const scale = 255 / sum
+          weights[i + 1] = 0
+          weights[i + 2] = 0
+          weights[i + 3] = 0
+          joints[i] = boneCount > 0 ? 0 : 0
+          joints[i + 1] = 0
+          joints[i + 2] = 0
+          joints[i + 3] = 0
+        } else if (validWeightSum !== 255) {
+          // Normalize valid weights to sum to exactly 255
+          const scale = 255 / validWeightSum
           let accum = 0
           for (let k = 0; k < 3; k++) {
-            const v = Math.max(0, Math.min(255, Math.round(weights[i + k] * scale)))
-            weights[i + k] = v
-            accum += v
+            if (joints[i + k] >= 0 && joints[i + k] < boneCount) {
+              const v = Math.max(0, Math.min(255, Math.round(weights[i + k] * scale)))
+              weights[i + k] = v
+              accum += v
+            } else {
+              weights[i + k] = 0
+            }
           }
-          weights[i + 3] = Math.max(0, Math.min(255, 255 - accum))
+          // Handle the 4th weight
+          if (joints[i + 3] >= 0 && joints[i + 3] < boneCount) {
+            weights[i + 3] = Math.max(0, Math.min(255, 255 - accum))
+          } else {
+            weights[i + 3] = 0
+            // Redistribute the remainder to the last valid weight
+            if (accum < 255) {
+              for (let k = 2; k >= 0; k--) {
+                if (joints[i + k] >= 0 && joints[i + k] < boneCount && weights[i + k] > 0) {
+                  weights[i + k] = Math.min(255, weights[i + k] + (255 - accum))
+                  break
+                }
+              }
+            }
+          }
+
+          // Final safety check: ensure sum is exactly 255
+          const finalSum = weights[i] + weights[i + 1] + weights[i + 2] + weights[i + 3]
+          if (finalSum !== 255) {
+            const diff = 255 - finalSum
+            // Add/subtract difference to/from the largest valid weight
+            let maxIdx = 0
+            let maxWeight = weights[i]
+            for (let k = 1; k < 4; k++) {
+              if (weights[i + k] > maxWeight && joints[i + k] >= 0 && joints[i + k] < boneCount) {
+                maxWeight = weights[i + k]
+                maxIdx = k
+              }
+            }
+            if (joints[i + maxIdx] >= 0 && joints[i + maxIdx] < boneCount) {
+              weights[i + maxIdx] = Math.max(0, Math.min(255, weights[i + maxIdx] + diff))
+            }
+          }
         }
       }
       skinning = { joints, weights }
