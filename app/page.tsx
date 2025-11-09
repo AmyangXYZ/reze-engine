@@ -60,7 +60,7 @@ export default function Home() {
           }
           return prev + 1
         })
-      }, 50) // Update every 50ms for smooth animation
+      }, 50)
 
       return () => clearInterval(interval)
     }

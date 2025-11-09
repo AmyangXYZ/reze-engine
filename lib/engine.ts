@@ -1,6 +1,6 @@
 import { Camera } from "./camera"
 import { Quat, Vec3 } from "./math"
-import { Model } from "./model"
+import { Model, Material } from "./model"
 import { PmxLoader } from "./pmx-loader"
 import { Physics } from "./physics"
 
@@ -10,6 +10,34 @@ export interface EngineStats {
   memoryUsed: number // MB
   vertices: number
   drawCalls: number
+}
+
+interface MaterialDraw {
+  count: number
+  firstIndex: number
+  bindGroup: GPUBindGroup
+  isTransparent: boolean
+  texturePath: string
+  materialIndices: number[] // Material indices for this batched draw
+}
+
+interface OutlineDraw {
+  count: number
+  firstIndex: number
+  bindGroup: GPUBindGroup
+  isTransparent: boolean
+}
+
+interface MaterialDrawInfo {
+  mat: Material
+  matIndex: number
+  firstIndex: number
+  count: number
+  diffuseTexture: GPUTexture
+  toonTexture: GPUTexture
+  texturePath: string
+  isTransparent: boolean
+  materialUniformBuffer: GPUBuffer
 }
 
 export class Engine {
@@ -128,10 +156,9 @@ export class Engine {
         };
 
         struct MaterialUniforms {
-          alpha: f32,
-          _padding1: f32,
-          _padding2: f32,
-          _padding3: f32,
+          diffuse: vec4f,
+          ambient: vec3f,
+          _padding: f32,
         };
 
         struct VertexOutput {
@@ -189,9 +216,14 @@ export class Engine {
 
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
           let n = normalize(input.normal);
-          let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
+          // MMD formula: textureColor * materialDiffuseColor
+          let texColor = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
+          let albedo = texColor * material.diffuse.rgb;
 
-          var lightAccum = vec3f(light.ambient);
+          // MMD uses per-material ambient color (adds warmth/redness to skin)
+          // Start with material ambient instead of global ambient
+          var lightAccum = material.ambient;
+          
           let numLights = u32(light.lightCount);
           for (var i = 0u; i < numLights; i++) {
             let l = -light.lights[i].direction;
@@ -203,7 +235,7 @@ export class Engine {
           }
           
           let color = albedo * lightAccum;
-          let finalAlpha = material.alpha;
+          let finalAlpha = material.diffuse.a;
           if (finalAlpha < 0.001) {
             discard;
           }
@@ -501,10 +533,9 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.setAmbient(0.75)
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.3)
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.25)
-    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.2)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.24)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.18)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.12)
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
@@ -525,10 +556,6 @@ export class Engine {
     this.lightCount++
     this.lightData[1] = this.lightCount
     return true
-  }
-
-  public setAmbient(intensity: number) {
-    this.lightData[0] = intensity
   }
 
   public getStats(): EngineStats {
@@ -646,8 +673,8 @@ export class Engine {
     await this.prepareMaterialDraws(model)
   }
 
-  private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
-  private outlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private materialDraws: MaterialDraw[] = []
+  private outlineDraws: OutlineDraw[] = []
 
   private async prepareMaterialDraws(model: Model) {
     const materials = model.getMaterials()
@@ -700,12 +727,12 @@ export class Engine {
       return defaultToonTexture
     }
 
-    this.materialDraws = []
-    this.outlineDraws = []
-    const outlineBindGroupLayout = this.outlinePipeline.getBindGroupLayout(0)
+    // First pass: collect all material draw info
+    const materialInfos: MaterialDrawInfo[] = []
     let runningFirstIndex = 0
 
-    for (const mat of materials) {
+    for (let matIndex = 0; matIndex < materials.length; matIndex++) {
+      const mat = materials[matIndex]
       const matCount = mat.vertexCount | 0
       if (matCount === 0) continue
 
@@ -713,16 +740,28 @@ export class Engine {
       if (!diffuseTexture) throw new Error(`Material "${mat.name}" has no diffuse texture`)
 
       const toonTexture = await loadToonTexture(mat.toonTextureIndex)
+      const texturePath =
+        mat.diffuseTextureIndex >= 0 && mat.diffuseTextureIndex < textures.length
+          ? textures[mat.diffuseTextureIndex].path
+          : ""
 
       const materialAlpha = mat.diffuse[3]
       const EPSILON = 0.001
       const isTransparent = materialAlpha < 1.0 - EPSILON
 
-      const materialUniformData = new Float32Array(4)
-      materialUniformData[0] = materialAlpha
-      materialUniformData[1] = 0.0
-      materialUniformData[2] = 0.0
-      materialUniformData[3] = 0.0
+      // MMD material uniforms: diffuse (RGBA) + ambient (RGB)
+      // Material ambient adds warmth/redness to skin tones
+      const materialUniformData = new Float32Array(8)
+      // Diffuse color (RGBA)
+      materialUniformData[0] = mat.diffuse[0] // R
+      materialUniformData[1] = mat.diffuse[1] // G
+      materialUniformData[2] = mat.diffuse[2] // B
+      materialUniformData[3] = mat.diffuse[3] // A
+      // Ambient color (RGB) - important for skin tone warmth
+      materialUniformData[4] = mat.ambient[0] // R
+      materialUniformData[5] = mat.ambient[1] // G
+      materialUniformData[6] = mat.ambient[2] // B
+      materialUniformData[7] = 0.0 // padding
 
       const materialUniformBuffer = this.device.createBuffer({
         label: `material uniform: ${mat.name}`,
@@ -731,28 +770,114 @@ export class Engine {
       })
       this.device.queue.writeBuffer(materialUniformBuffer, 0, materialUniformData)
 
+      materialInfos.push({
+        mat,
+        matIndex,
+        firstIndex: runningFirstIndex,
+        count: matCount,
+        diffuseTexture,
+        toonTexture,
+        texturePath,
+        isTransparent,
+        materialUniformBuffer,
+      })
+
+      runningFirstIndex += matCount
+    }
+
+    // Sort materials by texture path to group same textures together
+    // This reduces texture switching overhead, especially for large textures
+    materialInfos.sort((a, b) => {
+      // First sort by transparency (opaque first)
+      if (a.isTransparent !== b.isTransparent) {
+        return a.isTransparent ? 1 : -1
+      }
+      // Then sort by texture path
+      return a.texturePath.localeCompare(b.texturePath)
+    })
+
+    // Build bind groups and batch consecutive materials with same texture
+    this.materialDraws = []
+    this.outlineDraws = []
+    const outlineBindGroupLayout = this.outlinePipeline.getBindGroupLayout(0)
+
+    // Batch consecutive materials that share the same texture
+    for (let i = 0; i < materialInfos.length; i++) {
+      const firstInfo = materialInfos[i]
+      let batchCount = firstInfo.count
+      const batchFirstIndex = firstInfo.firstIndex
+      const batchMaterialIndices = [firstInfo.matIndex]
+
+      // Combine consecutive materials with the same texture AND same material properties
+      let j = i + 1
+      while (
+        j < materialInfos.length &&
+        materialInfos[j].texturePath === firstInfo.texturePath &&
+        materialInfos[j].isTransparent === firstInfo.isTransparent &&
+        materialInfos[j].firstIndex === batchFirstIndex + batchCount
+      ) {
+        // Check if material properties are identical (can share the same uniform)
+        const mat1 = firstInfo.mat
+        const mat2 = materialInfos[j].mat
+        const sameDiffuse =
+          mat1.diffuse[0] === mat2.diffuse[0] &&
+          mat1.diffuse[1] === mat2.diffuse[1] &&
+          mat1.diffuse[2] === mat2.diffuse[2] &&
+          mat1.diffuse[3] === mat2.diffuse[3]
+        const sameAmbient =
+          mat1.ambient[0] === mat2.ambient[0] &&
+          mat1.ambient[1] === mat2.ambient[1] &&
+          mat1.ambient[2] === mat2.ambient[2]
+
+        if (sameDiffuse && sameAmbient) {
+          // Same texture, same transparency, same material properties, and consecutive index range - can batch!
+          batchCount += materialInfos[j].count
+          batchMaterialIndices.push(materialInfos[j].matIndex)
+          j++
+        } else {
+          // Different material properties - can't batch
+          break
+        }
+      }
+
+      // Use the first material's bind group (they all share the same texture)
       const bindGroup = this.device.createBindGroup({
-        label: `material bind group: ${mat.name}`,
+        label: `material bind group: ${firstInfo.mat.name} (batched)`,
         layout: this.pipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-          { binding: 2, resource: diffuseTexture.createView() },
+          { binding: 2, resource: firstInfo.diffuseTexture.createView() },
           { binding: 3, resource: this.textureSampler },
           { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
-          { binding: 5, resource: toonTexture.createView() },
+          { binding: 5, resource: firstInfo.toonTexture.createView() },
           { binding: 6, resource: this.textureSampler },
-          { binding: 7, resource: { buffer: materialUniformBuffer } },
+          { binding: 7, resource: { buffer: firstInfo.materialUniformBuffer } },
         ],
       })
 
-      // All materials use the same pipeline
       this.materialDraws.push({
-        count: matCount,
-        firstIndex: runningFirstIndex,
+        count: batchCount,
+        firstIndex: batchFirstIndex,
         bindGroup,
-        isTransparent,
+        isTransparent: firstInfo.isTransparent,
+        texturePath: firstInfo.texturePath,
+        materialIndices: batchMaterialIndices,
       })
+
+      // Skip the batched materials
+      i = j - 1
+    }
+
+    // Process outlines for all materials (in original order to match indices)
+    runningFirstIndex = 0
+    for (const mat of materials) {
+      const matCount = mat.vertexCount | 0
+      if (matCount === 0) continue
+
+      const materialAlpha = mat.diffuse[3]
+      const EPSILON = 0.001
+      const isTransparent = materialAlpha < 1.0 - EPSILON
 
       // Outline for all materials (including transparent)
       if ((mat.edgeFlag & 0x01) !== 0 || mat.edgeSize > 0) {
