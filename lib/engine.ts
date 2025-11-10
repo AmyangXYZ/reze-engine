@@ -220,9 +220,9 @@ export class Engine {
           let texColor = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
           let albedo = texColor * material.diffuse.rgb;
 
-          // MMD uses per-material ambient color (adds warmth/redness to skin)
-          // Start with material ambient instead of global ambient
-          var lightAccum = material.ambient;
+          // Start with global ambient (applied uniformly), then add per-material ambient (adds warmth/redness to skin)
+          var lightAccum = vec3f(light.ambient, light.ambient, light.ambient);
+          lightAccum += material.ambient;
           
           let numLights = u32(light.lightCount);
           for (var i = 0u; i < numLights; i++) {
@@ -533,10 +533,20 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.24)
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.18)
-    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.12)
+    this.setAmbient(0.2)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.1)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.08)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.06)
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
+  }
+
+  public setAmbient(value: number) {
+    this.lightData[0] = value
+    this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
+  }
+
+  public getAmbient(): number {
+    return this.lightData[0]
   }
 
   public addLight(direction: Vec3, color: Vec3, intensity: number = 1.0): boolean {
@@ -555,6 +565,7 @@ export class Engine {
 
     this.lightCount++
     this.lightData[1] = this.lightCount
+    this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
     return true
   }
 
