@@ -14,7 +14,7 @@ export default function Header({ stats }: { stats: EngineStats }) {
           FPS: <span>{stats.fps}</span>
         </div>
 
-        {/* Desktop: show full set */}
+        {/* Desktop: show essential stats */}
         <div className="hidden md:flex items-center gap-4 tabular-nums">
           <div>
             FPS: <span>{stats.fps}</span>
@@ -25,14 +25,6 @@ export default function Header({ stats }: { stats: EngineStats }) {
           <div>
             Calls: <span>{stats.drawCalls}</span>
           </div>
-          <div>
-            Vertices: <span>{stats.vertices}</span>
-          </div>
-          {stats.memoryUsed > 0 && (
-            <div>
-              Memory: <span>{stats.memoryUsed} MB</span>
-            </div>
-          )}
         </div>
       </div>
 

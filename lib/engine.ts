@@ -7,9 +7,15 @@ import { Physics } from "./physics"
 export interface EngineStats {
   fps: number
   frameTime: number // ms
-  memoryUsed: number // MB
+  memoryUsed: number // MB (JS heap)
   vertices: number
   drawCalls: number
+  triangles: number
+  materials: number
+  textures: number
+  textureMemory: number // MB
+  bufferMemory: number // MB
+  gpuMemory: number // MB (estimated total GPU memory)
 }
 
 export class Engine {
@@ -41,8 +47,8 @@ export class Engine {
   private physics: Physics | null = null
   private textureSampler!: GPUSampler
   private textureCache = new Map<string, GPUTexture>()
+  private textureSizes = new Map<string, { width: number; height: number }>()
 
-  // Stats tracking
   private lastFpsUpdate = performance.now()
   private framesSinceLastUpdate = 0
   private frameTimeSamples: number[] = []
@@ -55,9 +61,13 @@ export class Engine {
     memoryUsed: 0,
     vertices: 0,
     drawCalls: 0,
+    triangles: 0,
+    materials: 0,
+    textures: 0,
+    textureMemory: 0,
+    bufferMemory: 0,
+    gpuMemory: 0,
   }
-
-  // Render loop
   private animationFrameId: number | null = null
   private renderLoopCallback: (() => void) | null = null
 
@@ -65,6 +75,7 @@ export class Engine {
     this.canvas = canvas
   }
 
+  // Step 1: Get WebGPU device and context
   public async init() {
     const adapter = await navigator.gpu?.requestAdapter()
     const device = await adapter?.requestDevice()
@@ -87,14 +98,14 @@ export class Engine {
       alphaMode: "premultiplied",
     })
 
-    this.initCamera()
-    this.initLighting()
-    this.initPipeline()
-    this.initOutline()
-    this.initResizeObserver()
+    this.setupCamera()
+    this.setupLighting()
+    this.createPipelines()
+    this.setupResize()
   }
 
-  private initPipeline() {
+  // Step 2: Create shaders and render pipelines
+  private createPipelines() {
     this.textureSampler = this.device.createSampler({
       magFilter: "linear",
       minFilter: "linear",
@@ -268,9 +279,7 @@ export class Engine {
         count: this.sampleCount,
       },
     })
-  }
 
-  private initOutline() {
     const outlineShaderModule = this.device.createShaderModule({
       label: "outline shaders",
       code: /* wgsl */ `
@@ -412,7 +421,8 @@ export class Engine {
     })
   }
 
-  private initResizeObserver() {
+  // Step 3: Setup canvas resize handling
+  private setupResize() {
     this.resizeObserver = new ResizeObserver(() => this.handleResize())
     this.resizeObserver.observe(this.canvas)
     this.handleResize()
@@ -479,7 +489,8 @@ export class Engine {
     }
   }
 
-  private initCamera() {
+  // Step 4: Create camera and uniform buffer
+  private setupCamera() {
     this.cameraUniformBuffer = this.device.createBuffer({
       label: "camera uniforms",
       size: 40 * 4,
@@ -492,7 +503,8 @@ export class Engine {
     this.camera.attachControl(this.canvas)
   }
 
-  private initLighting() {
+  // Step 5: Create lighting buffers
+  private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
       label: "light uniforms",
       size: 64 * 4,
@@ -501,7 +513,7 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.setAmbient(0.95)
+    this.setAmbient(0.96)
     this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.12)
     this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.1)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.08)
@@ -568,13 +580,16 @@ export class Engine {
     }
   }
 
-  public async loadPmx(dir: string, fileName: string) {
-    this.modelDir = dir.endsWith("/") ? dir : dir + "/"
-    const url = this.modelDir + fileName
-    const model = await PmxLoader.load(url)
+  // Step 6: Load PMX model file
+  public async loadModel(path: string) {
+    const pathParts = path.split("/")
+    pathParts.pop()
+    const dir = pathParts.join("/") + "/"
+    this.modelDir = dir
 
+    const model = await PmxLoader.load(path)
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
-    await this.drawModel(model)
+    await this.setupModelBuffers(model)
 
     model.rotateBones(
       ["腰", "首", "右腕", "左腕", "右ひざ"],
@@ -589,7 +604,8 @@ export class Engine {
     )
   }
 
-  private async drawModel(model: Model) {
+  // Step 7: Create vertex, index, and joint buffers
+  private async setupModelBuffers(model: Model) {
     this.currentModel = model
     const vertices = model.getVertices()
     const skinning = model.getSkinning()
@@ -645,16 +661,17 @@ export class Engine {
       })
       this.device.queue.writeBuffer(this.indexBuffer, 0, indices)
     } else {
-      throw new Error("Model must have index buffer")
+      throw new Error("Model has no index buffer")
     }
 
-    await this.prepareMaterialDraws(model)
+    await this.setupMaterials(model)
   }
 
   private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
   private outlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
 
-  private async prepareMaterialDraws(model: Model) {
+  // Step 8: Load textures and create material bind groups
+  private async setupMaterials(model: Model) {
     const materials = model.getMaterials()
     if (materials.length === 0) {
       throw new Error("Model has no materials")
@@ -702,6 +719,7 @@ export class Engine {
         { bytesPerRow: 256 * 4 },
         [256, 2]
       )
+      this.textureSizes.set("__default_toon__", { width: 256, height: 2 })
       return defaultToonTexture
     }
 
@@ -799,6 +817,7 @@ export class Engine {
     }
   }
 
+  // Helper: Load texture from file path
   private async createTextureFromPath(path: string): Promise<GPUTexture | null> {
     const cached = this.textureCache.get(path)
     if (cached) {
@@ -826,47 +845,24 @@ export class Engine {
       ])
 
       this.textureCache.set(path, texture)
+      this.textureSizes.set(path, { width: imageBitmap.width, height: imageBitmap.height })
       return texture
     } catch {
       return null
     }
   }
 
+  // Step 9: Render one frame
   public render() {
     if (this.multisampleTexture && this.camera && this.device && this.currentModel) {
       const currentTime = performance.now()
       const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
       this.lastFrameTime = currentTime
 
-      const viewMatrix = this.camera.getViewMatrix()
-      const projectionMatrix = this.camera.getProjectionMatrix()
-      const cameraPos = this.camera.getPosition()
-      this.cameraMatrixData.set(viewMatrix.values, 0)
-      this.cameraMatrixData.set(projectionMatrix.values, 16)
-      this.cameraMatrixData[32] = cameraPos.x
-      this.cameraMatrixData[33] = cameraPos.y
-      this.cameraMatrixData[34] = cameraPos.z
-      this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
+      this.updateCameraUniforms()
+      this.updateRenderTarget()
 
-      const colorAttachment = (this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
-      if (this.sampleCount > 1) {
-        colorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
-      } else {
-        colorAttachment.view = this.context.getCurrentTexture().createView()
-      }
-
-      this.currentModel.evaluatePose()
-      if (this.physics) {
-        this.physics.step(
-          deltaTime,
-          this.currentModel.getBoneWorldMatrices(),
-          this.currentModel.getBoneInverseBindMatrices()
-        )
-        this.currentModel.updateSkinMatrices()
-      }
-
-      const mats = this.currentModel.getSkinMatrices()
-      this.device.queue.writeBuffer(this.skinMatrixBuffer!, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+      this.updateModelPose(deltaTime)
 
       const encoder = this.device.createCommandEncoder()
       const pass = encoder.beginRenderPass(this.renderPassDescriptor)
@@ -877,51 +873,76 @@ export class Engine {
       pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
       this.drawCallCount = 0
-
-      // Render opaque outlines first (MMD invert hull method)
-      if (this.outlineDraws.length > 0) {
-        pass.setPipeline(this.outlinePipeline)
-        for (const draw of this.outlineDraws) {
-          if (draw.count > 0 && !draw.isTransparent) {
-            pass.setBindGroup(0, draw.bindGroup)
-            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          }
-        }
-      }
-
-      // Render opaque materials
-      pass.setPipeline(this.pipeline)
-      for (const draw of this.materialDraws) {
-        if (draw.count > 0 && !draw.isTransparent) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
-      }
-
-      // Render transparent materials
-      for (const draw of this.materialDraws) {
-        if (draw.count > 0 && draw.isTransparent) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
-      }
-
-      // Render transparent outlines after their materials
-      if (this.outlineDraws.length > 0) {
-        pass.setPipeline(this.outlinePipeline)
-        for (const draw of this.outlineDraws) {
-          if (draw.count > 0 && draw.isTransparent) {
-            pass.setBindGroup(0, draw.bindGroup)
-            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          }
-        }
-      }
+      this.drawOutlines(pass, false)
+      this.drawModel(pass, false)
+      this.drawModel(pass, true)
+      this.drawOutlines(pass, true)
 
       pass.end()
       this.device.queue.submit([encoder.finish()])
       this.updateStats(performance.now() - currentTime)
+    }
+  }
+
+  // Update camera uniform buffer each frame
+  private updateCameraUniforms() {
+    const viewMatrix = this.camera.getViewMatrix()
+    const projectionMatrix = this.camera.getProjectionMatrix()
+    const cameraPos = this.camera.getPosition()
+    this.cameraMatrixData.set(viewMatrix.values, 0)
+    this.cameraMatrixData.set(projectionMatrix.values, 16)
+    this.cameraMatrixData[32] = cameraPos.x
+    this.cameraMatrixData[33] = cameraPos.y
+    this.cameraMatrixData[34] = cameraPos.z
+    this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
+  }
+
+  // Update render target texture view
+  private updateRenderTarget() {
+    const colorAttachment = (this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
+    if (this.sampleCount > 1) {
+      colorAttachment.resolveTarget = this.context.getCurrentTexture().createView()
+    } else {
+      colorAttachment.view = this.context.getCurrentTexture().createView()
+    }
+  }
+
+  // Update model pose and physics
+  private updateModelPose(deltaTime: number) {
+    this.currentModel!.evaluatePose()
+    if (this.physics) {
+      this.physics.step(
+        deltaTime,
+        this.currentModel!.getBoneWorldMatrices(),
+        this.currentModel!.getBoneInverseBindMatrices()
+      )
+      this.currentModel!.updateSkinMatrices()
+    }
+    const mats = this.currentModel!.getSkinMatrices()
+    this.device.queue.writeBuffer(this.skinMatrixBuffer!, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+  }
+
+  // Draw outlines (opaque or transparent)
+  private drawOutlines(pass: GPURenderPassEncoder, transparent: boolean) {
+    if (this.outlineDraws.length === 0) return
+    pass.setPipeline(this.outlinePipeline)
+    for (const draw of this.outlineDraws) {
+      if (draw.count > 0 && draw.isTransparent === transparent) {
+        pass.setBindGroup(0, draw.bindGroup)
+        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      }
+    }
+  }
+
+  // Draw model materials (opaque or transparent)
+  private drawModel(pass: GPURenderPassEncoder, transparent: boolean) {
+    pass.setPipeline(this.pipeline)
+    for (const draw of this.materialDraws) {
+      if (draw.count > 0 && draw.isTransparent === transparent) {
+        pass.setBindGroup(0, draw.bindGroup)
+        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+        this.drawCallCount++
+      }
     }
   }
 
@@ -955,5 +976,65 @@ export class Engine {
 
     this.stats.vertices = this.vertexCount
     this.stats.drawCalls = this.drawCallCount
+
+    // Calculate triangles from index buffer
+    if (this.indexBuffer) {
+      const indexCount = this.currentModel?.getIndices()?.length || 0
+      this.stats.triangles = Math.floor(indexCount / 3)
+    } else {
+      this.stats.triangles = Math.floor(this.vertexCount / 3)
+    }
+
+    // Material count
+    this.stats.materials = this.materialDraws.length
+
+    // Texture stats
+    this.stats.textures = this.textureCache.size
+    let textureMemoryBytes = 0
+    for (const [path, size] of this.textureSizes.entries()) {
+      if (this.textureCache.has(path)) {
+        // RGBA8 = 4 bytes per pixel
+        textureMemoryBytes += size.width * size.height * 4
+      }
+    }
+    // Add render target textures (multisample + depth)
+    if (this.multisampleTexture) {
+      const width = this.canvas.width
+      const height = this.canvas.height
+      textureMemoryBytes += width * height * 4 * this.sampleCount // multisample color
+      textureMemoryBytes += width * height * 4 // depth (depth24plus = 4 bytes)
+    }
+    this.stats.textureMemory = Math.round((textureMemoryBytes / 1024 / 1024) * 100) / 100
+
+    // Buffer memory estimate
+    let bufferMemoryBytes = 0
+    if (this.vertexBuffer) {
+      const vertices = this.currentModel?.getVertices()
+      if (vertices) bufferMemoryBytes += vertices.byteLength
+    }
+    if (this.indexBuffer) {
+      const indices = this.currentModel?.getIndices()
+      if (indices) bufferMemoryBytes += indices.byteLength
+    }
+    if (this.jointsBuffer) {
+      const skinning = this.currentModel?.getSkinning()
+      if (skinning) bufferMemoryBytes += skinning.joints.byteLength
+    }
+    if (this.weightsBuffer) {
+      const skinning = this.currentModel?.getSkinning()
+      if (skinning) bufferMemoryBytes += skinning.weights.byteLength
+    }
+    if (this.skinMatrixBuffer) {
+      const skeleton = this.currentModel?.getSkeleton()
+      if (skeleton) bufferMemoryBytes += Math.max(256, skeleton.bones.length * 16 * 4)
+    }
+    bufferMemoryBytes += 40 * 4 // cameraUniformBuffer
+    bufferMemoryBytes += 64 * 4 // lightUniformBuffer
+    // Material uniform buffers (estimate: 4 bytes per material)
+    bufferMemoryBytes += this.materialDraws.length * 4
+    this.stats.bufferMemory = Math.round((bufferMemoryBytes / 1024 / 1024) * 100) / 100
+
+    // Total GPU memory estimate
+    this.stats.gpuMemory = Math.round((this.stats.textureMemory + this.stats.bufferMemory) * 100) / 100
   }
 }
