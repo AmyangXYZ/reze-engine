@@ -576,12 +576,17 @@ export class Engine {
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.drawModel(model)
 
-    setTimeout(() => {
-      model.rotateBones(["腰"], [new Quat(-0.7, -0.0, 0, 1)], 500)
-    }, 2000)
-    setTimeout(() => {
-      model.rotateBones(["腰"], [new Quat(-0.0, 0.0, 0, 1)], 500)
-    }, 3000)
+    model.rotateBones(
+      ["腰", "首", "右腕", "左腕", "右ひざ"],
+      [
+        new Quat(-0.4, -0.3, 0, 1),
+        new Quat(0.3, -0.3, -0.3, 1),
+        new Quat(0.3, 0.3, 0.3, 1),
+        new Quat(-0.3, 0.3, -0.3, 1),
+        new Quat(-1.0, -0.3, 0.0, 1),
+      ],
+      1000
+    )
   }
 
   private async drawModel(model: Model) {
