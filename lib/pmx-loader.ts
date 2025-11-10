@@ -259,6 +259,9 @@ export class PmxLoader {
         this.getText() // comment (skip)
         const vertexCount = this.getInt32()
 
+        // PMX material flag bits:
+        // Bit 0 (0x01): Double-sided rendering
+        // Bit 4 (0x10): Edge drawing (outline)
         this.materials.push({
           name,
           diffuse,
