@@ -49,7 +49,6 @@ export interface SkeletonRuntime {
   localRotations: Float32Array // quat per bone (x,y,z,w) length = boneCount*4
   localTranslations: Float32Array // vec3 per bone length = boneCount*3
   worldMatrices: Float32Array // mat4 per bone length = boneCount*16
-  skinMatrices: Float32Array // mat4 per bone length = boneCount*16
   computedBones: boolean[] // length = boneCount
 }
 
@@ -112,7 +111,6 @@ export class Model {
       localRotations: new Float32Array(boneCount * 4),
       localTranslations: new Float32Array(boneCount * 3),
       worldMatrices: new Float32Array(boneCount * 16),
-      skinMatrices: new Float32Array(boneCount * 16),
       nameIndex: {}, // Will be populated by buildBoneLookups()
       computedBones: new Array(boneCount).fill(false),
     }
@@ -288,10 +286,6 @@ export class Model {
 
   getJoints(): Joint[] {
     return this.joints
-  }
-
-  getSkinMatrices(): Float32Array {
-    return this.runtimeSkeleton.skinMatrices
   }
 
   private initializeRuntimePose(): void {
@@ -502,17 +496,6 @@ export class Model {
   evaluatePose(): void {
     this.updateRotationTweens()
     this.computeWorldMatrices()
-  }
-
-  updateSkinMatrices(): void {
-    const invBind = this.skeleton.inverseBindMatrices
-    const worldBuf = this.runtimeSkeleton.worldMatrices
-    const skinBuf = this.runtimeSkeleton.skinMatrices
-
-    for (let i = 0; i < this.skeleton.bones.length; i++) {
-      const offset = i * 16
-      Mat4.multiplyArrays(worldBuf, offset, invBind, offset, skinBuf, offset)
-    }
   }
 
   private computeWorldMatrices(): void {

@@ -39,6 +39,10 @@ export class Engine {
   private jointsBuffer!: GPUBuffer
   private weightsBuffer!: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
+  private worldMatrixBuffer?: GPUBuffer
+  private inverseBindMatrixBuffer?: GPUBuffer
+  private skinMatrixComputePipeline?: GPUComputePipeline
+  private boneCountBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
   private renderPassDescriptor!: GPURenderPassDescriptor
@@ -421,6 +425,47 @@ export class Engine {
     })
   }
 
+  // Create compute shader for skin matrix computation
+  private createSkinMatrixComputePipeline() {
+    const computeShader = this.device.createShaderModule({
+      label: "skin matrix compute",
+      code: /* wgsl */ `
+        struct BoneCountUniform {
+          count: u32,
+          _padding1: u32,
+          _padding2: u32,
+          _padding3: u32,
+          _padding4: vec4<u32>,
+        };
+        
+        @group(0) @binding(0) var<uniform> boneCount: BoneCountUniform;
+        @group(0) @binding(1) var<storage, read> worldMatrices: array<mat4x4f>;
+        @group(0) @binding(2) var<storage, read> inverseBindMatrices: array<mat4x4f>;
+        @group(0) @binding(3) var<storage, read_write> skinMatrices: array<mat4x4f>;
+        
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+          let boneIndex = globalId.x;
+          // Bounds check: we dispatch workgroups (64 threads each), so some threads may be out of range
+          if (boneIndex >= boneCount.count) {
+            return;
+          }
+          let worldMat = worldMatrices[boneIndex];
+          let invBindMat = inverseBindMatrices[boneIndex];
+          skinMatrices[boneIndex] = worldMat * invBindMat;
+        }
+      `,
+    })
+
+    this.skinMatrixComputePipeline = this.device.createComputePipeline({
+      label: "skin matrix compute pipeline",
+      layout: "auto",
+      compute: {
+        module: computeShader,
+      },
+    })
+  }
+
   // Step 3: Setup canvas resize handling
   private setupResize() {
     this.resizeObserver = new ResizeObserver(() => this.handleResize())
@@ -646,11 +691,45 @@ export class Engine {
     )
 
     const boneCount = skeleton.bones.length
+    const matrixSize = boneCount * 16 * 4
+
     this.skinMatrixBuffer = this.device.createBuffer({
       label: "skin matrices",
-      size: Math.max(256, boneCount * 16 * 4),
+      size: Math.max(256, matrixSize),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX,
+    })
+
+    this.worldMatrixBuffer = this.device.createBuffer({
+      label: "world matrices",
+      size: Math.max(256, matrixSize),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
+
+    this.inverseBindMatrixBuffer = this.device.createBuffer({
+      label: "inverse bind matrices",
+      size: Math.max(256, matrixSize),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+
+    const invBindMatrices = skeleton.inverseBindMatrices
+    this.device.queue.writeBuffer(
+      this.inverseBindMatrixBuffer,
+      0,
+      invBindMatrices.buffer,
+      invBindMatrices.byteOffset,
+      invBindMatrices.byteLength
+    )
+
+    this.boneCountBuffer = this.device.createBuffer({
+      label: "bone count uniform",
+      size: 32, // Minimum uniform buffer size is 32 bytes
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const boneCountData = new Uint32Array(8) // 32 bytes total
+    boneCountData[0] = boneCount
+    this.device.queue.writeBuffer(this.boneCountBuffer, 0, boneCountData)
+
+    this.createSkinMatrixComputePipeline()
 
     const indices = model.getIndices()
     if (indices) {
@@ -910,16 +989,63 @@ export class Engine {
   // Update model pose and physics
   private updateModelPose(deltaTime: number) {
     this.currentModel!.evaluatePose()
+
+    // Upload world matrices to GPU
+    const worldMats = this.currentModel!.getBoneWorldMatrices()
+    this.device.queue.writeBuffer(
+      this.worldMatrixBuffer!,
+      0,
+      worldMats.buffer,
+      worldMats.byteOffset,
+      worldMats.byteLength
+    )
+
     if (this.physics) {
-      this.physics.step(
-        deltaTime,
-        this.currentModel!.getBoneWorldMatrices(),
-        this.currentModel!.getBoneInverseBindMatrices()
+      this.physics.step(deltaTime, worldMats, this.currentModel!.getBoneInverseBindMatrices())
+      // Re-upload world matrices after physics (physics may have updated bones)
+      this.device.queue.writeBuffer(
+        this.worldMatrixBuffer!,
+        0,
+        worldMats.buffer,
+        worldMats.byteOffset,
+        worldMats.byteLength
       )
-      this.currentModel!.updateSkinMatrices()
     }
-    const mats = this.currentModel!.getSkinMatrices()
-    this.device.queue.writeBuffer(this.skinMatrixBuffer!, 0, mats.buffer, mats.byteOffset, mats.byteLength)
+
+    // Compute skin matrices on GPU
+    this.computeSkinMatrices()
+  }
+
+  // Compute skin matrices on GPU
+  private computeSkinMatrices() {
+    const boneCount = this.currentModel!.getSkeleton().bones.length
+    const workgroupSize = 64
+    // Dispatch exactly enough threads for all bones (no bounds check needed)
+    const workgroupCount = Math.ceil(boneCount / workgroupSize)
+
+    // Update bone count uniform
+    const boneCountData = new Uint32Array(8) // 32 bytes total
+    boneCountData[0] = boneCount
+    this.device.queue.writeBuffer(this.boneCountBuffer!, 0, boneCountData)
+
+    const bindGroup = this.device.createBindGroup({
+      label: "skin matrix compute bind group",
+      layout: this.skinMatrixComputePipeline!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.boneCountBuffer! } },
+        { binding: 1, resource: { buffer: this.worldMatrixBuffer! } },
+        { binding: 2, resource: { buffer: this.inverseBindMatrixBuffer! } },
+        { binding: 3, resource: { buffer: this.skinMatrixBuffer! } },
+      ],
+    })
+
+    const encoder = this.device.createCommandEncoder()
+    const pass = encoder.beginComputePass()
+    pass.setPipeline(this.skinMatrixComputePipeline!)
+    pass.setBindGroup(0, bindGroup)
+    pass.dispatchWorkgroups(workgroupCount)
+    pass.end()
+    this.device.queue.submit([encoder.finish()])
   }
 
   // Draw outlines (opaque or transparent)
