@@ -13,14 +13,6 @@ export default function Home() {
   const [stats, setStats] = useState<EngineStats>({
     fps: 0,
     frameTime: 0,
-    memoryUsed: 0,
-    drawCalls: 0,
-    vertices: 0,
-    triangles: 0,
-    materials: 0,
-    textures: 0,
-    textureMemory: 0,
-    bufferMemory: 0,
     gpuMemory: 0,
   })
   const [progress, setProgress] = useState(0)
