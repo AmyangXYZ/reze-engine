@@ -1,7 +1,7 @@
 import Image from "next/image"
 import Link from "next/link"
 import { Button } from "./ui/button"
-import type { EngineStats } from "@/lib/engine"
+import type { EngineStats } from "reze-engine"
 
 export default function Header({ stats }: { stats: EngineStats }) {
   return (
