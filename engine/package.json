@@ -1,7 +1,7 @@
 {
     "name": "reze-engine",
-    "version": "0.1.1",
-    "description": "A WebGPU-based 3D engine with PMX model support and physics",
+    "version": "0.1.2",
+    "description": "A WebGPU-based 3D engine with MMD model support and physics",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "type": "module",
