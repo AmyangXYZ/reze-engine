@@ -635,18 +635,6 @@ export class Engine {
     const model = await PmxLoader.load(path)
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.setupModelBuffers(model)
-
-    model.rotateBones(
-      ["腰", "首", "右腕", "左腕", "右ひざ"],
-      [
-        new Quat(-0.4, -0.3, 0, 1),
-        new Quat(0.3, -0.3, -0.3, 1),
-        new Quat(0.3, 0.3, 0.3, 1),
-        new Quat(-0.3, 0.3, -0.3, 1),
-        new Quat(-1.0, -0.3, 0.0, 1),
-      ],
-      1000
-    )
   }
 
   public rotateBones(bones: string[], rotations: Quat[], duration: number) {

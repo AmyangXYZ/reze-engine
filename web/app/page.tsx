@@ -2,7 +2,7 @@
 
 import Header from "@/components/header"
 import { Progress } from "@/components/ui/progress"
-import { Engine, EngineStats } from "reze-engine"
+import { Engine, EngineStats, Quat } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 
 export default function Home() {
@@ -38,6 +38,18 @@ export default function Home() {
         engine.runRenderLoop(() => {
           setStats(engine.getStats())
         })
+
+        engine.rotateBones(
+          ["腰", "首", "右腕", "左腕", "右ひざ"],
+          [
+            new Quat(-0.4, -0.3, 0, 1),
+            new Quat(0.3, -0.3, -0.3, 1),
+            new Quat(0.3, 0.3, 0.3, 1),
+            new Quat(-0.3, 0.3, -0.3, 1),
+            new Quat(-1.0, -0.3, 0.0, 1),
+          ],
+          1500
+        )
       } catch (error) {
         setEngineError(error instanceof Error ? error.message : "Unknown error")
       }
