@@ -649,6 +649,10 @@ export class Engine {
     )
   }
 
+  public rotateBones(bones: string[], rotations: Quat[], duration: number) {
+    this.currentModel?.rotateBones(bones, rotations, duration)
+  }
+
   // Step 7: Create vertex, index, and joint buffers
   private async setupModelBuffers(model: Model) {
     this.currentModel = model
