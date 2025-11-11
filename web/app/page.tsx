@@ -2,7 +2,7 @@
 
 import Header from "@/components/header"
 import { Progress } from "@/components/ui/progress"
-import { Engine, EngineStats } from "@/lib/engine"
+import { Engine, EngineStats } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 
 export default function Home() {

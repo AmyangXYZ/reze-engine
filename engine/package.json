@@ -1,0 +1,42 @@
+{
+    "name": "reze-engine",
+    "version": "0.1.0",
+    "description": "A WebGPU-based 3D engine with PMX model support and physics",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "type": "module",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "files": [
+        "dist",
+        "src"
+    ],
+    "scripts": {
+        "build": "tsc",
+        "dev": "tsc --watch",
+        "prepublishOnly": "npm run build"
+    },
+    "keywords": [
+        "webgpu",
+        "3d",
+        "engine",
+        "pmx",
+        "physics",
+        "ammo"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "@fred3d/ammo": "^1.0.0",
+        "@webgpu/types": "^0.1.66"
+    },
+    "devDependencies": {
+        "@types/node": "^20",
+        "typescript": "^5"
+    },
+    "peerDependencies": {}
+}

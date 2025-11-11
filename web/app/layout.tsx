@@ -1,6 +1,7 @@
 import type { Metadata } from "next"
 import { Geist, Geist_Mono } from "next/font/google"
 import "./globals.css"
+import { Analytics } from "@vercel/analytics/next"
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -14,7 +15,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Reze Engine",
-  description: "3D Anime Engine",
+  description: "WebGPU 3D Engine for real-time 3D anime character MMD model rendering",
+  keywords: ["WebGPU", "3D", "Engine", "MMD", "Model", "Rendering", "Animation", "Reze Engine"],
 }
 
 export default function RootLayout({
@@ -28,6 +30,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased fixed inset-0 w-full h-full overflow-hidden m-0 p-0`}
       >
         {children}
+        <Analytics />
       </body>
     </html>
   )

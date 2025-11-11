@@ -1,4 +1,3 @@
-"use client"
 import type { AmmoInstance } from "@fred3d/ammo"
 
 let ammoInstance: AmmoInstance | null = null
