@@ -1,3 +1,8 @@
+// Easing function: ease-in-out quadratic
+export function easeInOut(t: number): number {
+  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2
+}
+
 export class Vec3 {
   x: number
   y: number
@@ -145,6 +150,42 @@ export class Quat {
 
   toArray(): [number, number, number, number] {
     return [this.x, this.y, this.z, this.w]
+  }
+
+  // Spherical linear interpolation between two quaternions
+  static slerp(a: Quat, b: Quat, t: number): Quat {
+    let cos = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+    let bx = b.x,
+      by = b.y,
+      bz = b.z,
+      bw = b.w
+
+    // If dot product is negative, negate one quaternion to take shorter path
+    if (cos < 0) {
+      cos = -cos
+      bx = -bx
+      by = -by
+      bz = -bz
+      bw = -bw
+    }
+
+    // If quaternions are very close, use linear interpolation
+    if (cos > 0.9995) {
+      const x = a.x + t * (bx - a.x)
+      const y = a.y + t * (by - a.y)
+      const z = a.z + t * (bz - a.z)
+      const w = a.w + t * (bw - a.w)
+      const invLen = 1 / Math.hypot(x, y, z, w)
+      return new Quat(x * invLen, y * invLen, z * invLen, w * invLen)
+    }
+
+    // Standard SLERP
+    const theta0 = Math.acos(cos)
+    const sinTheta0 = Math.sin(theta0)
+    const theta = theta0 * t
+    const s0 = Math.sin(theta0 - theta) / sinTheta0
+    const s1 = Math.sin(theta) / sinTheta0
+    return new Quat(s0 * a.x + s1 * bx, s0 * a.y + s1 * by, s0 * a.z + s1 * bz, s0 * a.w + s1 * bw)
   }
 
   // Convert Euler angles to quaternion (ZXY order, left-handed, PMX format)
