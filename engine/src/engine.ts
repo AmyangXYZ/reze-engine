@@ -7,14 +7,6 @@ import { Physics } from "./physics"
 export interface EngineStats {
   fps: number
   frameTime: number // ms
-  memoryUsed: number // MB (JS heap)
-  vertices: number
-  drawCalls: number
-  triangles: number
-  materials: number
-  textures: number
-  textureMemory: number // MB
-  bufferMemory: number // MB
   gpuMemory: number // MB (estimated total GPU memory)
 }
 
@@ -62,14 +54,6 @@ export class Engine {
   private stats: EngineStats = {
     fps: 0,
     frameTime: 0,
-    memoryUsed: 0,
-    vertices: 0,
-    drawCalls: 0,
-    triangles: 0,
-    materials: 0,
-    textures: 0,
-    textureMemory: 0,
-    bufferMemory: 0,
     gpuMemory: 0,
   }
   private animationFrameId: number | null = null
@@ -764,7 +748,11 @@ export class Engine {
       const texture = await loadTextureByIndex(toonTextureIndex)
       if (texture) return texture
 
-      // Default toon texture fallback
+      // Default toon texture fallback - cache it
+      const defaultToonPath = "__default_toon__"
+      const cached = this.textureCache.get(defaultToonPath)
+      if (cached) return cached
+
       const defaultToonData = new Uint8Array(256 * 2 * 4)
       for (let i = 0; i < 256; i++) {
         const factor = i / 255.0
@@ -790,7 +778,8 @@ export class Engine {
         { bytesPerRow: 256 * 4 },
         [256, 2]
       )
-      this.textureSizes.set("__default_toon__", { width: 256, height: 2 })
+      this.textureCache.set(defaultToonPath, defaultToonTexture)
+      this.textureSizes.set(defaultToonPath, { width: 256, height: 2 })
       return defaultToonTexture
     }
 
@@ -888,8 +877,8 @@ export class Engine {
     }
   }
 
-  // Helper: Load texture from file path
-  private async createTextureFromPath(path: string): Promise<GPUTexture | null> {
+  // Helper: Load texture from file path with optional max size limit
+  private async createTextureFromPath(path: string, maxSize: number = 2048): Promise<GPUTexture | null> {
     const cached = this.textureCache.get(path)
     if (cached) {
       return cached
@@ -900,23 +889,38 @@ export class Engine {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-      const imageBitmap = await createImageBitmap(await response.blob(), {
+      let imageBitmap = await createImageBitmap(await response.blob(), {
         premultiplyAlpha: "none",
         colorSpaceConversion: "none",
       })
+
+      // Downscale if texture is too large
+      let finalWidth = imageBitmap.width
+      let finalHeight = imageBitmap.height
+      if (finalWidth > maxSize || finalHeight > maxSize) {
+        const scale = Math.min(maxSize / finalWidth, maxSize / finalHeight)
+        finalWidth = Math.floor(finalWidth * scale)
+        finalHeight = Math.floor(finalHeight * scale)
+
+        // Create canvas to downscale
+        const canvas = new OffscreenCanvas(finalWidth, finalHeight)
+        const ctx = canvas.getContext("2d")
+        if (ctx) {
+          ctx.drawImage(imageBitmap, 0, 0, finalWidth, finalHeight)
+          imageBitmap = await createImageBitmap(canvas)
+        }
+      }
+
       const texture = this.device.createTexture({
         label: `texture: ${path}`,
-        size: [imageBitmap.width, imageBitmap.height],
+        size: [finalWidth, finalHeight],
         format: "rgba8unorm",
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
       })
-      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [
-        imageBitmap.width,
-        imageBitmap.height,
-      ])
+      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [finalWidth, finalHeight])
 
       this.textureCache.set(path, texture)
-      this.textureSizes.set(path, { width: imageBitmap.width, height: imageBitmap.height })
+      this.textureSizes.set(path, { width: finalWidth, height: finalHeight })
       return texture
     } catch {
       return null
@@ -1083,48 +1087,16 @@ export class Engine {
       this.stats.fps = Math.round((this.framesSinceLastUpdate / elapsed) * 1000)
       this.framesSinceLastUpdate = 0
       this.lastFpsUpdate = now
-
-      const perf = performance as Performance & {
-        memory?: { usedJSHeapSize: number; totalJSHeapSize: number }
-      }
-      if (perf.memory) {
-        this.stats.memoryUsed = Math.round(perf.memory.usedJSHeapSize / 1024 / 1024)
-      }
     }
 
-    this.stats.vertices = this.vertexCount
-    this.stats.drawCalls = this.drawCallCount
-
-    // Calculate triangles from index buffer
-    if (this.indexBuffer) {
-      const indexCount = this.currentModel?.getIndices()?.length || 0
-      this.stats.triangles = Math.floor(indexCount / 3)
-    } else {
-      this.stats.triangles = Math.floor(this.vertexCount / 3)
-    }
-
-    // Material count
-    this.stats.materials = this.materialDraws.length
-
-    // Texture stats
-    this.stats.textures = this.textureCache.size
+    // Calculate GPU memory: textures + buffers + render targets
     let textureMemoryBytes = 0
     for (const [path, size] of this.textureSizes.entries()) {
       if (this.textureCache.has(path)) {
-        // RGBA8 = 4 bytes per pixel
-        textureMemoryBytes += size.width * size.height * 4
+        textureMemoryBytes += size.width * size.height * 4 // RGBA8 = 4 bytes per pixel
       }
     }
-    // Add render target textures (multisample + depth)
-    if (this.multisampleTexture) {
-      const width = this.canvas.width
-      const height = this.canvas.height
-      textureMemoryBytes += width * height * 4 * this.sampleCount // multisample color
-      textureMemoryBytes += width * height * 4 // depth (depth24plus = 4 bytes)
-    }
-    this.stats.textureMemory = Math.round((textureMemoryBytes / 1024 / 1024) * 100) / 100
 
-    // Buffer memory estimate
     let bufferMemoryBytes = 0
     if (this.vertexBuffer) {
       const vertices = this.currentModel?.getVertices()
@@ -1148,11 +1120,17 @@ export class Engine {
     }
     bufferMemoryBytes += 40 * 4 // cameraUniformBuffer
     bufferMemoryBytes += 64 * 4 // lightUniformBuffer
-    // Material uniform buffers (estimate: 4 bytes per material)
-    bufferMemoryBytes += this.materialDraws.length * 4
-    this.stats.bufferMemory = Math.round((bufferMemoryBytes / 1024 / 1024) * 100) / 100
+    bufferMemoryBytes += this.materialDraws.length * 4 // Material uniform buffers
 
-    // Total GPU memory estimate
-    this.stats.gpuMemory = Math.round((this.stats.textureMemory + this.stats.bufferMemory) * 100) / 100
+    let renderTargetMemoryBytes = 0
+    if (this.multisampleTexture) {
+      const width = this.canvas.width
+      const height = this.canvas.height
+      renderTargetMemoryBytes += width * height * 4 * this.sampleCount // multisample color
+      renderTargetMemoryBytes += width * height * 4 // depth
+    }
+
+    const totalGPUMemoryBytes = textureMemoryBytes + bufferMemoryBytes + renderTargetMemoryBytes
+    this.stats.gpuMemory = Math.round((totalGPUMemoryBytes / 1024 / 1024) * 100) / 100
   }
 }

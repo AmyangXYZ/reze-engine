@@ -9,13 +9,7 @@ export default function Header({ stats }: { stats: EngineStats }) {
       <h1 className="text-xl font-extrabold tracking-tight">Reze Engine</h1>
 
       <div className="ml-auto flex items-center gap-3 text-xs text-white/90 pointer-events-none bg-black py-2 px-4 rounded-full font-mono font-medium">
-        {/* Mobile: show only FPS */}
-        <div className="md:hidden tabular-nums">
-          FPS: <span>{stats.fps}</span>
-        </div>
-
-        {/* Desktop: show essential stats */}
-        <div className="hidden md:flex items-center gap-4 tabular-nums">
+        <div className="flex items-center gap-4 tabular-nums">
           <div>
             FPS: <span>{stats.fps}</span>
           </div>
@@ -23,7 +17,7 @@ export default function Header({ stats }: { stats: EngineStats }) {
             Frame: <span>{stats.frameTime.toFixed(2)} ms</span>
           </div>
           <div>
-            Calls: <span>{stats.drawCalls}</span>
+            GPU: <span>{stats.gpuMemory.toFixed(1)} MB</span>
           </div>
         </div>
       </div>
