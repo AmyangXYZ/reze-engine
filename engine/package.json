@@ -1,13 +1,13 @@
 {
     "name": "reze-engine",
-    "version": "0.1.10",
+    "version": "0.1.11",
     "description": "A WebGPU-based MMD model renderer",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
     "type": "module",
     "repository": {
         "type": "git",
-        "url": "https://github.com/reze-engine/reze-engine"
+        "url": "https://github.com/AmyangXYZ/reze-engine"
     },
     "exports": {
         ".": {

@@ -63,6 +63,10 @@ export class Engine {
   // Bloom settings
   public bloomThreshold: number = 0.3
   public bloomIntensity: number = 0.13
+  // Rim light settings
+  private rimLightIntensity: number = 0.35
+  private rimLightPower: number = 2.0
+  private rimLightColor: [number, number, number] = [1.0, 1.0, 1.0]
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
@@ -155,9 +159,11 @@ export class Engine {
 
         struct MaterialUniforms {
           alpha: f32,
+          rimIntensity: f32,
+          rimPower: f32,
           _padding1: f32,
+          rimColor: vec3f,
           _padding2: f32,
-          _padding3: f32,
         };
 
         struct VertexOutput {
@@ -228,7 +234,13 @@ export class Engine {
             lightAccum += toonFactor * radiance * nDotL;
           }
           
-          let color = albedo * lightAccum;
+          // Rim light calculation
+          let viewDir = normalize(camera.viewPos - input.worldPos);
+          var rimFactor = 1.0 - max(dot(n, viewDir), 0.0);
+          rimFactor = pow(rimFactor, material.rimPower);
+          let rimLight = material.rimColor * material.rimIntensity * rimFactor;
+          
+          let color = albedo * lightAccum + rimLight;
           let finalAlpha = material.alpha;
           if (finalAlpha < 0.001) {
             discard;
@@ -269,8 +281,10 @@ export class Engine {
         struct MaterialUniforms {
           alpha: f32,
           alphaMultiplier: f32, // New: multiplier for alpha (0.5 for over-eyes, 1.0 for over-non-eyes)
+          rimIntensity: f32,
+          rimPower: f32,
+          rimColor: vec3f,
           _padding1: f32,
-          _padding2: f32,
         };
 
         struct VertexOutput {
@@ -340,7 +354,13 @@ export class Engine {
             lightAccum += toonFactor * radiance * nDotL;
           }
           
-          let color = albedo * lightAccum;
+          // Rim light calculation
+          let viewDir = normalize(camera.viewPos - input.worldPos);
+          var rimFactor = 1.0 - max(dot(n, viewDir), 0.0);
+          rimFactor = pow(rimFactor, material.rimPower);
+          let rimLight = material.rimColor * material.rimIntensity * rimFactor;
+          
+          let color = albedo * lightAccum + rimLight;
           let finalAlpha = material.alpha * material.alphaMultiplier;
           if (finalAlpha < 0.001) {
             discard;
@@ -1698,11 +1718,16 @@ export class Engine {
       const isTransparent = materialAlpha < 1.0 - EPSILON
 
       // Create material uniform data - for hair materials, we'll create two versions
-      const materialUniformData = new Float32Array(4)
+      // MaterialUniforms struct: alpha, rimIntensity, rimPower, _padding1, rimColor (vec3), _padding2
+      const materialUniformData = new Float32Array(8)
       materialUniformData[0] = materialAlpha
-      materialUniformData[1] = 1.0 // alphaMultiplier: 1.0 for normal rendering
-      materialUniformData[2] = 0.0
-      materialUniformData[3] = 0.0
+      materialUniformData[1] = this.rimLightIntensity
+      materialUniformData[2] = this.rimLightPower
+      materialUniformData[3] = 0.0 // _padding1
+      materialUniformData[4] = this.rimLightColor[0] // rimColor.r
+      materialUniformData[5] = this.rimLightColor[1] // rimColor.g
+      materialUniformData[6] = this.rimLightColor[2] // rimColor.b
+      materialUniformData[7] = 0.0 // _padding2
 
       const materialUniformBuffer = this.device.createBuffer({
         label: `material uniform: ${mat.name}`,
@@ -1737,11 +1762,16 @@ export class Engine {
         })
       } else if (mat.isHair) {
         // For hair materials, create two bind groups: one for over-eyes (alphaMultiplier = 0.5) and one for over-non-eyes (alphaMultiplier = 1.0)
-        const materialUniformDataOverEyes = new Float32Array(4)
+        // Hair MaterialUniforms struct: alpha, alphaMultiplier, rimIntensity, rimPower, rimColor (vec3), _padding1
+        const materialUniformDataOverEyes = new Float32Array(8)
         materialUniformDataOverEyes[0] = materialAlpha
         materialUniformDataOverEyes[1] = 0.5 // alphaMultiplier: 0.5 for over-eyes
-        materialUniformDataOverEyes[2] = 0.0
-        materialUniformDataOverEyes[3] = 0.0
+        materialUniformDataOverEyes[2] = this.rimLightIntensity
+        materialUniformDataOverEyes[3] = this.rimLightPower
+        materialUniformDataOverEyes[4] = this.rimLightColor[0] // rimColor.r
+        materialUniformDataOverEyes[5] = this.rimLightColor[1] // rimColor.g
+        materialUniformDataOverEyes[6] = this.rimLightColor[2] // rimColor.b
+        materialUniformDataOverEyes[7] = 0.0 // _padding1
 
         const materialUniformBufferOverEyes = this.device.createBuffer({
           label: `material uniform (over eyes): ${mat.name}`,
@@ -1772,10 +1802,43 @@ export class Engine {
           isTransparent,
         })
 
+        // Create material uniform for hair over non-eyes (alphaMultiplier = 1.0)
+        const materialUniformDataOverNonEyes = new Float32Array(8)
+        materialUniformDataOverNonEyes[0] = materialAlpha
+        materialUniformDataOverNonEyes[1] = 1.0 // alphaMultiplier: 1.0 for over-non-eyes
+        materialUniformDataOverNonEyes[2] = this.rimLightIntensity
+        materialUniformDataOverNonEyes[3] = this.rimLightPower
+        materialUniformDataOverNonEyes[4] = this.rimLightColor[0] // rimColor.r
+        materialUniformDataOverNonEyes[5] = this.rimLightColor[1] // rimColor.g
+        materialUniformDataOverNonEyes[6] = this.rimLightColor[2] // rimColor.b
+        materialUniformDataOverNonEyes[7] = 0.0 // _padding1
+
+        const materialUniformBufferOverNonEyes = this.device.createBuffer({
+          label: `material uniform (over non-eyes): ${mat.name}`,
+          size: materialUniformDataOverNonEyes.byteLength,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+        this.device.queue.writeBuffer(materialUniformBufferOverNonEyes, 0, materialUniformDataOverNonEyes)
+
+        const bindGroupOverNonEyes = this.device.createBindGroup({
+          label: `material bind group (over non-eyes): ${mat.name}`,
+          layout: this.hairBindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+            { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+            { binding: 2, resource: diffuseTexture.createView() },
+            { binding: 3, resource: this.textureSampler },
+            { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
+            { binding: 5, resource: toonTexture.createView() },
+            { binding: 6, resource: this.textureSampler },
+            { binding: 7, resource: { buffer: materialUniformBufferOverNonEyes } },
+          ],
+        })
+
         this.hairDrawsOverNonEyes.push({
           count: matCount,
           firstIndex: runningFirstIndex,
-          bindGroup,
+          bindGroup: bindGroupOverNonEyes,
           isTransparent,
         })
       } else if (isTransparent) {
