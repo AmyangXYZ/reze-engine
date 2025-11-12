@@ -22,7 +22,6 @@ export class Engine {
   private lightData = new Float32Array(64)
   private lightCount = 0
   private vertexBuffer!: GPUBuffer
-  private vertexCount: number = 0
   private indexBuffer?: GPUBuffer
   private resizeObserver: ResizeObserver | null = null
   private depthTexture!: GPUTexture
@@ -240,9 +239,10 @@ export class Engine {
       `,
     })
 
-    // Create a separate shader for hair-over-eyes that outputs pre-multiplied color for darkening effect
-    const hairMultiplyShaderModule = this.device.createShaderModule({
-      label: "hair multiply shaders",
+    // Unified hair shader that can handle both over-eyes and over-non-eyes cases
+    // Uses material.alpha multiplier to control opacity (0.5 for over-eyes, 1.0 for over-non-eyes)
+    const hairShaderModule = this.device.createShaderModule({
+      label: "unified hair shaders",
       code: /* wgsl */ `
         struct CameraUniforms {
           view: mat4x4f,
@@ -268,9 +268,9 @@ export class Engine {
 
         struct MaterialUniforms {
           alpha: f32,
+          alphaMultiplier: f32, // New: multiplier for alpha (0.5 for over-eyes, 1.0 for over-non-eyes)
           _padding1: f32,
           _padding2: f32,
-          _padding3: f32,
         };
 
         struct VertexOutput {
@@ -341,15 +341,12 @@ export class Engine {
           }
           
           let color = albedo * lightAccum;
-          let finalAlpha = material.alpha;
+          let finalAlpha = material.alpha * material.alphaMultiplier;
           if (finalAlpha < 0.001) {
             discard;
           }
           
-          // For hair-over-eyes effect: simple half-transparent overlay - Use 50% opacity to create a semi-transparent hair color overlay
-          let overlayAlpha = finalAlpha * 0.5;
-          
-          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), overlayAlpha);
+          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), finalAlpha);
         }
       `,
     })
@@ -754,12 +751,13 @@ export class Engine {
       },
     })
 
-    // Hair pipeline with multiplicative blending (for hair over eyes)
+    // Unified hair pipeline - can be used for both over-eyes and over-non-eyes
+    // The difference is controlled by stencil state and alpha multiplier in material uniform
     this.hairMultiplyPipeline = this.device.createRenderPipeline({
-      label: "hair multiply pipeline",
+      label: "hair pipeline (over eyes)",
       layout: sharedPipelineLayout,
       vertex: {
-        module: hairMultiplyShaderModule,
+        module: hairShaderModule,
         buffers: [
           {
             arrayStride: 8 * 4,
@@ -780,13 +778,12 @@ export class Engine {
         ],
       },
       fragment: {
-        module: hairMultiplyShaderModule,
+        module: hairShaderModule,
         targets: [
           {
             format: this.presentationFormat,
             blend: {
               color: {
-                // Simple half-transparent overlay effect - Blend: hairColor * overlayAlpha + eyeColor * (1 - overlayAlpha)
                 srcFactor: "src-alpha",
                 dstFactor: "one-minus-src-alpha",
                 operation: "add",
@@ -821,12 +818,12 @@ export class Engine {
       multisample: { count: this.sampleCount },
     })
 
-    // Hair pipeline for opaque rendering (hair over non-eyes)
+    // Hair pipeline for opaque rendering (hair over non-eyes) - uses same shader, different stencil state
     this.hairOpaquePipeline = this.device.createRenderPipeline({
-      label: "hair opaque pipeline",
+      label: "hair pipeline (over non-eyes)",
       layout: sharedPipelineLayout,
       vertex: {
-        module: shaderModule,
+        module: hairShaderModule,
         buffers: [
           {
             arrayStride: 8 * 4,
@@ -847,7 +844,7 @@ export class Engine {
         ],
       },
       fragment: {
-        module: shaderModule,
+        module: hairShaderModule,
         targets: [
           {
             format: this.presentationFormat,
@@ -1498,7 +1495,6 @@ export class Engine {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices)
-    this.vertexCount = model.getVertexCount()
 
     this.jointsBuffer = this.device.createBuffer({
       label: "joints buffer",
@@ -1589,7 +1585,14 @@ export class Engine {
     isTransparent: boolean
   }[] = []
   private eyeDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
-  private hairDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private hairDrawsOverEyes: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] =
+    []
+  private hairDrawsOverNonEyes: {
+    count: number
+    firstIndex: number
+    bindGroup: GPUBindGroup
+    isTransparent: boolean
+  }[] = []
   private transparentNonEyeNonHairDraws: {
     count: number
     firstIndex: number
@@ -1672,7 +1675,8 @@ export class Engine {
 
     this.opaqueNonEyeNonHairDraws = []
     this.eyeDraws = []
-    this.hairDraws = []
+    this.hairDrawsOverEyes = []
+    this.hairDrawsOverNonEyes = []
     this.transparentNonEyeNonHairDraws = []
     this.opaqueNonEyeNonHairOutlineDraws = []
     this.eyeOutlineDraws = []
@@ -1693,9 +1697,10 @@ export class Engine {
       const EPSILON = 0.001
       const isTransparent = materialAlpha < 1.0 - EPSILON
 
+      // Create material uniform data - for hair materials, we'll create two versions
       const materialUniformData = new Float32Array(4)
       materialUniformData[0] = materialAlpha
-      materialUniformData[1] = 0.0
+      materialUniformData[1] = 1.0 // alphaMultiplier: 1.0 for normal rendering
       materialUniformData[2] = 0.0
       materialUniformData[3] = 0.0
 
@@ -1731,7 +1736,43 @@ export class Engine {
           isTransparent,
         })
       } else if (mat.isHair) {
-        this.hairDraws.push({
+        // For hair materials, create two bind groups: one for over-eyes (alphaMultiplier = 0.5) and one for over-non-eyes (alphaMultiplier = 1.0)
+        const materialUniformDataOverEyes = new Float32Array(4)
+        materialUniformDataOverEyes[0] = materialAlpha
+        materialUniformDataOverEyes[1] = 0.5 // alphaMultiplier: 0.5 for over-eyes
+        materialUniformDataOverEyes[2] = 0.0
+        materialUniformDataOverEyes[3] = 0.0
+
+        const materialUniformBufferOverEyes = this.device.createBuffer({
+          label: `material uniform (over eyes): ${mat.name}`,
+          size: materialUniformDataOverEyes.byteLength,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+        this.device.queue.writeBuffer(materialUniformBufferOverEyes, 0, materialUniformDataOverEyes)
+
+        const bindGroupOverEyes = this.device.createBindGroup({
+          label: `material bind group (over eyes): ${mat.name}`,
+          layout: this.hairBindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+            { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+            { binding: 2, resource: diffuseTexture.createView() },
+            { binding: 3, resource: this.textureSampler },
+            { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
+            { binding: 5, resource: toonTexture.createView() },
+            { binding: 6, resource: this.textureSampler },
+            { binding: 7, resource: { buffer: materialUniformBufferOverEyes } },
+          ],
+        })
+
+        this.hairDrawsOverEyes.push({
+          count: matCount,
+          firstIndex: runningFirstIndex,
+          bindGroup: bindGroupOverEyes,
+          isTransparent,
+        })
+
+        this.hairDrawsOverNonEyes.push({
           count: matCount,
           firstIndex: runningFirstIndex,
           bindGroup,
@@ -1910,49 +1951,60 @@ export class Engine {
         }
       }
 
-      // PASS 3a: Hair over eyes (stencil == 1, multiply blend) - Draw hair geometry first to establish depth
-      pass.setPipeline(this.hairMultiplyPipeline)
-      pass.setStencilReference(1) // Check against stencil value 1
-      for (const draw of this.hairDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
-      }
-
-      // PASS 3a.5: Hair outlines over eyes (stencil == 1, depth test to only draw near hair)
-      pass.setPipeline(this.hairOutlineOverEyesPipeline)
-      pass.setStencilReference(1) // Check against stencil value 1 (with equal test)
-      for (const draw of this.hairOutlineDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-        }
-      }
-
-      // PASS 3b: Hair over non-eyes (stencil != 1, opaque)
-      pass.setPipeline(this.hairOpaquePipeline)
-      pass.setStencilReference(1) // Check against stencil value 1 (with not-equal test)
-      for (const draw of this.hairDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
-      }
-
-      // PASS 3b.5: Hair outlines over non-eyes (stencil != 1) - Draw hair outlines after hair geometry, so they only appear where hair exists
-      pass.setPipeline(this.hairOutlinePipeline)
-      pass.setStencilReference(1) // Check against stencil value 1 (with not-equal test)
-      for (const draw of this.hairOutlineDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-        }
-      }
+      // PASS 3: Hair rendering - optimized single pass approach
+      // Since both hair passes use the same shader, we batch them together
+      // but still need separate passes due to stencil requirements (equal vs not-equal)
 
       this.drawOutlines(pass, false) // Opaque outlines
+
+      // 3a: Hair over eyes (stencil == 1, alphaMultiplier = 0.5)
+      if (this.hairDrawsOverEyes.length > 0) {
+        pass.setPipeline(this.hairMultiplyPipeline)
+        pass.setStencilReference(1)
+        for (const draw of this.hairDrawsOverEyes) {
+          if (draw.count > 0) {
+            pass.setBindGroup(0, draw.bindGroup)
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            this.drawCallCount++
+          }
+        }
+      }
+
+      // 3b: Hair over non-eyes (stencil != 1, alphaMultiplier = 1.0)
+      if (this.hairDrawsOverNonEyes.length > 0) {
+        pass.setPipeline(this.hairOpaquePipeline)
+        pass.setStencilReference(1)
+        for (const draw of this.hairDrawsOverNonEyes) {
+          if (draw.count > 0) {
+            pass.setBindGroup(0, draw.bindGroup)
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            this.drawCallCount++
+          }
+        }
+      }
+
+      // 3c: Hair outlines - batched together, only draw if outlines exist
+      if (this.hairOutlineDraws.length > 0) {
+        // Over eyes
+        pass.setPipeline(this.hairOutlineOverEyesPipeline)
+        pass.setStencilReference(1)
+        for (const draw of this.hairOutlineDraws) {
+          if (draw.count > 0) {
+            pass.setBindGroup(0, draw.bindGroup)
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          }
+        }
+
+        // Over non-eyes
+        pass.setPipeline(this.hairOutlinePipeline)
+        pass.setStencilReference(1)
+        for (const draw of this.hairOutlineDraws) {
+          if (draw.count > 0) {
+            pass.setBindGroup(0, draw.bindGroup)
+            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          }
+        }
+      }
 
       // PASS 4: Transparent non-eye, non-hair
       pass.setPipeline(this.pipeline)
@@ -2282,7 +2334,8 @@ export class Engine {
     const totalMaterialDraws =
       this.opaqueNonEyeNonHairDraws.length +
       this.eyeDraws.length +
-      this.hairDraws.length +
+      this.hairDrawsOverEyes.length +
+      this.hairDrawsOverNonEyes.length +
       this.transparentNonEyeNonHairDraws.length
     bufferMemoryBytes += totalMaterialDraws * 4 // Material uniform buffers
 
