@@ -9,7 +9,13 @@ export default function Header({ stats }: { stats: EngineStats }) {
       <h1 className="text-xl font-extrabold tracking-tight">Reze Engine</h1>
 
       <div className="ml-auto flex items-center gap-3 text-xs text-white/90 pointer-events-none bg-black py-2 px-4 rounded-full font-mono font-medium">
-        <div className="flex items-center gap-4 tabular-nums">
+        <div className="flex items-center gap-4 tabular-nums flex-wrap md:hidden">
+          <div>
+            FPS: <span>{stats.fps}</span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4 tabular-nums hidden md:flex">
           <div>
             FPS: <span>{stats.fps}</span>
           </div>
