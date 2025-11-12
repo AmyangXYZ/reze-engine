@@ -28,6 +28,10 @@ export class Engine {
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
   private outlinePipeline!: GPURenderPipeline
+  private hairMultiplyPipeline!: GPURenderPipeline
+  private hairOpaquePipeline!: GPURenderPipeline
+  private eyePipeline!: GPURenderPipeline
+  private hairBindGroupLayout!: GPUBindGroupLayout
   private jointsBuffer!: GPUBuffer
   private weightsBuffer!: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
@@ -212,10 +216,146 @@ export class Engine {
       `,
     })
 
+    // Create a separate shader for hair-over-eyes that outputs pre-multiplied color for darkening effect
+    const hairMultiplyShaderModule = this.device.createShaderModule({
+      label: "hair multiply shaders",
+      code: /* wgsl */ `
+        struct CameraUniforms {
+          view: mat4x4f,
+          projection: mat4x4f,
+          viewPos: vec3f,
+          _padding: f32,
+        };
+
+        struct Light {
+          direction: vec3f,
+          _padding1: f32,
+          color: vec3f,
+          intensity: f32,
+        };
+
+        struct LightUniforms {
+          ambient: f32,
+          lightCount: f32,
+          _padding1: f32,
+          _padding2: f32,
+          lights: array<Light, 4>,
+        };
+
+        struct MaterialUniforms {
+          alpha: f32,
+          _padding1: f32,
+          _padding2: f32,
+          _padding3: f32,
+        };
+
+        struct VertexOutput {
+          @builtin(position) position: vec4f,
+          @location(0) normal: vec3f,
+          @location(1) uv: vec2f,
+          @location(2) worldPos: vec3f,
+        };
+
+        @group(0) @binding(0) var<uniform> camera: CameraUniforms;
+        @group(0) @binding(1) var<uniform> light: LightUniforms;
+        @group(0) @binding(2) var diffuseTexture: texture_2d<f32>;
+        @group(0) @binding(3) var diffuseSampler: sampler;
+        @group(0) @binding(4) var<storage, read> skinMats: array<mat4x4f>;
+        @group(0) @binding(5) var toonTexture: texture_2d<f32>;
+        @group(0) @binding(6) var toonSampler: sampler;
+        @group(0) @binding(7) var<uniform> material: MaterialUniforms;
+
+        @vertex fn vs(
+          @location(0) position: vec3f,
+          @location(1) normal: vec3f,
+          @location(2) uv: vec2f,
+          @location(3) joints0: vec4<u32>,
+          @location(4) weights0: vec4<f32>
+        ) -> VertexOutput {
+          var output: VertexOutput;
+          let pos4 = vec4f(position, 1.0);
+          
+          let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
+          var normalizedWeights: vec4f;
+          if (weightSum > 0.0001) {
+            normalizedWeights = weights0 / weightSum;
+          } else {
+            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
+          }
+          
+          var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
+          var skinnedNrm = vec3f(0.0, 0.0, 0.0);
+          for (var i = 0u; i < 4u; i++) {
+            let j = joints0[i];
+            let w = normalizedWeights[i];
+            let m = skinMats[j];
+            skinnedPos += (m * pos4) * w;
+            let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
+            skinnedNrm += (r3 * normal) * w;
+          }
+          let worldPos = skinnedPos.xyz;
+          output.position = camera.projection * camera.view * vec4f(worldPos, 1.0);
+          output.normal = normalize(skinnedNrm);
+          output.uv = uv;
+          output.worldPos = worldPos;
+          return output;
+        }
+
+        @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
+          let n = normalize(input.normal);
+          let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
+
+          var lightAccum = vec3f(light.ambient);
+          let numLights = u32(light.lightCount);
+          for (var i = 0u; i < numLights; i++) {
+            let l = -light.lights[i].direction;
+            let nDotL = max(dot(n, l), 0.0);
+            let toonUV = vec2f(nDotL, 0.5);
+            let toonFactor = textureSample(toonTexture, toonSampler, toonUV).rgb;
+            let radiance = light.lights[i].color * light.lights[i].intensity;
+            lightAccum += toonFactor * radiance * nDotL;
+          }
+          
+          let color = albedo * lightAccum;
+          let finalAlpha = material.alpha;
+          if (finalAlpha < 0.001) {
+            discard;
+          }
+          
+          // For hair-over-eyes effect: reduce the hair color contribution to make it more subtle
+          // Use a reduced alpha (e.g., 30% of original) so the hair tint is very subtle
+          let subtleAlpha = finalAlpha * 0.3;
+          
+          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)) * subtleAlpha, subtleAlpha);
+        }
+      `,
+    })
+
+    // Create explicit bind group layout for all pipelines using the main shader
+    // This ensures compatibility across all pipelines (main, eye, hair multiply, hair opaque)
+    this.hairBindGroupLayout = this.device.createBindGroupLayout({
+      label: "shared material bind group layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // camera
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // light
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} }, // diffuseTexture
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {} }, // diffuseSampler
+        { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // skinMats
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} }, // toonTexture
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, sampler: {} }, // toonSampler
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // material
+      ],
+    })
+
+    const sharedPipelineLayout = this.device.createPipelineLayout({
+      label: "shared pipeline layout",
+      bindGroupLayouts: [this.hairBindGroupLayout],
+    })
+
     // Single pipeline for all materials with alpha blending
     this.pipeline = this.device.createRenderPipeline({
       label: "model pipeline",
-      layout: "auto",
+      layout: sharedPipelineLayout,
       vertex: {
         module: shaderModule,
         buffers: [
@@ -259,7 +399,7 @@ export class Engine {
       },
       primitive: { cullMode: "none" },
       depthStencil: {
-        format: "depth24plus",
+        format: "depth24plus-stencil8",
         depthWriteEnabled: true,
         depthCompare: "less",
       },
@@ -399,13 +539,215 @@ export class Engine {
         cullMode: "back",
       },
       depthStencil: {
-        format: "depth24plus",
+        format: "depth24plus-stencil8",
         depthWriteEnabled: true,
         depthCompare: "less",
       },
       multisample: {
         count: this.sampleCount,
       },
+    })
+
+    // Hair pipeline with multiplicative blending (for hair over eyes)
+    this.hairMultiplyPipeline = this.device.createRenderPipeline({
+      label: "hair multiply pipeline",
+      layout: sharedPipelineLayout,
+      vertex: {
+        module: hairMultiplyShaderModule,
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
+            ],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: hairMultiplyShaderModule,
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                // Subtle "looking through semi-transparent hair" effect
+                // Shader outputs pre-multiplied color with reduced alpha (hairColor * subtleAlpha)
+                // Blend: (hairColor * subtleAlpha) + eyeColor * (1 - subtleAlpha)
+                // This preserves most of the original eye color while adding a very subtle hair tint
+                srcFactor: "one", // Use pre-multiplied hair color directly
+                dstFactor: "one-minus-src-alpha", // Preserve most of original eye color
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "zero", // Don't modify eye alpha
+                dstFactor: "one", // Keep original eye alpha
+                operation: "add",
+              },
+            },
+          },
+        ],
+      },
+      primitive: { cullMode: "none" },
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: false, // Don't write depth
+        depthCompare: "less",
+        stencilFront: {
+          compare: "equal", // Only render where stencil == 1
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+        stencilBack: {
+          compare: "equal",
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+      },
+      multisample: { count: this.sampleCount },
+    })
+
+    // Hair pipeline for opaque rendering (hair over non-eyes)
+    this.hairOpaquePipeline = this.device.createRenderPipeline({
+      label: "hair opaque pipeline",
+      layout: sharedPipelineLayout,
+      vertex: {
+        module: shaderModule,
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
+            ],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: shaderModule,
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+            },
+          },
+        ],
+      },
+      primitive: { cullMode: "none" },
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+        stencilFront: {
+          compare: "not-equal", // Only render where stencil != 1
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+        stencilBack: {
+          compare: "not-equal",
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+      },
+      multisample: { count: this.sampleCount },
+    })
+
+    // Eye overlay pipeline (renders after opaque, writes stencil)
+    this.eyePipeline = this.device.createRenderPipeline({
+      label: "eye overlay pipeline",
+      layout: sharedPipelineLayout,
+      vertex: {
+        module: shaderModule,
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
+              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
+            ],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: shaderModule,
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+            },
+          },
+        ],
+      },
+      primitive: { cullMode: "none" },
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: false, // Don't write depth
+        depthCompare: "less", // Respect existing depth
+        stencilFront: {
+          compare: "always",
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "replace", // Write stencil value 1
+        },
+        stencilBack: {
+          compare: "always",
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "replace",
+        },
+      },
+      multisample: { count: this.sampleCount },
     })
   }
 
@@ -481,7 +823,7 @@ export class Engine {
         label: "depth texture",
         size: [width, height],
         sampleCount: this.sampleCount,
-        format: "depth24plus",
+        format: "depth24plus-stencil8",
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
@@ -511,6 +853,9 @@ export class Engine {
           depthClearValue: 1.0,
           depthLoadOp: "clear",
           depthStoreOp: "store",
+          stencilClearValue: 0, // New: clear stencil to 0
+          stencilLoadOp: "clear", // New: clear stencil each frame
+          stencilStoreOp: "store", // New: store stencil
         },
       }
 
@@ -722,8 +1067,35 @@ export class Engine {
     await this.setupMaterials(model)
   }
 
-  private materialDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
-  private outlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private opaqueNonEyeNonHairDraws: {
+    count: number
+    firstIndex: number
+    bindGroup: GPUBindGroup
+    isTransparent: boolean
+  }[] = []
+  private eyeDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private hairDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private transparentNonEyeNonHairDraws: {
+    count: number
+    firstIndex: number
+    bindGroup: GPUBindGroup
+    isTransparent: boolean
+  }[] = []
+  private opaqueNonEyeNonHairOutlineDraws: {
+    count: number
+    firstIndex: number
+    bindGroup: GPUBindGroup
+    isTransparent: boolean
+  }[] = []
+  private eyeOutlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
+  private hairOutlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] =
+    []
+  private transparentNonEyeNonHairOutlineDraws: {
+    count: number
+    firstIndex: number
+    bindGroup: GPUBindGroup
+    isTransparent: boolean
+  }[] = []
 
   // Step 8: Load textures and create material bind groups
   private async setupMaterials(model: Model) {
@@ -783,8 +1155,14 @@ export class Engine {
       return defaultToonTexture
     }
 
-    this.materialDraws = []
-    this.outlineDraws = []
+    this.opaqueNonEyeNonHairDraws = []
+    this.eyeDraws = []
+    this.hairDraws = []
+    this.transparentNonEyeNonHairDraws = []
+    this.opaqueNonEyeNonHairOutlineDraws = []
+    this.eyeOutlineDraws = []
+    this.hairOutlineDraws = []
+    this.transparentNonEyeNonHairOutlineDraws = []
     const outlineBindGroupLayout = this.outlinePipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
 
@@ -814,9 +1192,11 @@ export class Engine {
       })
       this.device.queue.writeBuffer(materialUniformBuffer, 0, materialUniformData)
 
+      // Create bind groups using the shared bind group layout
+      // All pipelines (main, eye, hair multiply, hair opaque) use the same shader and layout
       const bindGroup = this.device.createBindGroup({
         label: `material bind group: ${mat.name}`,
-        layout: this.pipeline.getBindGroupLayout(0),
+        layout: this.hairBindGroupLayout,
         entries: [
           { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
@@ -829,13 +1209,36 @@ export class Engine {
         ],
       })
 
-      // All materials use the same pipeline
-      this.materialDraws.push({
-        count: matCount,
-        firstIndex: runningFirstIndex,
-        bindGroup,
-        isTransparent,
-      })
+      // Classify materials into appropriate draw lists
+      if (mat.isEye) {
+        this.eyeDraws.push({
+          count: matCount,
+          firstIndex: runningFirstIndex,
+          bindGroup,
+          isTransparent,
+        })
+      } else if (mat.isHair) {
+        this.hairDraws.push({
+          count: matCount,
+          firstIndex: runningFirstIndex,
+          bindGroup,
+          isTransparent,
+        })
+      } else if (isTransparent) {
+        this.transparentNonEyeNonHairDraws.push({
+          count: matCount,
+          firstIndex: runningFirstIndex,
+          bindGroup,
+          isTransparent,
+        })
+      } else {
+        this.opaqueNonEyeNonHairDraws.push({
+          count: matCount,
+          firstIndex: runningFirstIndex,
+          bindGroup,
+          isTransparent,
+        })
+      }
 
       // Outline for all materials (including transparent)
       // Edge flag is at bit 4 (0x10) in PMX format, not bit 0 (0x01)
@@ -864,13 +1267,36 @@ export class Engine {
           ],
         })
 
-        // All outlines use the same pipeline
-        this.outlineDraws.push({
-          count: matCount,
-          firstIndex: runningFirstIndex,
-          bindGroup: outlineBindGroup,
-          isTransparent,
-        })
+        // Classify outlines into appropriate draw lists
+        if (mat.isEye) {
+          this.eyeOutlineDraws.push({
+            count: matCount,
+            firstIndex: runningFirstIndex,
+            bindGroup: outlineBindGroup,
+            isTransparent,
+          })
+        } else if (mat.isHair) {
+          this.hairOutlineDraws.push({
+            count: matCount,
+            firstIndex: runningFirstIndex,
+            bindGroup: outlineBindGroup,
+            isTransparent,
+          })
+        } else if (isTransparent) {
+          this.transparentNonEyeNonHairOutlineDraws.push({
+            count: matCount,
+            firstIndex: runningFirstIndex,
+            bindGroup: outlineBindGroup,
+            isTransparent,
+          })
+        } else {
+          this.opaqueNonEyeNonHairOutlineDraws.push({
+            count: matCount,
+            firstIndex: runningFirstIndex,
+            bindGroup: outlineBindGroup,
+            isTransparent,
+          })
+        }
       }
 
       runningFirstIndex += matCount
@@ -948,10 +1374,62 @@ export class Engine {
       pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
       this.drawCallCount = 0
-      this.drawOutlines(pass, false)
-      this.drawModel(pass, false)
-      this.drawModel(pass, true)
-      this.drawOutlines(pass, true)
+
+      // === PASS 1: Opaque non-eye, non-hair (face, body, etc) ===
+      this.drawOutlines(pass, false) // Opaque outlines
+      pass.setPipeline(this.pipeline)
+      for (const draw of this.opaqueNonEyeNonHairDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      // === PASS 2: Eyes (writes stencil = 1) ===
+      pass.setPipeline(this.eyePipeline)
+      pass.setStencilReference(1) // Set stencil reference value to 1
+      for (const draw of this.eyeDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      // === PASS 3a: Hair over eyes (stencil == 1, multiply blend) ===
+      pass.setPipeline(this.hairMultiplyPipeline)
+      pass.setStencilReference(1) // Check against stencil value 1
+      for (const draw of this.hairDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      // === PASS 3b: Hair over non-eyes (stencil != 1, opaque) ===
+      pass.setPipeline(this.hairOpaquePipeline)
+      pass.setStencilReference(1) // Check against stencil value 1 (with not-equal test)
+      for (const draw of this.hairDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      // === PASS 4: Transparent non-eye, non-hair ===
+      pass.setPipeline(this.pipeline)
+      for (const draw of this.transparentNonEyeNonHairDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+          this.drawCallCount++
+        }
+      }
+
+      this.drawOutlines(pass, true) // Transparent outlines
 
       pass.end()
       this.device.queue.submit([encoder.finish()])
@@ -1046,24 +1524,22 @@ export class Engine {
 
   // Draw outlines (opaque or transparent)
   private drawOutlines(pass: GPURenderPassEncoder, transparent: boolean) {
-    if (this.outlineDraws.length === 0) return
     pass.setPipeline(this.outlinePipeline)
-    for (const draw of this.outlineDraws) {
-      if (draw.count > 0 && draw.isTransparent === transparent) {
-        pass.setBindGroup(0, draw.bindGroup)
-        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+    if (transparent) {
+      // Draw transparent outlines (if any)
+      for (const draw of this.transparentNonEyeNonHairOutlineDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+        }
       }
-    }
-  }
-
-  // Draw model materials (opaque or transparent)
-  private drawModel(pass: GPURenderPassEncoder, transparent: boolean) {
-    pass.setPipeline(this.pipeline)
-    for (const draw of this.materialDraws) {
-      if (draw.count > 0 && draw.isTransparent === transparent) {
-        pass.setBindGroup(0, draw.bindGroup)
-        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-        this.drawCallCount++
+    } else {
+      // Draw opaque outlines before main geometry
+      for (const draw of this.opaqueNonEyeNonHairOutlineDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+        }
       }
     }
   }
@@ -1120,7 +1596,12 @@ export class Engine {
     }
     bufferMemoryBytes += 40 * 4 // cameraUniformBuffer
     bufferMemoryBytes += 64 * 4 // lightUniformBuffer
-    bufferMemoryBytes += this.materialDraws.length * 4 // Material uniform buffers
+    const totalMaterialDraws =
+      this.opaqueNonEyeNonHairDraws.length +
+      this.eyeDraws.length +
+      this.hairDraws.length +
+      this.transparentNonEyeNonHairDraws.length
+    bufferMemoryBytes += totalMaterialDraws * 4 // Material uniform buffers
 
     let renderTargetMemoryBytes = 0
     if (this.multisampleTexture) {

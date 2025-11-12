@@ -262,7 +262,7 @@ export class PmxLoader {
         // PMX material flag bits:
         // Bit 0 (0x01): Double-sided rendering
         // Bit 4 (0x10): Edge drawing (outline)
-        this.materials.push({
+        const mat: Material = {
           name,
           diffuse,
           specular,
@@ -277,7 +277,36 @@ export class PmxLoader {
           edgeColor,
           edgeSize,
           vertexCount,
-        })
+        }
+
+        // Classify materials based on name
+        const materialName = name.toLowerCase()
+
+        // Classify eye materials
+        mat.isEye =
+          materialName.includes("目") || // Japanese "eye"
+          materialName.includes("瞳") || // Japanese "pupil"
+          materialName.includes("eye") ||
+          materialName.includes("pupil") ||
+          materialName.includes("iris") ||
+          materialName.includes("目白")
+
+        // Classify face materials
+        mat.isFace =
+          materialName.includes("顔") || // Japanese "face"
+          materialName.includes("肌") || // Japanese "skin"
+          materialName.includes("face") ||
+          materialName.includes("skin") ||
+          materialName.includes("head")
+
+        // Classify hair materials
+        mat.isHair =
+          materialName.includes("髪") || // Japanese "hair"
+          materialName.includes("前髪") || // Japanese "bangs"
+          materialName.includes("hair_f") ||
+          materialName.includes("头发")
+
+        this.materials.push(mat)
       }
     } catch (error) {
       console.error("Error parsing materials:", error)
