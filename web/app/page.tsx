@@ -81,7 +81,7 @@ export default function Home() {
       className="fixed inset-0 w-full h-full overflow-hidden touch-none"
       style={{
         background:
-          "radial-gradient(ellipse at center, rgba(35, 35, 45, 0.8) 0%, rgba(35, 35, 45, 0.8) 8%, rgba(8, 8, 12, 0.95) 65%, rgba(0, 0, 0, 1) 100%)",
+          "black",
       }}
     >
       <Header stats={stats} />
