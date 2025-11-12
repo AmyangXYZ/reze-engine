@@ -326,8 +326,8 @@ export class Engine {
           }
           
           // For hair-over-eyes effect: simple half-transparent overlay
-          // Use 60% opacity to create a semi-transparent hair color overlay
-          let overlayAlpha = finalAlpha * 0.6;
+          // Use 50% opacity to create a semi-transparent hair color overlay
+          let overlayAlpha = finalAlpha * 0.5;
           
           return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), overlayAlpha);
         }
@@ -1561,7 +1561,8 @@ export class Engine {
       this.drawCallCount = 0
 
       // === PASS 1: Opaque non-eye, non-hair (face, body, etc) ===
-      this.drawOutlines(pass, false) // Opaque outlines
+      // this.drawOutlines(pass, false) // Opaque outlines
+
       pass.setPipeline(this.pipeline)
       for (const draw of this.opaqueNonEyeNonHairDraws) {
         if (draw.count > 0) {
@@ -1627,6 +1628,8 @@ export class Engine {
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
         }
       }
+
+      this.drawOutlines(pass, false) // Opaque outlines
 
       // === PASS 4: Transparent non-eye, non-hair ===
       pass.setPipeline(this.pipeline)

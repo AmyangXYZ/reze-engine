@@ -289,22 +289,16 @@ export class PmxLoader {
           materialName.includes("eye") ||
           materialName.includes("pupil") ||
           materialName.includes("iris") ||
-          materialName.includes("目白")
+          materialName.includes("目白") ||
+          materialName.includes("眼") ||
+          materialName.includes("睛") ||
+          materialName.includes("眉")
 
         // Classify face materials
-        mat.isFace =
-          materialName.includes("顔") || // Japanese "face"
-          materialName.includes("肌") || // Japanese "skin"
-          materialName.includes("face") ||
-          materialName.includes("skin") ||
-          materialName.includes("head")
+        mat.isFace = materialName.includes("face") || materialName.includes("脸")
 
         // Classify hair materials
-        mat.isHair =
-          materialName.includes("髪") || // Japanese "hair"
-          materialName.includes("前髪") || // Japanese "bangs"
-          materialName.includes("hair_f") ||
-          materialName.includes("头发")
+        mat.isHair = materialName.includes("hair_f")
 
         this.materials.push(mat)
       }
