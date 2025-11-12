@@ -28,10 +28,13 @@ export class Engine {
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
   private outlinePipeline!: GPURenderPipeline
+  private hairOutlinePipeline!: GPURenderPipeline
+  private hairOutlineOverEyesPipeline!: GPURenderPipeline
   private hairMultiplyPipeline!: GPURenderPipeline
   private hairOpaquePipeline!: GPURenderPipeline
   private eyePipeline!: GPURenderPipeline
   private hairBindGroupLayout!: GPUBindGroupLayout
+  private outlineBindGroupLayout!: GPUBindGroupLayout
   private jointsBuffer!: GPUBuffer
   private weightsBuffer!: GPUBuffer
   private skinMatrixBuffer?: GPUBuffer
@@ -322,11 +325,11 @@ export class Engine {
             discard;
           }
           
-          // For hair-over-eyes effect: reduce the hair color contribution to make it more subtle
-          // Use a reduced alpha (e.g., 30% of original) so the hair tint is very subtle
-          let subtleAlpha = finalAlpha * 0.3;
+          // For hair-over-eyes effect: simple half-transparent overlay
+          // Use 60% opacity to create a semi-transparent hair color overlay
+          let overlayAlpha = finalAlpha * 0.6;
           
-          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)) * subtleAlpha, subtleAlpha);
+          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), overlayAlpha);
         }
       `,
     })
@@ -408,6 +411,21 @@ export class Engine {
       },
     })
 
+    // Create bind group layout for outline pipelines
+    this.outlineBindGroupLayout = this.device.createBindGroupLayout({
+      label: "outline bind group layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // camera
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // material
+        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // skinMats
+      ],
+    })
+
+    const outlinePipelineLayout = this.device.createPipelineLayout({
+      label: "outline pipeline layout",
+      bindGroupLayouts: [this.outlineBindGroupLayout],
+    })
+
     const outlineShaderModule = this.device.createShaderModule({
       label: "outline shaders",
       code: /* wgsl */ `
@@ -481,7 +499,7 @@ export class Engine {
 
     this.outlinePipeline = this.device.createRenderPipeline({
       label: "outline pipeline",
-      layout: "auto",
+      layout: outlinePipelineLayout,
       vertex: {
         module: outlineShaderModule,
         buffers: [
@@ -548,6 +566,176 @@ export class Engine {
       },
     })
 
+    // Hair outline pipeline: draws hair outlines over non-eyes (stencil != 1)
+    // Drawn after hair geometry, so depth testing ensures outlines only appear where hair exists
+    this.hairOutlinePipeline = this.device.createRenderPipeline({
+      label: "hair outline pipeline",
+      layout: outlinePipelineLayout,
+      vertex: {
+        module: outlineShaderModule,
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [
+              {
+                shaderLocation: 0,
+                offset: 0,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 1,
+                offset: 3 * 4,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 2,
+                offset: 6 * 4,
+                format: "float32x2" as GPUVertexFormat,
+              },
+            ],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: outlineShaderModule,
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+            },
+          },
+        ],
+      },
+      primitive: {
+        cullMode: "back",
+      },
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: false, // Don't write depth - let hair geometry control depth
+        depthCompare: "less-equal", // Only draw where hair depth exists
+        stencilFront: {
+          compare: "not-equal", // Only render where stencil != 1 (not over eyes)
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+        stencilBack: {
+          compare: "not-equal",
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+      },
+      multisample: {
+        count: this.sampleCount,
+      },
+    })
+
+    // Hair outline pipeline for over eyes: draws where stencil == 1, but only where hair depth exists
+    // Uses depth compare "equal" with a small bias to only appear where hair geometry exists
+    this.hairOutlineOverEyesPipeline = this.device.createRenderPipeline({
+      label: "hair outline over eyes pipeline",
+      layout: outlinePipelineLayout,
+      vertex: {
+        module: outlineShaderModule,
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [
+              {
+                shaderLocation: 0,
+                offset: 0,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 1,
+                offset: 3 * 4,
+                format: "float32x3" as GPUVertexFormat,
+              },
+              {
+                shaderLocation: 2,
+                offset: 6 * 4,
+                format: "float32x2" as GPUVertexFormat,
+              },
+            ],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: outlineShaderModule,
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+              alpha: {
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add",
+              },
+            },
+          },
+        ],
+      },
+      primitive: {
+        cullMode: "back",
+      },
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: false, // Don't write depth
+
+        depthCompare: "less-equal", // Draw where outline depth <= existing depth (hair depth)
+        depthBias: -0.0001, // Small negative bias to bring outline slightly closer for depth test
+        depthBiasSlopeScale: 0.0,
+        depthBiasClamp: 0.0,
+        stencilFront: {
+          compare: "equal", // Only render where stencil == 1 (over eyes)
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+        stencilBack: {
+          compare: "equal",
+          failOp: "keep",
+          depthFailOp: "keep",
+          passOp: "keep",
+        },
+      },
+      multisample: {
+        count: this.sampleCount,
+      },
+    })
+
     // Hair pipeline with multiplicative blending (for hair over eyes)
     this.hairMultiplyPipeline = this.device.createRenderPipeline({
       label: "hair multiply pipeline",
@@ -580,17 +768,15 @@ export class Engine {
             format: this.presentationFormat,
             blend: {
               color: {
-                // Subtle "looking through semi-transparent hair" effect
-                // Shader outputs pre-multiplied color with reduced alpha (hairColor * subtleAlpha)
-                // Blend: (hairColor * subtleAlpha) + eyeColor * (1 - subtleAlpha)
-                // This preserves most of the original eye color while adding a very subtle hair tint
-                srcFactor: "one", // Use pre-multiplied hair color directly
-                dstFactor: "one-minus-src-alpha", // Preserve most of original eye color
+                // Simple half-transparent overlay effect
+                // Blend: hairColor * overlayAlpha + eyeColor * (1 - overlayAlpha)
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
                 operation: "add",
               },
               alpha: {
-                srcFactor: "zero", // Don't modify eye alpha
-                dstFactor: "one", // Keep original eye alpha
+                srcFactor: "one",
+                dstFactor: "one-minus-src-alpha",
                 operation: "add",
               },
             },
@@ -600,7 +786,7 @@ export class Engine {
       primitive: { cullMode: "none" },
       depthStencil: {
         format: "depth24plus-stencil8",
-        depthWriteEnabled: false, // Don't write depth
+        depthWriteEnabled: true, // Write depth so outlines can test against it
         depthCompare: "less",
         stencilFront: {
           compare: "equal", // Only render where stencil == 1
@@ -1163,7 +1349,6 @@ export class Engine {
     this.eyeOutlineDraws = []
     this.hairOutlineDraws = []
     this.transparentNonEyeNonHairOutlineDraws = []
-    const outlineBindGroupLayout = this.outlinePipeline.getBindGroupLayout(0)
     let runningFirstIndex = 0
 
     for (const mat of materials) {
@@ -1259,7 +1444,7 @@ export class Engine {
 
         const outlineBindGroup = this.device.createBindGroup({
           label: `outline bind group: ${mat.name}`,
-          layout: outlineBindGroupLayout,
+          layout: this.outlineBindGroupLayout,
           entries: [
             { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
             { binding: 1, resource: { buffer: materialUniformBuffer } },
@@ -1398,6 +1583,7 @@ export class Engine {
       }
 
       // === PASS 3a: Hair over eyes (stencil == 1, multiply blend) ===
+      // Draw hair geometry first to establish depth
       pass.setPipeline(this.hairMultiplyPipeline)
       pass.setStencilReference(1) // Check against stencil value 1
       for (const draw of this.hairDraws) {
@@ -1405,6 +1591,18 @@ export class Engine {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
           this.drawCallCount++
+        }
+      }
+
+      // === PASS 3a.5: Hair outlines over eyes (stencil == 1, depth test to only draw near hair) ===
+      // Use depth compare "less-equal" with the hair depth to only draw outline where hair exists
+      // The outline is expanded outward, so we need to ensure it only appears near the hair edge
+      pass.setPipeline(this.hairOutlineOverEyesPipeline)
+      pass.setStencilReference(1) // Check against stencil value 1 (with equal test)
+      for (const draw of this.hairOutlineDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
         }
       }
 
@@ -1416,6 +1614,17 @@ export class Engine {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
           this.drawCallCount++
+        }
+      }
+
+      // === PASS 3b.5: Hair outlines over non-eyes (stencil != 1) ===
+      // Draw hair outlines after hair geometry, so they only appear where hair exists
+      pass.setPipeline(this.hairOutlinePipeline)
+      pass.setStencilReference(1) // Check against stencil value 1 (with not-equal test)
+      for (const draw of this.hairOutlineDraws) {
+        if (draw.count > 0) {
+          pass.setBindGroup(0, draw.bindGroup)
+          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
         }
       }
 
