@@ -40,6 +40,7 @@ export class Engine {
   private worldMatrixBuffer?: GPUBuffer
   private inverseBindMatrixBuffer?: GPUBuffer
   private skinMatrixComputePipeline?: GPUComputePipeline
+  private skinMatrixComputeBindGroup?: GPUBindGroup
   private boneCountBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
@@ -60,6 +61,11 @@ export class Engine {
   private bloomIntensityBuffer!: GPUBuffer
   private bloomThresholdBuffer!: GPUBuffer
   private linearSampler!: GPUSampler
+  // Bloom bind groups (created once, reused every frame)
+  private bloomExtractBindGroup?: GPUBindGroup
+  private bloomBlurHBindGroup?: GPUBindGroup
+  private bloomBlurVBindGroup?: GPUBindGroup
+  private bloomComposeBindGroup?: GPUBindGroup
   // Bloom settings
   public bloomThreshold: number = 0.3
   public bloomIntensity: number = 0.1
@@ -1156,6 +1162,70 @@ export class Engine {
     this.linearSampler = linearSampler
   }
 
+  // Setup bloom textures and bind groups (called when canvas is resized)
+  private setupBloom(width: number, height: number) {
+    // Create bloom textures (half resolution for performance)
+    const bloomWidth = Math.floor(width / 2)
+    const bloomHeight = Math.floor(height / 2)
+    this.bloomExtractTexture = this.device.createTexture({
+      label: "bloom extract",
+      size: [bloomWidth, bloomHeight],
+      format: this.presentationFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.bloomBlurTexture1 = this.device.createTexture({
+      label: "bloom blur 1",
+      size: [bloomWidth, bloomHeight],
+      format: this.presentationFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.bloomBlurTexture2 = this.device.createTexture({
+      label: "bloom blur 2",
+      size: [bloomWidth, bloomHeight],
+      format: this.presentationFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+
+    // Create bloom bind groups
+    this.bloomExtractBindGroup = this.device.createBindGroup({
+      layout: this.bloomExtractPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sceneRenderTexture.createView() },
+        { binding: 1, resource: this.linearSampler },
+        { binding: 2, resource: { buffer: this.bloomThresholdBuffer } },
+      ],
+    })
+
+    this.bloomBlurHBindGroup = this.device.createBindGroup({
+      layout: this.bloomBlurPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.bloomExtractTexture.createView() },
+        { binding: 1, resource: this.linearSampler },
+        { binding: 2, resource: { buffer: this.blurDirectionBuffer } },
+      ],
+    })
+
+    this.bloomBlurVBindGroup = this.device.createBindGroup({
+      layout: this.bloomBlurPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.bloomBlurTexture1.createView() },
+        { binding: 1, resource: this.linearSampler },
+        { binding: 2, resource: { buffer: this.blurDirectionBuffer } },
+      ],
+    })
+
+    this.bloomComposeBindGroup = this.device.createBindGroup({
+      layout: this.bloomComposePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sceneRenderTexture.createView() },
+        { binding: 1, resource: this.linearSampler },
+        { binding: 2, resource: this.bloomBlurTexture2.createView() },
+        { binding: 3, resource: this.linearSampler },
+        { binding: 4, resource: { buffer: this.bloomIntensityBuffer } },
+      ],
+    })
+  }
+
   // Step 3: Setup canvas resize handling
   private setupResize() {
     this.resizeObserver = new ResizeObserver(() => this.handleResize())
@@ -1200,27 +1270,8 @@ export class Engine {
       })
       this.sceneRenderTextureView = this.sceneRenderTexture.createView()
 
-      // Create bloom textures (half resolution for performance)
-      const bloomWidth = Math.floor(width / 2)
-      const bloomHeight = Math.floor(height / 2)
-      this.bloomExtractTexture = this.device.createTexture({
-        label: "bloom extract",
-        size: [bloomWidth, bloomHeight],
-        format: this.presentationFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      })
-      this.bloomBlurTexture1 = this.device.createTexture({
-        label: "bloom blur 1",
-        size: [bloomWidth, bloomHeight],
-        format: this.presentationFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      })
-      this.bloomBlurTexture2 = this.device.createTexture({
-        label: "bloom blur 2",
-        size: [bloomWidth, bloomHeight],
-        format: this.presentationFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      })
+      // Setup bloom textures and bind groups
+      this.setupBloom(width, height)
 
       const depthTextureView = this.depthTexture.createView()
 
@@ -1446,6 +1497,17 @@ export class Engine {
     this.device.queue.writeBuffer(this.boneCountBuffer, 0, boneCountData)
 
     this.createSkinMatrixComputePipeline()
+
+    // Create compute bind group once (reused every frame)
+    this.skinMatrixComputeBindGroup = this.device.createBindGroup({
+      layout: this.skinMatrixComputePipeline!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.boneCountBuffer } },
+        { binding: 1, resource: { buffer: this.worldMatrixBuffer } },
+        { binding: 2, resource: { buffer: this.inverseBindMatrixBuffer } },
+        { binding: 3, resource: { buffer: this.skinMatrixBuffer } },
+      ],
+    })
 
     const indices = model.getIndices()
     if (indices) {
@@ -1987,17 +2049,8 @@ export class Engine {
       ],
     })
 
-    const extractBindGroup = this.device.createBindGroup({
-      layout: this.bloomExtractPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sceneRenderTexture.createView() },
-        { binding: 1, resource: this.linearSampler },
-        { binding: 2, resource: { buffer: this.bloomThresholdBuffer } },
-      ],
-    })
-
     extractPass.setPipeline(this.bloomExtractPipeline)
-    extractPass.setBindGroup(0, extractBindGroup)
+    extractPass.setBindGroup(0, this.bloomExtractBindGroup!)
     extractPass.draw(6, 1, 0, 0)
     extractPass.end()
 
@@ -2018,17 +2071,8 @@ export class Engine {
       ],
     })
 
-    const blurHBindGroup = this.device.createBindGroup({
-      layout: this.bloomBlurPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.bloomExtractTexture.createView() },
-        { binding: 1, resource: this.linearSampler },
-        { binding: 2, resource: { buffer: this.blurDirectionBuffer } },
-      ],
-    })
-
     blurHPass.setPipeline(this.bloomBlurPipeline)
-    blurHPass.setBindGroup(0, blurHBindGroup)
+    blurHPass.setBindGroup(0, this.bloomBlurHBindGroup!)
     blurHPass.draw(6, 1, 0, 0)
     blurHPass.end()
 
@@ -2049,17 +2093,8 @@ export class Engine {
       ],
     })
 
-    const blurVBindGroup = this.device.createBindGroup({
-      layout: this.bloomBlurPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.bloomBlurTexture1.createView() },
-        { binding: 1, resource: this.linearSampler },
-        { binding: 2, resource: { buffer: this.blurDirectionBuffer } },
-      ],
-    })
-
     blurVPass.setPipeline(this.bloomBlurPipeline)
-    blurVPass.setBindGroup(0, blurVBindGroup)
+    blurVPass.setBindGroup(0, this.bloomBlurVBindGroup!)
     blurVPass.draw(6, 1, 0, 0)
     blurVPass.end()
 
@@ -2076,19 +2111,8 @@ export class Engine {
       ],
     })
 
-    const composeBindGroup = this.device.createBindGroup({
-      layout: this.bloomComposePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sceneRenderTexture.createView() },
-        { binding: 1, resource: this.linearSampler },
-        { binding: 2, resource: this.bloomBlurTexture2.createView() },
-        { binding: 3, resource: this.linearSampler },
-        { binding: 4, resource: { buffer: this.bloomIntensityBuffer } },
-      ],
-    })
-
     composePass.setPipeline(this.bloomComposePipeline)
-    composePass.setBindGroup(0, composeBindGroup)
+    composePass.setBindGroup(0, this.bloomComposeBindGroup!)
     composePass.draw(6, 1, 0, 0)
     composePass.end()
 
@@ -2153,26 +2177,12 @@ export class Engine {
     // Dispatch exactly enough threads for all bones (no bounds check needed)
     const workgroupCount = Math.ceil(boneCount / workgroupSize)
 
-    // Update bone count uniform
-    const boneCountData = new Uint32Array(8) // 32 bytes total
-    boneCountData[0] = boneCount
-    this.device.queue.writeBuffer(this.boneCountBuffer!, 0, boneCountData)
-
-    const bindGroup = this.device.createBindGroup({
-      label: "skin matrix compute bind group",
-      layout: this.skinMatrixComputePipeline!.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.boneCountBuffer! } },
-        { binding: 1, resource: { buffer: this.worldMatrixBuffer! } },
-        { binding: 2, resource: { buffer: this.inverseBindMatrixBuffer! } },
-        { binding: 3, resource: { buffer: this.skinMatrixBuffer! } },
-      ],
-    })
+    // Bone count is written once in setupModelBuffers() and never changes
 
     const encoder = this.device.createCommandEncoder()
     const pass = encoder.beginComputePass()
     pass.setPipeline(this.skinMatrixComputePipeline!)
-    pass.setBindGroup(0, bindGroup)
+    pass.setBindGroup(0, this.skinMatrixComputeBindGroup!)
     pass.dispatchWorkgroups(workgroupCount)
     pass.end()
     this.device.queue.submit([encoder.finish()])
