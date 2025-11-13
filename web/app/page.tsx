@@ -77,13 +77,7 @@ export default function Home() {
   }, [loading])
 
   return (
-    <div
-      className="fixed inset-0 w-full h-full overflow-hidden touch-none"
-      style={{
-        background:
-          "black",
-      }}
-    >
+    <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
       <Header stats={stats} />
 
       {engineError && (

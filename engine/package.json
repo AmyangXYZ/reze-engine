@@ -1,6 +1,6 @@
 {
     "name": "reze-engine",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "description": "A WebGPU-based MMD model renderer",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",

@@ -62,7 +62,7 @@ export class Engine {
   private linearSampler!: GPUSampler
   // Bloom settings
   public bloomThreshold: number = 0.3
-  public bloomIntensity: number = 0.13
+  public bloomIntensity: number = 0.1
   // Rim light settings
   private rimLightIntensity: number = 0.35
   private rimLightPower: number = 2.0
