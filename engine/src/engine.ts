@@ -159,11 +159,11 @@ export class Engine {
 
         struct MaterialUniforms {
           alpha: f32,
+          alphaMultiplier: f32,
           rimIntensity: f32,
           rimPower: f32,
-          _padding1: f32,
           rimColor: vec3f,
-          _padding2: f32,
+          _padding1: f32,
         };
 
         struct VertexOutput {
@@ -193,126 +193,6 @@ export class Engine {
           let pos4 = vec4f(position, 1.0);
           
           // Normalize weights to ensure they sum to 1.0 (handles floating-point precision issues)
-          let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
-          var normalizedWeights: vec4f;
-          if (weightSum > 0.0001) {
-            normalizedWeights = weights0 / weightSum;
-          } else {
-            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
-          }
-          
-          var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
-          var skinnedNrm = vec3f(0.0, 0.0, 0.0);
-          for (var i = 0u; i < 4u; i++) {
-            let j = joints0[i];
-            let w = normalizedWeights[i];
-            let m = skinMats[j];
-            skinnedPos += (m * pos4) * w;
-            let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
-            skinnedNrm += (r3 * normal) * w;
-          }
-          let worldPos = skinnedPos.xyz;
-          output.position = camera.projection * camera.view * vec4f(worldPos, 1.0);
-          output.normal = normalize(skinnedNrm);
-          output.uv = uv;
-          output.worldPos = worldPos;
-          return output;
-        }
-
-        @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
-          let n = normalize(input.normal);
-          let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
-
-          var lightAccum = vec3f(light.ambient);
-          let numLights = u32(light.lightCount);
-          for (var i = 0u; i < numLights; i++) {
-            let l = -light.lights[i].direction;
-            let nDotL = max(dot(n, l), 0.0);
-            let toonUV = vec2f(nDotL, 0.5);
-            let toonFactor = textureSample(toonTexture, toonSampler, toonUV).rgb;
-            let radiance = light.lights[i].color * light.lights[i].intensity;
-            lightAccum += toonFactor * radiance * nDotL;
-          }
-          
-          // Rim light calculation
-          let viewDir = normalize(camera.viewPos - input.worldPos);
-          var rimFactor = 1.0 - max(dot(n, viewDir), 0.0);
-          rimFactor = pow(rimFactor, material.rimPower);
-          let rimLight = material.rimColor * material.rimIntensity * rimFactor;
-          
-          let color = albedo * lightAccum + rimLight;
-          let finalAlpha = material.alpha;
-          if (finalAlpha < 0.001) {
-            discard;
-          }
-          
-          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), finalAlpha);
-        }
-      `,
-    })
-
-    // Unified hair shader that can handle both over-eyes and over-non-eyes cases
-    // Uses material.alpha multiplier to control opacity (0.5 for over-eyes, 1.0 for over-non-eyes)
-    const hairShaderModule = this.device.createShaderModule({
-      label: "unified hair shaders",
-      code: /* wgsl */ `
-        struct CameraUniforms {
-          view: mat4x4f,
-          projection: mat4x4f,
-          viewPos: vec3f,
-          _padding: f32,
-        };
-
-        struct Light {
-          direction: vec3f,
-          _padding1: f32,
-          color: vec3f,
-          intensity: f32,
-        };
-
-        struct LightUniforms {
-          ambient: f32,
-          lightCount: f32,
-          _padding1: f32,
-          _padding2: f32,
-          lights: array<Light, 4>,
-        };
-
-        struct MaterialUniforms {
-          alpha: f32,
-          alphaMultiplier: f32, // New: multiplier for alpha (0.5 for over-eyes, 1.0 for over-non-eyes)
-          rimIntensity: f32,
-          rimPower: f32,
-          rimColor: vec3f,
-          _padding1: f32,
-        };
-
-        struct VertexOutput {
-          @builtin(position) position: vec4f,
-          @location(0) normal: vec3f,
-          @location(1) uv: vec2f,
-          @location(2) worldPos: vec3f,
-        };
-
-        @group(0) @binding(0) var<uniform> camera: CameraUniforms;
-        @group(0) @binding(1) var<uniform> light: LightUniforms;
-        @group(0) @binding(2) var diffuseTexture: texture_2d<f32>;
-        @group(0) @binding(3) var diffuseSampler: sampler;
-        @group(0) @binding(4) var<storage, read> skinMats: array<mat4x4f>;
-        @group(0) @binding(5) var toonTexture: texture_2d<f32>;
-        @group(0) @binding(6) var toonSampler: sampler;
-        @group(0) @binding(7) var<uniform> material: MaterialUniforms;
-
-        @vertex fn vs(
-          @location(0) position: vec3f,
-          @location(1) normal: vec3f,
-          @location(2) uv: vec2f,
-          @location(3) joints0: vec4<u32>,
-          @location(4) weights0: vec4<f32>
-        ) -> VertexOutput {
-          var output: VertexOutput;
-          let pos4 = vec4f(position, 1.0);
-          
           let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
           var normalizedWeights: vec4f;
           if (weightSum > 0.0001) {
@@ -492,7 +372,6 @@ export class Engine {
         @vertex fn vs(
           @location(0) position: vec3f,
           @location(1) normal: vec3f,
-          @location(2) uv: vec2f,
           @location(3) joints0: vec4<u32>,
           @location(4) weights0: vec4<f32>
         ) -> VertexOutput {
@@ -552,11 +431,6 @@ export class Engine {
                 shaderLocation: 1,
                 offset: 3 * 4,
                 format: "float32x3" as GPUVertexFormat,
-              },
-              {
-                shaderLocation: 2,
-                offset: 6 * 4,
-                format: "float32x2" as GPUVertexFormat,
               },
             ],
           },
@@ -622,11 +496,6 @@ export class Engine {
                 shaderLocation: 1,
                 offset: 3 * 4,
                 format: "float32x3" as GPUVertexFormat,
-              },
-              {
-                shaderLocation: 2,
-                offset: 6 * 4,
-                format: "float32x2" as GPUVertexFormat,
               },
             ],
           },
@@ -705,11 +574,6 @@ export class Engine {
                 offset: 3 * 4,
                 format: "float32x3" as GPUVertexFormat,
               },
-              {
-                shaderLocation: 2,
-                offset: 6 * 4,
-                format: "float32x2" as GPUVertexFormat,
-              },
             ],
           },
           {
@@ -777,7 +641,7 @@ export class Engine {
       label: "hair pipeline (over eyes)",
       layout: sharedPipelineLayout,
       vertex: {
-        module: hairShaderModule,
+        module: shaderModule,
         buffers: [
           {
             arrayStride: 8 * 4,
@@ -798,7 +662,7 @@ export class Engine {
         ],
       },
       fragment: {
-        module: hairShaderModule,
+        module: shaderModule,
         targets: [
           {
             format: this.presentationFormat,
@@ -843,7 +707,7 @@ export class Engine {
       label: "hair pipeline (over non-eyes)",
       layout: sharedPipelineLayout,
       vertex: {
-        module: hairShaderModule,
+        module: shaderModule,
         buffers: [
           {
             arrayStride: 8 * 4,
@@ -864,7 +728,7 @@ export class Engine {
         ],
       },
       fragment: {
-        module: hairShaderModule,
+        module: shaderModule,
         targets: [
           {
             format: this.presentationFormat,
@@ -1717,17 +1581,16 @@ export class Engine {
       const EPSILON = 0.001
       const isTransparent = materialAlpha < 1.0 - EPSILON
 
-      // Create material uniform data - for hair materials, we'll create two versions
-      // MaterialUniforms struct: alpha, rimIntensity, rimPower, _padding1, rimColor (vec3), _padding2
+      // Create material uniform data
       const materialUniformData = new Float32Array(8)
       materialUniformData[0] = materialAlpha
-      materialUniformData[1] = this.rimLightIntensity
-      materialUniformData[2] = this.rimLightPower
-      materialUniformData[3] = 0.0 // _padding1
+      materialUniformData[1] = 1.0 // alphaMultiplier: 1.0 for non-hair materials
+      materialUniformData[2] = this.rimLightIntensity
+      materialUniformData[3] = this.rimLightPower
       materialUniformData[4] = this.rimLightColor[0] // rimColor.r
       materialUniformData[5] = this.rimLightColor[1] // rimColor.g
       materialUniformData[6] = this.rimLightColor[2] // rimColor.b
-      materialUniformData[7] = 0.0 // _padding2
+      materialUniformData[7] = 0.0 // _padding1
 
       const materialUniformBuffer = this.device.createBuffer({
         label: `material uniform: ${mat.name}`,
@@ -1762,7 +1625,6 @@ export class Engine {
         })
       } else if (mat.isHair) {
         // For hair materials, create two bind groups: one for over-eyes (alphaMultiplier = 0.5) and one for over-non-eyes (alphaMultiplier = 1.0)
-        // Hair MaterialUniforms struct: alpha, alphaMultiplier, rimIntensity, rimPower, rimColor (vec3), _padding1
         const materialUniformDataOverEyes = new Float32Array(8)
         materialUniformDataOverEyes[0] = materialAlpha
         materialUniformDataOverEyes[1] = 0.5 // alphaMultiplier: 0.5 for over-eyes
@@ -2260,10 +2122,18 @@ export class Engine {
 
   // Update model pose and physics
   private updateModelPose(deltaTime: number) {
+    // Step 1: Animation evaluation (computes matrices to CPU memory, no upload yet)
     this.currentModel!.evaluatePose()
 
-    // Upload world matrices to GPU
+    // Step 2: Get world matrices (still in CPU memory)
     const worldMats = this.currentModel!.getBoneWorldMatrices()
+
+    // Step 3: Physics modifies matrices in-place
+    if (this.physics) {
+      this.physics.step(deltaTime, worldMats, this.currentModel!.getBoneInverseBindMatrices())
+    }
+
+    // Step 4: Upload ONCE with final result (animation + physics)
     this.device.queue.writeBuffer(
       this.worldMatrixBuffer!,
       0,
@@ -2272,19 +2142,7 @@ export class Engine {
       worldMats.byteLength
     )
 
-    if (this.physics) {
-      this.physics.step(deltaTime, worldMats, this.currentModel!.getBoneInverseBindMatrices())
-      // Re-upload world matrices after physics (physics may have updated bones)
-      this.device.queue.writeBuffer(
-        this.worldMatrixBuffer!,
-        0,
-        worldMats.buffer,
-        worldMats.byteOffset,
-        worldMats.byteLength
-      )
-    }
-
-    // Compute skin matrices on GPU
+    // Step 5: GPU skinning
     this.computeSkinMatrices()
   }
 
@@ -2392,22 +2250,59 @@ export class Engine {
       const skeleton = this.currentModel?.getSkeleton()
       if (skeleton) bufferMemoryBytes += Math.max(256, skeleton.bones.length * 16 * 4)
     }
+    if (this.worldMatrixBuffer) {
+      const skeleton = this.currentModel?.getSkeleton()
+      if (skeleton) bufferMemoryBytes += Math.max(256, skeleton.bones.length * 16 * 4)
+    }
+    if (this.inverseBindMatrixBuffer) {
+      const skeleton = this.currentModel?.getSkeleton()
+      if (skeleton) bufferMemoryBytes += Math.max(256, skeleton.bones.length * 16 * 4)
+    }
     bufferMemoryBytes += 40 * 4 // cameraUniformBuffer
     bufferMemoryBytes += 64 * 4 // lightUniformBuffer
+    bufferMemoryBytes += 32 // boneCountBuffer
+    bufferMemoryBytes += 32 // blurDirectionBuffer
+    bufferMemoryBytes += 32 // bloomIntensityBuffer
+    bufferMemoryBytes += 32 // bloomThresholdBuffer
+    if (this.fullscreenQuadBuffer) {
+      bufferMemoryBytes += 24 * 4 // fullscreenQuadBuffer (6 vertices * 4 floats)
+    }
+
+    // Material uniform buffers: Float32Array(8) = 32 bytes each
     const totalMaterialDraws =
       this.opaqueNonEyeNonHairDraws.length +
       this.eyeDraws.length +
       this.hairDrawsOverEyes.length +
       this.hairDrawsOverNonEyes.length +
       this.transparentNonEyeNonHairDraws.length
-    bufferMemoryBytes += totalMaterialDraws * 4 // Material uniform buffers
+    bufferMemoryBytes += totalMaterialDraws * 32 // Material uniform buffers (8 floats = 32 bytes)
+
+    // Outline material uniform buffers: Float32Array(8) = 32 bytes each
+    const totalOutlineDraws =
+      this.opaqueNonEyeNonHairOutlineDraws.length +
+      this.eyeOutlineDraws.length +
+      this.hairOutlineDraws.length +
+      this.transparentNonEyeNonHairOutlineDraws.length
+    bufferMemoryBytes += totalOutlineDraws * 32 // Outline material uniform buffers
 
     let renderTargetMemoryBytes = 0
     if (this.multisampleTexture) {
       const width = this.canvas.width
       const height = this.canvas.height
       renderTargetMemoryBytes += width * height * 4 * this.sampleCount // multisample color
-      renderTargetMemoryBytes += width * height * 4 // depth
+      renderTargetMemoryBytes += width * height * 4 // depth (depth24plus-stencil8 = 4 bytes)
+    }
+    if (this.sceneRenderTexture) {
+      const width = this.canvas.width
+      const height = this.canvas.height
+      renderTargetMemoryBytes += width * height * 4 // sceneRenderTexture (non-multisampled)
+    }
+    if (this.bloomExtractTexture) {
+      const width = Math.floor(this.canvas.width / 2)
+      const height = Math.floor(this.canvas.height / 2)
+      renderTargetMemoryBytes += width * height * 4 // bloomExtractTexture
+      renderTargetMemoryBytes += width * height * 4 // bloomBlurTexture1
+      renderTargetMemoryBytes += width * height * 4 // bloomBlurTexture2
     }
 
     const totalGPUMemoryBytes = textureMemoryBytes + bufferMemoryBytes + renderTargetMemoryBytes
