@@ -2,7 +2,7 @@
 
 import Header from "@/components/header"
 import { Progress } from "@/components/ui/progress"
-import { Engine, EngineStats, Quat } from "reze-engine"
+import { Engine, EngineStats } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 
 export default function Home() {
@@ -25,26 +25,38 @@ export default function Home() {
         engineRef.current = engine
         await engine.init()
         await engine.loadModel("/models/塞尔凯特/塞尔凯特.pmx")
+        await engine.loadAnimation("/animations/animation.vmd")
+
         setLoading(false)
 
         engine.runRenderLoop(() => {
           setStats(engine.getStats())
         })
 
-        engine.rotateBones(
-          ["腰", "首", "右腕", "左腕", "右ひざ"],
-          [
-            new Quat(-0.4, -0.3, 0, 1),
-            new Quat(0.3, -0.3, -0.3, 1),
-            new Quat(0.3, 0.3, 0.3, 1),
-            new Quat(-0.3, 0.3, -0.3, 1),
-            new Quat(-1.0, -0.3, 0.0, 1),
-          ],
-          1500
-        )
+
+        // engine.rotateBones(
+        //   ["腰", "首", "右腕", "左腕", "右ひざ"],
+        //   [
+        //     new Quat(-0.4, -0.3, 0, 1),
+        //     new Quat(0.3, -0.3, -0.3, 1),
+        //     new Quat(0.3, 0.3, 0.3, 1),
+        //     new Quat(-0.3, 0.3, -0.3, 1),
+        //     new Quat(-1.0, -0.3, 0.0, 1),
+        //   ],
+        //   1500
+        // )
+
+        // Wait a frame to ensure render loop has started and model is fully initialized
+        // This prevents physics explosion when animation starts
+        await new Promise((resolve) => requestAnimationFrame(resolve))
+        engine.playAnimation()
+
+
       } catch (error) {
         setEngineError(error instanceof Error ? error.message : "Unknown error")
       }
+
+
     }
   }, [])
 

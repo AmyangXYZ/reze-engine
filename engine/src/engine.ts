@@ -3,11 +3,19 @@ import { Quat, Vec3 } from "./math"
 import { Model } from "./model"
 import { PmxLoader } from "./pmx-loader"
 import { Physics } from "./physics"
+import { VMDKeyFrame, VMDLoader } from "./vmd-loader"
 
 export interface EngineStats {
   fps: number
   frameTime: number // ms
   gpuMemory: number // MB (estimated total GPU memory)
+}
+
+// Internal type for organizing bone keyframes during animation playback
+type BoneKeyFrame = {
+  boneName: string
+  time: number
+  rotation: Quat
 }
 
 export class Engine {
@@ -93,6 +101,9 @@ export class Engine {
   }
   private animationFrameId: number | null = null
   private renderLoopCallback: (() => void) | null = null
+
+  private animationFrames: VMDKeyFrame[] = []
+  private animationTimeouts: number[] = []
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
@@ -1352,7 +1363,7 @@ export class Engine {
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
-  public addLight(direction: Vec3, color: Vec3, intensity: number = 1.0): boolean {
+  private addLight(direction: Vec3, color: Vec3, intensity: number = 1.0): boolean {
     if (this.lightCount >= 4) return false
 
     const normalized = direction.normalize()
@@ -1371,8 +1382,129 @@ export class Engine {
     return true
   }
 
-  public setAmbient(intensity: number) {
+  private setAmbient(intensity: number) {
     this.lightData[0] = intensity
+  }
+
+  public async loadAnimation(url: string) {
+    const frames = await VMDLoader.load(url)
+    this.animationFrames = frames
+    console.log(this.animationFrames)
+  }
+
+  public playAnimation() {
+    if (this.animationFrames.length === 0) return
+
+    this.stopAnimation()
+
+    const allBoneKeyFrames: BoneKeyFrame[] = []
+    for (const keyFrame of this.animationFrames) {
+      for (const boneFrame of keyFrame.boneFrames) {
+        allBoneKeyFrames.push({
+          boneName: boneFrame.boneName,
+          time: keyFrame.time,
+          rotation: boneFrame.rotation,
+        })
+      }
+    }
+
+    const boneKeyFramesByBone = new Map<string, BoneKeyFrame[]>()
+    for (const boneKeyFrame of allBoneKeyFrames) {
+      if (!boneKeyFramesByBone.has(boneKeyFrame.boneName)) {
+        boneKeyFramesByBone.set(boneKeyFrame.boneName, [])
+      }
+      boneKeyFramesByBone.get(boneKeyFrame.boneName)!.push(boneKeyFrame)
+    }
+
+    for (const keyFrames of boneKeyFramesByBone.values()) {
+      keyFrames.sort((a, b) => a.time - b.time)
+    }
+
+    const time0Rotations: Array<{ boneName: string; rotation: Quat }> = []
+    const bonesWithTime0 = new Set<string>()
+    for (const [boneName, keyFrames] of boneKeyFramesByBone.entries()) {
+      if (keyFrames.length > 0 && keyFrames[0].time === 0) {
+        time0Rotations.push({
+          boneName: boneName,
+          rotation: keyFrames[0].rotation,
+        })
+        bonesWithTime0.add(boneName)
+      }
+    }
+
+    if (this.currentModel) {
+      if (time0Rotations.length > 0) {
+        const boneNames = time0Rotations.map((r) => r.boneName)
+        const rotations = time0Rotations.map((r) => r.rotation)
+        this.rotateBones(boneNames, rotations, 0)
+      }
+
+      const skeleton = this.currentModel.getSkeleton()
+      const bonesToReset: string[] = []
+      for (const bone of skeleton.bones) {
+        if (!bonesWithTime0.has(bone.name)) {
+          bonesToReset.push(bone.name)
+        }
+      }
+
+      if (bonesToReset.length > 0) {
+        const identityQuat = new Quat(0, 0, 0, 1)
+        const identityQuats = new Array(bonesToReset.length).fill(identityQuat)
+        this.rotateBones(bonesToReset, identityQuats, 0)
+      }
+
+      this.currentModel.evaluatePose()
+
+      // Reset physics immediately and upload matrices to prevent A-pose flash
+      if (this.physics) {
+        const worldMats = this.currentModel.getBoneWorldMatrices()
+        this.physics.reset(worldMats, this.currentModel.getBoneInverseBindMatrices())
+
+        // Upload matrices immediately so next frame shows correct pose
+        this.device.queue.writeBuffer(
+          this.worldMatrixBuffer!,
+          0,
+          worldMats.buffer,
+          worldMats.byteOffset,
+          worldMats.byteLength
+        )
+        this.computeSkinMatrices()
+      }
+    }
+    for (const [_, keyFrames] of boneKeyFramesByBone.entries()) {
+      for (let i = 0; i < keyFrames.length; i++) {
+        const boneKeyFrame = keyFrames[i]
+        const previousBoneKeyFrame = i > 0 ? keyFrames[i - 1] : null
+
+        if (boneKeyFrame.time === 0) continue
+
+        let durationMs = 0
+        if (i === 0) {
+          durationMs = boneKeyFrame.time * 1000
+        } else if (previousBoneKeyFrame) {
+          durationMs = (boneKeyFrame.time - previousBoneKeyFrame.time) * 1000
+        }
+
+        const scheduleTime = i > 0 && previousBoneKeyFrame ? previousBoneKeyFrame.time : 0
+        const delayMs = scheduleTime * 1000
+
+        if (delayMs <= 0) {
+          this.rotateBones([boneKeyFrame.boneName], [boneKeyFrame.rotation], durationMs)
+        } else {
+          const timeoutId = window.setTimeout(() => {
+            this.rotateBones([boneKeyFrame.boneName], [boneKeyFrame.rotation], durationMs)
+          }, delayMs)
+          this.animationTimeouts.push(timeoutId)
+        }
+      }
+    }
+  }
+
+  public stopAnimation() {
+    for (const timeoutId of this.animationTimeouts) {
+      clearTimeout(timeoutId)
+    }
+    this.animationTimeouts = []
   }
 
   public getStats(): EngineStats {
@@ -1405,6 +1537,7 @@ export class Engine {
 
   public dispose() {
     this.stopRenderLoop()
+    this.stopAnimation()
     if (this.camera) this.camera.detachControl()
     if (this.resizeObserver) {
       this.resizeObserver.disconnect()
@@ -2153,20 +2286,14 @@ export class Engine {
     }
   }
 
-  // Update model pose and physics
   private updateModelPose(deltaTime: number) {
-    // Step 1: Animation evaluation (computes matrices to CPU memory, no upload yet)
     this.currentModel!.evaluatePose()
-
-    // Step 2: Get world matrices (still in CPU memory)
     const worldMats = this.currentModel!.getBoneWorldMatrices()
 
-    // Step 3: Physics modifies matrices in-place
     if (this.physics) {
       this.physics.step(deltaTime, worldMats, this.currentModel!.getBoneInverseBindMatrices())
     }
 
-    // Step 4: Upload ONCE with final result (animation + physics)
     this.device.queue.writeBuffer(
       this.worldMatrixBuffer!,
       0,
@@ -2174,8 +2301,6 @@ export class Engine {
       worldMats.byteOffset,
       worldMats.byteLength
     )
-
-    // Step 5: GPU skinning
     this.computeSkinMatrices()
   }
 

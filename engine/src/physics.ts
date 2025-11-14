@@ -457,6 +457,78 @@ export class Physics {
     return angle
   }
 
+  // Reset physics state (reposition bodies, clear velocities)
+  // Following babylon-mmd pattern: initialize all rigid body positions from current bone poses
+  // Call this when starting a new animation to prevent physics instability from sudden pose changes
+  reset(boneWorldMatrices: Float32Array, boneInverseBindMatrices: Float32Array): void {
+    if (!this.ammoInitialized || !this.ammo || !this.dynamicsWorld) {
+      return
+    }
+
+    const boneCount = boneWorldMatrices.length / 16
+    const Ammo = this.ammo
+
+    // Ensure body offsets are computed
+    if (!this.rigidbodiesInitialized) {
+      this.computeBodyOffsets(boneInverseBindMatrices, boneCount)
+      this.rigidbodiesInitialized = true
+    }
+
+    // Reposition ALL rigid bodies from current bone poses (like babylon-mmd initialize)
+    // This ensures all bodies are correctly positioned before physics starts
+    for (let i = 0; i < this.rigidbodies.length; i++) {
+      const rb = this.rigidbodies[i]
+      const ammoBody = this.ammoRigidbodies[i]
+      if (!ammoBody || rb.boneIndex < 0 || rb.boneIndex >= boneCount) continue
+
+      const boneIdx = rb.boneIndex
+      const worldMatIdx = boneIdx * 16
+
+      // Get bone world matrix
+      const boneWorldMat = new Mat4(boneWorldMatrices.subarray(worldMatIdx, worldMatIdx + 16))
+
+      // Compute body world matrix: bodyWorld = boneWorld × bodyOffsetMatrix
+      // (like babylon-mmd: bodyWorldMatrix = bodyOffsetMatrix.multiplyToRef(bodyWorldMatrix))
+      const bodyOffsetMatrix = rb.bodyOffsetMatrix || rb.bodyOffsetMatrixInverse.inverse()
+      const bodyWorldMatrix = boneWorldMat.multiply(bodyOffsetMatrix)
+
+      const worldPos = bodyWorldMatrix.getPosition()
+      const worldRot = bodyWorldMatrix.toQuat()
+
+      // Set transform matrix
+      const transform = new Ammo.btTransform()
+      const pos = new Ammo.btVector3(worldPos.x, worldPos.y, worldPos.z)
+      const quat = new Ammo.btQuaternion(worldRot.x, worldRot.y, worldRot.z, worldRot.w)
+
+      transform.setOrigin(pos)
+      transform.setRotation(quat)
+
+      ammoBody.setWorldTransform(transform)
+      ammoBody.getMotionState().setWorldTransform(transform)
+
+      // Clear velocities for all rigidbodies
+      if (!this.zeroVector) {
+        this.zeroVector = new Ammo.btVector3(0, 0, 0)
+      }
+      ammoBody.setLinearVelocity(this.zeroVector)
+      ammoBody.setAngularVelocity(this.zeroVector)
+
+      // Explicitly activate dynamic rigidbodies after reset (wake them up)
+      // This is critical for dress pieces and other dynamic bodies to prevent teleporting
+      if (rb.type === RigidbodyType.Dynamic) {
+        ammoBody.activate(true) // Wake up the body
+      }
+
+      Ammo.destroy(pos)
+      Ammo.destroy(quat)
+    }
+
+    // Step simulation once to stabilize (like babylon-mmd)
+    if (this.dynamicsWorld.stepSimulation) {
+      this.dynamicsWorld.stepSimulation(0, 0, 0)
+    }
+  }
+
   // Syncs bones to rigidbodies, simulates dynamics, solves constraints
   // Modifies boneWorldMatrices in-place for dynamic rigidbodies that drive bones
   step(dt: number, boneWorldMatrices: Float32Array, boneInverseBindMatrices: Float32Array): void {

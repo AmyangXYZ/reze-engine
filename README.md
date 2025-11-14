@@ -14,6 +14,7 @@ A lightweight engine built with WebGPU and TypeScript for real-time 3D anime cha
 - MSAA 4x anti-aliasing
 - GPU-accelerated skinning
 - Bone rotation api
+- VMD animation
 
 ## Usage
 
