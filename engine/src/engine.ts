@@ -27,14 +27,10 @@ export class Engine {
   private depthTexture!: GPUTexture
   private pipeline!: GPURenderPipeline
   private outlinePipeline!: GPURenderPipeline
-  private hairOutlinePipeline!: GPURenderPipeline
-  private hairOutlineOverEyesPipeline!: GPURenderPipeline
-  private hairUnifiedOutlinePipeline!: GPURenderPipeline // Unified hair outline pipeline without stencil testing
-  private hairMultiplyPipeline!: GPURenderPipeline
-  private hairOpaquePipeline!: GPURenderPipeline
-  private hairUnifiedPipelineOverEyes!: GPURenderPipeline // Unified hair pipeline for over-eyes (stencil == 1)
-  private hairUnifiedPipelineOverNonEyes!: GPURenderPipeline // Unified hair pipeline for over-non-eyes (stencil != 1)
-  private hairDepthPipeline!: GPURenderPipeline // Depth-only pipeline for hair pre-pass
+  private hairUnifiedOutlinePipeline!: GPURenderPipeline
+  private hairUnifiedPipelineOverEyes!: GPURenderPipeline
+  private hairUnifiedPipelineOverNonEyes!: GPURenderPipeline
+  private hairDepthPipeline!: GPURenderPipeline
   private eyePipeline!: GPURenderPipeline
   private hairBindGroupLayout!: GPUBindGroupLayout
   private outlineBindGroupLayout!: GPUBindGroupLayout
@@ -252,8 +248,6 @@ export class Engine {
           
           let color = albedo * lightAccum + rimLight;
           
-          // Dynamic branching: adjust alpha based on whether we're over eyes
-          // This allows single-pass hair rendering instead of two separate passes
           var finalAlpha = material.alpha * material.alphaMultiplier;
           if (material.isOverEyes > 0.5) {
             finalAlpha *= 0.5; // Hair over eyes gets 50% alpha
@@ -269,7 +263,6 @@ export class Engine {
     })
 
     // Create explicit bind group layout for all pipelines using the main shader
-    // This ensures compatibility across all pipelines (main, eye, hair multiply, hair opaque)
     this.hairBindGroupLayout = this.device.createBindGroupLayout({
       label: "shared material bind group layout",
       entries: [
@@ -427,8 +420,6 @@ export class Engine {
         @fragment fn fs() -> @location(0) vec4f {
           var color = material.edgeColor;
           
-          // Dynamic branching: adjust alpha for hair outlines over eyes
-          // This allows single-pass outline rendering instead of two separate passes
           if (material.isOverEyes > 0.5) {
             color.a *= 0.5; // Hair outlines over eyes get 50% alpha
           }
@@ -502,168 +493,7 @@ export class Engine {
       },
     })
 
-    // Hair outline pipeline: draws hair outlines over non-eyes (stencil != 1) - Drawn after hair geometry, so depth testing ensures outlines only appear where hair exists
-    this.hairOutlinePipeline = this.device.createRenderPipeline({
-      label: "hair outline pipeline",
-      layout: outlinePipelineLayout,
-      vertex: {
-        module: outlineShaderModule,
-        buffers: [
-          {
-            arrayStride: 8 * 4,
-            attributes: [
-              {
-                shaderLocation: 0,
-                offset: 0,
-                format: "float32x3" as GPUVertexFormat,
-              },
-              {
-                shaderLocation: 1,
-                offset: 3 * 4,
-                format: "float32x3" as GPUVertexFormat,
-              },
-            ],
-          },
-          {
-            arrayStride: 4 * 2,
-            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
-          },
-          {
-            arrayStride: 4,
-            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
-          },
-        ],
-      },
-      fragment: {
-        module: outlineShaderModule,
-        targets: [
-          {
-            format: this.presentationFormat,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
-          },
-        ],
-      },
-      primitive: {
-        cullMode: "back",
-      },
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: false, // Don't write depth - let hair geometry control depth
-        depthCompare: "less-equal", // Only draw where hair depth exists
-        stencilFront: {
-          compare: "not-equal", // Only render where stencil != 1 (not over eyes)
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-        stencilBack: {
-          compare: "not-equal",
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-      },
-      multisample: {
-        count: this.sampleCount,
-      },
-    })
-
-    // Hair outline pipeline for over eyes: draws where stencil == 1, but only where hair depth exists - Uses depth compare "equal" with a small bias to only appear where hair geometry exists
-    this.hairOutlineOverEyesPipeline = this.device.createRenderPipeline({
-      label: "hair outline over eyes pipeline",
-      layout: outlinePipelineLayout,
-      vertex: {
-        module: outlineShaderModule,
-        buffers: [
-          {
-            arrayStride: 8 * 4,
-            attributes: [
-              {
-                shaderLocation: 0,
-                offset: 0,
-                format: "float32x3" as GPUVertexFormat,
-              },
-              {
-                shaderLocation: 1,
-                offset: 3 * 4,
-                format: "float32x3" as GPUVertexFormat,
-              },
-            ],
-          },
-          {
-            arrayStride: 4 * 2,
-            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
-          },
-          {
-            arrayStride: 4,
-            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
-          },
-        ],
-      },
-      fragment: {
-        module: outlineShaderModule,
-        targets: [
-          {
-            format: this.presentationFormat,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
-          },
-        ],
-      },
-      primitive: {
-        cullMode: "back",
-      },
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: false, // Don't write depth
-
-        depthCompare: "less-equal", // Draw where outline depth <= existing depth (hair depth)
-        depthBias: -0.0001, // Small negative bias to bring outline slightly closer for depth test
-        depthBiasSlopeScale: 0.0,
-        depthBiasClamp: 0.0,
-        stencilFront: {
-          compare: "equal", // Only render where stencil == 1 (over eyes)
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-        stencilBack: {
-          compare: "equal",
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-      },
-      multisample: {
-        count: this.sampleCount,
-      },
-    })
-
-    // Unified hair outline pipeline: single pass without stencil testing
-    // Uses depth test "less-equal" to draw everywhere hair exists
-    // Shader branches on isOverEyes uniform to adjust alpha dynamically
-    // This eliminates the need for two separate outline passes
+    // Unified hair outline pipeline: single pass without stencil testing, uses depth test "less-equal" to draw everywhere hair exists
     this.hairUnifiedOutlinePipeline = this.device.createRenderPipeline({
       label: "unified hair outline pipeline",
       layout: outlinePipelineLayout,
@@ -729,139 +559,6 @@ export class Engine {
       multisample: {
         count: this.sampleCount,
       },
-    })
-
-    // Unified hair pipeline - can be used for both over-eyes and over-non-eyes
-    // The difference is controlled by stencil state and alpha multiplier in material uniform
-    this.hairMultiplyPipeline = this.device.createRenderPipeline({
-      label: "hair pipeline (over eyes)",
-      layout: sharedPipelineLayout,
-      vertex: {
-        module: shaderModule,
-        buffers: [
-          {
-            arrayStride: 8 * 4,
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
-              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
-              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
-            ],
-          },
-          {
-            arrayStride: 4 * 2,
-            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
-          },
-          {
-            arrayStride: 4,
-            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
-          },
-        ],
-      },
-      fragment: {
-        module: shaderModule,
-        targets: [
-          {
-            format: this.presentationFormat,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
-          },
-        ],
-      },
-      primitive: { cullMode: "none" },
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true, // Write depth so outlines can test against it
-        depthCompare: "less",
-        stencilFront: {
-          compare: "equal", // Only render where stencil == 1
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-        stencilBack: {
-          compare: "equal",
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-      },
-      multisample: { count: this.sampleCount },
-    })
-
-    // Hair pipeline for opaque rendering (hair over non-eyes) - uses same shader, different stencil state
-    this.hairOpaquePipeline = this.device.createRenderPipeline({
-      label: "hair pipeline (over non-eyes)",
-      layout: sharedPipelineLayout,
-      vertex: {
-        module: shaderModule,
-        buffers: [
-          {
-            arrayStride: 8 * 4,
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
-              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
-              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
-            ],
-          },
-          {
-            arrayStride: 4 * 2,
-            attributes: [{ shaderLocation: 3, offset: 0, format: "uint16x4" as GPUVertexFormat }],
-          },
-          {
-            arrayStride: 4,
-            attributes: [{ shaderLocation: 4, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
-          },
-        ],
-      },
-      fragment: {
-        module: shaderModule,
-        targets: [
-          {
-            format: this.presentationFormat,
-            blend: {
-              color: {
-                srcFactor: "src-alpha",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-              alpha: {
-                srcFactor: "one",
-                dstFactor: "one-minus-src-alpha",
-                operation: "add",
-              },
-            },
-          },
-        ],
-      },
-      primitive: { cullMode: "none" },
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less",
-        stencilFront: {
-          compare: "not-equal", // Only render where stencil != 1
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-        stencilBack: {
-          compare: "not-equal",
-          failOp: "keep",
-          depthFailOp: "keep",
-          passOp: "keep",
-        },
-      },
-      multisample: { count: this.sampleCount },
     })
 
     // Eye overlay pipeline (renders after opaque, writes stencil)
@@ -973,18 +670,13 @@ export class Engine {
           return clipPos;
         }
 
-        // Minimal fragment shader - returns transparent, no color writes (writeMask: 0)
-        // Required because render pass has color attachments
-        // Depth is still written even though we don't write color
         @fragment fn fs() -> @location(0) vec4f {
           return vec4f(0.0, 0.0, 0.0, 0.0); // Transparent - color writes disabled via writeMask
         }
       `,
     })
 
-    // Hair depth pre-pass pipeline (depth-only, no color writes)
-    // This eliminates most overdraw by rejecting fragments early before expensive shading
-    // Note: Must have a color target to match render pass, but we disable all color writes
+    // Hair depth pre-pass pipeline: depth-only with color writes disabled to eliminate overdraw
     this.hairDepthPipeline = this.device.createRenderPipeline({
       label: "hair depth pre-pass",
       layout: sharedPipelineLayout,
@@ -1027,12 +719,7 @@ export class Engine {
       multisample: { count: this.sampleCount },
     })
 
-    // Unified hair pipeline: single pass with dynamic branching in shader
-    // Uses stencil testing to filter fragments, then shader branches on isOverEyes uniform
-    // This eliminates the need for separate pipelines - same shader, different stencil states
-    // We create two variants: one for over-eyes (stencil == 1) and one for over-non-eyes (stencil != 1)
-
-    // Unified pipeline for hair over eyes (stencil == 1)
+    // Unified hair pipeline for over-eyes (stencil == 1): single pass with dynamic branching
     this.hairUnifiedPipelineOverEyes = this.device.createRenderPipeline({
       label: "unified hair pipeline (over eyes)",
       layout: sharedPipelineLayout,
@@ -1624,9 +1311,9 @@ export class Engine {
           depthClearValue: 1.0,
           depthLoadOp: "clear",
           depthStoreOp: "store",
-          stencilClearValue: 0, // New: clear stencil to 0
-          stencilLoadOp: "clear", // New: clear stencil each frame
-          stencilStoreOp: "store", // New: store stencil
+          stencilClearValue: 0,
+          stencilLoadOp: "clear",
+          stencilStoreOp: "discard", // Discard stencil after frame to save bandwidth (we only use it during rendering)
         },
       }
 
@@ -1976,7 +1663,7 @@ export class Engine {
       materialUniformData[4] = this.rimLightColor[0] // rimColor.r
       materialUniformData[5] = this.rimLightColor[1] // rimColor.g
       materialUniformData[6] = this.rimLightColor[2] // rimColor.b
-      materialUniformData[7] = 0.0 // isOverEyes: 0.0 for non-hair materials
+      materialUniformData[7] = 0.0
 
       const materialUniformBuffer = this.device.createBuffer({
         label: `material uniform: ${mat.name}`,
@@ -2010,9 +1697,7 @@ export class Engine {
           isTransparent,
         })
       } else if (mat.isHair) {
-        // For hair materials, create a single bind group that will be used with the unified pipeline
-        // The shader will dynamically branch based on isOverEyes uniform
-        // We still need two uniform buffers (one for each render mode) but can reuse the same bind group structure
+        // Hair materials: create bind groups for unified pipeline with dynamic branching
         const materialUniformDataHair = new Float32Array(8)
         materialUniformDataHair[0] = materialAlpha
         materialUniformDataHair[1] = 1.0 // alphaMultiplier: base value, shader will adjust
@@ -2021,16 +1706,16 @@ export class Engine {
         materialUniformDataHair[4] = this.rimLightColor[0] // rimColor.r
         materialUniformDataHair[5] = this.rimLightColor[1] // rimColor.g
         materialUniformDataHair[6] = this.rimLightColor[2] // rimColor.b
-        materialUniformDataHair[7] = 0.0 // isOverEyes: will be set per draw call
+        materialUniformDataHair[7] = 0.0
 
-        // Create uniform buffers for both modes (we'll update them per frame)
+        // Create uniform buffers for both modes
         const materialUniformBufferOverEyes = this.device.createBuffer({
           label: `material uniform (over eyes): ${mat.name}`,
           size: materialUniformDataHair.byteLength,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         })
         const materialUniformDataOverEyes = new Float32Array(materialUniformDataHair)
-        materialUniformDataOverEyes[7] = 1.0 // isOverEyes = 1.0
+        materialUniformDataOverEyes[7] = 1.0
         this.device.queue.writeBuffer(materialUniformBufferOverEyes, 0, materialUniformDataOverEyes)
 
         const materialUniformBufferOverNonEyes = this.device.createBuffer({
@@ -2039,10 +1724,10 @@ export class Engine {
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         })
         const materialUniformDataOverNonEyes = new Float32Array(materialUniformDataHair)
-        materialUniformDataOverNonEyes[7] = 0.0 // isOverEyes = 0.0
+        materialUniformDataOverNonEyes[7] = 0.0
         this.device.queue.writeBuffer(materialUniformBufferOverNonEyes, 0, materialUniformDataOverNonEyes)
 
-        // Create bind groups for both modes (they share everything except the uniform buffer)
+        // Create bind groups for both modes
         const bindGroupOverEyes = this.device.createBindGroup({
           label: `material bind group (over eyes): ${mat.name}`,
           layout: this.hairBindGroupLayout,
@@ -2073,7 +1758,7 @@ export class Engine {
           ],
         })
 
-        // Store both bind groups - we'll use them with the unified pipeline
+        // Store both bind groups for unified pipeline
         this.hairDrawsOverEyes.push({
           count: matCount,
           firstIndex: runningFirstIndex,
@@ -2111,7 +1796,7 @@ export class Engine {
         materialUniformData[2] = mat.edgeColor[2] // edgeColor.b
         materialUniformData[3] = mat.edgeColor[3] // edgeColor.a
         materialUniformData[4] = mat.edgeSize
-        materialUniformData[5] = mat.isHair ? 0.0 : 0.0 // isOverEyes: 0.0 for all (unified pipeline doesn't use stencil)
+        materialUniformData[5] = 0.0 // isOverEyes: 0.0 for all (unified pipeline doesn't use stencil)
         materialUniformData[6] = 0.0 // _padding1
         materialUniformData[7] = 0.0 // _padding2
 
@@ -2240,9 +1925,7 @@ export class Engine {
 
       this.drawCallCount = 0
 
-      // PASS 1: Opaque non-eye, non-hair (face, body, etc)
-      // this.drawOutlines(pass, false) // Opaque outlines
-
+      // PASS 1: Opaque non-eye, non-hair
       pass.setPipeline(this.pipeline)
       for (const draw of this.opaqueNonEyeNonHairDraws) {
         if (draw.count > 0) {
@@ -2263,20 +1946,14 @@ export class Engine {
         }
       }
 
-      // PASS 3: Hair rendering - optimized with depth pre-pass and unified pipeline
-      // Depth pre-pass: render hair depth-only to eliminate overdraw early
-      // Then render shaded hair once with depth test "equal" to only shade visible fragments
+      // PASS 3: Hair rendering with depth pre-pass and unified pipeline
+      this.drawOutlines(pass, false)
 
-      this.drawOutlines(pass, false) // Opaque outlines
-
-      // 3a: Hair depth pre-pass (depth-only, no color writes)
-      // This eliminates most overdraw by rejecting fragments early before expensive shading
+      // 3a: Hair depth pre-pass (eliminates overdraw by rejecting fragments early)
       if (this.hairDrawsOverEyes.length > 0 || this.hairDrawsOverNonEyes.length > 0) {
         pass.setPipeline(this.hairDepthPipeline)
-        // Render all hair materials for depth (no stencil test needed for depth pass)
         for (const draw of this.hairDrawsOverEyes) {
           if (draw.count > 0) {
-            // Use the same bind group structure (camera, skin matrices) for depth pass
             pass.setBindGroup(0, draw.bindGroup)
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
           }
@@ -2289,10 +1966,7 @@ export class Engine {
         }
       }
 
-      // 3b: Hair shading pass - unified pipeline with dynamic branching
-      // Uses depth test "equal" to only render where depth was written in pre-pass
-      // Shader branches on isOverEyes uniform to adjust alpha dynamically
-      // This eliminates one full geometry pass compared to the old approach
+      // 3b: Hair shading pass with unified pipeline and dynamic branching
       if (this.hairDrawsOverEyes.length > 0) {
         pass.setPipeline(this.hairUnifiedPipelineOverEyes)
         pass.setStencilReference(1)
@@ -2318,9 +1992,6 @@ export class Engine {
       }
 
       // 3c: Hair outlines - unified single pass without stencil testing
-      // Uses depth test "less-equal" to draw everywhere hair exists
-      // Shader branches on isOverEyes uniform to adjust alpha dynamically (currently always 0.0)
-      // This eliminates the need for two separate outline passes
       if (this.hairOutlineDraws.length > 0) {
         pass.setPipeline(this.hairUnifiedOutlinePipeline)
         for (const draw of this.hairOutlineDraws) {
@@ -2341,7 +2012,7 @@ export class Engine {
         }
       }
 
-      this.drawOutlines(pass, true) // Transparent outlines
+      this.drawOutlines(pass, true)
 
       pass.end()
       this.device.queue.submit([encoder.finish()])
