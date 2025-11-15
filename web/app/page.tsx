@@ -2,7 +2,7 @@
 
 import Header from "@/components/header"
 import { Progress } from "@/components/ui/progress"
-import { Engine, EngineStats } from "reze-engine"
+import { Engine, EngineStats, Quat } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 
 export default function Home() {
@@ -16,6 +16,12 @@ export default function Home() {
     gpuMemory: 0,
   })
   const [progress, setProgress] = useState(0)
+
+  // Model rotation state
+  const isDraggingModel = useRef(false)
+  const lastMousePos = useRef({ x: 0, y: 0 })
+  const modelRotationY = useRef(0) // Current Y-axis rotation in radians
+  const rotationSensitivity = 0.002 // Similar to camera angular sensitivity
 
   const initEngine = useCallback(async () => {
     if (canvasRef.current) {
@@ -33,7 +39,6 @@ export default function Home() {
           setStats(engine.getStats())
         })
 
-
         // engine.rotateBones(
         //   ["腰", "首", "右腕", "左腕", "右ひざ"],
         //   [
@@ -50,13 +55,9 @@ export default function Home() {
         // This prevents physics explosion when animation starts
         await new Promise((resolve) => requestAnimationFrame(resolve))
         engine.playAnimation()
-
-
       } catch (error) {
         setEngineError(error instanceof Error ? error.message : "Unknown error")
       }
-
-
     }
   }, [])
 
@@ -87,6 +88,61 @@ export default function Home() {
       return () => clearInterval(interval)
     }
   }, [loading])
+
+  // Mouse event handlers for model rotation
+  // Use capture phase to intercept events before camera handlers
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas || loading) return
+
+    const handleMouseDown = (e: MouseEvent) => {
+      // Only handle left-click (button 0) and prevent it from reaching camera
+      if (e.button === 0) {
+        isDraggingModel.current = true
+        lastMousePos.current = { x: e.clientX, y: e.clientY }
+        e.stopPropagation() // Prevent camera from receiving this event
+        e.preventDefault()
+      }
+    }
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDraggingModel.current || !engineRef.current) return
+
+      // Stop propagation to prevent camera from handling this event
+      e.stopPropagation()
+
+      const deltaX = e.clientX - lastMousePos.current.x
+
+      // Update rotation angle (accumulate)
+      modelRotationY.current -= deltaX * rotationSensitivity
+
+      // Create quaternion for Y-axis rotation
+      const rotationQuat = Quat.fromEuler(0, modelRotationY.current, 0)
+
+      // Rotate the center bone "センター"
+      engineRef.current.rotateBones(["センター"], [rotationQuat], 0)
+
+      lastMousePos.current = { x: e.clientX, y: e.clientY }
+    }
+
+    const handleMouseUp = (e: MouseEvent) => {
+      if (e.button === 0) {
+        isDraggingModel.current = false
+        e.stopPropagation() // Prevent camera from receiving this event
+      }
+    }
+
+    // Use capture phase (true) so our handlers run before camera's handlers
+    canvas.addEventListener("mousedown", handleMouseDown, { capture: true })
+    window.addEventListener("mousemove", handleMouseMove, { capture: true })
+    window.addEventListener("mouseup", handleMouseUp, { capture: true })
+
+    return () => {
+      canvas.removeEventListener("mousedown", handleMouseDown, { capture: true })
+      window.removeEventListener("mousemove", handleMouseMove, { capture: true })
+      window.removeEventListener("mouseup", handleMouseUp, { capture: true })
+    }
+  }, [loading, rotationSensitivity])
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
