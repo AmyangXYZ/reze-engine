@@ -76,9 +76,9 @@ export class Engine {
   private bloomComposeBindGroup?: GPUBindGroup
   // Bloom settings
   public bloomThreshold: number = 0.3
-  public bloomIntensity: number = 0.1
+  public bloomIntensity: number = 0.12
   // Rim light settings
-  private rimLightIntensity: number = 0.35
+  private rimLightIntensity: number = 0.45
   private rimLightPower: number = 2.0
   private rimLightColor: [number, number, number] = [1.0, 1.0, 1.0]
   private currentModel: Model | null = null
@@ -1356,10 +1356,10 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.setAmbient(0.96)
-    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.12)
-    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.1)
-    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.08)
+    this.setAmbient(1)
+    this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.02)
+    this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.015)
+    this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.01)
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
