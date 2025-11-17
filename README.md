@@ -16,8 +16,6 @@ A lightweight engine built with WebGPU and TypeScript for real-time 3D anime cha
 - Bone rotation api
 - VMD animation
 
-![](./screenshot.webm)
-
 ## Usage
 
 [Example](./web/app/page.tsx)
