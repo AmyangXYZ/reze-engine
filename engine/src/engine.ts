@@ -1406,7 +1406,6 @@ export class Engine {
   public async loadAnimation(url: string) {
     const frames = await VMDLoader.load(url)
     this.animationFrames = frames
-    console.log(this.animationFrames)
   }
 
   public playAnimation() {
@@ -1570,6 +1569,14 @@ export class Engine {
     this.modelDir = dir
 
     const model = await PmxLoader.load(path)
+    // console.log({
+    //   vertices: Array.from(model.getVertices()),
+    //   indices: Array.from(model.getIndices()),
+    //   materials: model.getMaterials(),
+    //   textures: model.getTextures(),
+    //   bones: model.getSkeleton().bones,
+    //   skinning: { joints: Array.from(model.getSkinning().joints), weights: Array.from(model.getSkinning().weights) },
+    // })
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.setupModelBuffers(model)
   }

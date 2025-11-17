@@ -10,11 +10,7 @@ export default function Home() {
   const engineRef = useRef<Engine | null>(null)
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [stats, setStats] = useState<EngineStats>({
-    fps: 0,
-    frameTime: 0,
-    gpuMemory: 0,
-  })
+  const [stats, setStats] = useState<EngineStats | null>(null)
   const [progress, setProgress] = useState(0)
 
   // Model rotation state
