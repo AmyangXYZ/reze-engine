@@ -5,6 +5,14 @@ import { PmxLoader } from "./pmx-loader"
 import { Physics } from "./physics"
 import { VMDKeyFrame, VMDLoader } from "./vmd-loader"
 
+export type EngineOptions = {
+  ambient?: number
+  bloomIntensity?: number
+  bloomThreshold?: number
+  rimLightIntensity?: number
+  rimLightPower?: number
+}
+
 export interface EngineStats {
   fps: number
   frameTime: number // ms
@@ -53,6 +61,8 @@ export class Engine {
   private multisampleTexture!: GPUTexture
   private readonly sampleCount = 4 // MSAA 4x
   private renderPassDescriptor!: GPURenderPassDescriptor
+  // Ambient light settings
+  private ambient: number = 1.0
   // Bloom post-processing textures
   private sceneRenderTexture!: GPUTexture
   private sceneRenderTextureView!: GPUTextureView
@@ -75,12 +85,12 @@ export class Engine {
   private bloomBlurVBindGroup?: GPUBindGroup
   private bloomComposeBindGroup?: GPUBindGroup
   // Bloom settings
-  public bloomThreshold: number = 0.3
-  public bloomIntensity: number = 0.12
+  private bloomThreshold: number = 0.3
+  private bloomIntensity: number = 0.12
   // Rim light settings
   private rimLightIntensity: number = 0.45
   private rimLightPower: number = 2.0
-  private rimLightColor: [number, number, number] = [1.0, 1.0, 1.0]
+
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
@@ -105,8 +115,15 @@ export class Engine {
   private animationFrames: VMDKeyFrame[] = []
   private animationTimeouts: number[] = []
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, options?: EngineOptions) {
     this.canvas = canvas
+    if (options) {
+      this.ambient = options.ambient ?? 1.0
+      this.bloomThreshold = options.bloomThreshold ?? 0.3
+      this.bloomIntensity = options.bloomIntensity ?? 0.12
+      this.rimLightIntensity = options.rimLightIntensity ?? 0.45
+      this.rimLightPower = options.rimLightPower ?? 2.0
+    }
   }
 
   // Step 1: Get WebGPU device and context
@@ -1356,7 +1373,7 @@ export class Engine {
 
     this.lightCount = 0
 
-    this.setAmbient(1)
+    this.setAmbient(this.ambient)
     this.addLight(new Vec3(-0.5, -0.8, 0.5).normalize(), new Vec3(1.0, 0.95, 0.9), 0.02)
     this.addLight(new Vec3(0.7, -0.5, 0.3).normalize(), new Vec3(0.8, 0.85, 1.0), 0.015)
     this.addLight(new Vec3(0.3, -0.5, -1.0).normalize(), new Vec3(0.9, 0.9, 1.0), 0.01)
@@ -1793,9 +1810,9 @@ export class Engine {
       materialUniformData[1] = 1.0 // alphaMultiplier: 1.0 for non-hair materials
       materialUniformData[2] = this.rimLightIntensity
       materialUniformData[3] = this.rimLightPower
-      materialUniformData[4] = this.rimLightColor[0] // rimColor.r
-      materialUniformData[5] = this.rimLightColor[1] // rimColor.g
-      materialUniformData[6] = this.rimLightColor[2] // rimColor.b
+      materialUniformData[4] = 1.0 // rimColor.r
+      materialUniformData[5] = 1.0 // rimColor.g
+      materialUniformData[6] = 1.0 // rimColor.b
       materialUniformData[7] = 0.0
 
       const materialUniformBuffer = this.device.createBuffer({
@@ -1836,9 +1853,9 @@ export class Engine {
         materialUniformDataHair[1] = 1.0 // alphaMultiplier: base value, shader will adjust
         materialUniformDataHair[2] = this.rimLightIntensity
         materialUniformDataHair[3] = this.rimLightPower
-        materialUniformDataHair[4] = this.rimLightColor[0] // rimColor.r
-        materialUniformDataHair[5] = this.rimLightColor[1] // rimColor.g
-        materialUniformDataHair[6] = this.rimLightColor[2] // rimColor.b
+        materialUniformDataHair[4] = 1.0 // rimColor.r
+        materialUniformDataHair[5] = 1.0 // rimColor.g
+        materialUniformDataHair[6] = 1.0 // rimColor.b
         materialUniformDataHair[7] = 0.0
 
         // Create uniform buffers for both modes
