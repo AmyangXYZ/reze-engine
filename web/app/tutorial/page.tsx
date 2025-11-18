@@ -19,7 +19,7 @@ export const metadata = {
 
 export default function Tutorial() {
   return (
-    <div className="flex flex-col items-center w-full h-full px-8 py-4">
+    <div className="flex flex-col items-center w-full px-8 py-4">
       <Header stats={null} />
       <div className="flex flex-col items-center justify-start max-w-3xl w-full h-full mt-12 gap-8">
         <h1 className="scroll-m-20 text-center text-3xl font-extrabold tracking-tight text-balance">
