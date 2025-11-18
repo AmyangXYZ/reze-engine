@@ -46,7 +46,7 @@ export class EngineV2 {
   }
 
   private loadModel() {
-    const model = modelData as Model
+    const model = modelData as unknown as Model
     this.model = {
       vertices: new Float32Array(model.vertices),
       indices: new Uint32Array(model.indices),
