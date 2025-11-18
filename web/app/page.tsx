@@ -1,9 +1,9 @@
 "use client"
 
 import Header from "@/components/header"
-import { Progress } from "@/components/ui/progress"
 import { Engine, EngineStats, Quat } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
+import Loading from "@/components/loading"
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -11,7 +11,6 @@ export default function Home() {
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
-  const [progress, setProgress] = useState(0)
 
   // Model rotation state
   const isDraggingModel = useRef(false)
@@ -74,21 +73,6 @@ export default function Home() {
       }
     }
   }, [initEngine])
-
-  useEffect(() => {
-    if (loading) {
-      const interval = setInterval(() => {
-        setProgress((prev) => {
-          if (prev >= 100) {
-            return 0
-          }
-          return prev + 1
-        })
-      }, 50)
-
-      return () => clearInterval(interval)
-    }
-  }, [loading])
 
   // Mouse event handlers for model rotation
   // Use capture phase to intercept events before camera handlers
@@ -247,11 +231,7 @@ export default function Home() {
           Engine Error: {engineError}
         </div>
       )}
-      {loading && !engineError && (
-        <div className="absolute inset-0 max-w-xs mx-auto w-full h-full flex items-center justify-center text-white p-6">
-          <Progress value={progress} className="rounded-none" />
-        </div>
-      )}
+      {loading && !engineError && <Loading loading={loading} />}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
     </div>
   )

@@ -1,0 +1,53 @@
+"use client"
+
+import { useCallback, useRef, useState } from "react"
+import { EngineV1 } from "../engines/v1"
+import { Button } from "@/components/ui/button"
+
+export default function Canvas1() {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [rendered, setRendered] = useState(false)
+  const [engineError, setEngineError] = useState<string | null>(null)
+  const engineRef = useRef<EngineV1 | null>(null)
+
+  const render = useCallback(async () => {
+    if (!canvasRef.current || rendered) return
+    try {
+      const engine = new EngineV1(canvasRef.current)
+      await engine.init()
+      engineRef.current = engine
+      engine.runRenderLoop()
+      setRendered(true)
+    } catch (error) {
+      setEngineError(error instanceof Error ? error.message : "Unknown error")
+    }
+  }, [rendered])
+
+  const stop = useCallback(() => {
+    if (engineRef.current) {
+      engineRef.current.dispose()
+      setRendered(false)
+    }
+  }, [])
+
+  return (
+    <div className="flex flex-col items-center justify-center relative w-full max-w-sm">
+      {engineError && (
+        <div className="absolute inset-0 w-full h-full flex items-center justify-center max-w-sm mx-auto p-4">
+          Engine Error: {engineError}
+        </div>
+      )}
+      {!rendered && !engineError && (
+        <Button onClick={render} className="absolute max-w-xs mx-auto z-10 flex my-auto">
+          Render
+        </Button>
+      )}
+      {rendered && !engineError && (
+        <Button onClick={stop} className="absolute top-0 right-0 max-w-xs mx-auto z-10 flex my-auto">
+          Stop
+        </Button>
+      )}
+      <canvas ref={canvasRef} className="w-full  border border-muted-foreground p-4" />
+    </div>
+  )
+}

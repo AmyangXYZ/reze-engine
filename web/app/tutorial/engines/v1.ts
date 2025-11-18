@@ -1,5 +1,8 @@
-// Basic engine rendering a triangle
-export class EngineV0 {
+import { Vec3 } from "../lib/math"
+import { Camera } from "../lib/camera"
+
+// Basic engine with arc rotate camera
+export class EngineV1 {
   private canvas: HTMLCanvasElement
   private device!: GPUDevice
   private context!: GPUCanvasContext
@@ -8,6 +11,15 @@ export class EngineV0 {
   private vertexBuffer!: GPUBuffer
   private renderPassDescriptor!: GPURenderPassDescriptor
   private shaderModule!: GPUShaderModule
+
+  // Camera
+  private camera!: Camera
+  private cameraUniformBuffer!: GPUBuffer
+  private cameraMatrixData = new Float32Array(36)
+  // Bind group
+  private bindGroup!: GPUBindGroup
+  // Render loop
+  private animationFrameId: number | null = null
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
@@ -19,6 +31,8 @@ export class EngineV0 {
     this.initShader()
     this.initVertexBuffers()
     this.initPipeline()
+    this.setupCamera()
+    this.createBindGroups()
   }
 
   private async initDevice() {
@@ -58,9 +72,19 @@ export class EngineV0 {
   private initShader() {
     this.shaderModule = this.device.createShaderModule({
       code: /* wgsl */ `
+        struct CameraUniforms {
+          view: mat4x4f,
+          projection: mat4x4f,
+          viewPos: vec3f,
+          _padding: f32,
+        };
+
+        @group(0) @binding(0) var<uniform> camera: CameraUniforms;
+
+
         @vertex
         fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-          return vec4<f32>(position, 0.0, 1.0);
+          return camera.projection * camera.view * vec4f(position, 0.0, 1.0);
         }
 
         @fragment
@@ -107,17 +131,74 @@ export class EngineV0 {
     })
   }
 
+  private setupCamera() {
+    this.cameraUniformBuffer = this.device.createBuffer({
+      label: "camera uniforms",
+      size: 40 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
+    this.camera = new Camera(0, Math.PI / 2.5, 2, new Vec3(0, 0, 0))
+
+    this.camera.aspect = this.canvas.width / this.canvas.height
+    this.camera.attachControl(this.canvas)
+  }
+
+  private createBindGroups() {
+    this.bindGroup = this.device.createBindGroup({
+      label: "bind group layout",
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: this.cameraUniformBuffer } }],
+    })
+  }
+
+  private updateCameraUniforms() {
+    const viewMatrix = this.camera.getViewMatrix()
+    const projectionMatrix = this.camera.getProjectionMatrix()
+    const cameraPos = this.camera.getPosition()
+    this.cameraMatrixData.set(viewMatrix.values, 0)
+    this.cameraMatrixData.set(projectionMatrix.values, 16)
+    this.cameraMatrixData[32] = cameraPos.x
+    this.cameraMatrixData[33] = cameraPos.y
+    this.cameraMatrixData[34] = cameraPos.z
+    this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
+  }
+
   public render() {
     ;(this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0].view = this.context
       .getCurrentTexture()
       .createView()
 
+    // V1: Update camera uniforms
+    this.updateCameraUniforms()
+
     const encoder = this.device.createCommandEncoder()
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     pass.setPipeline(this.pipeline)
+    pass.setBindGroup(0, this.bindGroup)
     pass.setVertexBuffer(0, this.vertexBuffer)
     pass.draw(3)
     pass.end()
     this.device.queue.submit([encoder.finish()])
+  }
+
+  public runRenderLoop() {
+    const loop = () => {
+      this.render()
+      this.animationFrameId = requestAnimationFrame(loop)
+    }
+
+    this.animationFrameId = requestAnimationFrame(loop)
+  }
+
+  public dispose() {
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId)
+      this.animationFrameId = null
+    }
+    if (this.camera) {
+      this.camera.detachControl()
+    }
+    this.context.unconfigure()
   }
 }

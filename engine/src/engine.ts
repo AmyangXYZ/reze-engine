@@ -29,7 +29,7 @@ export class Engine {
   private device!: GPUDevice
   private context!: GPUCanvasContext
   private presentationFormat!: GPUTextureFormat
-  public camera!: Camera
+  private camera!: Camera
   private cameraUniformBuffer!: GPUBuffer
   private cameraMatrixData = new Float32Array(36)
   private lightUniformBuffer!: GPUBuffer
