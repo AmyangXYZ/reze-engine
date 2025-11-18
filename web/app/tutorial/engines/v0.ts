@@ -43,6 +43,16 @@ export class EngineV0 {
       format: this.presentationFormat,
     })
 
+    const displayWidth = this.canvas.clientWidth
+    const displayHeight = this.canvas.clientHeight
+    const dpr = window.devicePixelRatio || 1
+    console.log(displayWidth, displayHeight, dpr)
+    const width = Math.floor(displayWidth * dpr)
+    const height = Math.floor(displayHeight * dpr)
+    this.canvas.width = width
+    this.canvas.height = height
+    console.log(width, height)
+
     this.renderPassDescriptor = {
       colorAttachments: [
         {

@@ -1,16 +1,25 @@
 import { Vec3 } from "../lib/math"
 import { Camera } from "../lib/camera"
+import modelData from "../model.json"
+
+interface Model {
+  vertices: Float32Array
+  indices: Uint32Array
+}
 
 // Basic engine with arc rotate camera
-export class EngineV1 {
+export class EngineV2 {
   private canvas: HTMLCanvasElement
   private device!: GPUDevice
   private context!: GPUCanvasContext
   private presentationFormat!: GPUTextureFormat
   private pipeline!: GPURenderPipeline
   private vertexBuffer!: GPUBuffer
+  private indexBuffer!: GPUBuffer
   private renderPassDescriptor!: GPURenderPassDescriptor
   private shaderModule!: GPUShaderModule
+
+  private model!: Model
 
   // Camera
   private camera!: Camera
@@ -26,6 +35,7 @@ export class EngineV1 {
   }
 
   public async init() {
+    this.loadModel()
     await this.initDevice()
     this.initContext()
     this.initShader()
@@ -33,6 +43,14 @@ export class EngineV1 {
     this.initPipeline()
     this.setupCamera()
     this.createBindGroups()
+  }
+
+  private loadModel() {
+    const model = modelData as Model
+    this.model = {
+      vertices: new Float32Array(model.vertices),
+      indices: new Uint32Array(model.indices),
+    }
   }
 
   private async initDevice() {
@@ -57,6 +75,7 @@ export class EngineV1 {
       format: this.presentationFormat,
     })
 
+    // Set canvas size with device pixel ratio (like engine.ts)
     const displayWidth = this.canvas.clientWidth
     const displayHeight = this.canvas.clientHeight
     const dpr = window.devicePixelRatio || 1
@@ -89,10 +108,9 @@ export class EngineV1 {
 
         @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 
-
         @vertex
-        fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-          return camera.projection * camera.view * vec4f(position, 0.0, 1.0);
+        fn vs(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+          return camera.projection * camera.view * vec4f(position, 1.0);
         }
 
         @fragment
@@ -104,29 +122,38 @@ export class EngineV1 {
   }
 
   private initVertexBuffers() {
-    const triangleVertices = new Float32Array([-0.5, -0.5, 0.5, -0.5, 0.0, 0.5])
+    const vertices = Float32Array.from(this.model.vertices)
     this.vertexBuffer = this.device.createBuffer({
-      label: "v1 vertex buffer",
-      size: triangleVertices.byteLength,
+      label: "model vertex buffer",
+      size: vertices.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     })
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, triangleVertices)
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, vertices.buffer)
+
+    // Create index buffer
+    const indices = Uint32Array.from(this.model.indices)
+    this.indexBuffer = this.device.createBuffer({
+      label: "model index buffer",
+      size: indices.byteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.indexBuffer, 0, indices.buffer)
   }
 
   private initPipeline() {
     this.pipeline = this.device.createRenderPipeline({
-      label: "v1 pipeline",
+      label: "v2 pipeline",
       layout: "auto",
       vertex: {
         module: this.shaderModule,
         buffers: [
           {
-            arrayStride: 2 * 4, // 2 floats * 4 bytes each = 8 bytes per vertex
+            arrayStride: 8 * 4, // 8 floats * 4 bytes each = 32 bytes per vertex (position + normal + UV)
             attributes: [
               {
                 shaderLocation: 0, // matches @location(0) in the shader
-                offset: 0,
-                format: "float32x2", // vec2<f32> = 2 float32s
+                offset: 0, // position is at offset 0
+                format: "float32x3", // vec3<f32> = 3 float32s for position
               },
             ],
           },
@@ -146,7 +173,7 @@ export class EngineV1 {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
-    this.camera = new Camera(0, Math.PI / 2.5, 2, new Vec3(0, 0, 0))
+    this.camera = new Camera(Math.PI, Math.PI / 2.5, 27, new Vec3(0, 12, 0))
 
     this.camera.aspect = this.canvas.width / this.canvas.height
     this.camera.attachControl(this.canvas)
@@ -173,11 +200,12 @@ export class EngineV1 {
   }
 
   public render() {
+    // Update render target views
     ;(this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0].view = this.context
       .getCurrentTexture()
       .createView()
 
-    // V1: Update camera uniforms
+    // Update camera uniforms
     this.updateCameraUniforms()
 
     const encoder = this.device.createCommandEncoder()
@@ -185,7 +213,8 @@ export class EngineV1 {
     pass.setPipeline(this.pipeline)
     pass.setBindGroup(0, this.bindGroup)
     pass.setVertexBuffer(0, this.vertexBuffer)
-    pass.draw(3)
+    pass.setIndexBuffer(this.indexBuffer, "uint32")
+    pass.drawIndexed(this.model.indices.length)
     pass.end()
     this.device.queue.submit([encoder.finish()])
   }

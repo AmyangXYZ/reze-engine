@@ -31,7 +31,7 @@ export default function Canvas1() {
   }, [])
 
   return (
-    <div className="flex flex-col items-center justify-center relative w-full max-w-sm">
+    <div className="flex flex-col items-center justify-center relative w-full max-w-md">
       {engineError && (
         <div className="absolute inset-0 w-full h-full flex items-center justify-center max-w-sm mx-auto p-4">
           Engine Error: {engineError}
@@ -43,11 +43,11 @@ export default function Canvas1() {
         </Button>
       )}
       {rendered && !engineError && (
-        <Button onClick={stop} className="absolute top-0 right-0 max-w-xs mx-auto z-10 flex my-auto">
+        <Button onClick={stop} className="absolute top-2 right-2 max-w-xs mx-auto z-10 flex my-auto">
           Stop
         </Button>
       )}
-      <canvas ref={canvasRef} className="w-full  border border-muted-foreground p-4" />
+      <canvas ref={canvasRef} className="w-full h-[240px] border border-muted-foreground p-4" />
     </div>
   )
 }
