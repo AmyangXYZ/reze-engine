@@ -8,9 +8,7 @@ import { VMDKeyFrame, VMDLoader } from "./vmd-loader"
 export type EngineOptions = {
   ambient?: number
   bloomIntensity?: number
-  bloomThreshold?: number
   rimLightIntensity?: number
-  rimLightPower?: number
 }
 
 export interface EngineStats {
@@ -119,10 +117,8 @@ export class Engine {
     this.canvas = canvas
     if (options) {
       this.ambient = options.ambient ?? 1.0
-      this.bloomThreshold = options.bloomThreshold ?? 0.3
       this.bloomIntensity = options.bloomIntensity ?? 0.12
       this.rimLightIntensity = options.rimLightIntensity ?? 0.45
-      this.rimLightPower = options.rimLightPower ?? 2.0
     }
   }
 
