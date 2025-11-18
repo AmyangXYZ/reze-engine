@@ -6,6 +6,7 @@ import Canvas2 from "./canvas/canvas2"
 import Code from "@/components/code"
 import Inline from "@/components/inline"
 import Image from "next/image"
+import Canvas3 from "./canvas/canvas3"
 
 export const metadata = {
   title: "How to render an anime character with WebGPU",
@@ -20,26 +21,28 @@ export default function Tutorial() {
   return (
     <div className="flex flex-col items-center w-full px-8 py-4">
       <Header stats={null} />
-      <div className="flex flex-col items-center justify-start max-w-3xl w-full h-full mt-12 gap-8 pb-20">
+      <div className="flex flex-col items-center justify-start max-w-3xl w-full h-full mt-12 gap-10 pb-20">
         <h1 className="scroll-m-20 text-center text-3xl font-extrabold tracking-tight text-balance">
           How to Render an Anime Character with WebGPU
         </h1>
-        <p className="leading-7">
-          This is a tutorial for developers who want to learn WebGPU or dive deeper after playing with high-level frameworks like three.js or babylon.js, but don&apos;t know where to start beyond the simple triangle example. This tutorial covers the core pipeline for rendering anime characters with WebGPU: geometry rendering, skinning, material and texture handling, bone attachment, and animation. We focus on concepts and workflow
-          rather than implementation details—matrix math, shader programming, and model parsing are handled by standard
-          code you can generate with AI tools. By the end, you&apos;ll understand how the pieces fit together and can
-          build your own rendering engine like the Reze Engine. Full source code for each example is available{" "}
-          <Link
-            href={REPO_URL}
-            className="text-blue-400"
-            target="_blank"
-          >
-            here
-          </Link>
-          .
-        </p>
+        <section className="flex flex-col items-start justify-start gap-6 w-full">
+          <p className="leading-7">
+            This is a tutorial for developers who want to learn WebGPU or dive deeper after playing with high-level frameworks like three.js or babylon.js, but don&apos;t know where to start beyond the simple triangle example. This tutorial covers the core pipeline for rendering anime characters with WebGPU: geometry rendering, skinning, material and texture handling, bone attachment, and animation. We focus on concepts and workflow
+            rather than implementation details—matrix math, shader programming, and model parsing are handled by standard
+            code you can generate with AI tools. By the end, you&apos;ll understand how the pieces fit together and can
+            build your own rendering engine like the Reze Engine. Full source code for each example is available{" "}
+            <Link
+              href={REPO_URL}
+              className="text-blue-400"
+              target="_blank"
+            >
+              here
+            </Link>
+            .
+          </p>
+          <Image src="/image-banner.png" alt="open" width={1000} height={1000} className="w-full h-auto" />
+        </section>
 
-        <Image src="/image-banner.png" alt="open" width={1000} height={1000} className="w-full h-auto" />
         <section className="flex flex-col items-start justify-start gap-6 w-full">
           <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
             Engine v0: Your First Triangle
@@ -184,6 +187,17 @@ pass.drawIndexed(this.model.indices.length) // draw all triangles using indices`
 
           <div className="w-full h-full items-center justify-center flex mt-2">
             <Canvas2 />
+          </div>
+        </section>
+
+        <section className="flex flex-col items-start justify-start gap-6 w-full">
+          <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
+            Engine v3: Textures and Materials
+          </h2>
+          <p className="leading-7">Now we add textures to the character. Textures are images that are mapped onto the model&apos;s surface to give it color and detail. In WebGPU, textures are created from image data and can be sampled in the fragment shader to determine the color of each pixel.</p>
+
+          <div className="w-full h-full items-center justify-center flex mt-2">
+            <Canvas3 />
           </div>
         </section>
       </div>
