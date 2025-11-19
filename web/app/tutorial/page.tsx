@@ -44,7 +44,7 @@ export default function Tutorial() {
               </Link>
               .
             </p>
-            <Image src="/image-banner.png" alt="img" width={1000} height={1000} />
+            <Image src="/image-banner.png" alt="img" width={1000} height={1000} loading="eager" />
           </section>
 
           <section className="flex flex-col items-start justify-start gap-6 w-full">
