@@ -425,10 +425,7 @@ for (let i = 0; i < this.model.materials.length; i++) {
             </div>
 
             <p className="leading-7">
-              However, you might notice the character appears transparent or you can see through to the back faces. We
-              didn&apos;t notice this issue in the previous version because the model was covered by solid red color.
-              The fix is surprisingly simple—just three steps: create a depth texture, add it to the render pass, and
-              configure the pipeline. No shader changes needed:
+              However, you might notice the character appears transparent or you can see through to the back faces. This happens because without depth testing, the GPU draws triangles in the order they&apos;re submitted—far triangles can draw over near ones. The fix is surprisingly simple—just three steps: create a depth texture, add it to the render pass, and configure the pipeline. No shader changes needed:
             </p>
 
             <Code language="typescript">
