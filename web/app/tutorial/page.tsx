@@ -8,6 +8,7 @@ import Inline from "@/components/inline"
 import Image from "next/image"
 import Canvas3 from "./canvas/canvas3"
 import TableOfContents from "@/components/table-of-contents"
+import Canvas3_2 from "./canvas/canvas3_2"
 
 export const metadata = {
   title: "How to render an anime character with WebGPU",
@@ -406,10 +407,52 @@ for (let i = 0; i < this.model.materials.length; i++) {
             </div>
 
             <p className="leading-7">
-              However, you might notice the character appears transparent or you can see through to the back faces—this
-              is because we haven&apos;t enabled depth testing yet. We didn&apos;t notice this issue in the previous
-              version because the model was covered by solid red color. We&apos;ll fix this in the next step.
+              However, you might notice the character appears transparent or you can see through to the back faces. We
+              didn&apos;t notice this issue in the previous version because the model was covered by solid red color.
+              The fix is surprisingly simple—just three steps: create a depth texture, add it to the render pass, and
+              configure the pipeline. The depth texture stores how far each pixel is from the camera, allowing the GPU
+              to correctly determine which triangles should be drawn in front of others. No shader changes needed—the
+              GPU handles everything automatically. Look for the depth texture creation in <Inline>initContext</Inline>{" "}
+              and the depth configuration in <Inline>initPipeline</Inline>:
             </p>
+
+            <Code language="typescript">
+              {`// Create depth texture
+this.depthTexture = this.device.createTexture({
+  size: [width, height],
+  format: "depth24plus",
+  usage: GPUTextureUsage.RENDER_ATTACHMENT,
+})
+
+// Add to render pass
+depthStencilAttachment: {
+  view: this.depthTexture.createView(),
+  depthClearValue: 1.0,
+  depthLoadOp: "clear",
+  depthStoreOp: "store",
+}
+
+// Add to pipeline
+depthStencil: {
+  depthWriteEnabled: true,
+  depthCompare: "less",
+  format: "depth24plus",
+}`}
+            </Code>
+
+            <p className="leading-7">
+              The complete implementation is in{" "}
+              <Link href={`${REPO_URL}/engines/v3_2.ts`} target="_blank" className="text-blue-400">
+                engines/v3_2.ts
+              </Link>
+              . With materials, textures, and depth testing in place, we now have a complete static rendering pipeline
+              that can load a 3D model, apply textures, and render it with correct depth ordering. The character is
+              fully textured and looks solid from any angle.
+            </p>
+
+            <div className="w-full h-full items-center justify-center flex mt-2">
+              <Canvas3_2 />
+            </div>
           </section>
         </div>
         <div className="w-64 sticky top-12 self-start ">
