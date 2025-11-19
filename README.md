@@ -20,14 +20,14 @@ A lightweight engine built with WebGPU and TypeScript for real-time 3D anime cha
 
 [Example](./web/app/page.tsx)
 
-## Tutorial
-
-Learn WebGPU from scratch by building an anime character renderer in incremental steps. The tutorial covers the complete rendering pipeline from a simple triangle to fully textured, skeletal-animated characters.
-
-[WebGPU Tutorial](./web/app/tutorial/page.tsx)
-
 ## Projects Using This Engine
 
 - **[MiKaPo](https://mikapo.vercel.app)** - Online real-time motion capture for MMD using webcam and MediaPipe
 - **[Popo](https://popo.love)** - Fine-tuned LLM that generates MMD poses from natural language descriptions
 - **[MPL](https://mmd-mpl.vercel.app)** - Semantic motion programming language for scripting MMD animations with intuitive syntax
+
+## Tutorial
+
+Learn WebGPU from scratch by building an anime character renderer in incremental steps. The tutorial covers the complete rendering pipeline from a simple triangle to fully textured, skeletal-animated characters.
+
+[How to Render an Anime Character with WebGPU](https://reze.one/tutorial)
