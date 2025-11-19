@@ -47,7 +47,7 @@ export default function Canvas2() {
           Stop
         </Button>
       )}
-      <canvas ref={canvasRef} className="w-full h-[640px] border border-muted-foreground p-4" />
+      <canvas ref={canvasRef} className="w-full h-[560px] border border-muted-foreground p-4" />
     </div>
   )
 }

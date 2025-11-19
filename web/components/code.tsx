@@ -11,7 +11,7 @@ interface CodeBlockProps {
 
 export default function Code({ children, language, className = "" }: CodeBlockProps) {
   return (
-    <div className={`rounded-md border border-zinc-700 overflow-hidden w-full ${className}`}>
+    <div className={`w-full text-sm ${className}`}>
       <SyntaxHighlighter
         language={language}
         style={oneDark}
@@ -21,10 +21,7 @@ export default function Code({ children, language, className = "" }: CodeBlockPr
           background: "#0d1117",
         }}
         codeTagProps={{
-          style: {
-            fontWeight: "600",
-            fontSize: "0.9rem",
-          }
+          style: {},
         }}
         wrapLongLines
       >
