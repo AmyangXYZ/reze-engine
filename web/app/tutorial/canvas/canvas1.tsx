@@ -43,7 +43,7 @@ export default function Canvas1() {
         </Button>
       )}
       {rendered && !engineError && (
-        <Button onClick={stop} className="absolute top-2 right-2 max-w-xs mx-auto z-10 flex my-auto">
+        <Button onClick={stop} className="absolute top-2 right-2 max-w-xs mx-auto z-10 flex my-auto" variant="outline">
           Stop
         </Button>
       )}

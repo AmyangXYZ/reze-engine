@@ -23,7 +23,7 @@ export default function Tutorial() {
   return (
     <div className="flex flex-row justify-center w-full px-8 py-4">
       <Header stats={null} />
-      <div className="flex flex-row items-start justify-center w-full max-w-7xl gap-8 mt-12 pb-20">
+      <div className="flex flex-row items-start justify-center w-full max-w-7xl gap-8 mt-12 pb-50">
         <div className="w-64"></div>
 
         <div className="flex flex-col items-center justify-start max-w-2xl w-full h-full gap-10">
@@ -209,9 +209,10 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
               <Link href={`${REPO_URL}/model.json`} target="_blank" className="text-blue-400">
                 model data
               </Link>{" "}
-              —the standard format for MMD (MikuMikuDance) anime characters. The parser itself isn&apos;t covered here
-              (any model format works; use AI to generate parsers as needed). What matters is understanding the two key
-              data structures: vertices and indices.
+              —the standard format for MMD (MikuMikuDance) anime characters. MMD is widely used for anime-style character
+              modeling, with massive fan communities creating models from popular games like Genshin Impact (原神) and Aether Gazer (深空之眼). The parser itself isn&apos;t covered here (any model format
+              works; use AI to generate parsers as needed). What matters is understanding the two key data structures:
+              vertices and indices.
             </p>
 
             <p className="leading-7">
@@ -473,16 +474,160 @@ depthStencil: {
               Engine v4: Bones and Skinning
             </h2>
 
-            <div className="w-full h-full items-center justify-center flex mt-2">
+            <h3 className="scroll-m-20 text-xl font-semibold tracking-tight">Bones and Hierarchy</h3>
+
+            <p className="leading-7">
+              A <span className="font-semibold">bone</span> is a transform in a hierarchy. Each bone has a parent (except the root), and moving a parent bone moves all its children. In MMD models, a typical arm chain looks like:
+            </p>
+
+            <p className="leading-7 pl-4 font-mono text-sm">
+              センター (center) → 上半身 (upper_body) → 右肩 (shoulder_R) → 右腕 (arm_R) → 右ひじ (elbow_R) → 右手首 (wrist_R) → finger joints
+            </p>
+
+            <p className="leading-7">
+              When you rotate 上半身 (upper_body), the entire upper body—shoulders, arms, elbows, wrists, and fingers—all follow. This cascading effect happens because each bone&apos;s transform is relative to its parent.
+            </p>
+
+            <h3 className="scroll-m-20 text-xl font-semibold tracking-tight">Skinning: Connecting Bones to Vertices</h3>
+
+            <p className="leading-7">
+              <span className="font-semibold">Skinning</span> is how bones deform the mesh. Each vertex stores up to 4 bone indices and 4 weights that sum to 1.0. When bones move, the vertex&apos;s final position is a weighted blend:
+            </p>
+
+            <Code language="typescript">
+              {`// Vertex data
+joints:  [15, 16, 0, 0]    // Bone indices
+weights: [0.7, 0.3, 0, 0]  // 70% from bone 15, 30% from bone 16
+
+// Final position = weighted sum of each bone's transform
+finalPosition = (skinMatrix[15] * position) * 0.7 
+              + (skinMatrix[16] * position) * 0.3`}
+            </Code>
+
+            <p className="leading-7">
+              The <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">skinMatrix</code> for each bone combines the bone&apos;s current pose with its bind pose. This is what allows smooth deformation as bones rotate.
+            </p>
+
+            <h3 className="scroll-m-20 text-xl font-semibold tracking-tight">CPU-Side Bone Control</h3>
+
+            <p className="leading-7">
+              Bones live on the CPU. Animations, physics, and user input all update bone rotations here. When you rotate a bone, the engine recalculates the hierarchy (parent-to-child transforms) and uploads the results to GPU:
+            </p>
+
+            <Code language="typescript">
+              {`// Your game code: rotate the neck bone
+engine.rotateBone("首", rotation)
+
+// Internally, this triggers:
+// 1. evaluatePose() - recalculate all world matrices from hierarchy
+// 2. Upload world matrices to GPU
+// 3. Compute pass - calculate skin matrices
+// 4. Next render uses updated skinning`}
+            </Code>
+
+            <h3 className="scroll-m-20 text-xl font-semibold tracking-tight">Compute Shaders: Parallel Matrix Calculations</h3>
+
+            <p className="leading-7">
+              With hundreds of bones and thousands of vertices, calculating skin matrices on the CPU is too slow. This is where <span className="font-semibold">compute shaders</span> shine—a key WebGPU advantage over WebGL. Compute shaders run massively parallel calculations on the GPU, perfect for matrix operations.
+            </p>
+
+            <p className="leading-7">
+              We upload bone matrices to storage buffers, then dispatch a compute shader to calculate all skin matrices in parallel. For a model with 471 bones, this means 471 matrix multiplications happening simultaneously on the GPU:
+            </p>
+
+            <Code language="wgsl">
+              {`@group(0) @binding(1) var<storage, read> worldMatrices: array<mat4x4f>;
+@group(0) @binding(2) var<storage, read> inverseBindMatrices: array<mat4x4f>;
+@group(0) @binding(3) var<storage, read_write> skinMatrices: array<mat4x4f>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let boneIndex = globalId.x;
+  if (boneIndex >= boneCount.count) { return; }
+  
+  skinMatrices[boneIndex] = worldMatrices[boneIndex] * inverseBindMatrices[boneIndex];
+}`}
+            </Code>
+
+            <h3 className="scroll-m-20 text-xl font-semibold tracking-tight">Putting It Together</h3>
+
+            <p className="leading-7">
+              Here&apos;s the complete flow each frame (see the full implementation in{" "}
+              <Link href={`${REPO_URL}/engines/v4.ts`} target="_blank" className="text-blue-400">
+                engines/v4.ts
+              </Link>
+              ):
+            </p>
+
+            <ol className="ml-6 list-decimal [&>li]:mt-2">
+              <li>
+                <span className="font-semibold">CPU</span>: Animation or user input updates bone rotations
+              </li>
+              <li>
+                <span className="font-semibold">CPU</span>: <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">evaluatePose()</code> walks the hierarchy to calculate world matrices
+              </li>
+              <li>
+                <span className="font-semibold">CPU → GPU</span>: Upload world matrices to storage buffer
+              </li>
+              <li>
+                <span className="font-semibold">GPU compute pass</span>: Calculate <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">skinMatrix = world × inverseBind</code> for all bones in parallel
+              </li>
+              <li>
+                <span className="font-semibold">GPU render pass</span>: Vertex shader reads skin matrices and blends each vertex by its bone weights
+              </li>
+            </ol>
+
+            <p className="leading-7">
+              The vertex shader performs the final skinning calculation:
+            </p>
+
+            <Code language="wgsl">
+              {`@group(0) @binding(1) var<storage, read> skinMats: array<mat4x4f>;
+
+@vertex
+fn vs(
+  @location(0) position: vec3<f32>,
+  @location(3) joints: vec4<u32>,
+  @location(4) weights: vec4<f32>
+) -> VertexOutput {
+  // Blend position by bone influences
+  var skinnedPos = vec4f(0.0);
+  for (var i = 0u; i < 4u; i++) {
+    skinnedPos += (skinMats[joints[i]] * vec4f(position, 1.0)) * weights[i];
+  }
+  
+  output.position = camera.projection * camera.view * skinnedPos;
+}`}
+            </Code>
+
+            <div className="w-full h-full items-center justify-center flex mt-4">
               <Canvas4 />
             </div>
+
+            <p className="leading-7">
+              Try rotating the waist and neck bones with the sliders above to see skeletal skinning in action.
+            </p>
           </section>
 
           <section className="flex flex-col items-start justify-start gap-6 w-full">
             <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
-              Engine v5: Animation
+              Conclusion
             </h2>
+
+            <p className="leading-7">
+              You&apos;ve now built a complete WebGPU rendering pipeline—from a simple triangle to a fully textured, skeletal-animated character. You understand the core components (buffers, bind groups, pipelines, render passes), how they connect (CPU to GPU data flow, shader interfaces), and why they&apos;re designed this way (uniform vs storage buffers, compute shaders for parallel work).
+            </p>
+
+            <p className="leading-7">
+              This tutorial focused on WebGPU fundamentals. Advanced features like physics simulation, inverse kinematics, dynamic lighting, bloom, and post-processing build on these same concepts—they&apos;re application-level features, not new WebGPU primitives. You can explore these in the{" "}
+              <Link href="/" className="text-blue-400">
+                Reze Engine
+              </Link>{" "}
+              source code, which extends what you&apos;ve learned here into a full-featured anime character renderer.
+            </p>
           </section>
+
+
         </div>
         <div className="w-64 sticky top-12 self-start ">
           <TableOfContents />
