@@ -9,6 +9,7 @@ import Image from "next/image"
 import Canvas3 from "./canvas/canvas3"
 import TableOfContents from "@/components/table-of-contents"
 import Canvas3_2 from "./canvas/canvas3_2"
+import Canvas4 from "./canvas/canvas4"
 
 export const metadata = {
   title: "How to render an anime character with WebGPU",
@@ -31,14 +32,25 @@ export default function Tutorial() {
           </h1>
           <section className="flex flex-col items-start justify-start gap-6 w-full">
             <p className="leading-7">
-              This is a tutorial for developers who want to learn WebGPU or dive deeper after playing with high-level
-              frameworks like three.js or babylon.js, but don&apos;t know where to start beyond the simple triangle
-              example. This tutorial covers the core pipeline for rendering anime characters with WebGPU: geometry
-              rendering, material and texture handling, bone and skinning, and animation. We focus on concepts and
-              workflow rather than implementation details—matrix math, shader programming, and model parsing are handled
-              by standard code you can generate with AI tools. By the end, you&apos;ll understand how the pieces fit
-              together and can build your own rendering engine like the Reze Engine. Full source code for each example
-              is available{" "}
+              You&apos;ve tried three.js or babylon.js and wanted to understand what&apos;s happening under the hood. You
+              looked at WebGPU tutorials, saw the &quot;Hello Triangle&quot; example, but still don&apos;t know how to
+              render a real 3D character from scratch. This tutorial bridges that gap. In five incremental steps,
+              you&apos;ll go from a simple triangle to a fully textured, animated anime character—learning the complete
+              rendering pipeline along the way: geometry buffers, camera transforms, materials and textures, skeletal
+              animation, and the render loop that ties it all together.
+            </p>
+            <p className="leading-7">
+              We focus on understanding the GPU pipeline itself, not implementation details. The real challenge
+              isn&apos;t the math or the shaders—AI can generate those. The challenge is learning a different mental
+              model: you need to know <span className="font-semibold">what components exist</span> (buffers, bind
+              groups, pipelines, render passes), <span className="font-semibold">how they connect</span> (which data
+              goes where, in what order), and <span className="font-semibold">why they&apos;re necessary</span> (when to
+              use uniform vs storage buffers, how textures flow from CPU to GPU). By the end, you&apos;ll have built a
+              working renderer and understand the architecture behind engines like the{" "}
+              <Link href="/" className="text-blue-400">
+                Reze Engine
+              </Link>
+              . Full source code is available{" "}
               <Link href={REPO_URL} className="text-blue-400" target="_blank">
                 here
               </Link>
@@ -52,9 +64,14 @@ export default function Tutorial() {
               Engine v0: Your First Triangle
             </h2>
             <p className="leading-7">
-              Here we walk through the Hello World of WebGPU programming: rendering a triangle. Think of the GPU as a
-              separate computer with its own memory and instruction set. Unlike JavaScript where you pass data directly
-              to functions, working with the GPU involves cross-boundary communication—you need to be explicit about:
+              Let&apos;s start with the classic Hello Triangle—not because it&apos;s exciting, but because it&apos;s the simplest
+              example that shows every essential component of the WebGPU pipeline. Once you understand how these pieces
+              connect here, scaling up to complex models is just adding more data, not learning new concepts.
+            </p>
+            <p className="leading-7">
+              Think of the GPU as a separate computer with its own memory and instruction set. Unlike JavaScript where
+              you pass data directly to functions, working with the GPU involves cross-boundary communication—you need to
+              be explicit about:
             </p>
             <ul className="my-2 ml-6 list-disc [&>li]:mt-2">
               <li>
@@ -407,7 +424,7 @@ for (let i = 0; i < this.model.materials.length; i++) {
             </div>
 
             <p className="leading-7">
-              However, you must notice the character appears transparent or you can see through to the back faces. We
+              However, you might notice the character appears transparent or you can see through to the back faces. We
               didn&apos;t notice this issue in the previous version because the model was covered by solid red color.
               The fix is surprisingly simple—just three steps: create a depth texture, add it to the render pass, and
               configure the pipeline. No shader changes needed:
@@ -455,6 +472,10 @@ depthStencil: {
             <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
               Engine v4: Bones and Skinning
             </h2>
+
+            <div className="w-full h-full items-center justify-center flex mt-2">
+              <Canvas4 />
+            </div>
           </section>
 
           <section className="flex flex-col items-start justify-start gap-6 w-full">
@@ -466,7 +487,7 @@ depthStencil: {
         <div className="w-64 sticky top-12 self-start ">
           <TableOfContents />
         </div>
-      </div>
-    </div>
+      </div >
+    </div >
   )
 }
