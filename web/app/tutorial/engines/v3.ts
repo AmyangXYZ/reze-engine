@@ -5,6 +5,19 @@ import modelData from "../model.json"
 interface Model {
   vertices: Float32Array
   indices: Uint32Array
+  textures: Texture[]
+  materials: Material[]
+}
+
+interface Texture {
+  path: string
+  name: string
+}
+
+interface Material {
+  name: string
+  diffuseTextureIndex: number
+  vertexCount: number
 }
 
 // Basic engine with arc rotate camera
@@ -25,8 +38,12 @@ export class EngineV3 {
   private camera!: Camera
   private cameraUniformBuffer!: GPUBuffer
   private cameraMatrixData = new Float32Array(36)
-  // Bind group
+  // Bind groups
   private bindGroup!: GPUBindGroup
+  private materialBindGroups: GPUBindGroup[] = []
+  // Textures
+  private textures: GPUTexture[] = []
+  private sampler!: GPUSampler
   // Render loop
   private animationFrameId: number | null = null
 
@@ -38,6 +55,7 @@ export class EngineV3 {
     this.loadModel()
     await this.initDevice()
     this.initContext()
+    await this.initTexture()
     this.initShader()
     this.initVertexBuffers()
     this.initPipeline()
@@ -50,7 +68,10 @@ export class EngineV3 {
     this.model = {
       vertices: new Float32Array(model.vertices),
       indices: new Uint32Array(model.indices),
+      textures: model.textures,
+      materials: model.materials,
     }
+    console.log(this.model)
   }
 
   private async initDevice() {
@@ -106,16 +127,30 @@ export class EngineV3 {
           _padding: f32,
         };
 
+        struct VertexOutput {
+          @builtin(position) position: vec4<f32>,
+          @location(0) uv: vec2<f32>,
+        };
+
         @group(0) @binding(0) var<uniform> camera: CameraUniforms;
+        @group(1) @binding(0) var texture: texture_2d<f32>;
+        @group(1) @binding(1) var textureSampler: sampler;
 
         @vertex
-        fn vs(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-          return camera.projection * camera.view * vec4f(position, 1.0);
+        fn vs(
+          @location(0) position: vec3<f32>,
+          @location(1) normal: vec3<f32>,
+          @location(2) uv: vec2<f32>
+        ) -> VertexOutput {
+          var output: VertexOutput;
+          output.position = camera.projection * camera.view * vec4f(position, 1.0);
+          output.uv = uv;
+          return output;
         }
 
         @fragment
-        fn fs() -> @location(0) vec4<f32> {
-          return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+        fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
+          return vec4<f32>(textureSample(texture, textureSampler, input.uv).rgb, 1.0);
         }
       `,
     })
@@ -142,7 +177,7 @@ export class EngineV3 {
 
   private initPipeline() {
     this.pipeline = this.device.createRenderPipeline({
-      label: "v2 pipeline",
+      label: "v3 pipeline",
       layout: "auto",
       vertex: {
         module: this.shaderModule,
@@ -151,9 +186,19 @@ export class EngineV3 {
             arrayStride: 8 * 4, // 8 floats * 4 bytes each = 32 bytes per vertex (position + normal + UV)
             attributes: [
               {
-                shaderLocation: 0, // matches @location(0) in the shader
-                offset: 0, // position is at offset 0
-                format: "float32x3", // vec3<f32> = 3 float32s for position
+                shaderLocation: 0, // position
+                offset: 0,
+                format: "float32x3",
+              },
+              {
+                shaderLocation: 1, // normal (not used in shader, but we need to skip it)
+                offset: 3 * 4, // 12 bytes (3 floats)
+                format: "float32x3",
+              },
+              {
+                shaderLocation: 2, // UV
+                offset: 6 * 4, // 24 bytes (3 floats position + 3 floats normal)
+                format: "float32x2",
               },
             ],
           },
@@ -163,6 +208,7 @@ export class EngineV3 {
         module: this.shaderModule,
         targets: [{ format: this.presentationFormat }],
       },
+      primitive: { cullMode: "none" },
     })
   }
 
@@ -179,12 +225,84 @@ export class EngineV3 {
     this.camera.attachControl(this.canvas)
   }
 
+  private async initTexture() {
+    // Collect all unique texture indices used by materials
+    const textureIndices = new Set<number>()
+    for (const material of this.model.materials) {
+      if (material.diffuseTextureIndex >= 0 && material.diffuseTextureIndex < this.model.textures.length) {
+        textureIndices.add(material.diffuseTextureIndex)
+      }
+    }
+    const textureDir = "/models/塞尔凯特"
+    // Load all textures referenced by materials
+    const textureLoadPromises = Array.from(textureIndices).map(async (textureIndex) => {
+      const texturePath = `${textureDir}/${this.model.textures[textureIndex].path}`
+      const response = await fetch(texturePath)
+      if (!response.ok) {
+        throw new Error(`Failed to load texture: ${texturePath}`)
+      }
+
+      const imageBitmap = await createImageBitmap(await response.blob(), {
+        premultiplyAlpha: "none",
+        colorSpaceConversion: "none",
+      })
+
+      // Create texture
+      const texture = this.device.createTexture({
+        label: `texture: ${this.model.textures[textureIndex].name}`,
+        size: [imageBitmap.width, imageBitmap.height],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+
+      // Upload image data to texture
+      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [
+        imageBitmap.width,
+        imageBitmap.height,
+      ])
+
+      return { textureIndex, texture }
+    })
+
+    const loadedTextures = await Promise.all(textureLoadPromises)
+
+    // Store textures in array indexed by texture index
+    this.textures = new Array(this.model.textures.length)
+    for (const { textureIndex, texture } of loadedTextures) {
+      this.textures[textureIndex] = texture
+    }
+
+    // Create sampler
+    this.sampler = this.device.createSampler({
+      label: "texture sampler",
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "repeat",
+      addressModeV: "repeat",
+    })
+  }
+
   private createBindGroups() {
     this.bindGroup = this.device.createBindGroup({
-      label: "bind group layout",
+      label: "camera bind group",
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: this.cameraUniformBuffer } }],
     })
+
+    // Create bind group for each material with its own texture
+    for (const material of this.model.materials) {
+      const textureIndex = material.diffuseTextureIndex
+      const materialBindGroup = this.device.createBindGroup({
+        label: `texture bind group: ${material.name}`,
+        layout: this.pipeline.getBindGroupLayout(1),
+        entries: [
+          { binding: 0, resource: this.textures[textureIndex].createView() },
+          { binding: 1, resource: this.sampler },
+        ],
+      })
+
+      this.materialBindGroups.push(materialBindGroup)
+    }
   }
 
   private updateCameraUniforms() {
@@ -214,7 +332,19 @@ export class EngineV3 {
     pass.setBindGroup(0, this.bindGroup)
     pass.setVertexBuffer(0, this.vertexBuffer)
     pass.setIndexBuffer(this.indexBuffer, "uint32")
-    pass.drawIndexed(this.model.indices.length)
+
+    // Render each material separately with its own texture
+    let firstIndex = 0
+    for (let i = 0; i < this.model.materials.length; i++) {
+      const material = this.model.materials[i]
+      if (material.vertexCount === 0) continue
+
+      const bindGroup = this.materialBindGroups[i]
+      pass.setBindGroup(1, bindGroup)
+      pass.drawIndexed(material.vertexCount, 1, firstIndex)
+      firstIndex += material.vertexCount
+    }
+
     pass.end()
     this.device.queue.submit([encoder.finish()])
   }

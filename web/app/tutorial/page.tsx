@@ -33,11 +33,11 @@ export default function Tutorial() {
               This is a tutorial for developers who want to learn WebGPU or dive deeper after playing with high-level
               frameworks like three.js or babylon.js, but don&apos;t know where to start beyond the simple triangle
               example. This tutorial covers the core pipeline for rendering anime characters with WebGPU: geometry
-              rendering, skinning, material and texture handling, bone attachment, and animation. We focus on concepts
-              and workflow rather than implementation details—matrix math, shader programming, and model parsing are
-              handled by standard code you can generate with AI tools. By the end, you&apos;ll understand how the pieces
-              fit together and can build your own rendering engine like the Reze Engine. Full source code for each
-              example is available{" "}
+              rendering, material and texture handling, bone and skinning, and animation. We focus on concepts and
+              workflow rather than implementation details—matrix math, shader programming, and model parsing are handled
+              by standard code you can generate with AI tools. By the end, you&apos;ll understand how the pieces fit
+              together and can build your own rendering engine like the Reze Engine. Full source code for each example
+              is available{" "}
               <Link href={REPO_URL} className="text-blue-400" target="_blank">
                 here
               </Link>
@@ -74,13 +74,21 @@ export default function Tutorial() {
               <Link href={`${REPO_URL}/engines/v0.ts`} target="_blank" className="text-blue-400">
                 engines/v0.ts
               </Link>
-              . The code follows the standard WebGPU initialization pattern. First, we request a GPU device and set up a
-              rendering context on the canvas. Then we allocate a GPU buffer and write the positions of our 3 vertices
-              into it using <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">writeBuffer</code>. Next, we
-              define shaders: the vertex shader processes each vertex, and the fragment shader determines the color of
-              each pixel. We bundle these shaders with metadata about the buffer layout into a pipeline. Finally, we
-              create a render pass that executes the pipeline and produces the triangle on screen.
+              . The code follows the standard WebGPU initialization pattern:
             </p>
+            <ol className="ml-6 list-decimal [&>li]:mt-2">
+              <li>Request a GPU device and set up a rendering context on the canvas</li>
+              <li>
+                Allocate a GPU buffer and write the positions of our 3 vertices into it using{" "}
+                <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">writeBuffer</code>
+              </li>
+              <li>
+                Define shaders: the vertex shader processes each vertex, and the fragment shader determines the color of
+                each pixel
+              </li>
+              <li>Bundle these shaders with metadata about the buffer layout into a pipeline</li>
+              <li>Create a render pass that executes the pipeline and produces the triangle on screen</li>
+            </ol>
 
             <div className="w-full h-full items-center justify-center flex mt-2">
               <Canvas0 />
@@ -113,25 +121,9 @@ export default function Tutorial() {
               <Link href={`${REPO_URL}/engines/v1.ts`} target="_blank" className="text-blue-400">
                 engines/v1.ts
               </Link>
-              . The key change is in the vertex shader, where we multiply each vertex position by the camera matrices:{" "}
-            </p>
-
-            <Code language="wgsl">
-              {`@vertex
-fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-  return camera.projection * camera.view * vec4f(position, 0.0, 1.0);
-}            `}
-            </Code>
-
-            <div className="w-full h-full items-center justify-center flex mt-2">
-              <Canvas1 />
-            </div>
-
-            <p className="leading-7">
-              The interesting part is how we get these matrices from the CPU (JavaScript) to the GPU (shader). This is
-              done through a <span className="font-semibold">uniform buffer</span>—essentially a chunk of GPU memory
-              that acts like a global variable accessible to all shaders in a pipeline. First, we write the camera data
-              to the buffer:{" "}
+              . To pass camera matrices from JavaScript to the shader, we use a{" "}
+              <span className="font-semibold">uniform buffer</span>—a chunk of GPU memory that acts like a global
+              variable accessible to all shaders. First, we write the camera data to the buffer:
             </p>
 
             <Code language="typescript">
@@ -154,8 +146,7 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
             <Code language="typescript">{`pass.setBindGroup(0, this.bindGroup);`}</Code>
 
             <p className="leading-7">
-              Finally, in the shader, we define a struct matching the buffer&apos;s memory layout and bind it to group
-              0:
+              Finally, in the shader, we define a struct matching the buffer&apos;s memory layout:
             </p>
 
             <Code language="wgsl">
@@ -170,7 +161,22 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
             </Code>
 
             <p className="leading-7">
-              Now the shader can access <Inline>camera.view</Inline> and <Inline>camera.projection</Inline> directly.
+              Now the shader can access <Inline>camera.view</Inline> and <Inline>camera.projection</Inline> directly. In
+              the vertex shader, we multiply each vertex position by these matrices:
+            </p>
+
+            <Code language="wgsl">
+              {`@vertex
+fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+  return camera.projection * camera.view * vec4f(position, 0.0, 1.0);
+}            `}
+            </Code>
+
+            <div className="w-full h-full items-center justify-center flex mt-2">
+              <Canvas1 />
+            </div>
+
+            <p className="leading-7">
               This uniform buffer pattern is fundamental in WebGPU—you&apos;ll use it to pass any data from CPU to GPU,
               including lighting parameters, material properties, and transformation matrices.
             </p>
@@ -181,10 +187,13 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
               Engine v2: Render Character Geometry
             </h2>
             <p className="leading-7">
-              Now we move from a hardcoded triangle to actual model geometry. We&apos;re using a pre-parsed PMX model
-              file—the standard format for MMD (MikuMikuDance) anime characters. The parser itself isn&apos;t covered
-              here (any model format works; use AI to generate parsers as needed). What matters is understanding the two
-              key data structures: vertices and indices.
+              Now we move from a hardcoded triangle to actual model geometry. We&apos;re using a pre-parsed PMX{" "}
+              <Link href={`${REPO_URL}/model.json`} target="_blank" className="text-blue-400">
+                model data
+              </Link>{" "}
+              —the standard format for MMD (MikuMikuDance) anime characters. The parser itself isn&apos;t covered here
+              (any model format works; use AI to generate parsers as needed). What matters is understanding the two key
+              data structures: vertices and indices.
             </p>
 
             <p className="leading-7">
@@ -205,9 +214,8 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
               </li>
             </ul>
             <p className="leading-7">
-              That&apos;s 8 floats per vertex (3 + 3 + 2 = 8 floats = 32 bytes). The index buffer specifies which
-              vertices form each triangle—instead of duplicating vertex data, we reference existing vertices by their
-              indices. This dramatically reduces memory usage.
+              The index buffer specifies which vertices form each triangle—instead of duplicating vertex data, we
+              reference existing vertices by their indices. This dramatically reduces memory usage.
             </p>
 
             <p className="leading-7">
@@ -215,7 +223,8 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
               <Link href={`${REPO_URL}/engines/v2.ts`} target="_blank" className="text-blue-400">
                 engines/v2.ts
               </Link>
-              , we create both vertex and index buffers from the model data:
+              , we create both vertex and index buffers from the model data. Look for the{" "}
+              <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">initVertexBuffers</code> method:
             </p>
 
             <Code language="typescript">
@@ -241,27 +250,7 @@ fn vs(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
             </Code>
 
             <p className="leading-7">
-              The pipeline configuration changes in two ways. First, we update the vertex buffer layout to match our
-              32-byte stride. The shader only needs position data for now (we&apos;ll use normals and UVs in later
-              steps), but the GPU must skip the correct number of bytes to read each position:
-            </p>
-
-            <Code language="typescript">
-              {`vertex: {
-  module: this.shaderModule,
-  buffers: [{
-    arrayStride: 8 * 4, // 32 bytes: skip position + normal + UV for each vertex
-    attributes: [{
-      shaderLocation: 0,
-      offset: 0, // position starts at byte 0
-      format: "float32x3" // read 3 floats for position
-    }]
-  }]
-}`}
-            </Code>
-
-            <p className="leading-7">
-              Second, we use indexed drawing instead of direct drawing. The render pass now calls{" "}
+              The key change is using indexed drawing instead of direct drawing. The render pass now calls{" "}
               <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">drawIndexed</code> and specifies the index
               buffer:
             </p>
@@ -273,9 +262,9 @@ pass.drawIndexed(this.model.indices.length) // draw all triangles using indices`
             </Code>
 
             <p className="leading-7">
-              The result is a red shape of the character. Without textures or lighting (coming next), we see only the
-              raw geometry. But this is a major milestone—we&apos;ve gone from 3 hardcoded vertices to rendering a
-              complex model with thousands of triangles.
+              The result is a red shape of the character. Without textures (coming next), we see only the raw geometry.
+              But this is a major milestone—we&apos;ve gone from 3 hardcoded vertices to rendering a complex model with
+              thousands of triangles.
             </p>
 
             <div className="w-full h-full items-center justify-center flex mt-2">
@@ -285,17 +274,142 @@ pass.drawIndexed(this.model.indices.length) // draw all triangles using indices`
 
           <section className="flex flex-col items-start justify-start gap-6 w-full">
             <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
-              Engine v3: Textures and Materials
+              Engine v3: Material and Texture
             </h2>
             <p className="leading-7">
-              Now we add textures to the character. Textures are images that are mapped onto the model&apos;s surface to
-              give it color and detail. In WebGPU, textures are created from image data and can be sampled in the
-              fragment shader to determine the color of each pixel.
+              Now we add textures to bring color and detail to the character. This introduces two important concepts:{" "}
+              <span className="font-semibold">materials</span> and <span className="font-semibold">textures</span>.
             </p>
+
+            <p className="leading-7">
+              A <span className="font-semibold">material</span> links a group of vertices (by their indices) and
+              specifies which texture and visual parameters to use when drawing those triangles. In a character model, a
+              material can be the face, hair, clothes, or other components.
+            </p>
+
+            <p className="leading-7">
+              A <span className="font-semibold">texture</span> is an image file that contains color data. Each vertex
+              has UV coordinates that map it to a location in the texture. The fragment shader samples the texture using
+              these coordinates to determine the color for each pixel.
+            </p>
+
+            <p className="leading-7">
+              In{" "}
+              <Link href={`${REPO_URL}/engines/v3.ts`} target="_blank" className="text-blue-400">
+                engines/v3.ts
+              </Link>
+              , we first load texture images and create GPU textures. Look for the{" "}
+              <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">initTexture</code> method. We fetch each image
+              file, create an <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">ImageBitmap</code>, then
+              create a <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">GPUTexture</code> and upload the
+              image data:
+            </p>
+
+            <Code language="typescript">
+              {`const imageBitmap = await createImageBitmap(await response.blob())
+const texture = this.device.createTexture({
+  size: [imageBitmap.width, imageBitmap.height],
+  format: "rgba8unorm",
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+})
+this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [
+  imageBitmap.width,
+  imageBitmap.height,
+])`}
+            </Code>
+
+            <p className="leading-7">
+              Next, we create a sampler that defines how the texture should be sampled (filtering, wrapping, etc.):
+            </p>
+
+            <Code language="typescript">
+              {`this.sampler = this.device.createSampler({
+  magFilter: "linear",
+  minFilter: "linear",
+  addressModeU: "repeat",
+  addressModeV: "repeat",
+})`}
+            </Code>
+
+            <p className="leading-7">
+              In the shader, we need to pass UV coordinates from the vertex shader to the fragment shader. We define a{" "}
+              <Inline>VertexOutput</Inline> struct to bundle the position and UV together:
+            </p>
+
+            <Code language="wgsl">
+              {`struct VertexOutput {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs(@location(2) uv: vec2<f32>) -> VertexOutput {
+  var output: VertexOutput;
+  output.position = camera.projection * camera.view * vec4f(position, 1.0);
+  output.uv = uv;
+  return output;
+}`}
+            </Code>
+
+            <p className="leading-7">
+              The fragment shader receives the UV coordinates and samples the texture using{" "}
+              <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-sm">textureSample</code>:
+            </p>
+
+            <Code language="wgsl">
+              {`@fragment
+fn fs(input: VertexOutput) -> @location(0) vec4<f32> {
+  return vec4<f32>(textureSample(texture, textureSampler, input.uv).rgb, 1.0);
+}`}
+            </Code>
+
+            <p className="leading-7">
+              To bind textures to the shader, we create a bind group for each material with its texture and sampler. We
+              add this as a second bind group alongside the camera uniform:
+            </p>
+
+            <Code language="typescript">
+              {`for (const material of this.model.materials) {
+  const textureIndex = material.diffuseTextureIndex
+  const materialBindGroup = this.device.createBindGroup({
+    layout: this.pipeline.getBindGroupLayout(1),
+    entries: [
+      { binding: 0, resource: this.textures[textureIndex].createView() },
+      { binding: 1, resource: this.sampler },
+    ],
+  })
+  this.materialBindGroups.push(materialBindGroup)
+}`}
+            </Code>
+
+            <p className="leading-7">
+              Finally, we render each material separately. Instead of one <Inline>drawIndexed</Inline> call for the
+              entire model, we iterate through materials, set each material&apos;s bind group, and draw its triangles:
+            </p>
+
+            <Code language="typescript">
+              {`let firstIndex = 0
+for (let i = 0; i < this.model.materials.length; i++) {
+  const material = this.model.materials[i]
+  if (material.vertexCount === 0) continue
+
+  pass.setBindGroup(1, this.materialBindGroups[i])
+  pass.drawIndexed(material.vertexCount, 1, firstIndex)
+  firstIndex += material.vertexCount
+}`}
+            </Code>
+
+            <p className="leading-7">The result transforms our red model into a fully textured character.</p>
 
             <div className="w-full h-full items-center justify-center flex mt-2">
               <Canvas3 />
             </div>
+
+            <p className="leading-7">
+              However, you might notice the character appears transparent or you can see through to the back faces—this
+              is because we haven&apos;t enabled depth testing yet. We didn&apos;t notice this issue in the previous
+              version because the model was covered by solid red color. We&apos;ll fix this in the next step.
+            </p>
           </section>
         </div>
         <div className="w-64 sticky top-12 self-start ">
