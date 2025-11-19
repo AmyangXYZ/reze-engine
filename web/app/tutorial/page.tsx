@@ -25,7 +25,7 @@ export default function Tutorial() {
       <div className="flex flex-row items-start justify-center w-full max-w-7xl gap-8 mt-12 pb-20">
         <div className="w-64"></div>
 
-        <div className="flex flex-col items-center justify-start max-w-3xl w-full h-full gap-10">
+        <div className="flex flex-col items-center justify-start max-w-2xl w-full h-full gap-10">
           <h1 className="scroll-m-20 text-center text-3xl font-extrabold tracking-tight text-balance">
             How to Render an Anime Character with WebGPU
           </h1>
@@ -407,13 +407,10 @@ for (let i = 0; i < this.model.materials.length; i++) {
             </div>
 
             <p className="leading-7">
-              However, you might notice the character appears transparent or you can see through to the back faces. We
+              However, you must notice the character appears transparent or you can see through to the back faces. We
               didn&apos;t notice this issue in the previous version because the model was covered by solid red color.
               The fix is surprisingly simple—just three steps: create a depth texture, add it to the render pass, and
-              configure the pipeline. The depth texture stores how far each pixel is from the camera, allowing the GPU
-              to correctly determine which triangles should be drawn in front of others. No shader changes needed—the
-              GPU handles everything automatically. Look for the depth texture creation in <Inline>initContext</Inline>{" "}
-              and the depth configuration in <Inline>initPipeline</Inline>:
+              configure the pipeline. No shader changes needed:
             </p>
 
             <Code language="typescript">
@@ -445,14 +442,25 @@ depthStencil: {
               <Link href={`${REPO_URL}/engines/v3_2.ts`} target="_blank" className="text-blue-400">
                 engines/v3_2.ts
               </Link>
-              . With materials, textures, and depth testing in place, we now have a complete static rendering pipeline
-              that can load a 3D model, apply textures, and render it with correct depth ordering. The character is
-              fully textured and looks solid from any angle.
+              . With materials, textures, and depth testing in place, we now have a complete static rendering pipeline.
+              The character is fully textured and looks solid from any angle.
             </p>
 
             <div className="w-full h-full items-center justify-center flex mt-2">
               <Canvas3_2 />
             </div>
+          </section>
+
+          <section className="flex flex-col items-start justify-start gap-6 w-full">
+            <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
+              Engine v4: Bones and Skinning
+            </h2>
+          </section>
+
+          <section className="flex flex-col items-start justify-start gap-6 w-full">
+            <h2 className="scroll-m-20 border-b pb-2 text-2xl font-semibold tracking-tight first:mt-0">
+              Engine v5: Animation
+            </h2>
           </section>
         </div>
         <div className="w-64 sticky top-12 self-start ">
