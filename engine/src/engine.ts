@@ -39,14 +39,14 @@ export class Engine {
   private indexBuffer?: GPUBuffer
   private resizeObserver: ResizeObserver | null = null
   private depthTexture!: GPUTexture
-  private pipeline!: GPURenderPipeline
+  private modelPipeline!: GPURenderPipeline
   private outlinePipeline!: GPURenderPipeline
-  private hairUnifiedOutlinePipeline!: GPURenderPipeline
-  private hairUnifiedPipelineOverEyes!: GPURenderPipeline
-  private hairUnifiedPipelineOverNonEyes!: GPURenderPipeline
+  private hairOutlinePipeline!: GPURenderPipeline
+  private hairPipelineOverEyes!: GPURenderPipeline
+  private hairPipelineOverNonEyes!: GPURenderPipeline
   private hairDepthPipeline!: GPURenderPipeline
   private eyePipeline!: GPURenderPipeline
-  private hairBindGroupLayout!: GPUBindGroupLayout
+  private mainBindGroupLayout!: GPUBindGroupLayout
   private outlineBindGroupLayout!: GPUBindGroupLayout
   private jointsBuffer!: GPUBuffer
   private weightsBuffer!: GPUBuffer
@@ -57,8 +57,12 @@ export class Engine {
   private skinMatrixComputeBindGroup?: GPUBindGroup
   private boneCountBuffer?: GPUBuffer
   private multisampleTexture!: GPUTexture
-  private readonly sampleCount = 4 // MSAA 4x
+  private readonly sampleCount = 4
   private renderPassDescriptor!: GPURenderPassDescriptor
+  // Constants
+  private readonly STENCIL_EYE_VALUE = 1
+  private readonly COMPUTE_WORKGROUP_SIZE = 64
+  private readonly BLOOM_DOWNSCALE_FACTOR = 2
   // Ambient light settings
   private ambient: number = 1.0
   // Bloom post-processing textures
@@ -94,7 +98,6 @@ export class Engine {
   private physics: Physics | null = null
   private textureSampler!: GPUSampler
   private textureCache = new Map<string, GPUTexture>()
-  private textureSizes = new Map<string, { width: number; height: number }>()
 
   private lastFpsUpdate = performance.now()
   private framesSinceLastUpdate = 0
@@ -112,6 +115,7 @@ export class Engine {
 
   private animationFrames: VMDKeyFrame[] = []
   private animationTimeouts: number[] = []
+  private gpuMemoryMB: number = 0
 
   constructor(canvas: HTMLCanvasElement, options?: EngineOptions) {
     this.canvas = canvas
@@ -287,8 +291,8 @@ export class Engine {
     })
 
     // Create explicit bind group layout for all pipelines using the main shader
-    this.hairBindGroupLayout = this.device.createBindGroupLayout({
-      label: "shared material bind group layout",
+    this.mainBindGroupLayout = this.device.createBindGroupLayout({
+      label: "main material bind group layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // camera
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // light
@@ -301,15 +305,14 @@ export class Engine {
       ],
     })
 
-    const sharedPipelineLayout = this.device.createPipelineLayout({
-      label: "shared pipeline layout",
-      bindGroupLayouts: [this.hairBindGroupLayout],
+    const mainPipelineLayout = this.device.createPipelineLayout({
+      label: "main pipeline layout",
+      bindGroupLayouts: [this.mainBindGroupLayout],
     })
 
-    // Single pipeline for all materials with alpha blending
-    this.pipeline = this.device.createRenderPipeline({
+    this.modelPipeline = this.device.createRenderPipeline({
       label: "model pipeline",
-      layout: sharedPipelineLayout,
+      layout: mainPipelineLayout,
       vertex: {
         module: shaderModule,
         buffers: [
@@ -517,9 +520,9 @@ export class Engine {
       },
     })
 
-    // Unified hair outline pipeline: single pass without stencil testing, uses depth test "less-equal" to draw everywhere hair exists
-    this.hairUnifiedOutlinePipeline = this.device.createRenderPipeline({
-      label: "unified hair outline pipeline",
+    // Hair outline pipeline
+    this.hairOutlinePipeline = this.device.createRenderPipeline({
+      label: "hair outline pipeline",
       layout: outlinePipelineLayout,
       vertex: {
         module: outlineShaderModule,
@@ -588,7 +591,7 @@ export class Engine {
     // Eye overlay pipeline (renders after opaque, writes stencil)
     this.eyePipeline = this.device.createRenderPipeline({
       label: "eye overlay pipeline",
-      layout: sharedPipelineLayout,
+      layout: mainPipelineLayout,
       vertex: {
         module: shaderModule,
         buffers: [
@@ -703,7 +706,7 @@ export class Engine {
     // Hair depth pre-pass pipeline: depth-only with color writes disabled to eliminate overdraw
     this.hairDepthPipeline = this.device.createRenderPipeline({
       label: "hair depth pre-pass",
-      layout: sharedPipelineLayout,
+      layout: mainPipelineLayout,
       vertex: {
         module: depthOnlyShaderModule,
         buffers: [
@@ -743,10 +746,10 @@ export class Engine {
       multisample: { count: this.sampleCount },
     })
 
-    // Unified hair pipeline for over-eyes (stencil == 1): single pass with dynamic branching
-    this.hairUnifiedPipelineOverEyes = this.device.createRenderPipeline({
-      label: "unified hair pipeline (over eyes)",
-      layout: sharedPipelineLayout,
+    // Hair pipeline for rendering over eyes (stencil == 1)
+    this.hairPipelineOverEyes = this.device.createRenderPipeline({
+      label: "hair pipeline (over eyes)",
+      layout: mainPipelineLayout,
       vertex: {
         module: shaderModule,
         buffers: [
@@ -809,10 +812,10 @@ export class Engine {
       multisample: { count: this.sampleCount },
     })
 
-    // Unified pipeline for hair over non-eyes (stencil != 1)
-    this.hairUnifiedPipelineOverNonEyes = this.device.createRenderPipeline({
-      label: "unified hair pipeline (over non-eyes)",
-      layout: sharedPipelineLayout,
+    // Hair pipeline for rendering over non-eyes (stencil != 1)
+    this.hairPipelineOverNonEyes = this.device.createRenderPipeline({
+      label: "hair pipeline (over non-eyes)",
+      layout: mainPipelineLayout,
       vertex: {
         module: shaderModule,
         buffers: [
@@ -894,10 +897,9 @@ export class Engine {
         @group(0) @binding(2) var<storage, read> inverseBindMatrices: array<mat4x4f>;
         @group(0) @binding(3) var<storage, read_write> skinMatrices: array<mat4x4f>;
         
-        @compute @workgroup_size(64)
+        @compute @workgroup_size(64) // Must match COMPUTE_WORKGROUP_SIZE
         fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
           let boneIndex = globalId.x;
-          // Bounds check: we dispatch workgroups (64 threads each), so some threads may be out of range
           if (boneIndex >= boneCount.count) {
             return;
           }
@@ -1035,21 +1037,16 @@ export class Engine {
         @group(0) @binding(1) var inputSampler: sampler;
         @group(0) @binding(2) var<uniform> blurUniforms: BlurUniforms;
 
-        // 9-tap gaussian blur
+        // 5-tap gaussian blur
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
           let texelSize = 1.0 / vec2f(textureDimensions(inputTexture));
           var result = vec4f(0.0);
           
-          // Gaussian weights for 9-tap filter
-          let weights = array<f32, 9>(
-            0.01621622, 0.05405405, 0.12162162,
-            0.19459459, 0.22702703,
-            0.19459459, 0.12162162, 0.05405405, 0.01621622
-          );
+          // Optimized 5-tap Gaussian filter (faster, nearly same quality)
+          let weights = array<f32, 5>(0.06136, 0.24477, 0.38774, 0.24477, 0.06136);
+          let offsets = array<f32, 5>(-2.0, -1.0, 0.0, 1.0, 2.0);
           
-          let offsets = array<f32, 9>(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0);
-          
-          for (var i = 0u; i < 9u; i++) {
+          for (var i = 0u; i < 5u; i++) {
             let offset = offsets[i] * texelSize * blurUniforms.direction;
             result += textureSample(inputTexture, inputSampler, input.uv + offset) * weights[i];
           }
@@ -1197,11 +1194,9 @@ export class Engine {
     this.linearSampler = linearSampler
   }
 
-  // Setup bloom textures and bind groups (called when canvas is resized)
   private setupBloom(width: number, height: number) {
-    // Create bloom textures (half resolution for performance)
-    const bloomWidth = Math.floor(width / 2)
-    const bloomHeight = Math.floor(height / 2)
+    const bloomWidth = Math.floor(width / this.BLOOM_DOWNSCALE_FACTOR)
+    const bloomHeight = Math.floor(height / this.BLOOM_DOWNSCALE_FACTOR)
     this.bloomExtractTexture = this.device.createTexture({
       label: "bloom extract",
       size: [bloomWidth, bloomHeight],
@@ -1480,7 +1475,9 @@ export class Engine {
           worldMats.byteOffset,
           worldMats.byteLength
         )
-        this.computeSkinMatrices()
+        const encoder = this.device.createCommandEncoder()
+        this.computeSkinMatrices(encoder)
+        this.device.queue.submit([encoder.finish()])
       }
     }
     for (const [_, keyFrames] of boneKeyFramesByBone.entries()) {
@@ -1779,7 +1776,6 @@ export class Engine {
         [256, 2]
       )
       this.textureCache.set(defaultToonPath, defaultToonTexture)
-      this.textureSizes.set(defaultToonPath, { width: 256, height: 2 })
       return defaultToonTexture
     }
 
@@ -1792,11 +1788,11 @@ export class Engine {
     this.eyeOutlineDraws = []
     this.hairOutlineDraws = []
     this.transparentNonEyeNonHairOutlineDraws = []
-    let runningFirstIndex = 0
+    let currentIndexOffset = 0
 
     for (const mat of materials) {
-      const matCount = mat.vertexCount | 0
-      if (matCount === 0) continue
+      const indexCount = mat.vertexCount
+      if (indexCount === 0) continue
 
       const diffuseTexture = await loadTextureByIndex(mat.diffuseTextureIndex)
       if (!diffuseTexture) throw new Error(`Material "${mat.name}" has no diffuse texture`)
@@ -1828,7 +1824,7 @@ export class Engine {
       // Create bind groups using the shared bind group layout - All pipelines (main, eye, hair multiply, hair opaque) use the same shader and layout
       const bindGroup = this.device.createBindGroup({
         label: `material bind group: ${mat.name}`,
-        layout: this.hairBindGroupLayout,
+        layout: this.mainBindGroupLayout,
         entries: [
           { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
@@ -1844,104 +1840,80 @@ export class Engine {
       // Classify materials into appropriate draw lists
       if (mat.isEye) {
         this.eyeDraws.push({
-          count: matCount,
-          firstIndex: runningFirstIndex,
+          count: indexCount,
+          firstIndex: currentIndexOffset,
           bindGroup,
           isTransparent,
         })
       } else if (mat.isHair) {
-        // Hair materials: create bind groups for unified pipeline with dynamic branching
-        const materialUniformDataHair = new Float32Array(8)
-        materialUniformDataHair[0] = materialAlpha
-        materialUniformDataHair[1] = 1.0 // alphaMultiplier: base value, shader will adjust
-        materialUniformDataHair[2] = this.rimLightIntensity
-        materialUniformDataHair[3] = this.rimLightPower
-        materialUniformDataHair[4] = 1.0 // rimColor.r
-        materialUniformDataHair[5] = 1.0 // rimColor.g
-        materialUniformDataHair[6] = 1.0 // rimColor.b
-        materialUniformDataHair[7] = 0.0
+        // Hair materials: create separate bind groups for over-eyes vs over-non-eyes
+        const createHairBindGroup = (isOverEyes: boolean) => {
+          const uniformData = new Float32Array(8)
+          uniformData[0] = materialAlpha
+          uniformData[1] = 1.0 // alphaMultiplier (shader adjusts based on isOverEyes)
+          uniformData[2] = this.rimLightIntensity
+          uniformData[3] = this.rimLightPower
+          uniformData[4] = 1.0 // rimColor.rgb
+          uniformData[5] = 1.0
+          uniformData[6] = 1.0
+          uniformData[7] = isOverEyes ? 1.0 : 0.0
 
-        // Create uniform buffers for both modes
-        const materialUniformBufferOverEyes = this.device.createBuffer({
-          label: `material uniform (over eyes): ${mat.name}`,
-          size: materialUniformDataHair.byteLength,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        })
-        const materialUniformDataOverEyes = new Float32Array(materialUniformDataHair)
-        materialUniformDataOverEyes[7] = 1.0
-        this.device.queue.writeBuffer(materialUniformBufferOverEyes, 0, materialUniformDataOverEyes)
+          const buffer = this.device.createBuffer({
+            label: `material uniform (${isOverEyes ? "over eyes" : "over non-eyes"}): ${mat.name}`,
+            size: uniformData.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          })
+          this.device.queue.writeBuffer(buffer, 0, uniformData)
 
-        const materialUniformBufferOverNonEyes = this.device.createBuffer({
-          label: `material uniform (over non-eyes): ${mat.name}`,
-          size: materialUniformDataHair.byteLength,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        })
-        const materialUniformDataOverNonEyes = new Float32Array(materialUniformDataHair)
-        materialUniformDataOverNonEyes[7] = 0.0
-        this.device.queue.writeBuffer(materialUniformBufferOverNonEyes, 0, materialUniformDataOverNonEyes)
+          return this.device.createBindGroup({
+            label: `material bind group (${isOverEyes ? "over eyes" : "over non-eyes"}): ${mat.name}`,
+            layout: this.mainBindGroupLayout,
+            entries: [
+              { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+              { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+              { binding: 2, resource: diffuseTexture.createView() },
+              { binding: 3, resource: this.textureSampler },
+              { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
+              { binding: 5, resource: toonTexture.createView() },
+              { binding: 6, resource: this.textureSampler },
+              { binding: 7, resource: { buffer: buffer } },
+            ],
+          })
+        }
 
-        // Create bind groups for both modes
-        const bindGroupOverEyes = this.device.createBindGroup({
-          label: `material bind group (over eyes): ${mat.name}`,
-          layout: this.hairBindGroupLayout,
-          entries: [
-            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
-            { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-            { binding: 2, resource: diffuseTexture.createView() },
-            { binding: 3, resource: this.textureSampler },
-            { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
-            { binding: 5, resource: toonTexture.createView() },
-            { binding: 6, resource: this.textureSampler },
-            { binding: 7, resource: { buffer: materialUniformBufferOverEyes } },
-          ],
-        })
+        const bindGroupOverEyes = createHairBindGroup(true)
+        const bindGroupOverNonEyes = createHairBindGroup(false)
 
-        const bindGroupOverNonEyes = this.device.createBindGroup({
-          label: `material bind group (over non-eyes): ${mat.name}`,
-          layout: this.hairBindGroupLayout,
-          entries: [
-            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
-            { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-            { binding: 2, resource: diffuseTexture.createView() },
-            { binding: 3, resource: this.textureSampler },
-            { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
-            { binding: 5, resource: toonTexture.createView() },
-            { binding: 6, resource: this.textureSampler },
-            { binding: 7, resource: { buffer: materialUniformBufferOverNonEyes } },
-          ],
-        })
-
-        // Store both bind groups for unified pipeline
         this.hairDrawsOverEyes.push({
-          count: matCount,
-          firstIndex: runningFirstIndex,
+          count: indexCount,
+          firstIndex: currentIndexOffset,
           bindGroup: bindGroupOverEyes,
           isTransparent,
         })
 
         this.hairDrawsOverNonEyes.push({
-          count: matCount,
-          firstIndex: runningFirstIndex,
+          count: indexCount,
+          firstIndex: currentIndexOffset,
           bindGroup: bindGroupOverNonEyes,
           isTransparent,
         })
       } else if (isTransparent) {
         this.transparentNonEyeNonHairDraws.push({
-          count: matCount,
-          firstIndex: runningFirstIndex,
+          count: indexCount,
+          firstIndex: currentIndexOffset,
           bindGroup,
           isTransparent,
         })
       } else {
         this.opaqueNonEyeNonHairDraws.push({
-          count: matCount,
-          firstIndex: runningFirstIndex,
+          count: indexCount,
+          firstIndex: currentIndexOffset,
           bindGroup,
           isTransparent,
         })
       }
 
-      // Outline for all materials (including transparent) - Edge flag is at bit 4 (0x10) in PMX format, not bit 0 (0x01)
+      // Edge flag is at bit 4 (0x10) in PMX format
       if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
         const materialUniformData = new Float32Array(8)
         materialUniformData[0] = mat.edgeColor[0] // edgeColor.r
@@ -1949,9 +1921,9 @@ export class Engine {
         materialUniformData[2] = mat.edgeColor[2] // edgeColor.b
         materialUniformData[3] = mat.edgeColor[3] // edgeColor.a
         materialUniformData[4] = mat.edgeSize
-        materialUniformData[5] = 0.0 // isOverEyes: 0.0 for all (unified pipeline doesn't use stencil)
-        materialUniformData[6] = 0.0 // _padding1
-        materialUniformData[7] = 0.0 // _padding2
+        materialUniformData[5] = 0.0 // isOverEyes
+        materialUniformData[6] = 0.0
+        materialUniformData[7] = 0.0
 
         const materialUniformBuffer = this.device.createBuffer({
           label: `outline material uniform: ${mat.name}`,
@@ -1970,44 +1942,44 @@ export class Engine {
           ],
         })
 
-        // Classify outlines into appropriate draw lists
         if (mat.isEye) {
           this.eyeOutlineDraws.push({
-            count: matCount,
-            firstIndex: runningFirstIndex,
+            count: indexCount,
+            firstIndex: currentIndexOffset,
             bindGroup: outlineBindGroup,
             isTransparent,
           })
         } else if (mat.isHair) {
           this.hairOutlineDraws.push({
-            count: matCount,
-            firstIndex: runningFirstIndex,
+            count: indexCount,
+            firstIndex: currentIndexOffset,
             bindGroup: outlineBindGroup,
             isTransparent,
           })
         } else if (isTransparent) {
           this.transparentNonEyeNonHairOutlineDraws.push({
-            count: matCount,
-            firstIndex: runningFirstIndex,
+            count: indexCount,
+            firstIndex: currentIndexOffset,
             bindGroup: outlineBindGroup,
             isTransparent,
           })
         } else {
           this.opaqueNonEyeNonHairOutlineDraws.push({
-            count: matCount,
-            firstIndex: runningFirstIndex,
+            count: indexCount,
+            firstIndex: currentIndexOffset,
             bindGroup: outlineBindGroup,
             isTransparent,
           })
         }
       }
 
-      runningFirstIndex += matCount
+      currentIndexOffset += indexCount
     }
+
+    this.gpuMemoryMB = this.calculateGpuMemory()
   }
 
-  // Helper: Load texture from file path with optional max size limit
-  private async createTextureFromPath(path: string, maxSize: number = 2048): Promise<GPUTexture | null> {
+  private async createTextureFromPath(path: string): Promise<GPUTexture | null> {
     const cached = this.textureCache.get(path)
     if (cached) {
       return cached
@@ -2018,45 +1990,30 @@ export class Engine {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`)
       }
-      let imageBitmap = await createImageBitmap(await response.blob(), {
+      const imageBitmap = await createImageBitmap(await response.blob(), {
         premultiplyAlpha: "none",
         colorSpaceConversion: "none",
       })
 
-      // Downscale if texture is too large
-      let finalWidth = imageBitmap.width
-      let finalHeight = imageBitmap.height
-      if (finalWidth > maxSize || finalHeight > maxSize) {
-        const scale = Math.min(maxSize / finalWidth, maxSize / finalHeight)
-        finalWidth = Math.floor(finalWidth * scale)
-        finalHeight = Math.floor(finalHeight * scale)
-
-        // Create canvas to downscale
-        const canvas = new OffscreenCanvas(finalWidth, finalHeight)
-        const ctx = canvas.getContext("2d")
-        if (ctx) {
-          ctx.drawImage(imageBitmap, 0, 0, finalWidth, finalHeight)
-          imageBitmap = await createImageBitmap(canvas)
-        }
-      }
-
       const texture = this.device.createTexture({
         label: `texture: ${path}`,
-        size: [finalWidth, finalHeight],
+        size: [imageBitmap.width, imageBitmap.height],
         format: "rgba8unorm",
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
       })
-      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [finalWidth, finalHeight])
+      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [
+        imageBitmap.width,
+        imageBitmap.height,
+      ])
 
       this.textureCache.set(path, texture)
-      this.textureSizes.set(path, { width: finalWidth, height: finalHeight })
       return texture
     } catch {
       return null
     }
   }
 
-  // Step 9: Render one frame
+  // Render strategy: 1) Opaque non-eye/hair 2) Eyes (stencil=1) 3) Hair (depth pre-pass + split by stencil) 4) Transparent 5) Bloom
   public render() {
     if (this.multisampleTexture && this.camera && this.device && this.currentModel) {
       const currentTime = performance.now()
@@ -2066,9 +2023,11 @@ export class Engine {
       this.updateCameraUniforms()
       this.updateRenderTarget()
 
-      this.updateModelPose(deltaTime)
-
+      // Use single encoder for both compute and render (reduces sync points)
       const encoder = this.device.createCommandEncoder()
+
+      this.updateModelPose(deltaTime, encoder)
+
       const pass = encoder.beginRenderPass(this.renderPassDescriptor)
 
       pass.setVertexBuffer(0, this.vertexBuffer)
@@ -2078,8 +2037,8 @@ export class Engine {
 
       this.drawCallCount = 0
 
-      // PASS 1: Opaque non-eye, non-hair
-      pass.setPipeline(this.pipeline)
+      // Pass 1: Opaque non-eye, non-hair
+      pass.setPipeline(this.modelPipeline)
       for (const draw of this.opaqueNonEyeNonHairDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
@@ -2088,9 +2047,9 @@ export class Engine {
         }
       }
 
-      // PASS 2: Eyes (writes stencil = 1)
+      // Pass 2: Eyes (writes stencil value for hair to test against)
       pass.setPipeline(this.eyePipeline)
-      pass.setStencilReference(1) // Set stencil reference value to 1
+      pass.setStencilReference(this.STENCIL_EYE_VALUE)
       for (const draw of this.eyeDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
@@ -2099,10 +2058,10 @@ export class Engine {
         }
       }
 
-      // PASS 3: Hair rendering with depth pre-pass and unified pipeline
+      // Pass 3: Hair rendering (depth pre-pass + shading + outlines)
       this.drawOutlines(pass, false)
 
-      // 3a: Hair depth pre-pass (eliminates overdraw by rejecting fragments early)
+      // 3a: Hair depth pre-pass (reduces overdraw via early depth rejection)
       if (this.hairDrawsOverEyes.length > 0 || this.hairDrawsOverNonEyes.length > 0) {
         pass.setPipeline(this.hairDepthPipeline)
         for (const draw of this.hairDrawsOverEyes) {
@@ -2119,10 +2078,10 @@ export class Engine {
         }
       }
 
-      // 3b: Hair shading pass with unified pipeline and dynamic branching
+      // 3b: Hair shading (split by stencil for transparency over eyes)
       if (this.hairDrawsOverEyes.length > 0) {
-        pass.setPipeline(this.hairUnifiedPipelineOverEyes)
-        pass.setStencilReference(1)
+        pass.setPipeline(this.hairPipelineOverEyes)
+        pass.setStencilReference(this.STENCIL_EYE_VALUE)
         for (const draw of this.hairDrawsOverEyes) {
           if (draw.count > 0) {
             pass.setBindGroup(0, draw.bindGroup)
@@ -2133,8 +2092,8 @@ export class Engine {
       }
 
       if (this.hairDrawsOverNonEyes.length > 0) {
-        pass.setPipeline(this.hairUnifiedPipelineOverNonEyes)
-        pass.setStencilReference(1)
+        pass.setPipeline(this.hairPipelineOverNonEyes)
+        pass.setStencilReference(this.STENCIL_EYE_VALUE)
         for (const draw of this.hairDrawsOverNonEyes) {
           if (draw.count > 0) {
             pass.setBindGroup(0, draw.bindGroup)
@@ -2144,9 +2103,9 @@ export class Engine {
         }
       }
 
-      // 3c: Hair outlines - unified single pass without stencil testing
+      // 3c: Hair outlines
       if (this.hairOutlineDraws.length > 0) {
-        pass.setPipeline(this.hairUnifiedOutlinePipeline)
+        pass.setPipeline(this.hairOutlinePipeline)
         for (const draw of this.hairOutlineDraws) {
           if (draw.count > 0) {
             pass.setBindGroup(0, draw.bindGroup)
@@ -2155,8 +2114,8 @@ export class Engine {
         }
       }
 
-      // PASS 4: Transparent non-eye, non-hair
-      pass.setPipeline(this.pipeline)
+      // Pass 4: Transparent non-eye, non-hair
+      pass.setPipeline(this.modelPipeline)
       for (const draw of this.transparentNonEyeNonHairDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
@@ -2170,14 +2129,12 @@ export class Engine {
       pass.end()
       this.device.queue.submit([encoder.finish()])
 
-      // Apply bloom post-processing
       this.applyBloom()
 
       this.updateStats(performance.now() - currentTime)
     }
   }
 
-  // Apply bloom post-processing
   private applyBloom() {
     if (!this.sceneRenderTexture || !this.bloomExtractTexture) {
       return
@@ -2195,10 +2152,10 @@ export class Engine {
     const encoder = this.device.createCommandEncoder()
     const width = this.canvas.width
     const height = this.canvas.height
-    const bloomWidth = Math.floor(width / 2)
-    const bloomHeight = Math.floor(height / 2)
+    const bloomWidth = Math.floor(width / this.BLOOM_DOWNSCALE_FACTOR)
+    const bloomHeight = Math.floor(height / this.BLOOM_DOWNSCALE_FACTOR)
 
-    // Pass 1: Extract bright areas (downsample to half resolution)
+    // Extract bright areas
     const extractPass = encoder.beginRenderPass({
       label: "bloom extract",
       colorAttachments: [
@@ -2216,8 +2173,8 @@ export class Engine {
     extractPass.draw(6, 1, 0, 0)
     extractPass.end()
 
-    // Pass 2: Horizontal blur
-    const hBlurData = new Float32Array(4) // vec2f + padding = 4 floats
+    // Horizontal blur
+    const hBlurData = new Float32Array(4)
     hBlurData[0] = 1.0
     hBlurData[1] = 0.0
     this.device.queue.writeBuffer(this.blurDirectionBuffer, 0, hBlurData)
@@ -2238,8 +2195,8 @@ export class Engine {
     blurHPass.draw(6, 1, 0, 0)
     blurHPass.end()
 
-    // Pass 3: Vertical blur
-    const vBlurData = new Float32Array(4) // vec2f + padding = 4 floats
+    // Vertical blur
+    const vBlurData = new Float32Array(4)
     vBlurData[0] = 0.0
     vBlurData[1] = 1.0
     this.device.queue.writeBuffer(this.blurDirectionBuffer, 0, vBlurData)
@@ -2260,7 +2217,7 @@ export class Engine {
     blurVPass.draw(6, 1, 0, 0)
     blurVPass.end()
 
-    // Pass 4: Compose scene + bloom to canvas
+    // Compose to canvas
     const composePass = encoder.beginRenderPass({
       label: "bloom compose",
       colorAttachments: [
@@ -2281,7 +2238,6 @@ export class Engine {
     this.device.queue.submit([encoder.finish()])
   }
 
-  // Update camera uniform buffer each frame
   private updateCameraUniforms() {
     const viewMatrix = this.camera.getViewMatrix()
     const projectionMatrix = this.camera.getProjectionMatrix()
@@ -2294,19 +2250,16 @@ export class Engine {
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
   }
 
-  // Update render target texture view
   private updateRenderTarget() {
     const colorAttachment = (this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
     if (this.sampleCount > 1) {
-      // Resolve to scene render texture for post-processing
       colorAttachment.resolveTarget = this.sceneRenderTextureView
     } else {
-      // Render directly to scene render texture
       colorAttachment.view = this.sceneRenderTextureView
     }
   }
 
-  private updateModelPose(deltaTime: number) {
+  private updateModelPose(deltaTime: number, encoder: GPUCommandEncoder) {
     this.currentModel!.evaluatePose()
     const worldMats = this.currentModel!.getBoneWorldMatrices()
 
@@ -2321,32 +2274,23 @@ export class Engine {
       worldMats.byteOffset,
       worldMats.byteLength
     )
-    this.computeSkinMatrices()
+    this.computeSkinMatrices(encoder)
   }
 
-  // Compute skin matrices on GPU
-  private computeSkinMatrices() {
+  private computeSkinMatrices(encoder: GPUCommandEncoder) {
     const boneCount = this.currentModel!.getSkeleton().bones.length
-    const workgroupSize = 64
-    // Dispatch exactly enough threads for all bones (no bounds check needed)
-    const workgroupCount = Math.ceil(boneCount / workgroupSize)
+    const workgroupCount = Math.ceil(boneCount / this.COMPUTE_WORKGROUP_SIZE)
 
-    // Bone count is written once in setupModelBuffers() and never changes
-
-    const encoder = this.device.createCommandEncoder()
     const pass = encoder.beginComputePass()
     pass.setPipeline(this.skinMatrixComputePipeline!)
     pass.setBindGroup(0, this.skinMatrixComputeBindGroup!)
     pass.dispatchWorkgroups(workgroupCount)
     pass.end()
-    this.device.queue.submit([encoder.finish()])
   }
 
-  // Draw outlines (opaque or transparent)
   private drawOutlines(pass: GPURenderPassEncoder, transparent: boolean) {
     pass.setPipeline(this.outlinePipeline)
     if (transparent) {
-      // Draw transparent outlines (if any)
       for (const draw of this.transparentNonEyeNonHairOutlineDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
@@ -2354,7 +2298,6 @@ export class Engine {
         }
       }
     } else {
-      // Draw opaque outlines before main geometry
       for (const draw of this.opaqueNonEyeNonHairOutlineDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
@@ -2385,12 +2328,13 @@ export class Engine {
       this.lastFpsUpdate = now
     }
 
-    // Calculate GPU memory: textures + buffers + render targets
+    this.stats.gpuMemory = this.gpuMemoryMB
+  }
+
+  private calculateGpuMemory(): number {
     let textureMemoryBytes = 0
-    for (const [path, size] of this.textureSizes.entries()) {
-      if (this.textureCache.has(path)) {
-        textureMemoryBytes += size.width * size.height * 4 // RGBA8 = 4 bytes per pixel
-      }
+    for (const texture of this.textureCache.values()) {
+      textureMemoryBytes += texture.width * texture.height * 4
     }
 
     let bufferMemoryBytes = 0
@@ -2422,54 +2366,49 @@ export class Engine {
       const skeleton = this.currentModel?.getSkeleton()
       if (skeleton) bufferMemoryBytes += Math.max(256, skeleton.bones.length * 16 * 4)
     }
-    bufferMemoryBytes += 40 * 4 // cameraUniformBuffer
-    bufferMemoryBytes += 64 * 4 // lightUniformBuffer
-    bufferMemoryBytes += 32 // boneCountBuffer
-    bufferMemoryBytes += 32 // blurDirectionBuffer
-    bufferMemoryBytes += 32 // bloomIntensityBuffer
-    bufferMemoryBytes += 32 // bloomThresholdBuffer
+    bufferMemoryBytes += 40 * 4
+    bufferMemoryBytes += 64 * 4
+    bufferMemoryBytes += 32
+    bufferMemoryBytes += 32
+    bufferMemoryBytes += 32
+    bufferMemoryBytes += 32
     if (this.fullscreenQuadBuffer) {
-      bufferMemoryBytes += 24 * 4 // fullscreenQuadBuffer (6 vertices * 4 floats)
+      bufferMemoryBytes += 24 * 4
     }
-
-    // Material uniform buffers: Float32Array(8) = 32 bytes each
     const totalMaterialDraws =
       this.opaqueNonEyeNonHairDraws.length +
       this.eyeDraws.length +
       this.hairDrawsOverEyes.length +
       this.hairDrawsOverNonEyes.length +
       this.transparentNonEyeNonHairDraws.length
-    bufferMemoryBytes += totalMaterialDraws * 32 // Material uniform buffers (8 floats = 32 bytes)
+    bufferMemoryBytes += totalMaterialDraws * 32
 
-    // Outline material uniform buffers: Float32Array(8) = 32 bytes each
     const totalOutlineDraws =
       this.opaqueNonEyeNonHairOutlineDraws.length +
       this.eyeOutlineDraws.length +
       this.hairOutlineDraws.length +
       this.transparentNonEyeNonHairOutlineDraws.length
-    bufferMemoryBytes += totalOutlineDraws * 32 // Outline material uniform buffers
+    bufferMemoryBytes += totalOutlineDraws * 32
 
     let renderTargetMemoryBytes = 0
     if (this.multisampleTexture) {
       const width = this.canvas.width
       const height = this.canvas.height
-      renderTargetMemoryBytes += width * height * 4 * this.sampleCount // multisample color
-      renderTargetMemoryBytes += width * height * 4 // depth (depth24plus-stencil8 = 4 bytes)
+      renderTargetMemoryBytes += width * height * 4 * this.sampleCount
+      renderTargetMemoryBytes += width * height * 4
     }
     if (this.sceneRenderTexture) {
       const width = this.canvas.width
       const height = this.canvas.height
-      renderTargetMemoryBytes += width * height * 4 // sceneRenderTexture (non-multisampled)
+      renderTargetMemoryBytes += width * height * 4
     }
     if (this.bloomExtractTexture) {
-      const width = Math.floor(this.canvas.width / 2)
-      const height = Math.floor(this.canvas.height / 2)
-      renderTargetMemoryBytes += width * height * 4 // bloomExtractTexture
-      renderTargetMemoryBytes += width * height * 4 // bloomBlurTexture1
-      renderTargetMemoryBytes += width * height * 4 // bloomBlurTexture2
+      const width = Math.floor(this.canvas.width / this.BLOOM_DOWNSCALE_FACTOR)
+      const height = Math.floor(this.canvas.height / this.BLOOM_DOWNSCALE_FACTOR)
+      renderTargetMemoryBytes += width * height * 4 * 3
     }
 
     const totalGPUMemoryBytes = textureMemoryBytes + bufferMemoryBytes + renderTargetMemoryBytes
-    this.stats.gpuMemory = Math.round((totalGPUMemoryBytes / 1024 / 1024) * 100) / 100
+    return Math.round((totalGPUMemoryBytes / 1024 / 1024) * 100) / 100
   }
 }
