@@ -99,7 +99,6 @@ export class Engine {
   private bloomIntensity: number = 0.12
   // Rim light settings
   private rimLightIntensity: number = 0.45
-  private rimLightPower: number = 2.0
 
   private currentModel: Model | null = null
   private modelDir: string = ""
@@ -212,7 +211,7 @@ export class Engine {
           alpha: f32,
           alphaMultiplier: f32,
           rimIntensity: f32,
-          rimPower: f32,
+          _padding1: f32,
           rimColor: vec3f,
           isOverEyes: f32, // 1.0 if rendering over eyes, 0.0 otherwise
         };
@@ -243,14 +242,10 @@ export class Engine {
           var output: VertexOutput;
           let pos4 = vec4f(position, 1.0);
           
-          // Normalize weights to ensure they sum to 1.0 (handles floating-point precision issues)
+          // Branchless weight normalization (avoids GPU branch divergence)
           let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
-          var normalizedWeights: vec4f;
-          if (weightSum > 0.0001) {
-            normalizedWeights = weights0 / weightSum;
-          } else {
-            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
-          }
+          let invWeightSum = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
+          let normalizedWeights = select(vec4f(1.0, 0.0, 0.0, 0.0), weights0 * invWeightSum, weightSum > 0.0001);
           
           var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
           var skinnedNrm = vec3f(0.0, 0.0, 0.0);
@@ -271,6 +266,15 @@ export class Engine {
         }
 
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
+          // Early alpha test - discard before expensive calculations
+          var finalAlpha = material.alpha * material.alphaMultiplier;
+          if (material.isOverEyes > 0.5) {
+            finalAlpha *= 0.5; // Hair over eyes gets 50% alpha
+          }
+          if (finalAlpha < 0.001) {
+            discard;
+          }
+          
           let n = normalize(input.normal);
           let albedo = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
 
@@ -288,21 +292,12 @@ export class Engine {
           // Rim light calculation
           let viewDir = normalize(camera.viewPos - input.worldPos);
           var rimFactor = 1.0 - max(dot(n, viewDir), 0.0);
-          rimFactor = pow(rimFactor, material.rimPower);
+          rimFactor = rimFactor * rimFactor; // Optimized: direct multiply instead of pow(x, 2.0)
           let rimLight = material.rimColor * material.rimIntensity * rimFactor;
           
           let color = albedo * lightAccum + rimLight;
           
-          var finalAlpha = material.alpha * material.alphaMultiplier;
-          if (material.isOverEyes > 0.5) {
-            finalAlpha *= 0.5; // Hair over eyes gets 50% alpha
-          }
-          
-          if (finalAlpha < 0.001) {
-            discard;
-          }
-          
-          return vec4f(clamp(color, vec3f(0.0), vec3f(1.0)), finalAlpha);
+          return vec4f(color, finalAlpha);
         }
       `,
     })
@@ -432,14 +427,10 @@ export class Engine {
           var output: VertexOutput;
           let pos4 = vec4f(position, 1.0);
           
-          // Normalize weights to ensure they sum to 1.0 (handles floating-point precision issues)
+          // Branchless weight normalization (avoids GPU branch divergence)
           let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
-          var normalizedWeights: vec4f;
-          if (weightSum > 0.0001) {
-            normalizedWeights = weights0 / weightSum;
-          } else {
-            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
-          }
+          let invWeightSum = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
+          let normalizedWeights = select(vec4f(1.0, 0.0, 0.0, 0.0), weights0 * invWeightSum, weightSum > 0.0001);
           
           var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
           var skinnedNrm = vec3f(0.0, 0.0, 0.0);
@@ -693,14 +684,10 @@ export class Engine {
         ) -> @builtin(position) vec4f {
           let pos4 = vec4f(position, 1.0);
           
-          // Normalize weights
+          // Branchless weight normalization (avoids GPU branch divergence)
           let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
-          var normalizedWeights: vec4f;
-          if (weightSum > 0.0001) {
-            normalizedWeights = weights0 / weightSum;
-          } else {
-            normalizedWeights = vec4f(1.0, 0.0, 0.0, 0.0);
-          }
+          let invWeightSum = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
+          let normalizedWeights = select(vec4f(1.0, 0.0, 0.0, 0.0), weights0 * invWeightSum, weightSum > 0.0001);
           
           var skinnedPos = vec4f(0.0, 0.0, 0.0, 0.0);
           for (var i = 0u; i < 4u; i++) {
@@ -1054,19 +1041,21 @@ export class Engine {
         @group(0) @binding(1) var inputSampler: sampler;
         @group(0) @binding(2) var<uniform> blurUniforms: BlurUniforms;
 
-        // 5-tap gaussian blur
+        // 3-tap gaussian blur using bilinear filtering trick (40% fewer texture fetches!)
         @fragment fn fs(input: VertexOutput) -> @location(0) vec4f {
           let texelSize = 1.0 / vec2f(textureDimensions(inputTexture));
-          var result = vec4f(0.0);
           
-          // Optimized 5-tap Gaussian filter (faster, nearly same quality)
-          let weights = array<f32, 5>(0.06136, 0.24477, 0.38774, 0.24477, 0.06136);
-          let offsets = array<f32, 5>(-2.0, -1.0, 0.0, 1.0, 2.0);
+          // Bilinear optimization: leverage hardware filtering to sample between pixels
+          // Original 5-tap: weights [0.06136, 0.24477, 0.38774, 0.24477, 0.06136] at offsets [-2, -1, 0, 1, 2]
+          // Optimized 3-tap: combine adjacent samples using weighted offsets
+          let weight0 = 0.38774; // Center sample
+          let weight1 = 0.24477 + 0.06136; // Combined outer samples = 0.30613
+          let offset1 = (0.24477 * 1.0 + 0.06136 * 2.0) / weight1; // Weighted position = 1.2
           
-          for (var i = 0u; i < 5u; i++) {
-            let offset = offsets[i] * texelSize * blurUniforms.direction;
-            result += textureSample(inputTexture, inputSampler, input.uv + offset) * weights[i];
-          }
+          var result = textureSample(inputTexture, inputSampler, input.uv) * weight0;
+          let offsetVec = offset1 * texelSize * blurUniforms.direction;
+          result += textureSample(inputTexture, inputSampler, input.uv + offsetVec) * weight1;
+          result += textureSample(inputTexture, inputSampler, input.uv - offsetVec) * weight1;
           
           return result;
         }
@@ -1787,11 +1776,11 @@ export class Engine {
       materialUniformData[0] = materialAlpha
       materialUniformData[1] = 1.0 // alphaMultiplier: 1.0 for non-hair materials
       materialUniformData[2] = this.rimLightIntensity
-      materialUniformData[3] = this.rimLightPower
+      materialUniformData[3] = 0.0 // _padding1
       materialUniformData[4] = 1.0 // rimColor.r
       materialUniformData[5] = 1.0 // rimColor.g
       materialUniformData[6] = 1.0 // rimColor.b
-      materialUniformData[7] = 0.0
+      materialUniformData[7] = 0.0 // isOverEyes
 
       const materialUniformBuffer = this.device.createBuffer({
         label: `material uniform: ${mat.name}`,
@@ -1830,11 +1819,11 @@ export class Engine {
           uniformData[0] = materialAlpha
           uniformData[1] = 1.0 // alphaMultiplier (shader adjusts based on isOverEyes)
           uniformData[2] = this.rimLightIntensity
-          uniformData[3] = this.rimLightPower
+          uniformData[3] = 0.0 // _padding1
           uniformData[4] = 1.0 // rimColor.rgb
           uniformData[5] = 1.0
           uniformData[6] = 1.0
-          uniformData[7] = isOverEyes ? 1.0 : 0.0
+          uniformData[7] = isOverEyes ? 1.0 : 0.0 // isOverEyes
 
           const buffer = this.device.createBuffer({
             label: `material uniform (${isOverEyes ? "over eyes" : "over non-eyes"}): ${mat.name}`,
