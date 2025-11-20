@@ -17,7 +17,13 @@ export interface EngineStats {
   gpuMemory: number // MB (estimated total GPU memory)
 }
 
-// Internal type for organizing bone keyframes during animation playback
+interface DrawCall {
+  count: number
+  firstIndex: number
+  bindGroup: GPUBindGroup
+  isTransparent: boolean
+}
+
 type BoneKeyFrame = {
   boneName: string
   time: number
@@ -39,13 +45,15 @@ export class Engine {
   private indexBuffer?: GPUBuffer
   private resizeObserver: ResizeObserver | null = null
   private depthTexture!: GPUTexture
+  // Material rendering pipelines
   private modelPipeline!: GPURenderPipeline
-  private outlinePipeline!: GPURenderPipeline
-  private hairOutlinePipeline!: GPURenderPipeline
+  private eyePipeline!: GPURenderPipeline
   private hairPipelineOverEyes!: GPURenderPipeline
   private hairPipelineOverNonEyes!: GPURenderPipeline
   private hairDepthPipeline!: GPURenderPipeline
-  private eyePipeline!: GPURenderPipeline
+  // Outline pipelines
+  private outlinePipeline!: GPURenderPipeline
+  private hairOutlinePipeline!: GPURenderPipeline
   private mainBindGroupLayout!: GPUBindGroupLayout
   private outlineBindGroupLayout!: GPUBindGroupLayout
   private jointsBuffer!: GPUBuffer
@@ -71,7 +79,7 @@ export class Engine {
   private bloomExtractTexture!: GPUTexture
   private bloomBlurTexture1!: GPUTexture
   private bloomBlurTexture2!: GPUTexture
-  // Bloom post-processing pipelines
+  // Post-processing pipelines
   private bloomExtractPipeline!: GPURenderPipeline
   private bloomBlurPipeline!: GPURenderPipeline
   private bloomComposePipeline!: GPURenderPipeline
@@ -96,8 +104,18 @@ export class Engine {
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
-  private textureSampler!: GPUSampler
+  private materialSampler!: GPUSampler
   private textureCache = new Map<string, GPUTexture>()
+  // Draw lists
+  private opaqueDraws: DrawCall[] = []
+  private eyeDraws: DrawCall[] = []
+  private hairDrawsOverEyes: DrawCall[] = []
+  private hairDrawsOverNonEyes: DrawCall[] = []
+  private transparentDraws: DrawCall[] = []
+  private opaqueOutlineDraws: DrawCall[] = []
+  private eyeOutlineDraws: DrawCall[] = []
+  private hairOutlineDraws: DrawCall[] = []
+  private transparentOutlineDraws: DrawCall[] = []
 
   private lastFpsUpdate = performance.now()
   private framesSinceLastUpdate = 0
@@ -157,9 +175,8 @@ export class Engine {
     this.setupResize()
   }
 
-  // Step 2: Create shaders and render pipelines
   private createPipelines() {
-    this.textureSampler = this.device.createSampler({
+    this.materialSampler = this.device.createSampler({
       magFilter: "linear",
       minFilter: "linear",
       addressModeU: "repeat",
@@ -1685,44 +1702,6 @@ export class Engine {
     await this.setupMaterials(model)
   }
 
-  private opaqueNonEyeNonHairDraws: {
-    count: number
-    firstIndex: number
-    bindGroup: GPUBindGroup
-    isTransparent: boolean
-  }[] = []
-  private eyeDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
-  private hairDrawsOverEyes: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] =
-    []
-  private hairDrawsOverNonEyes: {
-    count: number
-    firstIndex: number
-    bindGroup: GPUBindGroup
-    isTransparent: boolean
-  }[] = []
-  private transparentNonEyeNonHairDraws: {
-    count: number
-    firstIndex: number
-    bindGroup: GPUBindGroup
-    isTransparent: boolean
-  }[] = []
-  private opaqueNonEyeNonHairOutlineDraws: {
-    count: number
-    firstIndex: number
-    bindGroup: GPUBindGroup
-    isTransparent: boolean
-  }[] = []
-  private eyeOutlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] = []
-  private hairOutlineDraws: { count: number; firstIndex: number; bindGroup: GPUBindGroup; isTransparent: boolean }[] =
-    []
-  private transparentNonEyeNonHairOutlineDraws: {
-    count: number
-    firstIndex: number
-    bindGroup: GPUBindGroup
-    isTransparent: boolean
-  }[] = []
-
-  // Step 8: Load textures and create material bind groups
   private async setupMaterials(model: Model) {
     const materials = model.getMaterials()
     if (materials.length === 0) {
@@ -1779,15 +1758,15 @@ export class Engine {
       return defaultToonTexture
     }
 
-    this.opaqueNonEyeNonHairDraws = []
+    this.opaqueDraws = []
     this.eyeDraws = []
     this.hairDrawsOverEyes = []
     this.hairDrawsOverNonEyes = []
-    this.transparentNonEyeNonHairDraws = []
-    this.opaqueNonEyeNonHairOutlineDraws = []
+    this.transparentDraws = []
+    this.opaqueOutlineDraws = []
     this.eyeOutlineDraws = []
     this.hairOutlineDraws = []
-    this.transparentNonEyeNonHairOutlineDraws = []
+    this.transparentOutlineDraws = []
     let currentIndexOffset = 0
 
     for (const mat of materials) {
@@ -1829,15 +1808,14 @@ export class Engine {
           { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
           { binding: 2, resource: diffuseTexture.createView() },
-          { binding: 3, resource: this.textureSampler },
+          { binding: 3, resource: this.materialSampler },
           { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
           { binding: 5, resource: toonTexture.createView() },
-          { binding: 6, resource: this.textureSampler },
+          { binding: 6, resource: this.materialSampler },
           { binding: 7, resource: { buffer: materialUniformBuffer } },
         ],
       })
 
-      // Classify materials into appropriate draw lists
       if (mat.isEye) {
         this.eyeDraws.push({
           count: indexCount,
@@ -1872,10 +1850,10 @@ export class Engine {
               { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
               { binding: 1, resource: { buffer: this.lightUniformBuffer } },
               { binding: 2, resource: diffuseTexture.createView() },
-              { binding: 3, resource: this.textureSampler },
+              { binding: 3, resource: this.materialSampler },
               { binding: 4, resource: { buffer: this.skinMatrixBuffer! } },
               { binding: 5, resource: toonTexture.createView() },
-              { binding: 6, resource: this.textureSampler },
+              { binding: 6, resource: this.materialSampler },
               { binding: 7, resource: { buffer: buffer } },
             ],
           })
@@ -1898,14 +1876,14 @@ export class Engine {
           isTransparent,
         })
       } else if (isTransparent) {
-        this.transparentNonEyeNonHairDraws.push({
+        this.transparentDraws.push({
           count: indexCount,
           firstIndex: currentIndexOffset,
           bindGroup,
           isTransparent,
         })
       } else {
-        this.opaqueNonEyeNonHairDraws.push({
+        this.opaqueDraws.push({
           count: indexCount,
           firstIndex: currentIndexOffset,
           bindGroup,
@@ -1957,14 +1935,14 @@ export class Engine {
             isTransparent,
           })
         } else if (isTransparent) {
-          this.transparentNonEyeNonHairOutlineDraws.push({
+          this.transparentOutlineDraws.push({
             count: indexCount,
             firstIndex: currentIndexOffset,
             bindGroup: outlineBindGroup,
             isTransparent,
           })
         } else {
-          this.opaqueNonEyeNonHairOutlineDraws.push({
+          this.opaqueOutlineDraws.push({
             count: indexCount,
             firstIndex: currentIndexOffset,
             bindGroup: outlineBindGroup,
@@ -2037,9 +2015,9 @@ export class Engine {
 
       this.drawCallCount = 0
 
-      // Pass 1: Opaque non-eye, non-hair
+      // Pass 1: Opaque
       pass.setPipeline(this.modelPipeline)
-      for (const draw of this.opaqueNonEyeNonHairDraws) {
+      for (const draw of this.opaqueDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
@@ -2114,9 +2092,9 @@ export class Engine {
         }
       }
 
-      // Pass 4: Transparent non-eye, non-hair
+      // Pass 4: Transparent
       pass.setPipeline(this.modelPipeline)
-      for (const draw of this.transparentNonEyeNonHairDraws) {
+      for (const draw of this.transparentDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
@@ -2291,14 +2269,14 @@ export class Engine {
   private drawOutlines(pass: GPURenderPassEncoder, transparent: boolean) {
     pass.setPipeline(this.outlinePipeline)
     if (transparent) {
-      for (const draw of this.transparentNonEyeNonHairOutlineDraws) {
+      for (const draw of this.transparentOutlineDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
         }
       }
     } else {
-      for (const draw of this.opaqueNonEyeNonHairOutlineDraws) {
+      for (const draw of this.opaqueOutlineDraws) {
         if (draw.count > 0) {
           pass.setBindGroup(0, draw.bindGroup)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
@@ -2376,18 +2354,18 @@ export class Engine {
       bufferMemoryBytes += 24 * 4
     }
     const totalMaterialDraws =
-      this.opaqueNonEyeNonHairDraws.length +
+      this.opaqueDraws.length +
       this.eyeDraws.length +
       this.hairDrawsOverEyes.length +
       this.hairDrawsOverNonEyes.length +
-      this.transparentNonEyeNonHairDraws.length
+      this.transparentDraws.length
     bufferMemoryBytes += totalMaterialDraws * 32
 
     const totalOutlineDraws =
-      this.opaqueNonEyeNonHairOutlineDraws.length +
+      this.opaqueOutlineDraws.length +
       this.eyeOutlineDraws.length +
       this.hairOutlineDraws.length +
-      this.transparentNonEyeNonHairOutlineDraws.length
+      this.transparentOutlineDraws.length
     bufferMemoryBytes += totalOutlineDraws * 32
 
     let renderTargetMemoryBytes = 0
