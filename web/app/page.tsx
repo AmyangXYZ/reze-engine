@@ -27,10 +27,14 @@ export default function Home() {
     if (canvasRef.current) {
       // Initialize engine
       try {
-        const engine = new Engine(canvasRef.current)
+        const engine = new Engine(canvasRef.current, {
+          ambient: 1.0,
+          bloomIntensity: 0.08,
+          rimLightIntensity: 0.3,
+        })
         engineRef.current = engine
         await engine.init()
-        await engine.loadModel("/models/塞尔凯特/塞尔凯特.pmx")
+        await engine.loadModel("/models/塞尔凯特2/塞尔凯特2.pmx")
         await engine.loadAnimation("/animations/animation.vmd")
 
         setLoading(false)
