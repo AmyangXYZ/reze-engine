@@ -29,7 +29,7 @@ export default function Home() {
       try {
         const engine = new Engine(canvasRef.current, {
           ambient: 1.0,
-          bloomIntensity: 0.08,
+          bloomIntensity: 0.12,
           rimLightIntensity: 0.3,
         })
         engineRef.current = engine
