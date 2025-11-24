@@ -19,10 +19,9 @@ A lightweight engine built with WebGPU and TypeScript for real-time 3D anime cha
 ## Usage
 
 ```javascript
-export default function MainScene() {
+export default function Scene() {
   const canvasRef = useRef < HTMLCanvasElement > null
   const engineRef = useRef < Engine > null
-  const [engineError, setEngineError] = (useState < string) | (null > null)
 
   const initEngine = useCallback(async () => {
     if (canvasRef.current) {
@@ -37,9 +36,8 @@ export default function MainScene() {
         await engine.loadModel("/models/塞尔凯特/塞尔凯特.pmx")
 
         engine.runRenderLoop(() => {})
-        setTimeout(() => setModelLoaded(true), 200)
       } catch (error) {
-        setEngineError(error instanceof Error ? error.message : "Unknown error")
+        console.error(error)
       }
     }
   }, [])
@@ -56,18 +54,7 @@ export default function MainScene() {
     }
   }, [initEngine])
 
-  return (
-    <div className="w-full h-full flex flex-col md:flex-row">
-      <div className="w-full h-full relative">
-        {engineError && (
-          <div className="text-red-500 z-10 absolute top-0 left-0 w-full h-full flex items-center justify-center text-lg font-medium">
-            {engineError}
-          </div>
-        )}
-        <canvas ref={canvasRef} className="w-full h-full z-1" />
-      </div>
-    </div>
-  )
+  return <canvas ref={canvasRef} className="w-full h-full" />
 }
 ```
 
