@@ -644,8 +644,11 @@ export class Engine {
       primitive: { cullMode: "none" },
       depthStencil: {
         format: "depth24plus-stencil8",
-        depthWriteEnabled: false, // Don't write depth
-        depthCompare: "less", // Respect existing depth
+        depthWriteEnabled: true, // Write depth to occlude back of head
+        depthCompare: "less", // Respect existing depth (face)
+        depthBias: -0.0001, // Small negative bias to bring eyes slightly forward
+        depthBiasSlopeScale: 0.0,
+        depthBiasClamp: 0.0,
         stencilFront: {
           compare: "always",
           failOp: "keep",
@@ -2117,10 +2120,6 @@ export class Engine {
     this.device.queue.writeBuffer(this.bloomIntensityBuffer, 0, intensityData)
 
     const encoder = this.device.createCommandEncoder()
-    const width = this.canvas.width
-    const height = this.canvas.height
-    const bloomWidth = Math.floor(width / this.BLOOM_DOWNSCALE_FACTOR)
-    const bloomHeight = Math.floor(height / this.BLOOM_DOWNSCALE_FACTOR)
 
     // Extract bright areas
     const extractPass = encoder.beginRenderPass({
