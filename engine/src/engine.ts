@@ -370,7 +370,7 @@ export class Engine {
       depthStencil: {
         format: "depth24plus-stencil8",
         depthWriteEnabled: true,
-        depthCompare: "less",
+        depthCompare: "less-equal",
       },
       multisample: {
         count: this.sampleCount,
@@ -521,7 +521,7 @@ export class Engine {
       depthStencil: {
         format: "depth24plus-stencil8",
         depthWriteEnabled: true,
-        depthCompare: "less",
+        depthCompare: "less-equal",
       },
       multisample: {
         count: this.sampleCount,
@@ -641,12 +641,12 @@ export class Engine {
           },
         ],
       },
-      primitive: { cullMode: "none" },
+      primitive: { cullMode: "front" },
       depthStencil: {
         format: "depth24plus-stencil8",
         depthWriteEnabled: true, // Write depth to occlude back of head
-        depthCompare: "less", // Respect existing depth (face)
-        depthBias: -0.0001, // Small negative bias to bring eyes slightly forward
+        depthCompare: "less-equal", // More lenient to reduce precision conflicts
+        depthBias: -0.00005, // Reduced bias to minimize conflicts while still occluding back face
         depthBiasSlopeScale: 0.0,
         depthBiasClamp: 0.0,
         stencilFront: {
@@ -744,11 +744,14 @@ export class Engine {
           },
         ],
       },
-      primitive: { cullMode: "none" },
+      primitive: { cullMode: "front" },
       depthStencil: {
         format: "depth24plus-stencil8",
         depthWriteEnabled: true,
-        depthCompare: "less",
+        depthCompare: "less-equal", // Match the color pass compare mode for consistency
+        depthBias: 0.0,
+        depthBiasSlopeScale: 0.0,
+        depthBiasClamp: 0.0,
       },
       multisample: { count: this.sampleCount },
     })
@@ -798,11 +801,11 @@ export class Engine {
           },
         ],
       },
-      primitive: { cullMode: "none" },
+      primitive: { cullMode: "front" },
       depthStencil: {
         format: "depth24plus-stencil8",
         depthWriteEnabled: false, // Don't write depth (already written in pre-pass)
-        depthCompare: "equal", // Only render where depth matches pre-pass
+        depthCompare: "less-equal", // More lenient than "equal" to avoid precision issues with MSAA
         stencilFront: {
           compare: "equal", // Only render where stencil == 1 (over eyes)
           failOp: "keep",
@@ -864,11 +867,11 @@ export class Engine {
           },
         ],
       },
-      primitive: { cullMode: "none" },
+      primitive: { cullMode: "front" },
       depthStencil: {
         format: "depth24plus-stencil8",
         depthWriteEnabled: false, // Don't write depth (already written in pre-pass)
-        depthCompare: "equal", // Only render where depth matches pre-pass
+        depthCompare: "less-equal", // More lenient than "equal" to avoid precision issues with MSAA
         stencilFront: {
           compare: "not-equal", // Only render where stencil != 1 (over non-eyes)
           failOp: "keep",
