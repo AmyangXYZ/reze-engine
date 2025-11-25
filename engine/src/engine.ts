@@ -9,6 +9,8 @@ export type EngineOptions = {
   ambient?: number
   bloomIntensity?: number
   rimLightIntensity?: number
+  cameraDistance?: number
+  cameraTarget?: Vec3
 }
 
 export interface EngineStats {
@@ -38,6 +40,8 @@ export class Engine {
   private camera!: Camera
   private cameraUniformBuffer!: GPUBuffer
   private cameraMatrixData = new Float32Array(36)
+  private cameraDistance: number = 26.6
+  private cameraTarget: Vec3 = new Vec3(0, 12.5, 0)
   private lightUniformBuffer!: GPUBuffer
   private lightData = new Float32Array(64)
   private lightCount = 0
@@ -140,6 +144,8 @@ export class Engine {
       this.ambient = options.ambient ?? 1.0
       this.bloomIntensity = options.bloomIntensity ?? 0.12
       this.rimLightIntensity = options.rimLightIntensity ?? 0.45
+      this.cameraDistance = options.cameraDistance ?? 26.6
+      this.cameraTarget = options.cameraTarget ?? new Vec3(0, 12.5, 0)
     }
   }
 
@@ -1360,7 +1366,7 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
-    this.camera = new Camera(Math.PI, Math.PI / 2.5, 26.6, new Vec3(0, 12.5, 0))
+    this.camera = new Camera(Math.PI, Math.PI / 2.5, this.cameraDistance, this.cameraTarget)
 
     this.camera.aspect = this.canvas.width / this.canvas.height
     this.camera.attachControl(this.canvas)

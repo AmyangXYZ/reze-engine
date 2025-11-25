@@ -1,7 +1,7 @@
 "use client"
 
 import Header from "@/components/header"
-import { Engine, EngineStats, Quat } from "reze-engine"
+import { Engine, EngineStats, Quat, Vec3 } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
 
@@ -31,11 +31,13 @@ export default function Home() {
           ambient: 1.0,
           bloomIntensity: 0.12,
           rimLightIntensity: 0.3,
+          cameraDistance: 12.8,
+          cameraTarget: new Vec3(0, 16.6, 0),
         })
         engineRef.current = engine
         await engine.init()
         await engine.loadModel("/models/塞尔凯特2/塞尔凯特2.pmx")
-        await engine.loadAnimation("/animations/animation.vmd")
+        await engine.loadAnimation("/animations/pool.vmd")
 
         setLoading(false)
 
@@ -57,7 +59,6 @@ export default function Home() {
 
         // Wait a frame to ensure render loop has started and model is fully initialized
         // This prevents physics explosion when animation starts
-        await new Promise((resolve) => requestAnimationFrame(resolve))
         engine.playAnimation()
       } catch (error) {
         setEngineError(error instanceof Error ? error.message : "Unknown error")
