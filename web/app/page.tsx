@@ -5,13 +5,18 @@ import { Engine, EngineStats, Quat, Vec3 } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
 import Image from "next/image"
+import { Button } from "@/components/ui/button"
+import { Music, VolumeX } from "lucide-react"
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
+  const [isMuted, setIsMuted] = useState(false)
+  const audioStartedRef = useRef(false)
 
   // Model rotation state
   const isDraggingModel = useRef(false)
@@ -62,6 +67,20 @@ export default function Home() {
         // This prevents physics explosion when animation starts
         await new Promise(resolve => requestAnimationFrame(resolve))
         engine.playAnimation()
+
+        // Attempt to autoplay audio after model is rendered and animation starts
+        // This will fail silently if browser blocks autoplay, and will start on first user interaction
+        setTimeout(() => {
+          if (audioRef.current && !audioStartedRef.current) {
+            audioStartedRef.current = true
+            audioRef.current.currentTime = 22
+            audioRef.current.volume = 1.0
+            audioRef.current.play().catch(() => {
+              // Autoplay blocked - will start on user interaction
+              audioStartedRef.current = false
+            })
+          }
+        }, 100)
       } catch (error) {
         setEngineError(error instanceof Error ? error.message : "Unknown error")
       }
@@ -78,8 +97,56 @@ export default function Home() {
       if (engineRef.current) {
         engineRef.current.dispose()
       }
+      if (audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current = null
+      }
     }
   }, [initEngine])
+
+  // Start audio playback from 22 seconds (called on first user interaction)
+  const startAudio = useCallback(() => {
+    if (audioRef.current && !audioStartedRef.current) {
+      audioStartedRef.current = true
+      audioRef.current.currentTime = 22
+      audioRef.current.volume = 1.0
+      audioRef.current.play().catch(() => {
+        // Silently handle autoplay restrictions
+        audioStartedRef.current = false
+      })
+    }
+  }, [])
+
+  // Handle mute/unmute toggle
+  const toggleMute = useCallback(() => {
+    // Start audio on first interaction if not started yet
+    startAudio()
+
+    if (audioRef.current) {
+      audioRef.current.muted = !isMuted
+      setIsMuted(!isMuted)
+    }
+  }, [isMuted, startAudio])
+
+  // Start audio on first user interaction (click or touch)
+  useEffect(() => {
+    if (loading) return
+
+    const handleFirstInteraction = () => {
+      startAudio()
+      // Remove listeners after first interaction
+      document.removeEventListener("click", handleFirstInteraction)
+      document.removeEventListener("touchstart", handleFirstInteraction)
+    }
+
+    document.addEventListener("click", handleFirstInteraction, { once: true })
+    document.addEventListener("touchstart", handleFirstInteraction, { once: true })
+
+    return () => {
+      document.removeEventListener("click", handleFirstInteraction)
+      document.removeEventListener("touchstart", handleFirstInteraction)
+    }
+  }, [loading, startAudio])
 
   // Mouse event handlers for model rotation
   // Use capture phase to intercept events before camera handlers
@@ -243,6 +310,26 @@ export default function Home() {
         <Image src="/pool.jpeg" alt="Reze Engine" width={1000} height={1000} className="w-full h-full md:h-auto touch-none z-0 object-cover" />
       </div>
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
+
+      {/* Audio element */}
+      <audio
+        ref={audioRef}
+        src="/in the pool.mp3"
+        loop
+        preload="auto"
+        className="hidden"
+      />
+
+      {/* Floating mute button */}
+      <Button
+        onClick={toggleMute}
+        variant="secondary"
+        size="icon"
+        className="fixed bottom-6 right-6 z-50 rounded-full shadow-lg hover:shadow-xl transition-all"
+        aria-label={isMuted ? "Unmute audio" : "Mute audio"}
+      >
+        {isMuted ? <VolumeX className="h-6 w-6" /> : <Music className="h-6 w-6" />}
+      </Button>
     </div>
   )
 }
