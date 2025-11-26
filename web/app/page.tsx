@@ -4,6 +4,7 @@ import Header from "@/components/header"
 import { Engine, EngineStats, Quat, Vec3 } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
+import Image from "next/image"
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -30,9 +31,9 @@ export default function Home() {
         const engine = new Engine(canvasRef.current, {
           ambient: 1.0,
           bloomIntensity: 0.12,
-          rimLightIntensity: 0.3,
-          cameraDistance: 12.8,
-          cameraTarget: new Vec3(0, 16.6, 0),
+          rimLightIntensity: 0.4,
+          cameraDistance: 13.5,
+          cameraTarget: new Vec3(0, 17.2, 0),
         })
         engineRef.current = engine
         await engine.init()
@@ -59,6 +60,7 @@ export default function Home() {
 
         // Wait a frame to ensure render loop has started and model is fully initialized
         // This prevents physics explosion when animation starts
+        await new Promise(resolve => requestAnimationFrame(resolve))
         engine.playAnimation()
       } catch (error) {
         setEngineError(error instanceof Error ? error.message : "Unknown error")
@@ -237,6 +239,9 @@ export default function Home() {
         </div>
       )}
       {loading && !engineError && <Loading loading={loading} />}
+      <div className="absolute inset-0 w-full h-full flex justify-center items-center">
+        <Image src="/pool.jpeg" alt="Reze Engine" width={1000} height={1000} className="w-full h-full md:h-auto touch-none z-0 object-cover" />
+      </div>
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
     </div>
   )

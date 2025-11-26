@@ -137,6 +137,8 @@ export class Engine {
   private animationFrames: VMDKeyFrame[] = []
   private animationTimeouts: number[] = []
   private gpuMemoryMB: number = 0
+  private hasAnimation = false // Set to true when loadAnimation is called
+  private playingAnimation = false // Set to true when playAnimation is called
 
   constructor(canvas: HTMLCanvasElement, options?: EngineOptions) {
     this.canvas = canvas
@@ -1415,12 +1417,14 @@ export class Engine {
   public async loadAnimation(url: string) {
     const frames = await VMDLoader.load(url)
     this.animationFrames = frames
+    this.hasAnimation = true
   }
 
   public playAnimation() {
     if (this.animationFrames.length === 0) return
 
     this.stopAnimation()
+    this.playingAnimation = true
 
     const allBoneKeyFrames: BoneKeyFrame[] = []
     for (const keyFrame of this.animationFrames) {
@@ -1478,10 +1482,10 @@ export class Engine {
         this.rotateBones(bonesToReset, identityQuats, 0)
       }
 
-      this.currentModel.evaluatePose()
-
       // Reset physics immediately and upload matrices to prevent A-pose flash
       if (this.physics) {
+        this.currentModel.evaluatePose()
+
         const worldMats = this.currentModel.getBoneWorldMatrices()
         this.physics.reset(worldMats, this.currentModel.getBoneInverseBindMatrices())
 
@@ -1532,6 +1536,7 @@ export class Engine {
       clearTimeout(timeoutId)
     }
     this.animationTimeouts = []
+    this.playingAnimation = false
   }
 
   public getStats(): EngineStats {
@@ -2006,6 +2011,14 @@ export class Engine {
       const encoder = this.device.createCommandEncoder()
 
       this.updateModelPose(deltaTime, encoder)
+
+      // Hide model if animation is loaded but not playing yet (prevents A-pose flash)
+      // Still update physics and poses, just don't render visually
+      if (this.hasAnimation && !this.playingAnimation) {
+        // Submit encoder to ensure matrices are uploaded and physics initializes
+        this.device.queue.submit([encoder.finish()])
+        return
+      }
 
       const pass = encoder.beginRenderPass(this.renderPassDescriptor)
 
