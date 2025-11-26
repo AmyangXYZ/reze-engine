@@ -35,7 +35,7 @@ export default function Home() {
       try {
         const engine = new Engine(canvasRef.current, {
           ambient: 1.0,
-          bloomIntensity: 0.12,
+          bloomIntensity: 0.13,
           rimLightIntensity: 0.4,
           cameraDistance: 13.5,
           cameraTarget: new Vec3(0, 17.2, 0),
@@ -65,7 +65,7 @@ export default function Home() {
 
         // Wait a frame to ensure render loop has started and model is fully initialized
         // This prevents physics explosion when animation starts
-        await new Promise(resolve => requestAnimationFrame(resolve))
+        await new Promise((resolve) => requestAnimationFrame(resolve))
         engine.playAnimation()
 
         // Attempt to autoplay audio after model is rendered and animation starts
@@ -307,18 +307,18 @@ export default function Home() {
       )}
       {loading && !engineError && <Loading loading={loading} />}
       <div className="absolute inset-0 w-full h-full flex justify-center items-center">
-        <Image src="/pool.jpeg" alt="Reze Engine" width={1000} height={1000} className="w-full h-full md:h-auto touch-none z-0 object-cover" />
+        <Image
+          src="/pool.jpeg"
+          alt="Reze Engine"
+          width={1000}
+          height={1000}
+          className="w-full h-full md:h-auto touch-none z-0 object-cover"
+        />
       </div>
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
 
       {/* Audio element */}
-      <audio
-        ref={audioRef}
-        src="/in the pool.mp3"
-        loop
-        preload="auto"
-        className="hidden"
-      />
+      <audio ref={audioRef} src="/in the pool.mp3" loop preload="auto" className="hidden" />
 
       {/* Floating mute button */}
       <Button
