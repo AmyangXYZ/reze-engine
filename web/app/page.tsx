@@ -38,7 +38,7 @@ export default function Home() {
           bloomIntensity: 0.13,
           rimLightIntensity: 0.4,
           cameraDistance: 13.5,
-          cameraTarget: new Vec3(0, 17.2, 0),
+          cameraTarget: new Vec3(0, 17.1, 0),
         })
         engineRef.current = engine
         await engine.init()
