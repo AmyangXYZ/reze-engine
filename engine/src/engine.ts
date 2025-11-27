@@ -1,7 +1,6 @@
 import { Camera } from "./camera"
 import { Quat, Vec3 } from "./math"
 import { Model } from "./model"
-import { Pool, PoolOptions } from "./pool"
 import { PmxLoader } from "./pmx-loader"
 import { Physics } from "./physics"
 import { VMDKeyFrame, VMDLoader } from "./vmd-loader"
@@ -108,7 +107,6 @@ export class Engine {
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
-  private pool: Pool | null = null
   private materialSampler!: GPUSampler
   private textureCache = new Map<string, GPUTexture>()
   // Draw lists
@@ -1376,38 +1374,6 @@ export class Engine {
     this.camera.attachControl(this.canvas)
   }
 
-  // Create camera bind group layout for pool (camera-only)
-  private createCameraBindGroupLayout(): GPUBindGroupLayout {
-    return this.device.createBindGroupLayout({
-      label: "camera bind group layout",
-      entries: [
-        {
-          binding: 0,
-          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-          buffer: {
-            type: "uniform",
-          },
-        },
-      ],
-    })
-  }
-
-  // Create camera bind group for pool
-  private createCameraBindGroup(layout: GPUBindGroupLayout): GPUBindGroup {
-    return this.device.createBindGroup({
-      label: "camera bind group for pool",
-      layout: layout,
-      entries: [
-        {
-          binding: 0,
-          resource: {
-            buffer: this.cameraUniformBuffer,
-          },
-        },
-      ],
-    })
-  }
-
   // Step 5: Create lighting buffers
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
@@ -1629,15 +1595,6 @@ export class Engine {
     // })
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.setupModelBuffers(model)
-  }
-
-  public async addPool(options?: PoolOptions) {
-    if (!this.device) {
-      throw new Error("Engine must be initialized before adding pool")
-    }
-    const cameraLayout = this.createCameraBindGroupLayout()
-    this.pool = new Pool(this.device, cameraLayout, this.cameraUniformBuffer, options)
-    await this.pool.init()
   }
 
   public rotateBones(bones: string[], rotations: Quat[], durationMs?: number) {
@@ -2067,12 +2024,6 @@ export class Engine {
 
       this.drawCallCount = 0
 
-      // Render pool first if no model
-      if (this.pool && !this.currentModel) {
-        this.pool.render(pass)
-        this.drawCallCount++
-      }
-
       if (this.currentModel) {
         pass.setVertexBuffer(0, this.vertexBuffer)
         pass.setVertexBuffer(1, this.jointsBuffer)
@@ -2087,17 +2038,6 @@ export class Engine {
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
             this.drawCallCount++
           }
-        }
-
-        // Pass 1.5: Pool (water plane) - render after opaque, before eyes
-        if (this.pool) {
-          this.pool.render(pass, {
-            vertexBuffer: this.vertexBuffer,
-            jointsBuffer: this.jointsBuffer,
-            weightsBuffer: this.weightsBuffer,
-            indexBuffer: this.indexBuffer!,
-          })
-          this.drawCallCount++
         }
 
         // Pass 2: Eyes (writes stencil value for hair to test against)
