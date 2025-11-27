@@ -1,6 +1,7 @@
 import { Camera } from "./camera"
 import { Quat, Vec3 } from "./math"
 import { Model } from "./model"
+import { Pool, PoolOptions } from "./pool"
 import { PmxLoader } from "./pmx-loader"
 import { Physics } from "./physics"
 import { VMDKeyFrame, VMDLoader } from "./vmd-loader"
@@ -107,6 +108,7 @@ export class Engine {
   private currentModel: Model | null = null
   private modelDir: string = ""
   private physics: Physics | null = null
+  private pool: Pool | null = null
   private materialSampler!: GPUSampler
   private textureCache = new Map<string, GPUTexture>()
   // Draw lists
@@ -1374,6 +1376,38 @@ export class Engine {
     this.camera.attachControl(this.canvas)
   }
 
+  // Create camera bind group layout for pool (camera-only)
+  private createCameraBindGroupLayout(): GPUBindGroupLayout {
+    return this.device.createBindGroupLayout({
+      label: "camera bind group layout",
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: {
+            type: "uniform",
+          },
+        },
+      ],
+    })
+  }
+
+  // Create camera bind group for pool
+  private createCameraBindGroup(layout: GPUBindGroupLayout): GPUBindGroup {
+    return this.device.createBindGroup({
+      label: "camera bind group for pool",
+      layout: layout,
+      entries: [
+        {
+          binding: 0,
+          resource: {
+            buffer: this.cameraUniformBuffer,
+          },
+        },
+      ],
+    })
+  }
+
   // Step 5: Create lighting buffers
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
@@ -1595,6 +1629,15 @@ export class Engine {
     // })
     this.physics = new Physics(model.getRigidbodies(), model.getJoints())
     await this.setupModelBuffers(model)
+  }
+
+  public async addPool(options?: PoolOptions) {
+    if (!this.device) {
+      throw new Error("Engine must be initialized before adding pool")
+    }
+    const cameraLayout = this.createCameraBindGroupLayout()
+    this.pool = new Pool(this.device, cameraLayout, this.cameraUniformBuffer, options)
+    await this.pool.init()
   }
 
   public rotateBones(bones: string[], rotations: Quat[], durationMs?: number) {
@@ -1999,7 +2042,7 @@ export class Engine {
 
   // Render strategy: 1) Opaque non-eye/hair 2) Eyes (stencil=1) 3) Hair (depth pre-pass + split by stencil) 4) Transparent 5) Bloom
   public render() {
-    if (this.multisampleTexture && this.camera && this.device && this.currentModel) {
+    if (this.multisampleTexture && this.camera && this.device) {
       const currentTime = performance.now()
       const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
       this.lastFrameTime = currentTime
@@ -2022,101 +2065,120 @@ export class Engine {
 
       const pass = encoder.beginRenderPass(this.renderPassDescriptor)
 
-      pass.setVertexBuffer(0, this.vertexBuffer)
-      pass.setVertexBuffer(1, this.jointsBuffer)
-      pass.setVertexBuffer(2, this.weightsBuffer)
-      pass.setIndexBuffer(this.indexBuffer!, "uint32")
-
       this.drawCallCount = 0
 
-      // Pass 1: Opaque
-      pass.setPipeline(this.modelPipeline)
-      for (const draw of this.opaqueDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
+      // Render pool first if no model
+      if (this.pool && !this.currentModel) {
+        this.pool.render(pass)
+        this.drawCallCount++
       }
 
-      // Pass 2: Eyes (writes stencil value for hair to test against)
-      pass.setPipeline(this.eyePipeline)
-      pass.setStencilReference(this.STENCIL_EYE_VALUE)
-      for (const draw of this.eyeDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
-      }
+      if (this.currentModel) {
+        pass.setVertexBuffer(0, this.vertexBuffer)
+        pass.setVertexBuffer(1, this.jointsBuffer)
+        pass.setVertexBuffer(2, this.weightsBuffer)
+        pass.setIndexBuffer(this.indexBuffer!, "uint32")
 
-      // Pass 3: Hair rendering (depth pre-pass + shading + outlines)
-      this.drawOutlines(pass, false)
-
-      // 3a: Hair depth pre-pass (reduces overdraw via early depth rejection)
-      if (this.hairDrawsOverEyes.length > 0 || this.hairDrawsOverNonEyes.length > 0) {
-        pass.setPipeline(this.hairDepthPipeline)
-        for (const draw of this.hairDrawsOverEyes) {
-          if (draw.count > 0) {
-            pass.setBindGroup(0, draw.bindGroup)
-            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          }
-        }
-        for (const draw of this.hairDrawsOverNonEyes) {
-          if (draw.count > 0) {
-            pass.setBindGroup(0, draw.bindGroup)
-            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          }
-        }
-      }
-
-      // 3b: Hair shading (split by stencil for transparency over eyes)
-      if (this.hairDrawsOverEyes.length > 0) {
-        pass.setPipeline(this.hairPipelineOverEyes)
-        pass.setStencilReference(this.STENCIL_EYE_VALUE)
-        for (const draw of this.hairDrawsOverEyes) {
+        // Pass 1: Opaque
+        pass.setPipeline(this.modelPipeline)
+        for (const draw of this.opaqueDraws) {
           if (draw.count > 0) {
             pass.setBindGroup(0, draw.bindGroup)
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
             this.drawCallCount++
           }
         }
-      }
 
-      if (this.hairDrawsOverNonEyes.length > 0) {
-        pass.setPipeline(this.hairPipelineOverNonEyes)
+        // Pass 1.5: Pool (water plane) - render after opaque, before eyes
+        if (this.pool) {
+          this.pool.render(pass, {
+            vertexBuffer: this.vertexBuffer,
+            jointsBuffer: this.jointsBuffer,
+            weightsBuffer: this.weightsBuffer,
+            indexBuffer: this.indexBuffer!,
+          })
+          this.drawCallCount++
+        }
+
+        // Pass 2: Eyes (writes stencil value for hair to test against)
+        pass.setPipeline(this.eyePipeline)
         pass.setStencilReference(this.STENCIL_EYE_VALUE)
-        for (const draw of this.hairDrawsOverNonEyes) {
+        for (const draw of this.eyeDraws) {
           if (draw.count > 0) {
             pass.setBindGroup(0, draw.bindGroup)
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
             this.drawCallCount++
           }
         }
-      }
 
-      // 3c: Hair outlines
-      if (this.hairOutlineDraws.length > 0) {
-        pass.setPipeline(this.hairOutlinePipeline)
-        for (const draw of this.hairOutlineDraws) {
+        // Pass 3: Hair rendering (depth pre-pass + shading + outlines)
+        this.drawOutlines(pass, false)
+
+        // 3a: Hair depth pre-pass (reduces overdraw via early depth rejection)
+        if (this.hairDrawsOverEyes.length > 0 || this.hairDrawsOverNonEyes.length > 0) {
+          pass.setPipeline(this.hairDepthPipeline)
+          for (const draw of this.hairDrawsOverEyes) {
+            if (draw.count > 0) {
+              pass.setBindGroup(0, draw.bindGroup)
+              pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            }
+          }
+          for (const draw of this.hairDrawsOverNonEyes) {
+            if (draw.count > 0) {
+              pass.setBindGroup(0, draw.bindGroup)
+              pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            }
+          }
+        }
+
+        // 3b: Hair shading (split by stencil for transparency over eyes)
+        if (this.hairDrawsOverEyes.length > 0) {
+          pass.setPipeline(this.hairPipelineOverEyes)
+          pass.setStencilReference(this.STENCIL_EYE_VALUE)
+          for (const draw of this.hairDrawsOverEyes) {
+            if (draw.count > 0) {
+              pass.setBindGroup(0, draw.bindGroup)
+              pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+              this.drawCallCount++
+            }
+          }
+        }
+
+        if (this.hairDrawsOverNonEyes.length > 0) {
+          pass.setPipeline(this.hairPipelineOverNonEyes)
+          pass.setStencilReference(this.STENCIL_EYE_VALUE)
+          for (const draw of this.hairDrawsOverNonEyes) {
+            if (draw.count > 0) {
+              pass.setBindGroup(0, draw.bindGroup)
+              pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+              this.drawCallCount++
+            }
+          }
+        }
+
+        // 3c: Hair outlines
+        if (this.hairOutlineDraws.length > 0) {
+          pass.setPipeline(this.hairOutlinePipeline)
+          for (const draw of this.hairOutlineDraws) {
+            if (draw.count > 0) {
+              pass.setBindGroup(0, draw.bindGroup)
+              pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            }
+          }
+        }
+
+        // Pass 4: Transparent
+        pass.setPipeline(this.modelPipeline)
+        for (const draw of this.transparentDraws) {
           if (draw.count > 0) {
             pass.setBindGroup(0, draw.bindGroup)
             pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+            this.drawCallCount++
           }
         }
-      }
 
-      // Pass 4: Transparent
-      pass.setPipeline(this.modelPipeline)
-      for (const draw of this.transparentDraws) {
-        if (draw.count > 0) {
-          pass.setBindGroup(0, draw.bindGroup)
-          pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          this.drawCallCount++
-        }
+        this.drawOutlines(pass, true)
       }
-
-      this.drawOutlines(pass, true)
 
       pass.end()
       this.device.queue.submit([encoder.finish()])

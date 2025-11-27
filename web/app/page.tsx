@@ -4,7 +4,6 @@ import Header from "@/components/header"
 import { Engine, EngineStats, Quat, Vec3 } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
-import Image from "next/image"
 import { Button } from "@/components/ui/button"
 import { Music, VolumeX } from "lucide-react"
 
@@ -36,7 +35,7 @@ export default function Home() {
         const engine = new Engine(canvasRef.current, {
           ambient: 1.0,
           bloomIntensity: 0.13,
-          rimLightIntensity: 0.4,
+          rimLightIntensity: 0.35,
           cameraDistance: 13.5,
           cameraTarget: new Vec3(0, 17.1, 0),
         })
@@ -44,6 +43,11 @@ export default function Home() {
         await engine.init()
         await engine.loadModel("/models/塞尔凯特2/塞尔凯特2.pmx")
         await engine.loadAnimation("/animations/pool.vmd")
+        await engine.addPool({
+          y: 15.2,
+          size: 100,
+          segments: 500, // More segments = more wave detail
+        })
 
         setLoading(false)
 
@@ -306,7 +310,7 @@ export default function Home() {
         </div>
       )}
       {loading && !engineError && <Loading loading={loading} />}
-      <div className="absolute inset-0 w-full h-full flex justify-center items-center">
+      {/* <div className="absolute inset-0 w-full h-full flex justify-center items-center">
         <Image
           src="/pool.jpeg"
           alt="Reze Engine"
@@ -314,7 +318,7 @@ export default function Home() {
           height={1000}
           className="w-full h-full md:h-auto touch-none z-0 object-cover"
         />
-      </div>
+      </div> */}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none z-1" />
 
       {/* Audio element */}

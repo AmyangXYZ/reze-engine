@@ -9,11 +9,16 @@ export default function Header({ stats }: { stats: EngineStats | null }) {
     <header className="absolute top-0 left-0 right-0 px-4 md:px-6 py-3 md:py-4 flex items-center gap-2 z-50 w-full select-none flex flex-row justify-between">
       <div className="flex items-center gap-2">
         <Link href="/">
-          <h1 className="text-2xl md:text-4xl font-light tracking-[0.2em] md:tracking-[0.28em] ext-white uppercase letter-spacing-wider" style={{
-            textShadow: '0 0 20px rgba(255, 255, 255, 0.3), 0 2px 10px rgba(0, 0, 0, 0.5)',
-            fontFamily: 'var(--font-geist-sans)',
-            fontWeight: 400
-          }}>Reze Engine</h1>
+          <h1
+            className="text-2xl font-light tracking-[0.2em] md:tracking-[0.3em] ext-white uppercase letter-spacing-wider"
+            style={{
+              textShadow: "0 0 20px rgba(255, 255, 255, 0.3), 0 2px 10px rgba(0, 0, 0, 0.5)",
+              fontFamily: "var(--font-geist-sans)",
+              fontWeight: 400,
+            }}
+          >
+            Reze Engine
+          </h1>
         </Link>
 
         {/* <Link href="/tutorial" className="hidden md:block">
@@ -60,6 +65,6 @@ export default function Header({ stats }: { stats: EngineStats | null }) {
           </Link>
         </Button>
       </div>
-    </header >
+    </header>
   )
 }
