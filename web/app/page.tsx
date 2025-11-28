@@ -61,7 +61,7 @@ export default function Home() {
             腰: 0.002,
             首: 0.005,
           },
-          breathDuration: 3000,
+          breathDuration: 5000,
         })
 
         // Attempt to autoplay audio after model is rendered and animation starts
