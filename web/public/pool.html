@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Anime Pool Shader (WebGPU)</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        background-color: #000;
+      }
+      canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="gpuCanvas"></canvas>
+
+    <script type="module">
+      // --- MATH UTILITIES (inline) ---
+      class Vec3 {
+        constructor(x, y, z) {
+          this.x = x
+          this.y = y
+          this.z = z
+        }
+        add(other) {
+          return new Vec3(this.x + other.x, this.y + other.y, this.z + other.z)
+        }
+        subtract(other) {
+          return new Vec3(this.x - other.x, this.y - other.y, this.z - other.z)
+        }
+        length() {
+          return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z)
+        }
+        normalize() {
+          const len = this.length()
+          return len === 0 ? new Vec3(0, 0, 0) : new Vec3(this.x / len, this.y / len, this.z / len)
+        }
+        cross(other) {
+          return new Vec3(
+            this.y * other.z - this.z * other.y,
+            this.z * other.x - this.x * other.z,
+            this.x * other.y - this.y * other.x
+          )
+        }
+        dot(other) {
+          return this.x * other.x + this.y * other.y + this.z * other.z
+        }
+        scale(scalar) {
+          return new Vec3(this.x * scalar, this.y * scalar, this.z * scalar)
+        }
+      }
+
+      class Mat4 {
+        constructor(values) {
+          this.values = values
+        }
+        static identity() {
+          return new Mat4(new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]))
+        }
+        static perspective(fov, aspect, near, far) {
+          const f = 1.0 / Math.tan(fov / 2)
+          const rangeInv = 1.0 / (far - near)
+          return new Mat4(
+            new Float32Array([
+              f / aspect,
+              0,
+              0,
+              0,
+              0,
+              f,
+              0,
+              0,
+              0,
+              0,
+              (far + near) * rangeInv,
+              1,
+              0,
+              0,
+              -near * far * rangeInv * 2,
+              0,
+            ])
+          )
+        }
+        static lookAt(eye, target, up) {
+          const forward = target.subtract(eye).normalize()
+          const right = up.cross(forward).normalize()
+          const upVec = forward.cross(right).normalize()
+          return new Mat4(
+            new Float32Array([
+              right.x,
+              upVec.x,
+              forward.x,
+              0,
+              right.y,
+              upVec.y,
+              forward.y,
+              0,
+              right.z,
+              upVec.z,
+              forward.z,
+              0,
+              -right.dot(eye),
+              -upVec.dot(eye),
+              -forward.dot(eye),
+              1,
+            ])
+          )
+        }
+      }
+
+      // --- CAMERA (simplified inline version) ---
+      class Camera {
+        constructor(alpha, beta, radius, target, fov = Math.PI / 4) {
+          this.alpha = alpha
+          this.beta = beta
+          this.radius = radius
+          this.target = target
+          this.fov = fov
+          this.aspect = 1
+          this.near = 0.05
+          this.far = 1000
+          this.angularSensitivity = 0.005
+          this.panSensitivity = 0.0002
+          this.wheelPrecision = 0.01
+          this.minZ = 0.1
+          this.maxZ = 1000
+          this.lowerBetaLimit = 0.001
+          this.upperBetaLimit = Math.PI - 0.001
+          this.isDragging = false
+          this.mouseButton = null
+          this.lastMousePos = { x: 0, y: 0 }
+        }
+        getPosition() {
+          const x = this.target.x + this.radius * Math.sin(this.beta) * Math.sin(this.alpha)
+          const y = this.target.y + this.radius * Math.cos(this.beta)
+          const z = this.target.z + this.radius * Math.sin(this.beta) * Math.cos(this.alpha)
+          return new Vec3(x, y, z)
+        }
+        getViewMatrix() {
+          const eye = this.getPosition()
+          const up = new Vec3(0, 1, 0)
+          return Mat4.lookAt(eye, this.target, up)
+        }
+        getProjectionMatrix() {
+          return Mat4.perspective(this.fov, this.aspect, this.near, this.far)
+        }
+        attachControl(canvas) {
+          canvas.addEventListener("mousedown", (e) => {
+            this.isDragging = true
+            this.mouseButton = e.button
+            this.lastMousePos = { x: e.clientX, y: e.clientY }
+          })
+          window.addEventListener("mousemove", (e) => {
+            if (!this.isDragging) return
+            const deltaX = e.clientX - this.lastMousePos.x
+            const deltaY = e.clientY - this.lastMousePos.y
+            if (this.mouseButton === 2) {
+              // Right-click pan (simplified)
+              const panDistance = this.radius * this.panSensitivity
+              const right = new Vec3(1, 0, 0)
+              const up = new Vec3(0, 1, 0)
+              this.target = this.target.add(right.scale(-deltaX * panDistance))
+              this.target = this.target.add(up.scale(deltaY * panDistance))
+            } else {
+              this.alpha += deltaX * this.angularSensitivity
+              this.beta -= deltaY * this.angularSensitivity
+              this.beta = Math.max(this.lowerBetaLimit, Math.min(this.upperBetaLimit, this.beta))
+            }
+            this.lastMousePos = { x: e.clientX, y: e.clientY }
+          })
+          window.addEventListener("mouseup", () => {
+            this.isDragging = false
+            this.mouseButton = null
+          })
+          canvas.addEventListener("wheel", (e) => {
+            e.preventDefault()
+            this.radius += e.deltaY * this.wheelPrecision
+            this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+          })
+          canvas.addEventListener("contextmenu", (e) => e.preventDefault())
+        }
+      }
+
+      // --- CONFIGURATION (Moonlight style) ---
+      const config = {
+        cloudSharpness: 0.001,
+        windSpeed: [-43.0, 32.0],
+        bumpFactor: 0.05,
+        bumpDistance: 70.0,
+        skyColor: [0.1, 0.1, 0.15],
+        moonlightColor: [0.4, 0.4, 0.2],
+        skyByMoonlightColor: [0.4, 0.2, 0.87],
+        bottleColor: [0.7, 1.0, 0.6],
+        waterColor: [0.2, 0.2, 0.4],
+        exposure: 0.9,
+        epsilon: 0.01,
+        marchSteps: 100,
+      }
+
+      const shaderCode = `
+            struct Uniforms {
+                time: f32,
+                _padding1: f32,
+                resolution: vec2<f32>,
+            };
+
+            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+            struct VertexOutput {
+                @builtin(position) Position: vec4<f32>,
+                @location(0) uv: vec2<f32>,
+            };
+
+            @vertex
+            fn vs_main(@builtin(vertex_index) VertexIndex: u32) -> VertexOutput {
+                var pos = array<vec2<f32>, 6>(
+                    vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+                    vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0)
+                );
+                
+                var output: VertexOutput;
+                output.Position = vec4<f32>(pos[VertexIndex], 0.0, 1.0);
+                var uv = pos[VertexIndex] * 0.5 + 0.5;
+                output.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+                return output;
+            }
+
+            // Constants
+            const CLOUDSHARPNESS: f32 = ${config.cloudSharpness};
+            const WINDSPEED: vec2<f32> = vec2<f32>(${config.windSpeed.join(",")});
+            const BUMPFACTOR: f32 = ${config.bumpFactor};
+            const BUMPDISTANCE: f32 = ${config.bumpDistance};
+            const SKYCOLOR: vec3<f32> = vec3<f32>(${config.skyColor.join(",")});
+            const MOONLIGHTCOLOR: vec3<f32> = vec3<f32>(${config.moonlightColor.join(",")});
+            const SKYBYMOONLIGHTCOLOR: vec3<f32> = vec3<f32>(${config.skyByMoonlightColor.join(",")});
+            const BOTTLECOLOR: vec3<f32> = vec3<f32>(${config.bottleColor.join(",")}) * 0.3;
+            const WATERCOLOR: vec3<f32> = vec3<f32>(${config.waterColor.join(",")});
+            const EXPOSURE: f32 = ${config.exposure};
+            const EPSILON: f32 = ${config.epsilon};
+            const MARCHSTEPS: i32 = ${config.marchSteps};
+
+            // Math matrices (column-major)
+            const m: mat3x3<f32> = mat3x3<f32>(
+                vec3<f32>(0.00, -0.90, -0.60),
+                vec3<f32>(0.90, 0.36, -0.48),
+                vec3<f32>(-0.60, -0.48, 0.34)
+            );
+
+            const mr: mat2x2<f32> = mat2x2<f32>(
+                0.84147, 0.54030,
+                0.54030, -0.84147
+            );
+
+            // Hash function
+            fn hash(n: f32) -> f32 {
+                return fract(sin(n) * 43758.5453);
+            }
+
+            // Procedural noise (replaces texture-based noise)
+            fn hash3(p: vec3<f32>) -> f32 {
+                var p3 = fract(p * 0.1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            fn noise3(x: vec3<f32>) -> f32 {
+                let p = floor(x);
+                var f = fract(x);
+                f = f * f * (3.0 - 2.0 * f);
+                
+                let n = p.x + p.y * 57.0 + 113.0 * p.z;
+                return mix(
+                    mix(mix(hash3(p), hash3(p + vec3<f32>(1.0, 0.0, 0.0)), f.x),
+                        mix(hash3(p + vec3<f32>(0.0, 1.0, 0.0)), hash3(p + vec3<f32>(1.0, 1.0, 0.0)), f.x), f.y),
+                    mix(mix(hash3(p + vec3<f32>(0.0, 0.0, 1.0)), hash3(p + vec3<f32>(1.0, 0.0, 1.0)), f.x),
+                        mix(hash3(p + vec3<f32>(0.0, 1.0, 1.0)), hash3(p + vec3<f32>(1.0, 1.0, 1.0)), f.x), f.y), f.z
+                );
+            }
+
+            fn noise2(x: vec2<f32>) -> f32 {
+                let p = floor(x);
+                var f = fract(x);
+                f = f * f * (3.0 - 2.0 * f);
+                
+                let n = p.x + p.y * 57.0;
+                return mix(
+                    mix(hash(f32(n)), hash(f32(n + 1.0)), f.x),
+                    mix(hash(f32(n + 57.0)), hash(f32(n + 58.0)), f.x),
+                    f.y
+                );
+            }
+
+            fn fbm3(p: vec3<f32>) -> f32 {
+                var f: f32 = 0.0;
+                var p_var = p;
+                f = 0.5000 * noise3(p_var);
+                p_var = m * p_var * 2.02;
+                f += 0.2500 * noise3(p_var);
+                p_var = m * p_var * 2.33;
+                f += 0.1250 * noise3(p_var);
+                p_var = m * p_var * 2.01;
+                f += 0.0625 * noise3(p_var);
+                return f / 0.9175;
+            }
+
+            fn fbm2(p: vec2<f32>) -> f32 {
+                var f: f32 = 0.0;
+                var p_var = p;
+                f = 0.5000 * noise2(p_var);
+                p_var = mr * p_var * 2.02;
+                f += 0.2500 * noise2(p_var);
+                p_var = mr * p_var * 2.33;
+                f += 0.1250 * noise2(p_var);
+                p_var = mr * p_var * 2.01;
+                f += 0.0625 * noise2(p_var);
+                return f / 0.9175;
+            }
+
+            // Height maps
+            fn heightMap(pos: vec3<f32>) -> f32 {
+                let n = noise2(vec2<f32>(0.0, 4.2) + pos.xz * 0.14);
+                return 9.0 * (n - 0.7);
+            }
+
+            fn waterHeightMap(pos: vec2<f32>, time: f32) -> f32 {
+                var posm = pos;
+                posm = mr * posm;
+                posm.x += 0.25 * time;
+                let f = fbm3(vec3<f32>(posm * 1.9, time * 0.27));
+                var height = 0.5 + 0.1 * f;
+                height += 0.13 * sin(posm.x * 6.0 + 10.0 * f);
+                
+                let d = length(pos - vec2<f32>(-3.0, 0.0));
+                height += 0.1 * cos(d * 50.0 - time * 4.0) * (1.0 - smoothstep(0.0, 1.0, d));
+                
+                return height;
+            }
+
+            // Intersection functions
+            struct IntersectResult {
+                hit: bool,
+                dist: f32,
+            }
+
+            fn intersectPlane(ro: vec3<f32>, rd: vec3<f32>, height: f32) -> IntersectResult {
+                var result: IntersectResult;
+                result.hit = false;
+                result.dist = 0.0;
+                
+                if (rd.y == 0.0) {
+                    return result;
+                }
+                
+                let d = -(ro.y - height) / rd.y;
+                let d_clamped = min(100000.0, d);
+                if (d_clamped > 0.0) {
+                    result.hit = true;
+                    result.dist = d_clamped;
+                }
+                return result;
+            }
+
+            fn intersectHeightMap(ro: vec3<f32>, rd: vec3<f32>, maxdist: f32) -> IntersectResult {
+                var result: IntersectResult;
+                result.hit = false;
+                result.dist = 0.0;
+                
+                var dt: f32 = 0.3;
+                var dist: f32 = 0.0;
+                
+                for (var i: i32 = 0; i < MARCHSTEPS; i++) {
+                    if (result.hit || dist > maxdist) {
+                        break;
+                    }
+                    dist += dt;
+                    dt = min(dt * 1.1, 0.5);
+                    let pos = ro + rd * dist;
+                    if (heightMap(pos) >= pos.y) {
+                        result.hit = true;
+                        result.dist = dist;
+                    }
+                }
+                return result;
+            }
+
+            struct SphereResult {
+                hit: bool,
+                dist: f32,
+                normal: vec3<f32>,
+            }
+
+            fn intersectSphere(ro: vec3<f32>, rd: vec3<f32>, sph: vec4<f32>) -> SphereResult {
+                var result: SphereResult;
+                result.hit = false;
+                result.dist = 0.0;
+                result.normal = vec3<f32>(0.0);
+                
+                let ds = ro - sph.xyz;
+                let bs = dot(rd, ds);
+                let cs = dot(ds, ds) - sph.w * sph.w;
+                let ts = bs * bs - cs;
+                
+                if (ts > 0.0) {
+                    let ts_val = -bs - sqrt(ts);
+                    if (ts_val > 0.0) {
+                        result.hit = true;
+                        result.dist = ts_val;
+                        result.normal = normalize(((ro + ts_val * rd) - sph.xyz) / sph.w);
+                    }
+                }
+                return result;
+            }
+
+            struct CylinderResult {
+                hit: bool,
+                dist: f32,
+                normal: vec3<f32>,
+            }
+
+            fn intersectCylinder(ro: vec3<f32>, rd: vec3<f32>, A: vec3<f32>, B: vec3<f32>, radius: f32) -> CylinderResult {
+                var result: CylinderResult;
+                result.hit = false;
+                result.dist = 0.0;
+                result.normal = vec3<f32>(0.0);
+                
+                let AB = B - A;
+                let AO = ro - A;
+                
+                let AB_dot_d = dot(AB, rd);
+                let AB_dot_AO = dot(AB, AO);
+                let AB_dot_AB = dot(AB, AB);
+                
+                let m = AB_dot_d / AB_dot_AB;
+                let n = AB_dot_AO / AB_dot_AB;
+                
+                let Q = rd - (AB * m);
+                let R = AO - (AB * n);
+                
+                let a = dot(Q, Q);
+                let b = 2.0 * dot(Q, R);
+                let c = dot(R, R) - (radius * radius);
+                
+                if (a == 0.0) {
+                    let sphereA = intersectSphere(ro, rd, vec4<f32>(A, radius));
+                    let sphereB = intersectSphere(ro, rd, vec4<f32>(B, radius));
+                    if (sphereA.hit || sphereB.hit) {
+                        if (sphereA.dist < sphereB.dist) {
+                            result.hit = sphereA.hit;
+                            result.dist = sphereA.dist;
+                            result.normal = sphereA.normal;
+                        } else {
+                            result.hit = sphereB.hit;
+                            result.dist = sphereB.dist;
+                            result.normal = sphereB.normal;
+                        }
+                    }
+                    return result;
+                }
+                
+                let discriminant = b * b - 4.0 * a * c;
+                if (discriminant < 0.0) {
+                    return result;
+                }
+                
+                let sqrtdis = sqrt(discriminant);
+                var tmin = (-b - sqrtdis) / (2.0 * a);
+                let tmax = (-b + sqrtdis) / (2.0 * a);
+                if (tmin < 0.0) {
+                    tmin = tmax;
+                } else {
+                    tmin = min(tmin, tmax);
+                }
+                
+                if (tmin < 0.0) {
+                    return result;
+                }
+                
+                let t_k1 = tmin * m + n;
+                
+                if (t_k1 < 0.0) {
+                    let sphereResult = intersectSphere(ro, rd, vec4<f32>(A, radius));
+                    result.hit = sphereResult.hit;
+                    result.dist = sphereResult.dist;
+                    result.normal = sphereResult.normal;
+                    return result;
+                } else if (t_k1 > 1.0) {
+                    let sphereResult = intersectSphere(ro, rd, vec4<f32>(B, radius));
+                    result.hit = sphereResult.hit;
+                    result.dist = sphereResult.dist;
+                    result.normal = sphereResult.normal;
+                    return result;
+                } else {
+                    let p1 = ro + (rd * tmin);
+                    let k1 = A + AB * t_k1;
+                    result.hit = true;
+                    result.dist = tmin;
+                    result.normal = normalize(p1 - k1);
+                }
+                return result;
+            }
+
+            fn intersectBottle(ro: vec3<f32>, rd: vec3<f32>, time: f32) -> CylinderResult {
+                var result: CylinderResult;
+                result.hit = false;
+                result.dist = 1000000.0;
+                result.normal = vec3<f32>(0.0);
+                
+                let rx = sin(time) * 0.2;
+                let up = vec3<f32>(0.0, 0.4 * cos(rx), 0.4 * sin(rx));
+                let pos = vec3<f32>(-3.0, 0.05 * cos(time * 0.6) + 0.05, 0.0);
+                
+                var hitc = intersectCylinder(ro, rd, pos + up * 1.5, pos - up * 1.5, 0.07);
+                if (hitc.hit && hitc.dist < result.dist) {
+                    result = hitc;
+                }
+                
+                hitc = intersectCylinder(ro, rd, pos + up * 0.15, pos - up * 0.15, 0.22);
+                if (hitc.hit && hitc.dist < result.dist) {
+                    result = hitc;
+                }
+                
+                return result;
+            }
+
+            // Cloud density
+            fn cloudDensity(rd: vec3<f32>, time: f32) -> f32 {
+                let planeResult = intersectPlane(vec3<f32>(0.0, 0.0, 0.0), rd, 500.0);
+                let intersection = rd * planeResult.dist;
+                
+                let cloudCover = 0.1 * cos(time * 0.072 + 0.2) + 0.26;
+                var cloud = 0.5 + 0.5 * fbm3(vec3<f32>((intersection.xz + WINDSPEED * time) * 0.001, time * 0.25)) - (1.0 - cloudCover);
+                
+                cloud += 0.02 * noise2(intersection.xz - WINDSPEED * time * 0.01);
+                
+                if (cloud < 0.0) {
+                    cloud = 0.0;
+                }
+                
+                cloud = 1.0 - pow(CLOUDSHARPNESS, cloud);
+                cloud = mix(cloudCover, cloud, smoothstep(0.0, 0.1, dot(rd, vec3<f32>(0.0, 1.0, 0.0))));
+                
+                return cloud;
+            }
+
+            // Sky color
+            fn skyColorFunc(rd: vec3<f32>, time: f32) -> vec3<f32> {
+                let moont = time * 0.1;
+                let moonf = -time * 0.1;
+                let moondir = normalize(vec3<f32>(cos(moont), 0.8 * (0.6 + 0.5 * sin(moonf)), sin(moont)));
+                
+                let moonglow = clamp(1.0782 * dot(moondir, rd), 0.0, 2.0);
+                var col = SKYCOLOR * moondir.y;
+                col += 0.4 * SKYBYMOONLIGHTCOLOR * moonglow;
+                col += 0.43 * MOONLIGHTCOLOR * pow(moonglow, 21.0);
+                
+                let moonSphere = intersectSphere(vec3<f32>(0.0, 0.0, 0.0), rd, vec4<f32>(moondir, 0.07));
+                var moonhit = false;
+                if (moonSphere.hit) {
+                    let l = dot(normalize(vec3<f32>(-moondir.x, 0.0, -moondir.z) + vec3<f32>(2.2, -1.6, 0.0)), moonSphere.normal);
+                    col += 3.0 * MOONLIGHTCOLOR * clamp(l, 0.0, 1.0);
+                    moonhit = true;
+                }
+                
+                if (!moonhit) {
+                    let rds = rd;
+                    let v = 1.0 / (2.0 * (1.0 + rds.z));
+                    let xy = vec2<f32>(rds.y * v, rds.x * v);
+                    var s = noise2(rds.xz * 134.0);
+                    s += noise2(rds.xz * 370.0);
+                    s += noise2(rds.xz * 870.0);
+                    s = pow(s, 19.0) * 0.00000001 * max(rd.y, 0.0);
+                    if (s > 0.1) {
+                        let backStars = vec3<f32>((1.0 - sin(xy.x * 20.0 + time * 13.0 * rds.x + xy.y * 30.0)) * 0.5 * s, s, s);
+                        col += backStars;
+                    }
+                }
+                
+                col *= (1.0 - cloudDensity(rd, time));
+                
+                return col;
+            }
+
+            // Trace function
+            struct TraceResult {
+                material: i32, // 0=sky, 1=mountain, 2=water, 3=bottle
+                intersection: vec3<f32>,
+                normal: vec3<f32>,
+                dist: f32,
+                color: vec3<f32>,
+            }
+
+            fn trace(ro: vec3<f32>, rd: vec3<f32>, currentDistance: f32, reflection: bool, time: f32) -> TraceResult {
+                var result: TraceResult;
+                result.material = 0;
+                result.dist = 100000.0;
+                result.intersection = vec3<f32>(0.0);
+                result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                result.color = vec3<f32>(0.0);
+                
+                // Skip mountains
+                
+                let planeResult = intersectPlane(ro, rd, 0.0);
+                var d = 100000.0;
+                var hitc = false;
+                var normalc = vec3<f32>(0.0, 1.0, 0.0);
+                
+                if (planeResult.hit && planeResult.dist < d) {
+                    result.material = 2;
+                    result.normal = vec3<f32>(0.0, 1.0, 0.0);
+                    d = planeResult.dist;
+                    hitc = true;
+                }
+                
+                let bottleResult = intersectBottle(ro, rd, time);
+                if (bottleResult.hit && bottleResult.dist < d) {
+                    result.material = 3;
+                    result.normal = bottleResult.normal;
+                    d = bottleResult.dist;
+                    hitc = true;
+                }
+                
+                if (d < 100000.0) {
+                    result.dist = d;
+                    result.intersection = ro + rd * result.dist;
+                }
+                
+                if (!reflection && result.material == 2) {
+                    let coord = result.intersection.xz;
+                    let dx = vec2<f32>(EPSILON, 0.0);
+                    let dz = vec2<f32>(0.0, EPSILON);
+                    
+                    let bumpfactor = BUMPFACTOR * (1.0 - smoothstep(0.0, BUMPDISTANCE, result.dist));
+                    
+                    result.normal.x = bumpfactor * (waterHeightMap(coord + dx, time) - waterHeightMap(coord - dx, time)) / (2.0 * EPSILON);
+                    result.normal.z = bumpfactor * (waterHeightMap(coord + dz, time) - waterHeightMap(coord - dz, time)) / (2.0 * EPSILON);
+                    result.normal = normalize(result.normal);
+                }
+                
+                let moont = time * 0.1;
+                let moonf = -time * 0.1;
+                let moondir = normalize(vec3<f32>(cos(moont), 0.8 * (0.6 + 0.5 * sin(moonf)), sin(moont)));
+                
+                let diff = clamp(dot(result.normal, moondir), 0.0, 1.0);
+                
+                if (result.material == 2) {
+                    result.color = WATERCOLOR * MOONLIGHTCOLOR * diff;
+                } else if (result.material == 3) {
+                    result.color = BOTTLECOLOR * diff * smoothstep(0.0, 0.2, result.intersection.y);
+                } else {
+                    result.color = skyColorFunc(rd, time);
+                }
+                
+                if (result.material > 0) {
+                    let cloudCover = 0.1 * cos(time * 0.072 + 0.2) + 0.26;
+                    result.color = mix(result.color, SKYCOLOR * cloudCover, clamp(result.dist / 100.0, 0.0, 1.0));
+                }
+                
+                return result;
+            }
+
+            @fragment
+            fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+                let time = uniforms.time + 23.0;
+                let q = input.uv;
+                var p = -1.0 + 2.0 * q;
+                p.y = -p.y; // Flip Y: WebGPU (0,0) is top-left, ShaderToy (0,0) is bottom-left
+                p.x *= uniforms.resolution.x / uniforms.resolution.y;
+                
+                let moont = time * 0.1;
+                let a = moont + 0.3 * sin(time * 0.12);
+                
+                let ce = vec3<f32>(0.0, 0.2, 0.0);
+                let ro = ce + vec3<f32>(1.3 * cos(0.11 * time), 0.65 * 0.5, 1.3 * sin(0.11 * time));
+                let ta = ro + vec3<f32>(0.95 * cos(a), 0.75 * ro.y - 0.3, 0.95 * sin(a));
+                
+                let roll = -0.15 * sin(0.1 * time);
+                
+                let cw = normalize(ta - ro);
+                let cp = vec3<f32>(sin(roll), cos(roll), 0.0);
+                let cu = normalize(cross(cw, cp));
+                let cv = normalize(cross(cu, cw));
+                let rd = normalize(p.x * cu + p.y * cv + 1.5 * cw);
+                
+                var traceResult = trace(ro, rd, 0.0, false, time);
+                
+                if (traceResult.material >= 2) {
+                    let rfld = reflect(rd, traceResult.normal);
+                    let reflectstrength = 1.0 - abs(dot(rd, traceResult.normal));
+                    let reflectResult = trace(traceResult.intersection + rfld * EPSILON, rfld, traceResult.dist, true, time);
+                    traceResult.color += 0.9 * reflectstrength * reflectResult.color;
+                }
+                
+                var col = pow(traceResult.color, vec3<f32>(EXPOSURE));
+                col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
+                
+                col *= 0.25 + 0.75 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.15);
+                
+                return vec4<f32>(col, 1.0);
+            }
+        `
+
+      async function init() {
+        const canvas = document.getElementById("gpuCanvas")
+        if (!navigator.gpu) {
+          alert("WebGPU not supported in this browser.")
+          return
+        }
+
+        const adapter = await navigator.gpu.requestAdapter()
+        const device = await adapter.requestDevice()
+        const context = canvas.getContext("webgpu")
+        const format = navigator.gpu.getPreferredCanvasFormat()
+
+        context.configure({
+          device,
+          format,
+          alphaMode: "premultiplied",
+        })
+
+        const module = device.createShaderModule({ code: shaderCode })
+
+        const pipeline = device.createRenderPipeline({
+          layout: "auto",
+          vertex: {
+            module,
+            entryPoint: "vs_main",
+          },
+          fragment: {
+            module,
+            entryPoint: "fs_main",
+            targets: [{ format }],
+          },
+          primitive: {
+            topology: "triangle-list",
+          },
+        })
+
+        // Create Uniform Buffer
+        const uniformBufferSize = 16 // 4 floats (time, padding, resX, resY)
+        const uniformBuffer = device.createBuffer({
+          size: uniformBufferSize,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+
+        const bindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+        })
+
+        const startTime = performance.now()
+
+        function frame() {
+          const now = performance.now()
+          const time = (now - startTime) / 1000
+
+          // Handle resize
+          const w = canvas.clientWidth * window.devicePixelRatio
+          const h = canvas.clientHeight * window.devicePixelRatio
+          if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w
+            canvas.height = h
+          }
+
+          // Write uniforms
+          const uniforms = new Float32Array([time, 0, w, h]) // time, padding, resX, resY
+          device.queue.writeBuffer(uniformBuffer, 0, uniforms)
+
+          // Encode commands
+          const commandEncoder = device.createCommandEncoder()
+          const textureView = context.getCurrentTexture().createView()
+
+          const passEncoder = commandEncoder.beginRenderPass({
+            colorAttachments: [
+              {
+                view: textureView,
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                loadOp: "clear",
+                storeOp: "store",
+              },
+            ],
+          })
+
+          passEncoder.setPipeline(pipeline)
+          passEncoder.setBindGroup(0, bindGroup)
+          passEncoder.draw(6)
+          passEncoder.end()
+
+          device.queue.submit([commandEncoder.finish()])
+          requestAnimationFrame(frame)
+        }
+
+        requestAnimationFrame(frame)
+      }
+
+      init()
+    </script>
+  </body>
+</html>
