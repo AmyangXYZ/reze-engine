@@ -51,22 +51,18 @@ export default function Home() {
           setStats(engine.getStats())
         })
 
-        // engine.rotateBones(
-        //   ["腰", "首", "右腕", "左腕", "右ひざ"],
-        //   [
-        //     new Quat(-0.4, -0.3, 0, 1),
-        //     new Quat(0.3, -0.3, -0.3, 1),
-        //     new Quat(0.3, 0.3, 0.3, 1),
-        //     new Quat(-0.3, 0.3, -0.3, 1),
-        //     new Quat(-1.0, -0.3, 0.0, 1),
-        //   ],
-        //   1500
-        // )
-
         // Wait a frame to ensure render loop has started and model is fully initialized
         // This prevents physics explosion when animation starts
         await new Promise((resolve) => requestAnimationFrame(resolve))
-        engine.playAnimation()
+        engine.playAnimation({
+          breathBones: {
+            右ひじ: 0.015,
+            左ひじ: 0.015,
+            腰: 0.002,
+            首: 0.005,
+          },
+          breathDuration: 3000,
+        })
 
         // Attempt to autoplay audio after model is rendered and animation starts
         // This will fail silently if browser blocks autoplay, and will start on first user interaction

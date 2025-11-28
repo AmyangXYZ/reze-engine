@@ -139,6 +139,8 @@ export class Engine {
   private gpuMemoryMB: number = 0
   private hasAnimation = false // Set to true when loadAnimation is called
   private playingAnimation = false // Set to true when playAnimation is called
+  private breathingTimeout: number | null = null
+  private breathingBaseRotations: Map<string, Quat> = new Map()
 
   constructor(canvas: HTMLCanvasElement, options?: EngineOptions) {
     this.canvas = canvas
@@ -1420,11 +1422,31 @@ export class Engine {
     this.hasAnimation = true
   }
 
-  public playAnimation() {
+  public playAnimation(options?: {
+    breathBones?: string[] | Record<string, number> // Array of bone names or map of bone name -> rotation range
+    breathDuration?: number // Breathing cycle duration in milliseconds
+  }) {
     if (this.animationFrames.length === 0) return
 
     this.stopAnimation()
+    this.stopBreathing()
     this.playingAnimation = true
+
+    // Enable breathing if breathBones is provided
+    const enableBreath = options?.breathBones !== undefined && options.breathBones !== null
+    let breathBones: string[] = []
+    let breathRotationRanges: Record<string, number> | undefined = undefined
+
+    if (enableBreath && options.breathBones) {
+      if (Array.isArray(options.breathBones)) {
+        breathBones = options.breathBones
+      } else {
+        breathBones = Object.keys(options.breathBones)
+        breathRotationRanges = options.breathBones
+      }
+    }
+
+    const breathDuration = options?.breathDuration ?? 4000
 
     const allBoneKeyFrames: BoneKeyFrame[] = []
     for (const keyFrame of this.animationFrames) {
@@ -1529,6 +1551,43 @@ export class Engine {
         }
       }
     }
+
+    // Setup breathing animation if enabled
+    if (enableBreath && this.currentModel) {
+      // Find the last frame time
+      let maxTime = 0
+      for (const keyFrame of this.animationFrames) {
+        if (keyFrame.time > maxTime) {
+          maxTime = keyFrame.time
+        }
+      }
+
+      // Get last frame rotations directly from animation data for breathing bones
+      const lastFrameRotations = new Map<string, Quat>()
+      for (const bone of breathBones) {
+        const keyFrames = boneKeyFramesByBone.get(bone)
+        if (keyFrames && keyFrames.length > 0) {
+          // Find the rotation at the last frame time (closest keyframe <= maxTime)
+          let lastRotation: Quat | null = null
+          for (let i = keyFrames.length - 1; i >= 0; i--) {
+            if (keyFrames[i].time <= maxTime) {
+              lastRotation = keyFrames[i].rotation
+              break
+            }
+          }
+          if (lastRotation) {
+            lastFrameRotations.set(bone, lastRotation)
+          }
+        }
+      }
+
+      // Start breathing after animation completes
+      // Use the last frame rotations directly from animation data (no need to capture from model)
+      const animationEndTime = maxTime * 1000 + 200 // Small buffer for final tweens to complete
+      this.breathingTimeout = window.setTimeout(() => {
+        this.startBreathing(breathBones, lastFrameRotations, breathRotationRanges, breathDuration)
+      }, animationEndTime)
+    }
   }
 
   public stopAnimation() {
@@ -1537,6 +1596,69 @@ export class Engine {
     }
     this.animationTimeouts = []
     this.playingAnimation = false
+  }
+
+  private stopBreathing() {
+    if (this.breathingTimeout !== null) {
+      clearTimeout(this.breathingTimeout)
+      this.breathingTimeout = null
+    }
+    this.breathingBaseRotations.clear()
+  }
+
+  private startBreathing(
+    bones: string[],
+    baseRotations: Map<string, Quat>,
+    rotationRanges?: Record<string, number>,
+    durationMs: number = 4000
+  ) {
+    if (!this.currentModel) return
+
+    // Store base rotations directly from last frame of animation data
+    // These are the exact rotations from the animation - use them as-is
+    for (const bone of bones) {
+      const baseRot = baseRotations.get(bone)
+      if (baseRot) {
+        this.breathingBaseRotations.set(bone, baseRot)
+      }
+    }
+
+    const halfCycleMs = durationMs / 2
+    const defaultRotation = 0.02 // Default rotation range if not specified per bone
+
+    // Start breathing cycle - oscillate around exact base rotation (final pose)
+    // Each bone can have its own rotation range, or use default
+    const animate = (isInhale: boolean) => {
+      if (!this.currentModel) return
+
+      const breathingBoneNames: string[] = []
+      const breathingQuats: Quat[] = []
+
+      for (const bone of bones) {
+        const baseRot = this.breathingBaseRotations.get(bone)
+        if (!baseRot) continue
+
+        // Get rotation range for this bone (per-bone or default)
+        const rotation = rotationRanges?.[bone] ?? defaultRotation
+
+        // Oscillate around base rotation with the bone's rotation range
+        // isInhale: base * rotation, exhale: base * (-rotation)
+        const oscillationRot = Quat.fromEuler(isInhale ? rotation : -rotation, 0, 0)
+        const finalRot = baseRot.multiply(oscillationRot)
+
+        breathingBoneNames.push(bone)
+        breathingQuats.push(finalRot)
+      }
+
+      if (breathingBoneNames.length > 0) {
+        this.rotateBones(breathingBoneNames, breathingQuats, halfCycleMs)
+      }
+
+      this.breathingTimeout = window.setTimeout(() => animate(!isInhale), halfCycleMs)
+    }
+
+    // Start breathing from exhale position (closer to base) to minimize initial movement
+    animate(false)
   }
 
   public getStats(): EngineStats {
@@ -1570,6 +1692,7 @@ export class Engine {
   public dispose() {
     this.stopRenderLoop()
     this.stopAnimation()
+    this.stopBreathing()
     if (this.camera) this.camera.detachControl()
     if (this.resizeObserver) {
       this.resizeObserver.disconnect()
