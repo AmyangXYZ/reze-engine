@@ -37,6 +37,18 @@ interface DrawCall {
 }
 
 export class Engine {
+  private readonly CAMERA_UNIFORM_STRIDE = 256
+
+  private sbsEnabled = false
+  private sbsIpdMeters = 0.064
+
+  private xrSession: XRSession | null = null
+  private xrRefSpace: XRReferenceSpace | null = null
+  private xrBinding: XRGPUBinding | null = null
+  private xrLayer: XRProjectionLayer | null = null
+  private xrMsaaTexture: GPUTexture | null = null
+  private xrDepthTexture: GPUTexture | null = null
+
   private canvas: HTMLCanvasElement
   private device!: GPUDevice
   private context!: GPUCanvasContext
@@ -147,8 +159,10 @@ export class Engine {
   }
 
   // Step 1: Get WebGPU device and context
-  public async init() {
-    const adapter = await navigator.gpu?.requestAdapter()
+  public async init(options?: { xrCompatible?: boolean }) {
+    const adapter = await navigator.gpu?.requestAdapter(
+      options?.xrCompatible ? ({ xrCompatible: true } as unknown as GPURequestAdapterOptions) : undefined
+    )
     const device = await adapter?.requestDevice()
     if (!device) {
       throw new Error("WebGPU is not supported in this browser.")
@@ -389,7 +403,11 @@ export class Engine {
     this.mainBindGroupLayout = this.device.createBindGroupLayout({
       label: "main material bind group layout",
       entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // camera
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 144 },
+        }, // camera
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // light
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} }, // diffuseTexture
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {} }, // diffuseSampler
@@ -421,7 +439,11 @@ export class Engine {
     this.outlineBindGroupLayout = this.device.createBindGroupLayout({
       label: "outline bind group layout",
       entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // camera
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 144 },
+        }, // camera
         { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }, // material
         { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // skinMats
       ],
@@ -1052,9 +1074,10 @@ export class Engine {
 
   // Step 4: Create camera and uniform buffer
   private setupCamera() {
+    // Dynamic uniform buffer: 2 views (mono/left + right) with 256-byte alignment.
     this.cameraUniformBuffer = this.device.createBuffer({
       label: "camera uniforms",
-      size: 40 * 4,
+      size: this.CAMERA_UNIFORM_STRIDE * 2,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
@@ -1392,7 +1415,7 @@ export class Engine {
         label: `material bind group: ${mat.name}`,
         layout: this.mainBindGroupLayout,
         entries: [
-          { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+          { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: 144 } },
           { binding: 1, resource: { buffer: this.lightUniformBuffer } },
           { binding: 2, resource: diffuseTexture.createView() },
           { binding: 3, resource: this.materialSampler },
@@ -1417,7 +1440,7 @@ export class Engine {
               label: `material bind group (${isOverEyes ? "over eyes" : "over non-eyes"}): ${mat.name}`,
               layout: this.mainBindGroupLayout,
               entries: [
-                { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+                { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: 144 } },
                 { binding: 1, resource: { buffer: this.lightUniformBuffer } },
                 { binding: 2, resource: diffuseTexture.createView() },
                 { binding: 3, resource: this.materialSampler },
@@ -1470,7 +1493,7 @@ export class Engine {
           label: `outline bind group: ${mat.name}`,
           layout: this.outlineBindGroupLayout,
           entries: [
-            { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+            { binding: 0, resource: { buffer: this.cameraUniformBuffer, size: 144 } },
             { binding: 1, resource: { buffer: materialUniformBuffer } },
             { binding: 2, resource: { buffer: this.skinMatrixBuffer! } },
           ],
@@ -1548,26 +1571,26 @@ export class Engine {
   }
 
   // Helper: Render eyes with stencil writing (for post-alpha-eye effect)
-  private renderEyes(pass: GPURenderPassEncoder) {
+  private renderEyes(pass: GPURenderPassEncoder, dynamicOffsets: number[]) {
     pass.setPipeline(this.eyePipeline)
     pass.setStencilReference(this.STENCIL_EYE_VALUE)
     for (const draw of this.drawCalls) {
       if (draw.type === "eye") {
-        pass.setBindGroup(0, draw.bindGroup)
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
         pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
       }
     }
   }
 
   // Helper: Render hair with post-alpha-eye effect (depth pre-pass + stencil-based shading + outlines)
-  private renderHair(pass: GPURenderPassEncoder) {
+  private renderHair(pass: GPURenderPassEncoder, dynamicOffsets: number[]) {
     // Hair depth pre-pass (reduces overdraw via early depth rejection)
     const hasHair = this.drawCalls.some((d) => d.type === "hair-over-eyes" || d.type === "hair-over-non-eyes")
     if (hasHair) {
       pass.setPipeline(this.hairDepthPipeline)
       for (const draw of this.drawCalls) {
         if (draw.type === "hair-over-eyes" || draw.type === "hair-over-non-eyes") {
-          pass.setBindGroup(0, draw.bindGroup)
+          pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
           pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
         }
       }
@@ -1579,7 +1602,7 @@ export class Engine {
       pass.setPipeline(this.hairPipelineOverEyes)
       pass.setStencilReference(this.STENCIL_EYE_VALUE)
       for (const draw of hairOverEyes) {
-        pass.setBindGroup(0, draw.bindGroup)
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
         pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
       }
     }
@@ -1589,7 +1612,7 @@ export class Engine {
       pass.setPipeline(this.hairPipelineOverNonEyes)
       pass.setStencilReference(this.STENCIL_EYE_VALUE)
       for (const draw of hairOverNonEyes) {
-        pass.setBindGroup(0, draw.bindGroup)
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
         pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
       }
     }
@@ -1599,7 +1622,7 @@ export class Engine {
     if (hairOutlines.length > 0) {
       pass.setPipeline(this.hairOutlinePipeline)
       for (const draw of hairOutlines) {
-        pass.setBindGroup(0, draw.bindGroup)
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
         pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
       }
     }
@@ -1607,87 +1630,340 @@ export class Engine {
 
   // Render strategy: 1) Opaque non-eye/hair 2) Eyes (stencil=1) 3) Hair (depth pre-pass + split by stencil) 4) Transparent 5) Bloom
   public render() {
-    if (this.multisampleTexture && this.camera && this.device) {
-      const currentTime = performance.now()
-      const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
-      this.lastFrameTime = currentTime
-
-      this.updateCameraUniforms()
-      this.updateRenderTarget()
-
-      // Animate VMD animation if playing
-      if (this.hasAnimation && this.currentModel) {
-        const pose = this.player.update(currentTime)
-        if (pose) {
-          this.applyPose(pose)
-        }
-      }
-
-      // Update model pose first (this may update morph weights via tweens)
-      // We need to do this before creating the encoder to ensure vertex buffer is ready
-      if (this.currentModel) {
-        const hasActiveMorphTweens = this.currentModel.evaluatePose()
-        if (hasActiveMorphTweens) {
-          this.vertexBufferNeedsUpdate = true
-        }
-      }
-
-      // Update vertex buffer if morphs changed
-      if (this.vertexBufferNeedsUpdate) {
-        this.updateVertexBuffer()
-        this.vertexBufferNeedsUpdate = false
-      }
-
-      // Update model pose (computes skin matrices on CPU)
-      this.updateModelPose(deltaTime)
-
-      // Use single encoder for render
-      const encoder = this.device.createCommandEncoder()
-
-      const pass = encoder.beginRenderPass(this.renderPassDescriptor)
-
-      if (this.currentModel) {
-        pass.setVertexBuffer(0, this.vertexBuffer)
-        pass.setVertexBuffer(1, this.jointsBuffer)
-        pass.setVertexBuffer(2, this.weightsBuffer)
-        pass.setIndexBuffer(this.indexBuffer!, "uint32")
-
-        // Pass 1: Opaque
-        pass.setPipeline(this.modelPipeline)
-        for (const draw of this.drawCalls) {
-          if (draw.type === "opaque") {
-            pass.setBindGroup(0, draw.bindGroup)
-            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          }
-        }
-
-        // Pass 2: Eyes (writes stencil value for hair to test against)
-        this.renderEyes(pass)
-
-        this.drawOutlines(pass, false)
-
-        // Pass 3: Hair rendering (depth pre-pass + shading + outlines)
-        this.renderHair(pass)
-
-        // Pass 4: Transparent
-        pass.setPipeline(this.modelPipeline)
-        for (const draw of this.drawCalls) {
-          if (draw.type === "transparent") {
-            pass.setBindGroup(0, draw.bindGroup)
-            pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-          }
-        }
-
-        this.drawOutlines(pass, true)
-      }
-
-      pass.end()
-      this.device.queue.submit([encoder.finish()])
-
-      this.applyBloom()
-
-      this.updateStats(performance.now() - currentTime)
+    if (!this.multisampleTexture || !this.camera || !this.device) {
+      return
     }
+
+    if (this.sbsEnabled) {
+      this.renderSbs()
+    } else {
+      this.renderStandard()
+    }
+  }
+
+  public setSbsEnabled(enabled: boolean, options?: { ipdMeters?: number }) {
+    this.sbsEnabled = enabled
+    if (options?.ipdMeters !== undefined) {
+      this.sbsIpdMeters = options.ipdMeters
+    }
+  }
+
+  private prepareFrame(currentTime: number): number {
+    const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
+    this.lastFrameTime = currentTime
+
+    // Animate VMD animation if playing
+    if (this.hasAnimation && this.currentModel) {
+      const pose = this.player.update(currentTime)
+      if (pose) {
+        this.applyPose(pose)
+      }
+    }
+
+    // Update model pose first (this may update morph weights via tweens)
+    // We need to do this before creating the encoder to ensure vertex buffer is ready
+    if (this.currentModel) {
+      const hasActiveMorphTweens = this.currentModel.evaluatePose()
+      if (hasActiveMorphTweens) {
+        this.vertexBufferNeedsUpdate = true
+      }
+    }
+
+    // Update vertex buffer if morphs changed
+    if (this.vertexBufferNeedsUpdate) {
+      this.updateVertexBuffer()
+      this.vertexBufferNeedsUpdate = false
+    }
+
+    // Update model pose (computes skin matrices on CPU)
+    if (this.currentModel) {
+      this.updateModelPose(deltaTime)
+    }
+
+    return deltaTime
+  }
+
+  private renderScene(pass: GPURenderPassEncoder, cameraOffset: number) {
+    if (!this.currentModel) {
+      return
+    }
+
+    const dynamicOffsets = [cameraOffset]
+
+    pass.setVertexBuffer(0, this.vertexBuffer)
+    pass.setVertexBuffer(1, this.jointsBuffer)
+    pass.setVertexBuffer(2, this.weightsBuffer)
+    pass.setIndexBuffer(this.indexBuffer!, "uint32")
+
+    // Pass 1: Opaque
+    pass.setPipeline(this.modelPipeline)
+    for (const draw of this.drawCalls) {
+      if (draw.type === "opaque") {
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
+        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      }
+    }
+
+    // Pass 2: Eyes (writes stencil value for hair to test against)
+    this.renderEyes(pass, dynamicOffsets)
+
+    this.drawOutlines(pass, dynamicOffsets, false)
+
+    // Pass 3: Hair rendering (depth pre-pass + shading + outlines)
+    this.renderHair(pass, dynamicOffsets)
+
+    // Pass 4: Transparent
+    pass.setPipeline(this.modelPipeline)
+    for (const draw of this.drawCalls) {
+      if (draw.type === "transparent") {
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
+        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      }
+    }
+
+    this.drawOutlines(pass, dynamicOffsets, true)
+  }
+
+  private renderStandard() {
+    const frameStart = performance.now()
+
+    this.prepareFrame(frameStart)
+    this.updateCameraUniforms()
+    this.updateRenderTarget()
+
+    const encoder = this.device.createCommandEncoder()
+    const pass = encoder.beginRenderPass(this.renderPassDescriptor)
+    this.renderScene(pass, 0)
+    pass.end()
+
+    this.device.queue.submit([encoder.finish()])
+
+    this.applyBloom()
+
+    this.updateStats(performance.now() - frameStart)
+  }
+
+  private updateSbsCameraUniforms() {
+    const up = new Vec3(0, 1, 0)
+
+    const baseEye = this.camera.getPosition()
+    const baseTarget = this.camera.target
+
+    const forward = baseTarget.subtract(baseEye).normalize()
+    const right = up.cross(forward).normalize()
+
+    const halfIpd = this.sbsIpdMeters * 0.5
+    const eyeOffset = right.scale(halfIpd)
+
+    const leftEye = baseEye.subtract(eyeOffset)
+    const rightEye = baseEye.add(eyeOffset)
+
+    // Parallel cameras: shift both eye and target by the same offset.
+    const leftTarget = baseTarget.subtract(eyeOffset)
+    const rightTarget = baseTarget.add(eyeOffset)
+
+    const projection = Mat4.perspective(this.camera.fov, this.camera.aspect / 2, this.camera.near, this.camera.far)
+
+    this.writeCameraUniform(0, Mat4.lookAt(leftEye, leftTarget, up), projection, leftEye)
+    this.writeCameraUniform(
+      this.CAMERA_UNIFORM_STRIDE,
+      Mat4.lookAt(rightEye, rightTarget, up),
+      projection,
+      rightEye
+    )
+  }
+
+  private renderSbs() {
+    const frameStart = performance.now()
+
+    this.prepareFrame(frameStart)
+    this.updateSbsCameraUniforms()
+
+    const currentTextureView = this.context.getCurrentTexture().createView()
+
+    const colorAttachment: GPURenderPassColorAttachment =
+      this.sampleCount > 1
+        ? {
+            view: this.multisampleTexture.createView(),
+            resolveTarget: currentTextureView,
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          }
+        : {
+            view: currentTextureView,
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          }
+
+    const passDescriptor: GPURenderPassDescriptor = {
+      label: "renderPass (sbs)",
+      colorAttachments: [colorAttachment],
+      depthStencilAttachment: {
+        view: this.depthTexture.createView(),
+        depthClearValue: 1.0,
+        depthLoadOp: "clear",
+        depthStoreOp: "store",
+        stencilClearValue: 0,
+        stencilLoadOp: "clear",
+        stencilStoreOp: "discard",
+      },
+    }
+
+    const encoder = this.device.createCommandEncoder()
+    const pass = encoder.beginRenderPass(passDescriptor)
+
+    const halfWidth = Math.floor(this.canvas.width / 2)
+    const height = this.canvas.height
+
+    // Left eye
+    pass.setViewport(0, 0, halfWidth, height, 0, 1)
+    pass.setScissorRect(0, 0, halfWidth, height)
+    this.renderScene(pass, 0)
+
+    // Right eye
+    pass.setViewport(halfWidth, 0, halfWidth, height, 0, 1)
+    pass.setScissorRect(halfWidth, 0, halfWidth, height)
+    this.renderScene(pass, this.CAMERA_UNIFORM_STRIDE)
+
+    pass.end()
+    this.device.queue.submit([encoder.finish()])
+
+    this.updateStats(performance.now() - frameStart)
+  }
+
+  public async startWebXR(session: XRSession, options?: { referenceSpaceType?: XRReferenceSpaceType }) {
+    if (!globalThis.XRGPUBinding) {
+      throw new Error("WebXR WebGPU binding (XRGPUBinding) is not available in this browser.")
+    }
+
+    this.xrSession = session
+    this.xrBinding = new globalThis.XRGPUBinding(session, this.device)
+
+    const layer = this.xrBinding.createProjectionLayer({
+      colorFormat: this.presentationFormat,
+      depthFormat: "depth24plus-stencil8",
+      textureType: "texture-array",
+    } as unknown)
+    this.xrLayer = layer
+
+    ;(session as unknown as { updateRenderState: (state: unknown) => void }).updateRenderState({ layers: [layer] })
+
+    const referenceSpaceType = options?.referenceSpaceType ?? "local-floor"
+    this.xrRefSpace = await session
+      .requestReferenceSpace(referenceSpaceType)
+      .catch(async () => session.requestReferenceSpace("local"))
+
+    this.xrMsaaTexture = this.device.createTexture({
+      label: "xr multisample render target",
+      size: [layer.textureWidth, layer.textureHeight],
+      sampleCount: this.sampleCount,
+      format: this.presentationFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+
+    this.xrDepthTexture = this.device.createTexture({
+      label: "xr depth texture",
+      size: [layer.textureWidth, layer.textureHeight],
+      sampleCount: this.sampleCount,
+      format: "depth24plus-stencil8",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+
+    this.camera.detachControl()
+  }
+
+  public stopWebXR() {
+    this.xrSession = null
+    this.xrRefSpace = null
+    this.xrBinding = null
+    this.xrLayer = null
+    this.xrMsaaTexture = null
+    this.xrDepthTexture = null
+
+    this.camera.attachControl(this.canvas)
+  }
+
+  private convertXrMat4RhsToLhs(matrix: Float32Array): Mat4 {
+    const out = new Float32Array(16)
+    const s = [1, 1, -1, 1]
+    for (let c = 0; c < 4; c++) {
+      for (let r = 0; r < 4; r++) {
+        out[c * 4 + r] = matrix[c * 4 + r] * s[r] * s[c]
+      }
+    }
+    return new Mat4(out)
+  }
+
+  public renderWebXRFrame(frame: XRFrame) {
+    if (!this.xrSession || !this.xrRefSpace || !this.xrBinding || !this.xrLayer || !this.xrMsaaTexture || !this.xrDepthTexture) {
+      return
+    }
+
+    const frameStart = performance.now()
+    this.prepareFrame(frameStart)
+
+    const pose = frame.getViewerPose(this.xrRefSpace)
+    if (!pose) {
+      return
+    }
+
+    const encoder = this.device.createCommandEncoder()
+
+    for (let viewIndex = 0; viewIndex < pose.views.length; viewIndex++) {
+      const view = pose.views[viewIndex]
+      if (viewIndex > 1) {
+        break
+      }
+
+      const subImage = this.xrBinding.getViewSubImage(this.xrLayer, view)
+
+      const cameraOffset = viewIndex * this.CAMERA_UNIFORM_STRIDE
+
+      const viewMatrix = this.convertXrMat4RhsToLhs(view.transform.inverse.matrix as Float32Array)
+      const projectionMatrix = this.convertXrMat4RhsToLhs(view.projectionMatrix as Float32Array)
+      const p = view.transform.position
+      const cameraPos = new Vec3(p.x, p.y, -p.z)
+
+      this.writeCameraUniform(cameraOffset, viewMatrix, projectionMatrix, cameraPos)
+
+      const baseArrayLayer = subImage.imageIndex ?? 0
+      const colorView = subImage.colorTexture.createView({ baseArrayLayer, arrayLayerCount: 1 })
+
+      const colorAttachment: GPURenderPassColorAttachment = {
+        view: this.xrMsaaTexture.createView(),
+        resolveTarget: colorView,
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "store",
+      }
+
+      const pass = encoder.beginRenderPass({
+        label: `renderPass (xr) view ${viewIndex}`,
+        colorAttachments: [colorAttachment],
+        depthStencilAttachment: {
+          view: this.xrDepthTexture.createView(),
+          depthClearValue: 1.0,
+          depthLoadOp: "clear",
+          depthStoreOp: "store",
+          stencilClearValue: 0,
+          stencilLoadOp: "clear",
+          stencilStoreOp: "discard",
+        },
+      })
+
+      const { x, y, width, height } = subImage.viewport
+      pass.setViewport(x, y, width, height, 0, 1)
+      pass.setScissorRect(Math.floor(x), Math.floor(y), Math.floor(width), Math.floor(height))
+
+      this.renderScene(pass, cameraOffset)
+      pass.end()
+    }
+
+    this.device.queue.submit([encoder.finish()])
+
+    this.updateStats(performance.now() - frameStart)
   }
 
   private applyBloom() {
@@ -1789,16 +2065,17 @@ export class Engine {
     this.device.queue.submit([encoder.finish()])
   }
 
-  private updateCameraUniforms() {
-    const viewMatrix = this.camera.getViewMatrix()
-    const projectionMatrix = this.camera.getProjectionMatrix()
-    const cameraPos = this.camera.getPosition()
+  private writeCameraUniform(offset: number, viewMatrix: Mat4, projectionMatrix: Mat4, cameraPos: Vec3) {
     this.cameraMatrixData.set(viewMatrix.values, 0)
     this.cameraMatrixData.set(projectionMatrix.values, 16)
     this.cameraMatrixData[32] = cameraPos.x
     this.cameraMatrixData[33] = cameraPos.y
     this.cameraMatrixData[34] = cameraPos.z
-    this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
+    this.device.queue.writeBuffer(this.cameraUniformBuffer, offset, this.cameraMatrixData)
+  }
+
+  private updateCameraUniforms() {
+    this.writeCameraUniform(0, this.camera.getViewMatrix(), this.camera.getProjectionMatrix(), this.camera.getPosition())
   }
 
   private updateRenderTarget() {
@@ -1834,12 +2111,12 @@ export class Engine {
     )
   }
 
-  private drawOutlines(pass: GPURenderPassEncoder, transparent: boolean) {
+  private drawOutlines(pass: GPURenderPassEncoder, dynamicOffsets: number[], transparent: boolean) {
     pass.setPipeline(this.outlinePipeline)
     const outlineType: DrawCallType = transparent ? "transparent-outline" : "opaque-outline"
     for (const draw of this.drawCalls) {
       if (draw.type === outlineType) {
-        pass.setBindGroup(0, draw.bindGroup)
+        pass.setBindGroup(0, draw.bindGroup, dynamicOffsets)
         pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
       }
     }

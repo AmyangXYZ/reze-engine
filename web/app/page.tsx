@@ -1,7 +1,7 @@
 "use client"
 
 import Header from "@/components/header"
-import { Engine, EngineStats, Vec3 } from "reze-engine"
+import { Engine, EngineStats, Vec3 } from "@/lib/reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
 import { Button } from "@/components/ui/button"
@@ -29,12 +29,58 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+
+  const xrSessionRef = useRef<XRSession | null>(null)
+  const prevSbsEnabledRef = useRef(false)
+
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
   const [isPlaying, setIsPlaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [progress, setProgress] = useState({ current: 0, duration: 0, percentage: 0 })
+
+  const [webxrSupported, setWebxrSupported] = useState<boolean | null>(null)
+  const [xrActive, setXrActive] = useState(false)
+  const [sbsEnabled, setSbsEnabled] = useState(false)
+
+  // Detect WebXR + WebGPU binding support
+  useEffect(() => {
+    let cancelled = false
+
+    void (async () => {
+      const isSessionSupported = async (): Promise<boolean> => {
+        if (!navigator.xr || typeof navigator.xr.isSessionSupported !== "function") {
+          return false
+        }
+        try {
+          return await navigator.xr.isSessionSupported("immersive-vr")
+        } catch {
+          return false
+        }
+      }
+
+      const hasXrGpuBinding =
+        typeof (globalThis as typeof globalThis & { XRGPUBinding?: unknown }).XRGPUBinding !== "undefined"
+      const supported = (await isSessionSupported()) && hasXrGpuBinding
+
+      if (!cancelled) {
+        setWebxrSupported(supported)
+        if (!supported) {
+          setSbsEnabled(true)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Keep engine SBS state in sync
+  useEffect(() => {
+    engineRef.current?.setSbsEnabled(sbsEnabled)
+  }, [sbsEnabled])
 
   // Update progress using requestAnimationFrame for smooth updates
   useEffect(() => {
@@ -164,6 +210,68 @@ export default function Home() {
     }
   }, [])
 
+  const handleEnterVr = useCallback(async () => {
+    if (!engineRef.current || !navigator.xr || xrActive) {
+      return
+    }
+
+    prevSbsEnabledRef.current = sbsEnabled
+
+    try {
+      const session = await navigator.xr.requestSession("immersive-vr", {
+        optionalFeatures: ["local-floor"],
+      })
+
+      xrSessionRef.current = session
+      setXrActive(true)
+      setSbsEnabled(false)
+
+      engineRef.current.stopRenderLoop()
+      await engineRef.current.startWebXR(session)
+
+      const handleEnd = () => {
+        session.removeEventListener("end", handleEnd)
+        xrSessionRef.current = null
+
+        const engine = engineRef.current
+        if (!engine) {
+          setXrActive(false)
+          return
+        }
+
+        engine.stopWebXR()
+        setXrActive(false)
+        setSbsEnabled(prevSbsEnabledRef.current)
+
+        engine.runRenderLoop(() => {
+          setStats(engine.getStats())
+        })
+      }
+
+      session.addEventListener("end", handleEnd)
+
+      const onXRFrame: XRFrameRequestCallback = (_time, frame) => {
+        const engine = engineRef.current
+        if (!engine) return
+        engine.renderWebXRFrame(frame)
+        setStats(engine.getStats())
+        session.requestAnimationFrame(onXRFrame)
+      }
+
+      session.requestAnimationFrame(onXRFrame)
+    } catch (e) {
+      console.error(e)
+      setXrActive(false)
+      setSbsEnabled(true)
+    }
+  }, [sbsEnabled, xrActive])
+
+  const handleExitVr = useCallback(() => {
+    xrSessionRef.current?.end().catch(() => {
+      // ignore
+    })
+  }, [])
+
   // Seek to position
   const handleSeek = useCallback(
     (value: number[]) => {
@@ -191,7 +299,7 @@ export default function Home() {
           cameraTarget: new Vec3(0, 12.1, 0),
         })
         engineRef.current = engine
-        await engine.init()
+        await engine.init({ xrCompatible: true })
         await handleLoadAnimation()
         await engine.loadModel("/models/塞尔凯特2/塞尔凯特2.pmx")
 
@@ -259,6 +367,25 @@ export default function Home() {
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
       <Header stats={stats} />
+
+      {!loading && !engineError && (
+        <div className="absolute top-14 right-4 z-50 flex items-center gap-2">
+          <Button
+            onClick={() => setSbsEnabled((v) => !v)}
+            variant={sbsEnabled ? "default" : "secondary"}
+            size="sm"
+            disabled={xrActive}
+          >
+            SBS
+          </Button>
+
+          {webxrSupported === true && (
+            <Button onClick={xrActive ? handleExitVr : handleEnterVr} variant="secondary" size="sm">
+              {xrActive ? "Exit VR" : "Enter VR"}
+            </Button>
+          )}
+        </div>
+      )}
 
       {engineError && (
         <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white p-6">
