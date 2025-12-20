@@ -1,18 +1,12 @@
 import type { NextConfig } from "next"
-import path from "path"
 // import { join } from "path"
 
 const nextConfig: NextConfig = {
   experimental: {
     externalDir: true,
   },
-  // Next.js 16 uses Turbopack by default; avoid webpack customization.
-  turbopack: {
-    resolveAlias: {
-      // When importing engine sources from ../engine, resolve runtime deps from this app's node_modules.
-      "@fred3d/ammo": path.resolve(__dirname, "node_modules/@fred3d/ammo"),
-    },
-  },
+  // Rely on tsconfig `paths` for resolving engine runtime deps when importing from ../engine.
+  turbopack: {},
   // outputFileTracingRoot: join(__dirname, ".."),
 }
 
