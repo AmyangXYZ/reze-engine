@@ -1885,30 +1885,27 @@ export class Engine {
     this.camera.attachControl(this.canvas)
   }
 
-  private convertXrMat4RhsToLhs(matrix: Float32Array): Float32Array {
-    const out = new Float32Array(16)
-    const s = [1, 1, -1, 1]
-    for (let c = 0; c < 4; c++) {
-      for (let r = 0; r < 4; r++) {
-        out[c * 4 + r] = matrix[c * 4 + r] * s[r] * s[c]
-      }
-    }
-    return out
-  }
-
   private convertXrViewMatrix(matrix: Float32Array): Mat4 {
-    const out = this.convertXrMat4RhsToLhs(matrix)
-    out[12] *= Engine.WORLD_UNITS_PER_METER
-    out[13] *= Engine.WORLD_UNITS_PER_METER
-    out[14] *= Engine.WORLD_UNITS_PER_METER
+    // WebXR matrices are right-handed and expressed in meters.
+    // The engine scene is left-handed and uses WORLD_UNITS_PER_METER units per meter.
+    // We keep XR's per-eye projection matrix unchanged (to preserve asymmetric frustum / IPD),
+    // and instead convert engine world-space into XR meter-space by right-multiplying the XR view matrix
+    // with a scale+handedness transform: diag(s, s, -s, 1), where s = 1 / WORLD_UNITS_PER_METER.
+    const out = new Float32Array(matrix)
+    const s = 1 / Engine.WORLD_UNITS_PER_METER
+
+    // Right-multiply by diag(s, s, -s, 1) => scale columns 0/1 by s and column 2 by -s.
+    for (let r = 0; r < 4; r++) {
+      out[0 * 4 + r] *= s
+      out[1 * 4 + r] *= s
+      out[2 * 4 + r] *= -s
+    }
+
     return new Mat4(out)
   }
 
-  private convertXrProjectionMatrix(matrix: Float32Array): Mat4 {
-    const out = this.convertXrMat4RhsToLhs(matrix)
-    // Near/far (and depth) are expressed in meters; rescale the projection's translation term.
-    out[14] *= Engine.WORLD_UNITS_PER_METER
-    return new Mat4(out)
+  private convertXrWorldPositionToEngineUnits(p: DOMPointReadOnly): Vec3 {
+    return new Vec3(p.x * Engine.WORLD_UNITS_PER_METER, p.y * Engine.WORLD_UNITS_PER_METER, -p.z * Engine.WORLD_UNITS_PER_METER)
   }
 
   public renderWebXRFrame(frame: XRFrame) {
@@ -1937,13 +1934,8 @@ export class Engine {
       const cameraOffset = viewIndex * this.CAMERA_UNIFORM_STRIDE
 
       const viewMatrix = this.convertXrViewMatrix(view.transform.inverse.matrix as Float32Array)
-      const projectionMatrix = this.convertXrProjectionMatrix(view.projectionMatrix as Float32Array)
-      const p = view.transform.position
-      const cameraPos = new Vec3(
-        p.x * Engine.WORLD_UNITS_PER_METER,
-        p.y * Engine.WORLD_UNITS_PER_METER,
-        -p.z * Engine.WORLD_UNITS_PER_METER
-      )
+      const projectionMatrix = new Mat4(new Float32Array(view.projectionMatrix as Float32Array))
+      const cameraPos = this.convertXrWorldPositionToEngineUnits(view.transform.position)
 
       this.writeCameraUniform(cameraOffset, viewMatrix, projectionMatrix, cameraPos)
 
