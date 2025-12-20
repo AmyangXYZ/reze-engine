@@ -1,7 +1,7 @@
 import Image from "next/image"
 import Link from "next/link"
 import { Button } from "./ui/button"
-import { EngineStats } from "reze-engine"
+import { EngineStats } from "@/lib/reze-engine"
 import { BookOpenText } from "lucide-react"
 
 export default function Header({ stats }: { stats: EngineStats | null }) {

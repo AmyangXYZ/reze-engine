@@ -29,6 +29,7 @@ export class Camera {
   panSensitivity: number = 0.0002 // Sensitivity for right-click panning
   wheelPrecision: number = 0.01
   pinchPrecision: number = 0.05
+  pinchZoomMode: "zoom" | "dolly" = "zoom"
   minZ: number = 0.1
   maxZ: number = FAR
   lowerBetaLimit: number = 0.001
@@ -125,6 +126,10 @@ export class Camera {
 
     // Update target position smoothly
     this.target = this.target.add(panRight).add(panUp)
+  }
+
+  setPinchZoomMode(mode: "zoom" | "dolly") {
+    this.pinchZoomMode = mode
   }
 
   getProjectionMatrix(): Mat4 {
@@ -279,14 +284,21 @@ export class Camera {
       const isPanGesture = midpointDelta > PAN_THRESHOLD && distanceChangeRatio < ZOOM_THRESHOLD * 2
 
       if (isZoomGesture) {
-        // Primary gesture is zoom (pinch)
-        const delta = this.lastPinchDistance - distance
-        this.radius += delta * this.pinchPrecision
+        // Primary gesture is pinch in/out.
+        if (this.pinchZoomMode === "zoom") {
+          const delta = this.lastPinchDistance - distance
+          this.radius += delta * this.pinchPrecision
 
-        // Clamp radius to reasonable bounds
-        this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
-        // Expand far plane for pinch zoom as well
-        this.far = Math.max(FAR, this.radius * 4)
+          // Clamp radius to reasonable bounds
+          this.radius = Math.max(this.minZ, Math.min(this.maxZ, this.radius))
+          // Expand far plane for pinch zoom as well
+          this.far = Math.max(FAR, this.radius * 4)
+        } else {
+          // Dolly the whole camera rig (camera + target) forward/backward.
+          const forward = this.target.subtract(this.getPosition()).normalize()
+          const amount = (distance - this.lastPinchDistance) * this.pinchPrecision
+          this.target = this.target.add(forward.scale(amount))
+        }
       }
 
       if (isPanGesture) {
