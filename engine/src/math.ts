@@ -201,6 +201,35 @@ export class Mat4 {
     )
   }
 
+  static perspectiveOffCenter(left: number, right: number, bottom: number, top: number, near: number, far: number): Mat4 {
+    const x = (2 * near) / (right - left)
+    const y = (2 * near) / (top - bottom)
+    const a = (right + left) / (right - left)
+    const b = (top + bottom) / (top - bottom)
+    const rangeInv = 1.0 / (far - near)
+
+    return new Mat4(
+      new Float32Array([
+        x,
+        0,
+        0,
+        0,
+        0,
+        y,
+        0,
+        0,
+        a,
+        b,
+        (far + near) * rangeInv,
+        1,
+        0,
+        0,
+        -near * far * rangeInv * 2,
+        0,
+      ])
+    )
+  }
+
   // LookAt matrix for LEFT-HANDED coordinate system (Z+ forward)
   // For left-handed: camera looks along +Z direction
   static lookAt(eye: Vec3, target: Vec3, up: Vec3): Mat4 {

@@ -1760,17 +1760,34 @@ export class Engine {
     const forward = baseTarget.subtract(baseEye).normalize()
     const right = up.cross(forward).normalize()
 
-    const halfIpd = this.sbsIpdMeters * Engine.WORLD_UNITS_PER_METER * 0.5
-    const eyeOffset = right.scale(halfIpd)
+    const ipdWorld = this.sbsIpdMeters * Engine.WORLD_UNITS_PER_METER
+    const eyeOffset = right.scale(ipdWorld * 0.5)
 
     const leftEye = baseEye.subtract(eyeOffset)
     const rightEye = baseEye.add(eyeOffset)
 
-    // Toe-in: both eyes converge on the same target so each half-view is centered independently.
-    const projection = Mat4.perspective(this.camera.fov, this.camera.aspect / 2, this.camera.near, this.camera.far)
+    // Parallel cameras (no toe-in) + off-center projection.
+    // This keeps each eye centered in its own half-viewport and avoids toe-in keystone distortion.
+    const convergence = Math.max(1e-3, this.camera.radius * 0.7)
 
-    this.writeCameraUniform(0, Mat4.lookAt(leftEye, baseTarget, up), projection, leftEye)
-    this.writeCameraUniform(this.CAMERA_UNIFORM_STRIDE, Mat4.lookAt(rightEye, baseTarget, up), projection, rightEye)
+    const near = this.camera.near
+    const far = this.camera.far
+    const top = near * Math.tan(this.camera.fov / 2)
+    const bottom = -top
+    const aspect = this.camera.aspect / 2
+    const rightPlane = top * aspect
+    const leftPlane = -rightPlane
+
+    const shift = (ipdWorld * 0.5 * near) / convergence
+
+    const leftProjection = Mat4.perspectiveOffCenter(leftPlane + shift, rightPlane + shift, bottom, top, near, far)
+    const rightProjection = Mat4.perspectiveOffCenter(leftPlane - shift, rightPlane - shift, bottom, top, near, far)
+
+    const leftTarget = baseTarget.subtract(eyeOffset)
+    const rightTarget = baseTarget.add(eyeOffset)
+
+    this.writeCameraUniform(0, Mat4.lookAt(leftEye, leftTarget, up), leftProjection, leftEye)
+    this.writeCameraUniform(this.CAMERA_UNIFORM_STRIDE, Mat4.lookAt(rightEye, rightTarget, up), rightProjection, rightEye)
   }
 
   private renderSbs() {
