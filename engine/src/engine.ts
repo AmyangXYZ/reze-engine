@@ -1652,6 +1652,10 @@ export class Engine {
     }
   }
 
+  public setTouchPinchZoomMode(mode: "zoom" | "dolly") {
+    this.camera.setPinchZoomMode(mode)
+  }
+
   private prepareFrame(currentTime: number): number {
     const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
     this.lastFrameTime = currentTime

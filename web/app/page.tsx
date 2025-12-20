@@ -43,6 +43,7 @@ export default function Home() {
   const [webxrSupported, setWebxrSupported] = useState<boolean | null>(null)
   const [xrActive, setXrActive] = useState(false)
   const [sbsEnabled, setSbsEnabled] = useState(false)
+  const [pinchZoomMode, setPinchZoomMode] = useState<"zoom" | "dolly">("zoom")
 
   // Detect WebXR + WebGPU binding support
   useEffect(() => {
@@ -81,6 +82,10 @@ export default function Home() {
   useEffect(() => {
     engineRef.current?.setSbsEnabled(sbsEnabled)
   }, [sbsEnabled])
+
+  useEffect(() => {
+    engineRef.current?.setTouchPinchZoomMode(pinchZoomMode)
+  }, [pinchZoomMode])
 
   // Update progress using requestAnimationFrame for smooth updates
   useEffect(() => {
@@ -377,6 +382,15 @@ export default function Home() {
             disabled={xrActive}
           >
             SBS
+          </Button>
+
+          <Button
+            onClick={() => setPinchZoomMode((m) => (m === "zoom" ? "dolly" : "zoom"))}
+            variant="secondary"
+            size="sm"
+            disabled={xrActive}
+          >
+            Pinch: {pinchZoomMode === "zoom" ? "Zoom" : "Dolly"}
           </Button>
 
           {webxrSupported === true && (
