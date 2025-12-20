@@ -96,8 +96,9 @@ export class Engine {
   private static readonly STATS_FPS_UPDATE_INTERVAL_MS = 1000
   private static readonly STATS_FRAME_TIME_ROUNDING = 100
 
-  // MMD assets are typically authored in centimeters; WebXR uses meters.
-  private static readonly WORLD_UNITS_PER_METER = 100
+  // MMD-style physics in this engine assumes 1 world unit = 10cm (decimeter).
+  // (e.g. gravity -98 => -9.8 m/s²)
+  private static readonly WORLD_UNITS_PER_METER = 10
 
   // Ambient light settings
   private ambientColor: Vec3 = new Vec3(1.0, 1.0, 1.0)
@@ -1761,19 +1762,11 @@ export class Engine {
     const leftEye = baseEye.subtract(eyeOffset)
     const rightEye = baseEye.add(eyeOffset)
 
-    // Parallel cameras: shift both eye and target by the same offset.
-    const leftTarget = baseTarget.subtract(eyeOffset)
-    const rightTarget = baseTarget.add(eyeOffset)
-
+    // Toe-in: both eyes converge on the same target so each half-view is centered independently.
     const projection = Mat4.perspective(this.camera.fov, this.camera.aspect / 2, this.camera.near, this.camera.far)
 
-    this.writeCameraUniform(0, Mat4.lookAt(leftEye, leftTarget, up), projection, leftEye)
-    this.writeCameraUniform(
-      this.CAMERA_UNIFORM_STRIDE,
-      Mat4.lookAt(rightEye, rightTarget, up),
-      projection,
-      rightEye
-    )
+    this.writeCameraUniform(0, Mat4.lookAt(leftEye, baseTarget, up), projection, leftEye)
+    this.writeCameraUniform(this.CAMERA_UNIFORM_STRIDE, Mat4.lookAt(rightEye, baseTarget, up), projection, rightEye)
   }
 
   private renderSbs() {
