@@ -25,6 +25,13 @@ export class RezePhysics {
   private readonly fixedTimeStep = 1 / 60
   private readonly maxSubSteps = 6
 
+  // Fixed-timestep render interpolation ("Fix Your Timestep"): the dynamic body pose is
+  // rendered as lerp(prev, curr, alpha) between the last two completed substeps, where
+  // alpha = leftover accumulator / fixedTimeStep. Removes the temporal aliasing that shows
+  // as hair/cloth judder when the render rate doesn't line up with the 60Hz physics step.
+  private prevPositions: Float32Array
+  private prevOrientations: Float32Array
+
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
     this.joints = joints
@@ -32,6 +39,14 @@ export class RezePhysics {
     this.world = new World(new Vec3(0, -98, 0))
     this.constraints = buildConstraints(rigidbodies, joints)
     this.contacts = new ContactPool()
+    this.prevPositions = new Float32Array(this.store.count * 3)
+    this.prevOrientations = new Float32Array(this.store.count * 4)
+  }
+
+  // Snapshot the current body pose as the interpolation "previous" state.
+  private savePrevState(): void {
+    this.prevPositions.set(this.store.positions)
+    this.prevOrientations.set(this.store.orientations)
   }
 
   setGravity(gravity: Vec3): void {
@@ -70,6 +85,8 @@ export class RezePhysics {
   reset(boneWorldMatrices: Mat4[]): void {
     if (this.firstFrame) return
     this.snapBodiesToBones(boneWorldMatrices)
+    this.savePrevState() // prev == curr after a snap, so no interpolation jump
+    this.timeAccum = 0
   }
 
   step(dt: number, boneWorldMatrices: Mat4[], boneInverseBindMatrices: Float32Array): void {
@@ -78,6 +95,7 @@ export class RezePhysics {
       // Start at current bone pose, not the PMX bind pose, so animations
       // that skip frame 0 don't pop bodies on first step.
       this.snapBodiesToBones(boneWorldMatrices)
+      this.savePrevState()
       this.firstFrame = false
     }
 
@@ -87,17 +105,21 @@ export class RezePhysics {
     this.syncFromBones(boneWorldMatrices, dt)
 
     // Fixed-timestep substeps. The maxSubSteps cap prevents runaway after
-    // a long stall (tab backgrounded, etc.).
+    // a long stall (tab backgrounded, etc.). Snapshot the pose before each step so
+    // after the loop prevState is one substep behind the live (current) state.
     this.timeAccum += dt
     let sub = 0
     while (this.timeAccum >= this.fixedTimeStep && sub < this.maxSubSteps) {
+      this.savePrevState()
       this.world.step(this.store, this.constraints, this.contacts, this.fixedTimeStep)
       this.timeAccum -= this.fixedTimeStep
       sub++
     }
     if (sub === this.maxSubSteps) this.timeAccum = 0
 
-    this.applyDynamicsToBones(boneWorldMatrices)
+    // Fraction into the next (not-yet-taken) step; always in [0, 1).
+    const alpha = this.fixedTimeStep > 0 ? this.timeAccum / this.fixedTimeStep : 0
+    this.applyDynamicsToBones(boneWorldMatrices, alpha)
   }
 
   // Snap all bone-bound bodies to boneWorld × bodyOffset, zero velocities.
@@ -217,13 +239,18 @@ export class RezePhysics {
 
   // Dynamic bodies write their transform back to the bone matrix:
   //   boneWorld = bodyWorld × bodyOffsetInverse.
-  private applyDynamicsToBones(boneWorldMatrices: Mat4[]): void {
+  // The body pose is the render-interpolated pose between the previous and current
+  // substep states (alpha = fraction into the next step), which removes fixed-step judder.
+  private applyDynamicsToBones(boneWorldMatrices: Mat4[], alpha: number): void {
     const N = this.store.count
     const inv = this.store.bodyOffsetInverse
     const positions = this.store.positions
     const orientations = this.store.orientations
+    const prevPos = this.prevPositions
+    const prevOri = this.prevOrientations
     const types = this.store.type
     const boneIdx = this.store.boneIndex
+    const oneMinus = 1 - alpha
 
     for (let i = 0; i < N; i++) {
       if (types[i] !== RigidbodyType.Dynamic) continue
@@ -232,16 +259,32 @@ export class RezePhysics {
 
       const i3 = i * 3
       const i4 = i * 4
-      Mat4.fromPositionRotationInto(
-        positions[i3 + 0],
-        positions[i3 + 1],
-        positions[i3 + 2],
-        orientations[i4 + 0],
-        orientations[i4 + 1],
-        orientations[i4 + 2],
-        orientations[i4 + 3],
-        _bodyMat,
-      )
+
+      // Position: straight lerp.
+      const px = prevPos[i3 + 0] * oneMinus + positions[i3 + 0] * alpha
+      const py = prevPos[i3 + 1] * oneMinus + positions[i3 + 1] * alpha
+      const pz = prevPos[i3 + 2] * oneMinus + positions[i3 + 2] * alpha
+
+      // Orientation: shortest-arc nlerp (bodies rotate little per fixed step, so nlerp
+      // tracks slerp closely and avoids the trig).
+      const ax = prevOri[i4 + 0], ay = prevOri[i4 + 1], az = prevOri[i4 + 2], aw = prevOri[i4 + 3]
+      let bx = orientations[i4 + 0], by = orientations[i4 + 1], bz = orientations[i4 + 2], bw = orientations[i4 + 3]
+      if (ax * bx + ay * by + az * bz + aw * bw < 0) {
+        bx = -bx; by = -by; bz = -bz; bw = -bw
+      }
+      let qx = ax * oneMinus + bx * alpha
+      let qy = ay * oneMinus + by * alpha
+      let qz = az * oneMinus + bz * alpha
+      let qw = aw * oneMinus + bw * alpha
+      const ql = Math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+      if (ql > 0) {
+        const invL = 1 / ql
+        qx *= invL; qy *= invL; qz *= invL; qw *= invL
+      } else {
+        qx = 0; qy = 0; qz = 0; qw = 1
+      }
+
+      Mat4.fromPositionRotationInto(px, py, pz, qx, qy, qz, qw, _bodyMat)
       Mat4.multiplyArrays(_bodyMat, 0, inv, i * 16, _boneMat, 0)
 
       // Sanity gate against NaN / extreme values — silently drop the update.
