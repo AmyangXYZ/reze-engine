@@ -37,6 +37,10 @@ export class Camera {
   lowerBetaLimit: number = 0.001
   upperBetaLimit: number = Math.PI - 0.001
 
+  // Reused each frame so getViewMatrix/getProjectionMatrix don't allocate a Mat4 per call.
+  private _viewMat = new Mat4(new Float32Array(16))
+  private _projMat = new Mat4(new Float32Array(16))
+
   constructor(alpha: number, beta: number, radius: number, target: Vec3, fov: number = Math.PI / 4) {
     this.alpha = alpha
     this.beta = beta
@@ -66,8 +70,9 @@ export class Camera {
 
   getViewMatrix(): Mat4 {
     const eye = this.getPosition()
-    const up = new Vec3(0, 1, 0)
-    return Mat4.lookAt(eye, this.target, up)
+    const t = this.target
+    Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, t.x, t.y, t.z, 0, 1, 0)
+    return this._viewMat
   }
 
   // Get camera's right and up vectors for panning
@@ -139,7 +144,8 @@ export class Camera {
 
   getProjectionMatrix(): Mat4 {
     this.updateFarFromRadius()
-    return Mat4.perspective(this.fov, this.aspect, this.near, this.far)
+    Mat4.perspectiveInto(this._projMat.values, this.fov, this.aspect, this.near, this.far)
+    return this._projMat
   }
 
   attachControl(canvas: HTMLCanvasElement) {

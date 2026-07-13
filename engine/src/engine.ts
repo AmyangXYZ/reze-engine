@@ -2486,7 +2486,24 @@ export class Engine {
   private updateVertexBuffer(inst: ModelInstance): void {
     const vertices = inst.model.getVertices()
     if (!vertices?.length) return
-    this.device.queue.writeBuffer(inst.vertexBuffer, 0, vertices)
+    // Vertex morphs touch only a subset of verts (typically the face), so upload just the
+    // changed [minVert, maxVert] slice when the model can report one; null = full upload.
+    const range = inst.model.consumeVertexUploadRange()
+    if (range) {
+      const STRIDE = 8 // floats per vertex (pos3 + normal3 + uv2)
+      const firstFloat = range.minVert * STRIDE
+      const floatLen = (range.maxVert - range.minVert + 1) * STRIDE
+      const byteOffset = firstFloat * 4
+      this.device.queue.writeBuffer(
+        inst.vertexBuffer,
+        byteOffset,
+        vertices.buffer,
+        vertices.byteOffset + byteOffset,
+        floatLen * 4,
+      )
+    } else {
+      this.device.queue.writeBuffer(inst.vertexBuffer, 0, vertices)
+    }
     inst.vertexBufferNeedsUpdate = false
   }
 

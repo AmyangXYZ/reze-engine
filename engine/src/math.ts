@@ -348,64 +348,54 @@ export class Mat4 {
 
   // Perspective matrix for LEFT-HANDED coordinate system (Z+ forward)
   // For left-handed: Z goes from 0 (near) to 1 (far), +Z is forward
-  static perspective(fov: number, aspect: number, near: number, far: number): Mat4 {
+  // Zero-alloc perspective into an existing column-major array (same values as perspective).
+  static perspectiveInto(out: Float32Array, fov: number, aspect: number, near: number, far: number): void {
     const f = 1.0 / Math.tan(fov / 2)
     const rangeInv = 1.0 / (far - near) // Positive for left-handed
+    out[0] = f / aspect; out[1] = 0; out[2] = 0; out[3] = 0
+    out[4] = 0; out[5] = f; out[6] = 0; out[7] = 0
+    out[8] = 0; out[9] = 0; out[10] = (far + near) * rangeInv; out[11] = 1 // Z+ forward (LH)
+    out[12] = 0; out[13] = 0; out[14] = -near * far * rangeInv * 2; out[15] = 0
+  }
 
-    return new Mat4(
-      new Float32Array([
-        f / aspect,
-        0,
-        0,
-        0,
-        0,
-        f,
-        0,
-        0,
-        0,
-        0,
-        (far + near) * rangeInv,
-        1, // Positive for left-handed (Z+ forward)
-        0,
-        0,
-        -near * far * rangeInv * 2, // Negated for left-handed
-        0,
-      ])
-    )
+  static perspective(fov: number, aspect: number, near: number, far: number): Mat4 {
+    const m = new Mat4(new Float32Array(16))
+    Mat4.perspectiveInto(m.values, fov, aspect, near, far)
+    return m
+  }
+
+  // Zero-alloc LH lookAt into an existing column-major array (scalar math, no Vec3 temps;
+  // identical result to lookAt: forward=norm(target-eye), right=norm(up×forward), up=norm(forward×right)).
+  static lookAtInto(
+    out: Float32Array,
+    ex: number, ey: number, ez: number,
+    tx: number, ty: number, tz: number,
+    ux: number, uy: number, uz: number
+  ): void {
+    // sqrt(dot) (not hypot) to match Vec3.length()/normalize() bit-for-bit.
+    let fx = tx - ex, fy = ty - ey, fz = tz - ez
+    const fl = Math.sqrt(fx * fx + fy * fy + fz * fz); const fi = fl > 0 ? 1 / fl : 0
+    fx *= fi; fy *= fi; fz *= fi
+    let rx = uy * fz - uz * fy, ry = uz * fx - ux * fz, rz = ux * fy - uy * fx
+    const rl = Math.sqrt(rx * rx + ry * ry + rz * rz); const ri = rl > 0 ? 1 / rl : 0
+    rx *= ri; ry *= ri; rz *= ri
+    let vx = fy * rz - fz * ry, vy = fz * rx - fx * rz, vz = fx * ry - fy * rx
+    const vl = Math.sqrt(vx * vx + vy * vy + vz * vz); const vi = vl > 0 ? 1 / vl : 0
+    vx *= vi; vy *= vi; vz *= vi
+    out[0] = rx; out[1] = vx; out[2] = fx; out[3] = 0
+    out[4] = ry; out[5] = vy; out[6] = fy; out[7] = 0
+    out[8] = rz; out[9] = vz; out[10] = fz; out[11] = 0
+    out[12] = -(rx * ex + ry * ey + rz * ez)
+    out[13] = -(vx * ex + vy * ey + vz * ez)
+    out[14] = -(fx * ex + fy * ey + fz * ez)
+    out[15] = 1
   }
 
   // LookAt matrix for LEFT-HANDED coordinate system (Z+ forward)
-  // For left-handed: camera looks along +Z direction
   static lookAt(eye: Vec3, target: Vec3, up: Vec3): Mat4 {
-    // In left-handed: forward = target - eye (Z+ direction)
-    // These operations create new Vec3 objects, so normalize() mutates those new objects
-    const forward = target.subtract(eye)
-    forward.normalize()
-    const right = up.cross(forward)
-    right.normalize() // X+ is right
-    const upVec = forward.cross(right)
-    upVec.normalize() // Y+ is up
-
-    return new Mat4(
-      new Float32Array([
-        right.x,
-        upVec.x,
-        forward.x,
-        0,
-        right.y,
-        upVec.y,
-        forward.y,
-        0,
-        right.z,
-        upVec.z,
-        forward.z,
-        0,
-        -right.dot(eye),
-        -upVec.dot(eye),
-        -forward.dot(eye),
-        1,
-      ])
-    )
+    const m = new Mat4(new Float32Array(16))
+    Mat4.lookAtInto(m.values, eye.x, eye.y, eye.z, target.x, target.y, target.z, up.x, up.y, up.z)
+    return m
   }
 
   // LH ortho, NDC depth 0=near 1=far

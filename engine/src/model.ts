@@ -200,6 +200,14 @@ export class Model {
   private baseVertexData: Float32Array<ArrayBuffer> // Original vertex data before morphing
   private vertexCount: number
   private indexData: Uint32Array<ArrayBuffer>
+
+  // Morph state reused across frames (S1) + partial vertex-upload range tracking (S2).
+  private morphEffectiveWeights?: Float32Array
+  private morphPrevMinVert = -1 // vertices touched by last applyMorphs (reset to base this pass)
+  private morphPrevMaxVert = -1
+  private morphPendingMinVert = -1 // accumulated range awaiting a GPU upload
+  private morphPendingMaxVert = -1
+  private morphUploadFull = true // first upload after load pushes the whole buffer once
   private textures: Texture[] = []
   private materials: Material[] = []
   // Static skeleton/skinning (not necessarily serialized yet)
@@ -891,8 +899,12 @@ export class Model {
     const morphCount = this.morphing.morphs.length
     const weights = this.runtimeMorph.weights
 
-    // First pass: Compute effective weights for all morphs (handling group morphs)
-    const effectiveWeights = new Float32Array(morphCount)
+    // First pass: Compute effective weights for all morphs (handling group morphs).
+    // Reuse a persistent buffer — this runs every frame during facial animation.
+    if (!this.morphEffectiveWeights || this.morphEffectiveWeights.length !== morphCount) {
+      this.morphEffectiveWeights = new Float32Array(morphCount)
+    }
+    const effectiveWeights = this.morphEffectiveWeights
     effectiveWeights.set(weights) // Start with direct weights
 
     // Apply group morphs: group morph weight * ratio affects referenced morphs
@@ -916,7 +928,10 @@ export class Model {
       effectiveWeights[i] = Math.max(0, Math.min(1, effectiveWeights[i]))
     }
 
-    // Second pass: Apply vertex morphs with their effective weights
+    // Second pass: Apply vertex morphs with their effective weights, tracking the
+    // touched vertex-index range so the engine can re-upload only that slice.
+    let curMinVert = -1
+    let curMaxVert = -1
     for (let morphIdx = 0; morphIdx < morphCount; morphIdx++) {
       const effectiveWeight = effectiveWeights[morphIdx]
       if (effectiveWeight === 0 || effectiveWeight < 0.0001) continue
@@ -944,8 +959,46 @@ export class Model {
         this.vertexData[vertexIdx] += offsetX * effectiveWeight
         this.vertexData[vertexIdx + 1] += offsetY * effectiveWeight
         this.vertexData[vertexIdx + 2] += offsetZ * effectiveWeight
+
+        if (curMinVert < 0 || vIdx < curMinVert) curMinVert = vIdx
+        if (vIdx > curMaxVert) curMaxVert = vIdx
       }
     }
+
+    // Vertices differing from what's on the GPU = touched this frame UNION touched last
+    // frame (this pass reset those back to base). Merge into any pending range; the engine
+    // consumes it and uploads only [min, max]. vertexData is the only thing that mutates
+    // verts (skinning runs on the GPU), so this range is exact.
+    let dirtyMin = curMinVert
+    let dirtyMax = curMaxVert
+    if (this.morphPrevMaxVert >= 0) {
+      if (dirtyMin < 0 || this.morphPrevMinVert < dirtyMin) dirtyMin = this.morphPrevMinVert
+      if (this.morphPrevMaxVert > dirtyMax) dirtyMax = this.morphPrevMaxVert
+    }
+    if (dirtyMin >= 0 && dirtyMax >= 0) {
+      this.morphPendingMinVert =
+        this.morphPendingMinVert < 0 ? dirtyMin : Math.min(this.morphPendingMinVert, dirtyMin)
+      this.morphPendingMaxVert =
+        this.morphPendingMaxVert < 0 ? dirtyMax : Math.max(this.morphPendingMaxVert, dirtyMax)
+    }
+    this.morphPrevMinVert = curMinVert
+    this.morphPrevMaxVert = curMaxVert
+  }
+
+  // Consume the pending morph vertex-upload range for the engine. Returns null when a
+  // full upload is needed (first time after load, or nothing tracked), else the inclusive
+  // [minVert, maxVert] slice that changed. Resets pending state.
+  consumeVertexUploadRange(): { minVert: number; maxVert: number } | null {
+    if (this.morphUploadFull || this.morphPendingMaxVert < 0) {
+      this.morphUploadFull = false
+      this.morphPendingMinVert = -1
+      this.morphPendingMaxVert = -1
+      return null
+    }
+    const range = { minVert: this.morphPendingMinVert, maxVert: this.morphPendingMaxVert }
+    this.morphPendingMinVert = -1
+    this.morphPendingMaxVert = -1
+    return range
   }
 
   private buildClipFromVmdKeyFrames(vmdKeyFrames: VMDKeyFrame[]): AnimationClip {
