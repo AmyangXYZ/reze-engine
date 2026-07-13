@@ -1,10 +1,8 @@
 # Reze Engine
 
-**Zero-runtime-dependency** WebGPU engine for real-time MMD/PMX rendering. Renderer, animation, IK, and physics all in TypeScript.
+**Zero-runtime-dependency** WebGPU engine for real-time MMD/PMX rendering — renderer, animation, IK, and physics, all in TypeScript.
 
 ![screenshot](./screenshot.png)
-
-## Install
 
 ```bash
 npm install reze-engine
@@ -12,36 +10,56 @@ npm install reze-engine
 
 ## Features
 
-- **Anime/MMD-style hybrid renderer** — toon-ramp NPR diffuse mixed with PBR GGX specular (multi-scatter + LTC energy compensation)
-- **Per-material presets** — `face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`, assigned by material name
-- **HDR pipeline** with bloom mip pyramid, Filmic tone mapping, 4× MSAA, tile-memory-friendly on Apple Silicon
-- **Alpha-hashed transparency** (Wyman & McGuire 2017) for self-overlapping transparent meshes like stockings
-- **Screen-space outlines** on opaque + transparent materials
-- **See-through hair over eyes** — stencil-gated MMD post-alpha-eye so eyes read at 75% through hair silhouettes
-- **In-house TS physics** — sequential-impulse 6DOF spring solver, sphere/box/capsule contacts, split-impulse position correction, fixed-step substepping
-- **VMD animation** with IK solver
-- **Orbit camera** with bone-follow mode
-- **GPU picking** (double-click/tap)
-- **Ground plane** with PCF shadow mapping
-- **Multi-model support**
+- Anime/MMD **hybrid renderer** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
+- **9 per-material presets** assigned by material name (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`)
+- **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
+- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, no external dependency
+- **VMD animation** with MMD IK, morphs (GPU compute path), and VMD export
+- **Interactive editing** — GPU picking, transform gizmo, bone/material selection
+- Orbit camera with bone-follow, ground + PCF shadows, multi-model
 
-## Usage
+See [Physics](#physics) and [Rendering](#rendering) for the internals.
+
+## Codebase map
+
+```
+engine/src/
+  engine.ts          Engine: device/context, render loop, all passes & pipelines,
+                     per-model GPU resources, picking, gizmo   (entry point)
+  model.ts           Model: skeleton, 4-bone skinning, morphs (CPU + GPU compute),
+                     animation state, drives IK; per-frame update()
+  animation.ts       AnimationClip, VMD bezier interpolation, playback/priority
+  ik-solver.ts       MMD-style CCD IK (angle limits, solve-axis specialization)
+  camera.ts          Orbit camera (alpha/beta/radius), bone-follow, mouse/touch
+  math.ts            Vec3 / Quat / Mat4 (zero-alloc *Into variants for hot paths)
+  pmx-loader.ts      PMX parser: mesh, bones, morphs, rigid bodies, joints
+  vmd-loader.ts      VMD motion parser  ·  vmd-writer.ts  VMD export (Shift-JIS)
+  asset-reader.ts    URL + local-folder asset resolution  ·  folder-upload.ts
+  index.ts           public exports
+
+  physics/           in-house rigid-body solver (~2.5k lines)
+    physics.ts         RezePhysics: bone↔body sync, fixed-step accumulator + interpolation
+    solver.ts          sequential-impulse PGS (joint + contact rows)
+    contact.ts         narrowphase (analytical sphere/box/capsule pairs) + contact pool
+    constraint.ts      6DOF spring joints   ·   world.ts  broadphase + step
+    body.ts            SoA rigid-body store  ·  types.ts
+
+  shaders/
+    materials/       nodes.ts (Blender-node WGSL library) + common.ts (bindings, skinning VS)
+                     + one file per preset (face, hair, body, eye, stockings, …)
+    passes/          shadow, morph (GPU vertex-morph compute), bloom, composite (Filmic),
+                     outline, selection, gizmo, pick, ground, mipmap
+```
+
+## Quick start
 
 ```javascript
 import { Engine, Vec3 } from "reze-engine";
 
 const engine = new Engine(canvas, {
-  world: { color: new Vec3(0.4, 0.49, 0.65), strength: 1.0 },
-  sun: {
-    color: new Vec3(1, 1, 1),
-    strength: 2.0,
-    direction: new Vec3(0, -0.5, 1),
-  },
-  bloom: {
-    color: new Vec3(0.9, 0.1, 0.8),
-    intensity: 0.05,
-    threshold: 0.5,
-  }
+  world: { color: new Vec3(0.4, 0.49, 0.65), strength: 1.0 }, // environment light
+  sun: { color: new Vec3(1, 1, 1), strength: 2.0, direction: new Vec3(0, -0.5, 1) },
+  bloom: { color: new Vec3(0.9, 0.1, 0.8), intensity: 0.05, threshold: 0.5 },
   camera: { distance: 31.5, target: new Vec3(0, 11.5, 0) }, // MMD units (1 unit = 8 cm)
 });
 await engine.init();
@@ -50,14 +68,9 @@ const model = await engine.loadModel("hero", "/models/hero/hero.pmx");
 
 // Map PMX material names to NPR presets (unlisted names fall back to `default`).
 engine.setMaterialPresets("hero", {
-  face: ["face01"],
-  body: ["skin"],
-  hair: ["hair_f"],
-  eye: ["eye"],
-  cloth_smooth: ["shirt", "shorts", "dress", "shoes"],
-  cloth_rough: ["jacket", "pants"],
-  stockings: ["stockings"],
-  metal: ["metal01", "earring"],
+  face: ["face01"], body: ["skin"], hair: ["hair_f"], eye: ["eye"],
+  cloth_smooth: ["shirt", "dress", "shoes"], cloth_rough: ["jacket"],
+  stockings: ["stockings"], metal: ["earring"],
 });
 
 await model.loadVmd("idle", "/animations/idle.vmd");
@@ -71,324 +84,150 @@ engine.runRenderLoop();
 
 ## API
 
-One WebGPU **Engine** per page (singleton after `init()`). Load models via URL **or** from a user-selected folder (see [Local folder uploads](#local-folder-uploads-browser)).
+One WebGPU **Engine** per page (singleton after `init()`). Models load by URL **or** from a user-selected folder ([below](#local-folder-uploads-browser)).
 
 ### Engine
 
 ```javascript
 engine.init()
-engine.loadModel(name, path)
-engine.loadModel(name, { files, pmxFile? })  // folder upload — see below
-engine.getModel(name)
-engine.getModelNames()
-engine.removeModel(name)
+engine.loadModel(name, path)                 // or ({ files, pmxFile? }) for folder upload
+engine.getModel(name) / getModelNames() / removeModel(name)
 
 engine.setMaterialPresets(name, presetMap)   // assign NPR presets by material name
-engine.setMaterialVisible(name, material, visible)
-engine.toggleMaterialVisible(name, material)
-engine.isMaterialVisible(name, material)
+engine.setMaterialVisible(name, material, visible) / toggleMaterialVisible / isMaterialVisible
 
 engine.setIKEnabled(enabled)
 engine.setPhysicsEnabled(enabled)
-engine.resetPhysics()                        // re-pose bodies from animation and zero velocities — call when physics explodes
+engine.resetPhysics()                        // re-pose bodies from animation + zero velocities (call if physics explodes)
 
-engine.setCameraFollow(model, bone?, offset?)
-engine.setCameraFollow(null)
-engine.setCameraTarget(vec3)
-engine.setCameraDistance(d)
-engine.setCameraAlpha(a)
-engine.setCameraBeta(b)
+engine.setCameraFollow(model, bone?, offset?) / setCameraFollow(null)
+engine.setCameraTarget(vec3) / setCameraDistance(d) / setCameraAlpha(a) / setCameraBeta(b)
 
+engine.setWorld({ color?, strength? }) / setSun({ color?, strength?, direction? })   // runtime lighting
 engine.addGround(options?)
-engine.runRenderLoop(callback?)
-engine.stopRenderLoop()
-engine.getStats()
+engine.runRenderLoop(callback?) / stopRenderLoop()
+engine.getStats()                            // fps + smoothness metrics (frameTimeMax, fps1PercentLow, jitter)
 engine.dispose()
 ```
 
-### Local folder uploads (browser)
-
-Use a hidden `<input type="file" webkitdirectory multiple>` (or drag/drop) and pass the resulting `FileList` or `File[]` into the engine. Textures resolve relative to the chosen PMX file inside that tree.
-
-**Important:** read `input.files` into a normal array **before** setting `input.value = ""`. The browser's `FileList` is _live_ — clearing the input empties it.
-
-1. **`parsePmxFolderInput(fileList)`** — returns a tagged result (`empty` | `not_directory` | `no_pmx` | `single` | `multiple`). For `single`, you already have `files` and `pmxFile`. For `multiple`, show a picker (dropdown) of `pmxRelativePaths`, then resolve with **`pmxFileAtRelativePath(files, path)`**.
-2. **`engine.loadModel(name, { files, pmxFile })`** — `pmxFile` selects which `.pmx` when the folder contains several.
-
-```javascript
-import {
-  Engine,
-  parsePmxFolderInput,
-  pmxFileAtRelativePath,
-} from "reze-engine";
-
-// In <input onChange>:
-const picked = parsePmxFolderInput(e.target.files);
-e.target.value = "";
-
-if (picked.status === "single") {
-  const model = await engine.loadModel("myModel", {
-    files: picked.files,
-    pmxFile: picked.pmxFile,
-  });
-}
-
-if (picked.status === "multiple") {
-  // Let the user choose `chosenPath` from picked.pmxRelativePaths, then:
-  const pmxFile = pmxFileAtRelativePath(picked.files, chosenPath);
-  const model = await engine.loadModel("myModel", {
-    files: picked.files,
-    pmxFile,
-  });
-}
-```
-
-VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths are resolved against the PMX directory inside the upload.
+**Options** — Blender-style scene config: `world` = environment lighting, `sun` = directional lamp (`direction` points from sun into the scene), `camera` = framing (`fov` in radians). Callbacks: `onRaycast`, `onGizmoDrag`. The shadow map is cast from `sun.direction` — the same vector the shader lights with — so shading and cast shadows stay coupled.
 
 ### Model
 
 ```javascript
-await model.loadVmd(name, url)
-model.loadClip(name, clip)
+await model.loadVmd(name, url) / model.loadClip(name, clip)
 model.show(name)
-model.play(name)
-model.play(name, { priority: 8 }) // higher number = higher priority (0 default/lowest)
-model.play(name, { loop: true }) // repeat until stop/pause or another play
-model.pause()
-model.stop()
-model.seek(time)
-model.getAnimationProgress()
-model.getClip(name)
-model.exportVmd(name)              // returns ArrayBuffer
+model.play(name, { priority?, loop? })       // priority: higher wins when clips compete (0 = default)
+model.pause() / stop() / seek(time)
+model.getAnimationProgress()                 // { current, duration (s), playing, paused, looping, … }
+model.exportVmd(name)                        // → ArrayBuffer (Shift-JIS bone/morph names)
 
-model.rotateBones({ 首: quat, 頭: quat }, ms?)
-model.moveBones({ センター: vec3 }, ms?)
+model.rotateBones({ 首: quat }, ms?) / moveBones({ センター: vec3 }, ms?)
 model.setMorphWeight(name, weight, ms?)
-model.resetAllBones()
-model.resetAllMorphs()
+model.resetAllBones() / resetAllMorphs()
 model.getBoneWorldPosition(name)
-
-// Direct bone local-transform accessors (used by interactive gizmo drag).
-// Readers return the live runtime state; snapshot with .clone() if needed.
-model.getBoneLocalRotation(boneIndex)
-model.getBoneLocalTranslation(boneIndex)
-
-// Raw absolute-local translation write. NOT the same as moveBones({ n: v }, 0)
-// — moveBones treats input as VMD-relative and converts. Use this when you
-// already have the final local translation. For rotation, rotateBones(..., 0)
-// is already an instant-write equivalent.
-model.setBoneLocalTranslation(boneIndex, vec3)
-
-// Freeze clip re-sampling so direct writes persist across frames. Auto-cleared
-// on play() / seek(). See "Interactive pose editing" below.
-model.setClipApplySuspended(suspended: boolean)
-model.isClipApplySuspended()
 ```
 
-#### Animation data
+`AnimationClip` holds keyframes only (bone/morph tracks keyed by `frame`, plus `frameCount`); time advances at fixed `FPS` (exported, default 30).
 
-`AnimationClip` holds keyframes only: bone/morph tracks keyed by `frame`, and `frameCount` (last keyframe index). Time advances at fixed `FPS` (see package export `FPS`, default 30).
+### Local folder uploads (browser)
 
-#### VMD Export
+Feed a `<input type="file" webkitdirectory>` `FileList` (or drag/drop) into the engine; textures resolve relative to the chosen PMX inside that tree.
 
-`model.exportVmd(name)` serialises a loaded clip back to the VMD binary format and returns an `ArrayBuffer`. Bone and morph names are Shift-JIS encoded for compatibility with standard MMD tools.
+> **Gotcha:** copy `input.files` into an array **before** `input.value = ""` — the `FileList` is live and clearing the input empties it.
+
+`parsePmxFolderInput(fileList)` returns a tagged result; for `single` you get `{ files, pmxFile }` directly, for `multiple` show a picker over `pmxRelativePaths` and resolve with `pmxFileAtRelativePath(files, path)`. Then:
 
 ```javascript
-const buffer = model.exportVmd("idle");
-const blob = new Blob([buffer], { type: "application/octet-stream" });
-const link = document.createElement("a");
-link.href = URL.createObjectURL(blob);
-link.download = "idle.vmd";
-link.click();
+const picked = parsePmxFolderInput(e.target.files);
+e.target.value = "";
+if (picked.status === "single")
+  await engine.loadModel("m", { files: picked.files, pmxFile: picked.pmxFile });
 ```
 
-#### Playback
-
-Call `model.play(name, options?)` to start or switch motion. `loop: true` makes the playhead wrap at the end of the clip until you stop, pause, or call `play` with something else. `priority` chooses which request wins when several clips compete.
-
-#### Progress
-
-`getAnimationProgress()` reports `current` and `duration` in seconds, plus `playing`, `paused`, `looping`, and related fields.
-
-### Engine Options
-
-Blender-style scene config — `world` = environment lighting, `sun` = the directional lamp, `camera` = view framing.
-
-```javascript
-{
-  world: {
-    color: Vec3,       // World > Surface > Color (linear scene-referred)
-    strength: number,  // World > Surface > Strength
-  },
-  sun: {
-    color: Vec3,       // Light > Color
-    strength: number,  // Light > Strength (Blender units)
-    direction: Vec3,   // direction light travels (points from sun into the scene)
-  },
-  camera: {
-    distance: number,
-    target: Vec3,
-    fov: number,       // radians
-  },
-  onRaycast: (modelName, material, bone, screenX, screenY) => void,
-  onGizmoDrag: (event: GizmoDragEvent) => void,
-}
-```
-
-The shadow map is cast from `sun.direction` — same vector the shader lights with — so visible shading and cast shadows stay coupled.
-
-`engine.setWorld({ color?, strength? })` and `engine.setSun({ color?, strength?, direction? })` update lighting at runtime; changing `sun.direction` refreshes the shadow VP on the next frame.
+VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths resolve against the PMX directory.
 
 ### Interactive pose editing
 
-Dblclick picks a bone or material; a transform gizmo (rings + axes, local-axis aligned) drags the selection. The engine does NOT write to the skeleton on its own — it fires a callback with the computed target local transform and the host picks a write policy (runtime override, tween, clip keyframe edit).
-
-**Pick callback.** Fires on dblclick. `modelName` is `""` when the click missed the mesh. `material` and `bone` are both resolved for every hit (per-triangle dominant-joint from the GPU pick), so a single handler can serve both material-mode and bone-mode toggles:
-
-```javascript
-onRaycast: (modelName, material, bone, screenX, screenY) => { ... }
-
-engine.setSelectedMaterial(modelName | null, materialName | null) // orange screen-space selection outline
-engine.setSelectedBone(modelName | null, boneName | null)          // shows the rings+axes gizmo at this bone
-```
-
-**Gizmo drag callback.** The engine only reports; you apply:
+Double-click picks a bone or material (per-triangle dominant-joint from the GPU pick, so one handler serves both modes); a local-axis transform gizmo drags it. **The engine only reports — it never writes the skeleton itself**, so the host chooses the write policy.
 
 ```typescript
+engine.setSelectedBone(modelName | null, boneName | null)       // shows the gizmo
+engine.setSelectedMaterial(modelName | null, materialName | null) // selection outline
+
+onRaycast: (modelName, material, bone, screenX, screenY) => { ... } // modelName "" = missed
+
 type GizmoDragEvent = {
-  modelName: string
-  boneName: string
-  boneIndex: number
-  kind: "rotate" | "translate"
-  localRotation: Quat       // target absolute local rotation
-  localTranslation: Vec3    // target absolute local translation
-  phase?: "start" | "end"   // undefined during drag moves
+  boneName: string; boneIndex: number; kind: "rotate" | "translate"
+  localRotation: Quat; localTranslation: Vec3   // target absolute local transform
+  phase?: "start" | "end"                       // undefined during drag moves
 }
 ```
 
-Fires once with `phase: "start"` on mousedown, on every mousemove (no phase), once with `phase: "end"` on mouseup. While drag is active the engine consumes any mouse input inside the gizmo's bounding sphere so camera orbit never conflicts with a drag — mousedown outside the sphere routes to camera as normal.
-
-**Two write strategies**, depending on whether you keep a clip on disk:
+The gizmo consumes mouse input inside its bounding sphere so drags never fight camera orbit. Apply the reported transform — runtime override (below) or keyframe edit into a clip you re-`loadClip`:
 
 ```javascript
-// Runtime override (no clip editor — this is what web/page.tsx does).
 onGizmoDrag: (e) => {
-  const model = engine.getModel(e.modelName)
-  if (!model) return
-  if (e.phase === "start") {
-    model.pause()
-    model.setClipApplySuspended(true) // stop clip re-sampling from wiping the edit
-    return
-  }
-  if (e.phase === "end") return
-  if (e.kind === "rotate")
-    model.rotateBones({ [e.boneName]: e.localRotation }, 0) // 0 = instant write
-  else
-    model.setBoneLocalTranslation(e.boneIndex, e.localTranslation)
+  const model = engine.getModel(e.modelName); if (!model) return;
+  if (e.phase === "start") { model.pause(); model.setClipApplySuspended(true); return; } // stop re-sampling wiping the edit
+  if (e.phase === "end") return;
+  if (e.kind === "rotate") model.rotateBones({ [e.boneName]: e.localRotation }, 0);       // 0 = instant write
+  else model.setBoneLocalTranslation(e.boneIndex, e.localTranslation);
 }
-// Pressing play/seek auto-clears the suspend flag → animation resumes, edit is lost
-// (expected runtime-override semantic).
-
-// Keyframe edit (animation editor — studio-style).
-onGizmoDrag: (e) => {
-  if (e.phase === "start") { beginUndoGroup(); return }
-  if (e.phase === "end")   { commitUndoGroup(); return }
-  const kf = findOrCreateKeyframe(clip, e.boneName, currentFrame)
-  kf.rotation = e.localRotation
-  kf.translation = e.localTranslation
-  model.loadClip(clipName, clip)
-  model.seek(currentTime)
-  // The re-sampled clip now produces the edited pose — no suspend flag needed.
-}
+// play()/seek() auto-clear the suspend flag (edit is lost — runtime-override semantic).
 ```
 
-Note the asymmetry: rotation uses `rotateBones({ name, q }, 0)` (the tween-based API reduces to an instant write when duration is 0) while translation uses `setBoneLocalTranslation(idx, v)` — `moveBones` can't be used because it converts VMD-relative input to local, and the gizmo's output is already local.
+Note the asymmetry: rotation goes through `rotateBones(…, 0)`, but translation uses `setBoneLocalTranslation(idx, v)` — `moveBones` converts VMD-relative→local, and the gizmo output is already local.
 
 ## Physics
 
-In-house sequential-impulse rigid-body solver, no external physics dependency. Targets PMX rigs (sphere / box / capsule colliders, 6DOF spring joints) at quality comparable to Bullet's defaults in ~1.5k lines of TypeScript.
+In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsule colliders, 6DOF spring joints), ~2.5k lines of TypeScript, no external dependency, at quality comparable to Bullet's defaults. A fixed-timestep accumulator runs at a constant **60 Hz** (≤6 substeps/frame) so spring impulse, damping, and integration stay deterministic; dynamic bodies are **render-interpolated** between substeps to stay smooth when the display rate ≠ 60 Hz.
 
-### Pipeline
+**Per substep:** `predict velocities → broad + narrowphase → solve constraints (10 iters) → split-impulse position correction → integrate`.
 
-Per substep:
+- **Solver** — projected Gauss-Seidel, joint rows + contact rows in one loop. Joints are 6DOF springs (3 linear + 3 angular) with stop-ERP limit correction and per-axis stiffness×error impulse.
+- **Narrowphase** — analytical sphere-sphere / -capsule / -box and capsule-capsule / -box. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
+- **Speculative contacts** (`margin 0.04`) fire at near-touch with a push-only clamp — inert until real overlap, but they stop fast bodies tunneling thin surfaces in one substep.
+- **Split-impulse correction** resolves penetration by a mass-weighted translation *outside* the velocity solver, so joint pulls can't fight separation.
+- **Kinematic velocity propagation** — bone-driven bodies derive linear+angular velocity from the bone-pose delta each frame, so joints feel real limb motion, not a teleport.
+- Sleeping is off (cloth must always react); resting bodies bleed micro-velocity via per-PMX damping.
 
-```
-predict velocities  → broadphase + narrowphase  → solve constraints (10 iters)
-                   → split-impulse position correction  → integrate transforms
-```
-
-A fixed-timestep accumulator runs the substep at a constant **60 Hz** regardless of render rate, with up to 6 substeps per render frame. Constant `dt` keeps spring impulse, damping, and integration deterministic — without it, coupled cloth chains never reach steady state.
-
-### Implementation notes
-
-- **Solver** — projected Gauss-Seidel sequential impulse, 10 iterations, joint rows + contact rows in the same loop. Joint constraints are 6DOF springs (3 linear, 3 angular) with stop-ERP for limit correction and a per-axis spring impulse driven by stiffness × position error.
-- **Narrowphase** — analytical per pair: sphere-sphere, sphere-capsule, sphere-box, capsule-capsule, capsule-box. Capsule-capsule emits multiple contact points along nearly-parallel axes for rotational stability (otherwise a single closest-point contact lets cloth pivot freely around the line through that point).
-- **Speculative contacts** — `CONTACT_MARGIN = 0.04` fires contacts at near-touch with signed depth. The push-only impulse clamp keeps them inert until actual overlap, but they prevent fast bodies from crossing a thin surface in a single substep.
-- **Split-impulse position correction** — penetration is resolved by a direct mass-weighted translation along the contact normal *outside* the velocity solver, so joint pulls in the SI loop can't fight the contact's separation.
-- **Kinematic velocity propagation** — bone-driven kinematic bodies have their linear + angular velocities derived from the bone-pose delta each render frame, so joints attached to a fast limb feel the actual motion instead of a position teleport.
-- **Body sleeping** is disabled (cloth must always respond to bone motion); resting bodies rely on per-PMX damping to bleed off micro-velocity.
-
-### API
-
-```javascript
-engine.setPhysicsEnabled(enabled)
-engine.resetPhysics()  // re-snap bodies to bone poses, zero velocities
-```
-
-That's the entire engine-level surface — physics options live on the PMX rig itself (mass, damping, friction, restitution, joint stiffness / limits, collision groups).
+Engine surface is just `setPhysicsEnabled` / `resetPhysics` — all tuning (mass, damping, friction, restitution, joint stiffness/limits, collision groups) lives on the PMX rig.
 
 ## Rendering
 
-Each surface combines an NPR stack with a Principled-style BSDF, mixed per material — anime characters keep their flat illustrated look while highlights and reflections stay grounded. Per-material shaders live in `engine/src/shaders/materials/`.
-
-### Material pipeline
-
-Every fragment shader follows the same 7-stage layout (shared stages from `nodes.ts` / `common.ts`):
+Each surface mixes an NPR stack with a Principled-style BSDF per material, so characters keep a flat illustrated look while highlights and reflections stay grounded. Shaders live in `engine/src/shaders/materials/`; each fragment shader follows one 7-stage layout (shared stages from `nodes.ts` / `common.ts`):
 
 ```
-(A) Fragment setup → (B) Texture + alpha → (C) NPR stack → (D) Optional bump
-→ (E) Principled BSDF → (F) NPR ↔ PBR mix → (G) FSOut
+(A) setup → (B) texture + alpha → (C) NPR stack → (D) optional bump
+→ (E) Principled BSDF → (F) NPR↔PBR mix → (G) FSOut
 ```
 
-The `default` preset uses only A/B/E/G; NPR presets layer C (and sometimes D) on top, with stage F choosing how NPR-leaning the final result is.
+`default` uses only A/B/E/G; NPR presets add C (and sometimes D), with F choosing how NPR-leaning the result is.
 
-**PBR core** (`eval_principled`) — GGX microfacet with Schlick Fresnel, Walter–Smith G1, Fdez-Agüera 2019 multi-scatter compensation, Karis 2013 split-sum DFG LUT, Heitz 2016 LTC direct-spec scaling, optional sheen.
+- **PBR core** (`eval_principled`) — GGX + Schlick Fresnel, Walter–Smith G1, Fdez-Agüera 2019 multi-scatter, Karis split-sum DFG LUT, Heitz 2016 LTC direct-spec, optional sheen.
+- **NPR toolbox** — toon ramps (constant / fwidth-AA'd), HSV warm-shadow / cool-light remaps, fresnel + layer-weight rims, value-noise bump, Voronoi metallic sparkle, BT.601-gated emission.
 
-**NPR toolbox** — toon ramps (constant or fwidth-AA'd), HSV warm-shadow / cool-light remaps, fresnel + layer-weight rims, value-noise bump, 3D Voronoi metallic sparkle, BT.601-luminance-gated emission.
+| Preset | Notes |
+| --- | --- |
+| `default` | Plain Principled, metallic 0, rough 0.5 |
+| `eye` | Plain + post-eval emission ×1.5 |
+| `face` | Toon + warm rim + dual-fresnel rim + bright-tex gate, noise bump |
+| `body` | Toon + warm rim + fresnel + facing rim, noise bump |
+| `hair` | Toon + fresnel + bevel + bright-tex gate, 20% PBR |
+| `cloth_smooth` | Toon + bevel + emission overlay (×18) |
+| `cloth_rough` | Same NPR, live noise bump, rough 0.82 |
+| `metal` | Toon + emission overlay (×8), Voronoi base, metallic 1 |
+| `stockings` | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
 
-| Preset         | Notes                                                                           |
-| -------------- | ------------------------------------------------------------------------------- |
-| `default`      | Plain Principled, metallic=0, rough=0.5                                         |
-| `eye`          | Plain + post-eval emission ×1.5                                                 |
-| `face`         | Toon + warm rim + dual-fresnel rim + bright-tex gate, noise bump                |
-| `body`         | Toon + warm rim + fresnel + facing rim, noise bump                              |
-| `hair`         | Toon + fresnel + bevel + bright-tex gate, mixed at 20% PBR                      |
-| `cloth_smooth` | Toon + bevel + emission overlay (×18)                                           |
-| `cloth_rough`  | Same NPR as cloth_smooth, live noise bump, rough=0.82                           |
-| `metal`        | Toon + emission overlay (×8), voronoi base, metallic=1                          |
-| `stockings`    | Gradient × facing mask + HSV emission (×5), sheen=0.7, **alpha-hashed**         |
+**Post & output.** Directional shadow map (2048², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → inverted-hull outline.
 
-Assign per-model with `engine.setMaterialPresets(name, map)`. Unlisted material names fall through to `default`.
+- **Alpha-hashed transparency** (`stockings`) — Wyman & McGuire 2017 derivative-aware stochastic discard in object space, so self-overlapping meshes resolve under MSAA with opaque depth writes and the dither doesn't swim.
+- **See-through hair over eyes** — stencil-gated extra pass: the eye stamps `EYE_VALUE`, main hair skips it, an extra pass matches it and blends hair at 25% in linear HDR so eyes stay readable.
 
-### Post & output
+## Used by
 
-- Directional shadow map (2048², depth32float, PCF, normal + depth bias)
-- HDR main pass at 4× MSAA, `rg11b10ufloat` color + `rg8unorm` aux MRT (bloom mask + accumulated alpha) — fits Apple Silicon TBDR tile memory so MSAA resolves in-tile. Falls back to `rgba16float` when `rg11b10ufloat-renderable` isn't available.
-- Bloom: threshold + downsample/upsample mip pyramid, gated by aux bloom mask
-- Filmic tone mapping (LUT extracted from Blender 3.6 OCIO "Filmic / Medium High Contrast")
-- Inverted-hull screen-space outline pass on opaque + transparent
-
-**Alpha-hashed transparency** (`stockings` only) — Wyman & McGuire 2017 derivative-aware stochastic discard with world-space hash, so self-overlapping transparent meshes resolve under MSAA with opaque-style depth writes and the dither doesn't swim with the camera.
-
-**See-through hair over eyes** (MMD post-alpha-eye) — single stencil-gated extra pass: eye stamps `EYE_VALUE`, main hair skips it, an extra hair-over-eyes pass matches it and alpha-blends at 25% in linear HDR before tonemap. Outline pass also skips the stamp so the iris stays readable.
-
-## Projects Using This Engine
-
-- **[Reze Studio](https://reze.studio)** - Web-native MMD animation editor
-- **[MiKaPo](https://mikapo.vercel.app)** — Real-time motion capture for MMD
-- **[Popo](https://popo.love)** — LLM-generated MMD poses
-- **[MPL](https://mmd-mpl.vercel.app)** — Motion programming language for MMD
-- **[Mixamo-MMD](https://mixamo-mmd.vercel.app)** — Retarget Mixamo FBX to VMD
+[Reze Studio](https://reze.studio) (MMD animation editor) · [MiKaPo](https://mikapo.vercel.app) (motion capture) · [Popo](https://popo.love) (LLM-generated poses) · [MPL](https://mmd-mpl.vercel.app) (motion language) · [Mixamo-MMD](https://mixamo-mmd.vercel.app) (FBX→VMD retarget)
 
 ## Tutorial
 
