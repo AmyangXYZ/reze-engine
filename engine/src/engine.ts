@@ -1,6 +1,7 @@
 import { Camera } from "./camera"
 import { Mat4, Quat, Vec3 } from "./math"
 import { Model } from "./model"
+import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
 import {
@@ -234,6 +235,16 @@ interface ModelInstance {
   materialPresets: MaterialPresetMap | undefined
   physics: RezePhysics | null
   vertexBufferNeedsUpdate: boolean
+  gpuMorph: GpuMorph | null
+}
+
+// Per-model GPU vertex-morph compute state. Present only for models with vertex morphs.
+interface GpuMorph {
+  bindGroup: GPUBindGroup
+  weightsBuffer: GPUBuffer
+  weightsData: Float32Array // staging copy uploaded when weights change
+  workgroups: number
+  dispatchNeeded: boolean
 }
 
 export class Engine {
@@ -377,6 +388,8 @@ export class Engine {
   // Safari's Metal backend won't fold pow(x, 1) to identity.
   private compositePipelineIdentity!: GPURenderPipeline
   private compositePipelineGamma!: GPURenderPipeline
+  private morphComputePipeline!: GPUComputePipeline
+  private morphComputeBindGroupLayout!: GPUBindGroupLayout
   private compositeBindGroupLayout!: GPUBindGroupLayout
   private compositeBindGroup!: GPUBindGroup
   private compositeUniformBuffer!: GPUBuffer
@@ -459,6 +472,8 @@ export class Engine {
   // IK and physics enabled at engine level (same for all models)
   private ikEnabled = true
   private physicsEnabled = true
+  // GPU vertex-morph path. Set false BEFORE loadModel to fall back to the CPU path (A/B).
+  private useGpuMorphs = true
 
   // Camera target binding (Babylon/Three style: camera follows model)
   private cameraTargetModel: Model | null = null
@@ -1565,6 +1580,31 @@ export class Engine {
     this.compositePipelineIdentity = makeCompositePipeline(false, "composite pipeline (gamma=1)")
     this.compositePipelineGamma = makeCompositePipeline(true, "composite pipeline (gamma!=1)")
 
+    // GPU vertex-morph compute pipeline (shared by all models; per-model bind groups).
+    // Bindings: 0-4 read-only storage (base pos, CSR rowStart/colMorph/colOffset, weights),
+    // 5 read-write storage (vertex buffer), 6 uniform (params).
+    const roStorage = { type: "read-only-storage" as const }
+    this.morphComputeBindGroupLayout = this.device.createBindGroupLayout({
+      label: "morph compute bind group layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      ],
+    })
+    this.morphComputePipeline = this.device.createComputePipeline({
+      label: "morph compute pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.morphComputeBindGroupLayout] }),
+      compute: {
+        module: this.device.createShaderModule({ label: "morph compute shader", code: MORPH_COMPUTE_WGSL }),
+        entryPoint: "cs",
+      },
+    })
+
     this.bloomPassDescriptor = {
       label: "bloom pass",
       colorAttachments: [
@@ -2445,6 +2485,11 @@ export class Engine {
     this.ikEnabled = enabled
   }
 
+  // Toggle the GPU vertex-morph path. Only affects models loaded afterwards.
+  setGpuMorphsEnabled(enabled: boolean): void {
+    this.useGpuMorphs = enabled
+  }
+
   getIKEnabled(): boolean {
     return this.ikEnabled
   }
@@ -2475,7 +2520,23 @@ export class Engine {
   private updateInstances(deltaTime: number): void {
     this.forEachInstance((inst) => {
       const verticesChanged = inst.model.update(deltaTime, this.ikEnabled)
-      if (verticesChanged) inst.vertexBufferNeedsUpdate = true
+      if (inst.gpuMorph) {
+        // GPU path: on a weight change, upload effective weights (thresholding tiny values
+        // to 0 to match the CPU skip) and flag the compute dispatch for this frame.
+        if (inst.model.consumeMorphWeightsDirty()) {
+          const eff = inst.model.getEffectiveMorphWeights()
+          const wd = inst.gpuMorph.weightsData
+          const n = Math.min(wd.length, eff.length)
+          for (let i = 0; i < n; i++) {
+            const w = eff[i]
+            wd[i] = w < 0.0001 ? 0 : w
+          }
+          this.device.queue.writeBuffer(inst.gpuMorph.weightsBuffer, 0, wd as ArrayBufferView<ArrayBuffer>)
+          inst.gpuMorph.dispatchNeeded = true
+        }
+      } else if (verticesChanged) {
+        inst.vertexBufferNeedsUpdate = true
+      }
       if (inst.physics && this.physicsEnabled) {
         inst.physics.step(deltaTime, inst.model.getWorldMatrices(), inst.model.getBoneInverseBindMatrices())
       }
@@ -2484,6 +2545,12 @@ export class Engine {
   }
 
   private updateVertexBuffer(inst: ModelInstance): void {
+    // GPU-morph models never CPU-upload the vertex buffer after load — the compute pass
+    // owns the position slots. Ignore any stray dirty flag (e.g. from markVertexBufferDirty).
+    if (inst.gpuMorph) {
+      inst.vertexBufferNeedsUpdate = false
+      return
+    }
     const vertices = inst.model.getVertices()
     if (!vertices?.length) return
     // Vertex morphs touch only a subset of verts (typically the face), so upload just the
@@ -2507,6 +2574,23 @@ export class Engine {
     inst.vertexBufferNeedsUpdate = false
   }
 
+  // One compute pass covering every model whose morph weights changed this frame.
+  private dispatchMorphCompute(encoder: GPUCommandEncoder): void {
+    let pass: GPUComputePassEncoder | null = null
+    for (const inst of this.modelInstances.values()) {
+      const gm = inst.gpuMorph
+      if (!gm || !gm.dispatchNeeded) continue
+      if (!pass) {
+        pass = encoder.beginComputePass({ label: "morph compute" })
+        pass.setPipeline(this.morphComputePipeline)
+      }
+      pass.setBindGroup(0, gm.bindGroup)
+      pass.dispatchWorkgroups(gm.workgroups)
+      gm.dispatchNeeded = false
+    }
+    if (pass) pass.end()
+  }
+
   private async setupModelInstance(
     name: string,
     model: Model,
@@ -2522,7 +2606,8 @@ export class Engine {
     const vertexBuffer = this.device.createBuffer({
       label: `${name}: vertex buffer`,
       size: vertices.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      // STORAGE so the morph compute pass can write morphed positions in place.
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
     })
     this.device.queue.writeBuffer(vertexBuffer, 0, vertices)
 
@@ -2593,6 +2678,8 @@ export class Engine {
 
     const gpuBuffers: GPUBuffer[] = [vertexBuffer, indexBuffer, jointsBuffer, weightsBuffer, skinMatrixBuffer]
 
+    const gpuMorph = this.createGpuMorph(name, model, vertexBuffer, gpuBuffers)
+
     const inst: ModelInstance = {
       name,
       model,
@@ -2615,9 +2702,81 @@ export class Engine {
       materialPresets: undefined,
       physics,
       vertexBufferNeedsUpdate: false,
+      gpuMorph,
     }
     await this.setupMaterialsForInstance(inst)
     this.modelInstances.set(name, inst)
+  }
+
+  // Build the per-model GPU vertex-morph state. Returns null (and leaves the model on the
+  // CPU morph path) when the model has no vertex morphs. Created buffers are pushed into
+  // gpuBuffers so they're released with the instance.
+  private createGpuMorph(
+    name: string,
+    model: Model,
+    vertexBuffer: GPUBuffer,
+    gpuBuffers: GPUBuffer[],
+  ): GpuMorph | null {
+    if (!this.useGpuMorphs) return null
+    const data = model.buildMorphComputeData()
+    if (!data) return null
+
+    const RO = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    const mkStorage = (label: string, arr: Float32Array | Uint32Array): GPUBuffer => {
+      const buf = this.device.createBuffer({
+        label: `${name}: morph ${label}`,
+        size: Math.max(arr.byteLength, 4),
+        usage: RO,
+      })
+      this.device.queue.writeBuffer(buf, 0, arr as ArrayBufferView<ArrayBuffer>)
+      gpuBuffers.push(buf)
+      return buf
+    }
+
+    const baseBuf = mkStorage("basePositions", data.basePositions)
+    const rowBuf = mkStorage("rowStart", data.rowStart)
+    const colMorphBuf = mkStorage("colMorph", data.colMorph)
+    const colOffsetBuf = mkStorage("colOffset", data.colOffset)
+
+    // Weights are zero-initialized by WebGPU; the first weight change uploads real values.
+    const weightsBuffer = this.device.createBuffer({
+      label: `${name}: morph weights`,
+      size: Math.max(data.morphCount * 4, 4),
+      usage: RO,
+    })
+    gpuBuffers.push(weightsBuffer)
+
+    const paramsBuffer = this.device.createBuffer({
+      label: `${name}: morph params`,
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([data.vertexCount, 0, 0, 0]))
+    gpuBuffers.push(paramsBuffer)
+
+    const bindGroup = this.device.createBindGroup({
+      label: `${name}: morph compute bind group`,
+      layout: this.morphComputeBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: baseBuf } },
+        { binding: 1, resource: { buffer: rowBuf } },
+        { binding: 2, resource: { buffer: colMorphBuf } },
+        { binding: 3, resource: { buffer: colOffsetBuf } },
+        { binding: 4, resource: { buffer: weightsBuffer } },
+        { binding: 5, resource: { buffer: vertexBuffer } },
+        { binding: 6, resource: { buffer: paramsBuffer } },
+      ],
+    })
+
+    model.enableGpuMorphs()
+
+    return {
+      bindGroup,
+      weightsBuffer,
+      weightsData: new Float32Array(data.morphCount),
+      workgroups: Math.ceil(data.vertexCount / 64),
+      dispatchNeeded: false, // vertex buffer already holds base; dispatch on first weight change
+    }
   }
 
   private createGroundGeometry(width: number = 100, height: number = 100) {
@@ -3587,6 +3746,11 @@ export class Engine {
     this.updateShadowLightVP()
 
     const encoder = this.device.createCommandEncoder()
+
+    // GPU vertex morphs: write morphed positions into vertex buffers before any pass reads
+    // them. WebGPU inserts the storage→vertex barrier between this pass and the render passes.
+    if (hasModels) this.dispatchMorphCompute(encoder)
+
     if (hasModels) {
       const sp = encoder.beginRenderPass({
         colorAttachments: [],

@@ -122,6 +122,17 @@ export interface Morphing {
   morphs: Morph[]
 }
 
+// CSR inversion of vertex-morph offsets for the GPU compute pass (built once at load).
+export interface MorphComputeData {
+  basePositions: Float32Array // vertexCount * 3
+  rowStart: Uint32Array // vertexCount + 1 (prefix offsets into the entry arrays)
+  colMorph: Uint32Array // entryCount (morph index per entry)
+  colOffset: Float32Array // entryCount * 3 (xyz offset per entry)
+  morphCount: number
+  vertexCount: number
+  entryCount: number
+}
+
 // Runtime skeleton pose state (updated each frame)
 export interface SkeletonRuntime {
   nameIndex: Record<string, number> // Cached lookup: bone name -> bone index (built on initialization)
@@ -200,13 +211,17 @@ export class Model {
   private vertexCount: number
   private indexData: Uint32Array<ArrayBuffer>
 
-  // Morph state reused across frames (S1) + partial vertex-upload range tracking (S2).
+  // Morph state reused across frames (S1) + partial vertex-upload range tracking (S2, CPU path).
   private morphEffectiveWeights?: Float32Array
   private morphPrevMinVert = -1 // vertices touched by last applyMorphs (reset to base this pass)
   private morphPrevMaxVert = -1
   private morphPendingMinVert = -1 // accumulated range awaiting a GPU upload
   private morphPendingMaxVert = -1
   private morphUploadFull = true // first upload after load pushes the whole buffer once
+  // GPU morph path: when enabled (engine set up the compute buffers), applyMorphs only
+  // resolves effective weights and flags them dirty — the compute pass does the vertex work.
+  private gpuMorphEnabled = false
+  private morphWeightsDirty = false
   private textures: Texture[] = []
   private materials: Material[] = []
   // Static skeleton/skinning (not necessarily serialized yet)
@@ -891,21 +906,12 @@ export class Model {
   }
 
   private applyMorphs(): void {
-    // Reset only the vertices morphed by the previous pass back to base — vertexData never
-    // diverges from base outside that range, so a full-buffer copy is wasted work. (First
-    // pass: prev range is empty and vertexData already equals base from construction.)
-    if (this.morphPrevMaxVert >= 0) {
-      const s = this.morphPrevMinVert * VERTEX_STRIDE
-      const e = (this.morphPrevMaxVert + 1) * VERTEX_STRIDE
-      this.vertexData.set(this.baseVertexData.subarray(s, e), s)
-    }
-
     const vertexCount = this.vertexCount
     const morphCount = this.morphing.morphs.length
     const weights = this.runtimeMorph.weights
 
-    // First pass: Compute effective weights for all morphs (handling group morphs).
-    // Reuse a persistent buffer — this runs every frame during facial animation.
+    // Effective weights (group-morph resolution + clamp). Both paths need these: the GPU
+    // path uploads them for the compute pass; the CPU path applies them below. Reused buffer.
     if (!this.morphEffectiveWeights || this.morphEffectiveWeights.length !== morphCount) {
       this.morphEffectiveWeights = new Float32Array(morphCount)
     }
@@ -920,21 +926,31 @@ export class Model {
         if (groupWeight > 0.0001) {
           for (const ref of morph.groupReferences) {
             if (ref.morphIndex >= 0 && ref.morphIndex < morphCount) {
-              // Add group morph's contribution to the referenced morph
               effectiveWeights[ref.morphIndex] += groupWeight * ref.ratio
             }
           }
         }
       }
     }
-
-    // Clamp effective weights to [0, 1]
     for (let i = 0; i < morphCount; i++) {
       effectiveWeights[i] = Math.max(0, Math.min(1, effectiveWeights[i]))
     }
 
-    // Second pass: Apply vertex morphs with their effective weights, tracking the
-    // touched vertex-index range so the engine can re-upload only that slice.
+    // GPU path: the compute pass applies the vertex offsets from these weights.
+    if (this.gpuMorphEnabled) {
+      this.morphWeightsDirty = true
+      return
+    }
+
+    // ── CPU path ── Reset only the vertices morphed by the previous pass back to base
+    // (targeted reset; vertexData never diverges from base outside that range).
+    if (this.morphPrevMaxVert >= 0) {
+      const s = this.morphPrevMinVert * VERTEX_STRIDE
+      const e = (this.morphPrevMaxVert + 1) * VERTEX_STRIDE
+      this.vertexData.set(this.baseVertexData.subarray(s, e), s)
+    }
+
+    // Apply vertex morphs, tracking the touched vertex-index range for partial upload.
     let curMinVert = -1
     let curMaxVert = -1
     for (let morphIdx = 0; morphIdx < morphCount; morphIdx++) {
@@ -944,22 +960,17 @@ export class Model {
       const morph = this.morphing.morphs[morphIdx]
       if (morph.type !== 1) continue // Only process vertex morphs
 
-      // For vertex morphs, iterate through vertices that have offsets
       for (const vertexOffset of morph.vertexOffsets) {
         const vIdx = vertexOffset.vertexIndex
         if (vIdx < 0 || vIdx >= vertexCount) continue
 
-        // Get morph offset for this vertex
         const offsetX = vertexOffset.positionOffset[0]
         const offsetY = vertexOffset.positionOffset[1]
         const offsetZ = vertexOffset.positionOffset[2]
-
-        // Skip if offset is zero
         if (Math.abs(offsetX) < 0.0001 && Math.abs(offsetY) < 0.0001 && Math.abs(offsetZ) < 0.0001) {
           continue
         }
 
-        // Apply weighted offset to vertex position (positions are at stride 0, 8, 16, ...)
         const vertexIdx = vIdx * VERTEX_STRIDE
         this.vertexData[vertexIdx] += offsetX * effectiveWeight
         this.vertexData[vertexIdx + 1] += offsetY * effectiveWeight
@@ -970,10 +981,6 @@ export class Model {
       }
     }
 
-    // Vertices differing from what's on the GPU = touched this frame UNION touched last
-    // frame (this pass reset those back to base). Merge into any pending range; the engine
-    // consumes it and uploads only [min, max]. vertexData is the only thing that mutates
-    // verts (skinning runs on the GPU), so this range is exact.
     let dirtyMin = curMinVert
     let dirtyMax = curMaxVert
     if (this.morphPrevMaxVert >= 0) {
@@ -988,6 +995,89 @@ export class Model {
     }
     this.morphPrevMinVert = curMinVert
     this.morphPrevMaxVert = curMaxVert
+  }
+
+  // ── GPU morph path support ──
+  // Called by the engine once it has created the compute buffers for this model; switches
+  // applyMorphs to the weights-only branch.
+  enableGpuMorphs(): void {
+    this.gpuMorphEnabled = true
+  }
+
+  // True (once) when morph weights changed since the last check — the engine then uploads
+  // getEffectiveMorphWeights() and dispatches the compute pass.
+  consumeMorphWeightsDirty(): boolean {
+    const d = this.morphWeightsDirty
+    this.morphWeightsDirty = false
+    return d
+  }
+
+  // Effective (group-resolved, clamped) morph weights for GPU upload. Ensures they're
+  // computed at least once even before the first weight change.
+  getEffectiveMorphWeights(): Float32Array {
+    if (!this.morphEffectiveWeights) this.applyMorphs()
+    return this.morphEffectiveWeights ?? new Float32Array(0)
+  }
+
+  // Build the CSR inversion of vertex-morph offsets for the GPU compute pass. Returns null
+  // when the model has no vertex-morph offsets (no GPU path needed). Entries for each vertex
+  // are emitted in ascending morph-index order, matching the CPU accumulation order.
+  buildMorphComputeData(): MorphComputeData | null {
+    const V = this.vertexCount
+    const M = this.morphing.morphs.length
+    const morphs = this.morphing.morphs
+    const EPS = 0.0001
+
+    const isLive = (o: VertexMorphOffset): boolean =>
+      o.vertexIndex >= 0 &&
+      o.vertexIndex < V &&
+      (Math.abs(o.positionOffset[0]) >= EPS ||
+        Math.abs(o.positionOffset[1]) >= EPS ||
+        Math.abs(o.positionOffset[2]) >= EPS)
+
+    const counts = new Uint32Array(V)
+    for (let m = 0; m < M; m++) {
+      const morph = morphs[m]
+      if (morph.type !== 1) continue
+      for (const o of morph.vertexOffsets) if (isLive(o)) counts[o.vertexIndex]++
+    }
+
+    const rowStart = new Uint32Array(V + 1)
+    let acc = 0
+    for (let v = 0; v < V; v++) {
+      rowStart[v] = acc
+      acc += counts[v]
+    }
+    rowStart[V] = acc
+    const E = acc
+    if (E === 0) return null
+
+    const colMorph = new Uint32Array(E)
+    const colOffset = new Float32Array(E * 3)
+    const fill = new Uint32Array(V)
+    for (let m = 0; m < M; m++) {
+      const morph = morphs[m]
+      if (morph.type !== 1) continue
+      for (const o of morph.vertexOffsets) {
+        if (!isLive(o)) continue
+        const v = o.vertexIndex
+        const p = rowStart[v] + fill[v]++
+        colMorph[p] = m
+        colOffset[p * 3] = o.positionOffset[0]
+        colOffset[p * 3 + 1] = o.positionOffset[1]
+        colOffset[p * 3 + 2] = o.positionOffset[2]
+      }
+    }
+
+    const basePositions = new Float32Array(V * 3)
+    for (let v = 0; v < V; v++) {
+      const vi = v * VERTEX_STRIDE
+      basePositions[v * 3] = this.baseVertexData[vi]
+      basePositions[v * 3 + 1] = this.baseVertexData[vi + 1]
+      basePositions[v * 3 + 2] = this.baseVertexData[vi + 2]
+    }
+
+    return { basePositions, rowStart, colMorph, colOffset, morphCount: M, vertexCount: V, entryCount: E }
   }
 
   // Consume the pending morph vertex-upload range for the engine. Returns null when a
