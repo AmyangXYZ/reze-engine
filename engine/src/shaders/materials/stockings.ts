@@ -22,15 +22,19 @@ const STOCK_RAMP002_P1: f32 = 0.9565;  // EASE [0→black, 0.9565→white]
 const STOCK_RAMPFACE_P1: f32 = 0.5435; // EASE [0→black, 0.5435→white]
 const STOCK_LW_BLEND: f32 = 0.4;       // Layer Weight Blend
 
-// Wyman & McGuire "Hashed Alpha Testing" (2017) — world-space hash with derivative-aware
+// Wyman & McGuire "Hashed Alpha Testing" (2017) — object-space hash with derivative-aware
 // pixel-scale selection, matches Blender EEVEE prepass_frag.glsl::hashed_alpha_threshold.
-// Key property: dither pattern is stable in object/world space (doesn't swim) and stays
-// at one-pixel frequency regardless of view distance, which makes it tolerable without TAA.
-fn _hash_wm(a: vec2f) -> f32 {
-  return fract(1e4 * sin(17.0 * a.x + 0.1 * a.y) * (0.1 + abs(sin(13.0 * a.y + a.x))));
-}
+// Key property: dither pattern is stable in object space (doesn't swim) and stays at
+// one-pixel frequency regardless of view distance, which makes it tolerable without TAA.
+// The hash grid is fed the bind-pose restPos (not worldPos), so the dots stay pinned to
+// the fabric even under root (センター) motion — worldPos would crawl across the surface.
+// Since MMD skinning is rigid, length(dpdx(restPos)) == length(dpdx(worldPos)), so the
+// pixel-scale selection is unaffected by the space change.
+// Grid samples reuse the PCG _hash33 from nodes.ts (integer-lattice inputs, Metal-friendly)
+// instead of a fract(sin()) hash — sin compiles to a slow transcendental on Apple's Metal
+// backend and this runs per-fragment on every stockings pixel.
 fn _hash3d_wm(a: vec3f) -> f32 {
-  return _hash_wm(vec2f(_hash_wm(a.xy), a.z));
+  return _hash33(a).x * 0.5 + 0.5;
 }
 fn hashed_alpha_threshold(co: vec3f) -> f32 {
   let alphaHashScale: f32 = 1.0;
@@ -72,12 +76,12 @@ fn ramp_ease_s(f: f32, p0: f32, p1: f32) -> f32 {
   let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
   let tex_rgb = tex_s.rgb;
   // Alpha HASHED (Blender EEVEE "Hashed" blend mode) per preset author's note — self-overlap
-  // on the stockings produces sort cracks under alpha blend. Wyman-style worldPos hash +
+  // on the stockings produces sort cracks under alpha blend. Wyman-style object-space hash +
   // depth-write is sort-independent. NOTE: Principled.Alpha=0.95 from the dump is DROPPED;
   // it relies on TAA to smooth the 5%-everywhere dither, and without TAA it shows as a
   // pervasive dot pattern. Hash now gates only on texture/material alpha.
   let combined_alpha = material.alpha * tex_s.a;
-  if (combined_alpha < hashed_alpha_threshold(input.worldPos)) { discard; }
+  if (combined_alpha < hashed_alpha_threshold(input.restPos)) { discard; }
 
   // ═══ NPR MASK ═══ TEX_COORD.Generated → Mapping(Rot=0,π/2,π/2, Loc=(1,1,1)) → Gradient.
   // The Blender mapping reduces to gradient.x = 1 - input.y (rot swaps axes, loc offsets).

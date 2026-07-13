@@ -67,7 +67,9 @@ fn ramp_ease(f: f32, p0: f32, c0: vec4f, p1: f32, c1: vec4f) -> vec4f {
 
   // ═══ PRINCIPLED BSDF with noise bump ═══
   // Mapping loc=rot=0 in the Blender graph folds to a plain scale multiply.
-  let noise_val = tex_noise_d2(input.worldPos * vec3f(1.0, 1.0, 1.5), 1.0);
+  // Height in rest space (restPos) so the bump rides with the skin; geometric basis stays
+  // worldPos so the perturbed normal matches the world-space n (see face.ts note).
+  let noise_val = tex_noise_d2(input.restPos * vec3f(1.0, 1.0, 1.5), 1.0);
   let noise_ramp = ramp_linear(noise_val, 0.0, vec4f(0,0,0,1), 1.0, vec4f(1,1,1,1)).r;
   let bumped_n = bump_lh(0.324644535779953, noise_ramp, n, input.worldPos);
 

@@ -66,7 +66,10 @@ const FACE_BRIGHT_TEX_THRESH: f32 = 0.9300000071525574;
   let npr_stack = rim1 + rim2_mixed + bright_emit + warm_emission;
 
   // ═══ PRINCIPLED BSDF with noise bump ═══
-  let noise_val = tex_noise_d2(input.worldPos * vec3f(1.0, 1.0, 1.5), 1.0);
+  // Height sampled in rest space (restPos) so the micro-bump doesn't swim under motion;
+  // bump_lh's geometric basis stays in worldPos so the perturbed normal lands in the same
+  // world frame as n (screen-space height gradient still pairs correctly with it).
+  let noise_val = tex_noise_d2(input.restPos * vec3f(1.0, 1.0, 1.5), 1.0);
   let noise_ramp = ramp_linear(noise_val, 0.0, vec4f(0,0,0,1), 1.0, vec4f(1,1,1,1)).r;
   let bumped_n = bump_lh(0.324644535779953, noise_ramp, n, input.worldPos);
 

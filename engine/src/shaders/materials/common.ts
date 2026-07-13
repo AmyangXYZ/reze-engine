@@ -51,6 +51,13 @@ struct VertexOutput {
   @location(0) normal: vec3f,
   @location(1) uv: vec2f,
   @location(2) worldPos: vec3f,
+  // Bind-pose object-space position (the raw pre-skin vertex attribute). Procedural
+  // textures (noise bump, sparkle, Generated-coord gradients) key off this instead of
+  // worldPos so the pattern rides with the surface — otherwise the mesh swims through a
+  // world-static noise field under any skinning deformation or root (センター) motion.
+  // At rest skinMats are identity so restPos == worldPos, which is why existing noise-
+  // scale constants stay valid without retuning.
+  @location(3) restPos: vec3f,
 };
 
 struct LightVP { viewProj: mat4x4f, };
@@ -129,6 +136,7 @@ export const COMMON_VS_WGSL = /* wgsl */ `
   output.normal = skinnedNrm;
   output.uv = uv;
   output.worldPos = skinnedPos.xyz;
+  output.restPos = position;
   return output;
 }
 

@@ -19,23 +19,29 @@ override APPLY_GAMMA: bool = true;
 // re-premultiply the tonemapped color for output so the premultiplied canvas
 // alphaMode composites the WebGPU surface over the page background correctly.
 @group(0) @binding(4) var maskTex: texture_2d<f32>;
+// Filmic tone curve baked to a WIDTH×1 r16float LUT (bakeFilmicLut on the CPU side).
+// Domain: log2(linear) mapped to [0,13]. Replaces the old array<f32,14> that was indexed
+// by a runtime u32 (a Metal-backend smell — dynamic local-array indexing lowers to a
+// per-invocation copy/switch) and interpolated piecewise-linearly (C0, so segment slope
+// discontinuities showed as Mach bands in smooth skin/shadow gradients). The LUT is a
+// monotone-cubic (Fritsch–Carlson) fit through the same 14 anchors — same values, C1
+// continuity kills the banding — sampled with hardware linear filtering.
+@group(0) @binding(5) var filmicLut: texture_2d<f32>;
 // viewU[0] = (exposure, invGamma, _, _);  viewU[1] = (tint.rgb, intensity)
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 
+// Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
+const FILMIC_LUT_W: f32 = 256.0;
+
 fn filmic(x: f32) -> f32 {
-  // Re-fit against Blender 3.6 Filmic MHC anchors (sobotka/filmic-blender
-  // look_medium-high-contrast.spi1d). Previous curve was compressed:
-  // midtones too bright, highlights too dim — flattened contrast, read
-  // as "washed-out" on saturated surfaces (hair especially).
-  // Reference checkpoints: linear 0.18 → ~0.395, linear 1.0 → ~0.83.
-  var lut = array<f32, 14>(
-    0.0028, 0.0068, 0.0151, 0.0313, 0.0610, 0.1120, 0.1920,
-    0.3060, 0.4590, 0.6310, 0.8200, 0.9070, 0.9620, 0.9890
-  );
+  // Reference checkpoints (Blender 3.6 Filmic MHC, sobotka/filmic-blender
+  // look_medium-high-contrast.spi1d): linear 0.18 → ~0.395, linear 1.0 → ~0.83.
+  // NOTE: version-pinned to Blender 3.6 — 4.x defaults to AgX, not Filmic.
   let t = clamp(log2(max(x, 1e-10)) + 10.0, 0.0, 13.0);
-  let i = u32(t);
-  let j = min(i + 1u, 13u);
-  return mix(lut[i], lut[j], t - f32(i));
+  // Map t∈[0,13] to the texel-center of baked sample j = t·(W-1)/13.
+  let u = (t * (FILMIC_LUT_W - 1.0) / 13.0 + 0.5) / FILMIC_LUT_W;
+  // textureSampleLevel (explicit LOD, no derivatives) is legal in non-uniform flow.
+  return textureSampleLevel(filmicLut, bloomSamp, vec2f(u, 0.5), 0.0).r;
 }
 
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {

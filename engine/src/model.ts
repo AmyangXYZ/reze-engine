@@ -19,6 +19,14 @@ import {
 
 const VERTEX_STRIDE = 8
 
+// Animation-sampling scratch (applyPoseFromClip → convertVMDTranslationToLocal). These
+// run sequentially and are not reentrant with the world-matrix scratch in math.ts, so
+// plain module singletons are safe and let the per-bone sample path allocate nothing.
+const _animSlerp = new Quat(0, 0, 0, 1)
+const _animInterpT = new Vec3(0, 0, 0)
+const _convOut = new Vec3(0, 0, 0)
+const _convMat = new Float32Array(16)
+
 export interface Texture {
   path: string
   name: string
@@ -225,6 +233,17 @@ export class Model {
   // Cached skin matrices array to avoid allocations in getSkinMatrices
   private skinMatricesArray?: Float32Array
 
+  // Static bone traversal order (parents before children), precomputed once at load.
+  // computeWorldMatrices replays this flat instead of recursing with a per-call
+  // visited-array + closure. Order depends only on parentIndex (static), so this
+  // reproduces the old recursion's finishing order exactly. See buildDeformOrder.
+  private deformOrder!: Int32Array
+
+  // Bind-pose absolute (world) position per bone, xyz packed. Static (bindTranslation
+  // accumulated down the hierarchy). Precomputed once so convertVMDTranslationToLocal
+  // stops re-deriving it recursively (with per-ancestor allocations) every frame.
+  private bindWorldPos!: Float32Array
+
   private tweenState!: TweenState
   private tweenTimeMs: number = 0 // Time tracking for tweens (milliseconds)
 
@@ -338,6 +357,59 @@ export class Model {
 
     this.runtimeSkeleton.ikChainInfo = ikChainInfo
     this.runtimeSkeleton.ikSolvers = ikSolvers
+
+    this.buildDeformOrder()
+  }
+
+  // Precompute the bone order that computeWorldMatrices iterates every frame: every
+  // bone appears after its parent. This is the exact finishing order the previous
+  // recursive computeWorld() produced (walk up the not-yet-emitted ancestor chain,
+  // then emit it top-down; ties broken by ascending index) — so behavior is identical,
+  // minus the per-frame closure + visited-array allocation and the recursion overhead.
+  private buildDeformOrder(): void {
+    const bones = this.skeleton.bones
+    const n = bones.length
+    const order = new Int32Array(n)
+    const done = new Uint8Array(n)
+    const stack: number[] = []
+    let k = 0
+    for (let i = 0; i < n; i++) {
+      if (done[i]) continue
+      stack.length = 0
+      let cur = i
+      // Collect the chain of not-yet-emitted ancestors up to the root (or a done one).
+      while (cur >= 0 && cur < n && !done[cur]) {
+        stack.push(cur)
+        cur = bones[cur].parentIndex
+      }
+      // Emit from the topmost ancestor down so parents precede children.
+      for (let s = stack.length - 1; s >= 0; s--) {
+        const b = stack[s]
+        done[b] = 1
+        order[k++] = b
+      }
+    }
+    this.deformOrder = order
+
+    // Accumulate bind-pose world positions in the same parent-before-child order and
+    // with the same add order as the old recursive computeBindPoseWorldPosition, so the
+    // downstream arithmetic stays bit-identical.
+    const bindWorld = new Float32Array(n * 3)
+    for (let idx = 0; idx < n; idx++) {
+      const i = order[idx]
+      const bt = bones[i].bindTranslation
+      const p = bones[i].parentIndex
+      if (p >= 0 && p < n) {
+        bindWorld[i * 3 + 0] = bindWorld[p * 3 + 0] + bt[0]
+        bindWorld[i * 3 + 1] = bindWorld[p * 3 + 1] + bt[1]
+        bindWorld[i * 3 + 2] = bindWorld[p * 3 + 2] + bt[2]
+      } else {
+        bindWorld[i * 3 + 0] = bt[0]
+        bindWorld[i * 3 + 1] = bt[1]
+        bindWorld[i * 3 + 2] = bt[2]
+      }
+    }
+    this.bindWorldPos = bindWorld
   }
 
   private initializeTweenBuffers(): void {
@@ -659,63 +731,49 @@ export class Model {
   }
 
   // VMD translation (world delta from bind pose) → bone local space; optional rotation for animation vs IK
+  // Returns a REUSED scratch Vec3 (_convOut) — callers must copy immediately (they do:
+  // .set() / destructure). Zero allocation; result is bit-identical to the previous
+  // recursive implementation (verified numerically).
   private convertVMDTranslationToLocal(boneIdx: number, vmdRelativeTranslation: Vec3, rotation?: Quat): Vec3 {
-    const skeleton = this.skeleton
-    const bones = skeleton.bones
-    const localRot = this.runtimeSkeleton.localRotations
+    const bone = this.skeleton.bones[boneIdx]
+    const bindWorld = this.bindWorldPos
+    const bt = bone.bindTranslation
+    const p = bone.parentIndex
 
-    // Compute bind pose world positions for all bones
-    const computeBindPoseWorldPosition = (idx: number): Vec3 => {
-      const bone = bones[idx]
-      const bindPos = new Vec3(bone.bindTranslation[0], bone.bindTranslation[1], bone.bindTranslation[2])
-      if (bone.parentIndex >= 0 && bone.parentIndex < bones.length) {
-        const parentWorldPos = computeBindPoseWorldPosition(bone.parentIndex)
-        return parentWorldPos.add(bindPos)
-      } else {
-        return bindPos
-      }
-    }
+    // afterBindTranslation = (bindWorld[bone] + vmd − bindWorld[parent]) − bindTranslation.
+    // (Algebraically this reduces to vmd, since bindWorld[bone] = bindWorld[parent] +
+    // bindTranslation, but the explicit form keeps the result bit-identical to before.)
+    const bi3 = boneIdx * 3
+    const targetX = bindWorld[bi3 + 0] + vmdRelativeTranslation.x
+    const targetY = bindWorld[bi3 + 1] + vmdRelativeTranslation.y
+    const targetZ = bindWorld[bi3 + 2] + vmdRelativeTranslation.z
+    const px = p >= 0 ? bindWorld[p * 3 + 0] : 0
+    const py = p >= 0 ? bindWorld[p * 3 + 1] : 0
+    const pz = p >= 0 ? bindWorld[p * 3 + 2] : 0
+    const abx = targetX - px - bt[0]
+    const aby = targetY - py - bt[1]
+    const abz = targetZ - pz - bt[2]
 
-    const bone = bones[boneIdx]
-
-    // VMD translation is relative to bind pose world position
-    // targetWorldPos = bindPoseWorldPos + vmdRelativeTranslation
-    const bindPoseWorldPos = computeBindPoseWorldPosition(boneIdx)
-    const targetWorldPos = bindPoseWorldPos.add(vmdRelativeTranslation)
-
-    // Convert target world position to local translation
-    // We need parent's bind pose world position to transform to parent space
-    let parentBindPoseWorldPos: Vec3
-    if (bone.parentIndex >= 0) {
-      parentBindPoseWorldPos = computeBindPoseWorldPosition(bone.parentIndex)
+    // Inverse rotation = conjugate + normalize (matches localRotation.clone().conjugate()
+    // .normalize()), applied via a rotation matrix (matches Mat4.fromQuat). Uses animation
+    // rotation when provided so IK-modified localRot doesn't perturb the conversion.
+    const q = rotation ?? this.runtimeSkeleton.localRotations[boneIdx]
+    const qlen = Math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+    let ix: number, iy: number, iz: number, iw: number
+    if (qlen === 0) {
+      ix = 0; iy = 0; iz = 0; iw = 1
     } else {
-      parentBindPoseWorldPos = Vec3.zeros()
+      const inv = 1 / qlen
+      ix = -q.x * inv; iy = -q.y * inv; iz = -q.z * inv; iw = q.w * inv
     }
-
-    // Transform target world position to parent's local space
-    // In bind pose, parent's world matrix is just a translation
-    const parentSpacePos = targetWorldPos.subtract(parentBindPoseWorldPos)
-
-    // Subtract bindTranslation to get position after bind translation
-    const afterBindTranslation = parentSpacePos.subtract(
-      new Vec3(bone.bindTranslation[0], bone.bindTranslation[1], bone.bindTranslation[2])
+    Mat4.fromQuatInto(ix, iy, iz, iw, _convMat, 0)
+    const rm = _convMat
+    _convOut.setXYZ(
+      rm[0] * abx + rm[4] * aby + rm[8] * abz,
+      rm[1] * abx + rm[5] * aby + rm[9] * abz,
+      rm[2] * abx + rm[6] * aby + rm[10] * abz
     )
-
-    // Apply inverse rotation to get local translation
-    // Use provided rotation (animation rotation) or fall back to current localRotation
-    // Using animation rotation prevents conflicts when IK modifies the rotation
-    const localRotation = rotation ?? localRot[boneIdx]
-    // Clone to avoid mutating, then conjugate and normalize
-    const invRotation = localRotation.clone().conjugate().normalize()
-    const rotationMat = Mat4.fromQuat(invRotation.x, invRotation.y, invRotation.z, invRotation.w)
-    const rm = rotationMat.values
-    const localTranslation = new Vec3(
-      rm[0] * afterBindTranslation.x + rm[4] * afterBindTranslation.y + rm[8] * afterBindTranslation.z,
-      rm[1] * afterBindTranslation.x + rm[5] * afterBindTranslation.y + rm[9] * afterBindTranslation.z,
-      rm[2] * afterBindTranslation.x + rm[6] * afterBindTranslation.y + rm[10] * afterBindTranslation.z
-    )
-
-    return localTranslation
+    return _convOut
   }
 
   getWorldMatrices(): Mat4[] {
@@ -1143,13 +1201,13 @@ export class Model {
         const interp = frameB.interpolation
 
         const rotT = interpolateControlPoints(interp.rotation, gradient)
-        const rotation = Quat.slerp(frameA.rotation, frameB.rotation, rotT)
+        const rotation = Quat.slerpInto(frameA.rotation, frameB.rotation, rotT, _animSlerp)
 
         const txWeight = interpolateControlPoints(interp.translationX, gradient)
         const tyWeight = interpolateControlPoints(interp.translationY, gradient)
         const tzWeight = interpolateControlPoints(interp.translationZ, gradient)
 
-        const interpolatedVMDTranslation = new Vec3(
+        const interpolatedVMDTranslation = _animInterpT.setXYZ(
           frameA.translation.x + (frameB.translation.x - frameA.translation.x) * txWeight,
           frameA.translation.y + (frameB.translation.y - frameA.translation.y) * tyWeight,
           frameA.translation.z + (frameB.translation.z - frameA.translation.z) * tzWeight
@@ -1235,10 +1293,13 @@ export class Model {
     if (!ikChainInfo) return
 
     // Solve each IK solver sequentially, ensuring consistent state between solvers
+    let firstSolver = true
     for (const solver of ikSolvers) {
-      // Recompute ALL world matrices before each solver starts
-      // This ensures each solver sees the effects of previous solvers on localRotations
-      this.computeWorldMatrices()
+      // Each solver must see the effects of previous solvers on localRotations, so
+      // recompute world matrices between solvers. The first solver is skipped: the
+      // caller (update) already computed them and nothing has changed localRotations yet.
+      if (!firstSolver) this.computeWorldMatrices()
+      firstSolver = false
 
       // Clear computed set for this solver's pass
       this.ikComputedSet.clear()
@@ -1388,21 +1449,13 @@ export class Model {
 
     if (boneCount === 0) return
 
-    // Local computed array (avoids instance field overhead)
-    const computed = new Array<boolean>(boneCount).fill(false)
-
-    const computeWorld = (i: number): void => {
-      if (computed[i]) return
-
+    // Flat traversal in precomputed order: every bone's parent is already done, so no
+    // per-bone visited check, no recursion, and no per-call allocation. Same per-bone
+    // math as before. Scratch slots are safe to reuse since there's no reentrancy now.
+    const order = this.deformOrder
+    for (let k = 0; k < boneCount; k++) {
+      const i = order[k]
       const b = bones[i]
-      if (b.parentIndex >= boneCount) {
-        console.warn(`[RZM] bone ${i} parent out of range: ${b.parentIndex}`)
-      }
-
-      // Ensure parent is computed FIRST, before we touch any scratch buffers.
-      // Recursion may itself use scratchMat4Values[0] / scratchQuat; doing it up
-      // front keeps the current frame's scratch slots untouched when we use them below.
-      if (b.parentIndex >= 0 && !computed[b.parentIndex]) computeWorld(b.parentIndex)
 
       const boneRot = localRot[i]
       let fx = boneRot.x, fy = boneRot.y, fz = boneRot.z, fw = boneRot.w
@@ -1467,10 +1520,6 @@ export class Model {
       } else {
         worldMat.values.set(localMVals)
       }
-      computed[i] = true
     }
-
-    // Process all bones (recursion handles dependencies automatically)
-    for (let i = 0; i < boneCount; i++) computeWorld(i)
   }
 }

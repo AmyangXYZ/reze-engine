@@ -188,8 +188,11 @@ export const DEFAULT_ENGINE_OPTIONS = {
 }
 
 export interface EngineStats {
-  fps: number
-  frameTime: number // ms
+  fps: number // derived from mean frame interval — bounded by the real refresh rate
+  frameTime: number // ms — mean frame interval (vsync-to-vsync), not CPU work time
+  frameTimeMax: number // ms — worst frame interval in the window (hitch / stutter indicator)
+  fps1PercentLow: number // "1% low" fps = 1000 / 99th-percentile frame interval
+  jitter: number // ms — stddev of frame intervals (pacing evenness; high = janky at any mean fps)
 }
 
 type DrawCallType = "opaque" | "transparent" | "ground" | "opaque-outline" | "transparent-outline"
@@ -417,6 +420,10 @@ export class Engine {
   private shadowMapDepthView!: GPUTextureView
   private brdfLutTexture!: GPUTexture
   private brdfLutView!: GPUTextureView
+  private filmicLutTexture!: GPUTexture
+  private filmicLutView!: GPUTextureView
+  // Width of the baked Filmic tone LUT (composite.ts FILMIC_LUT_W must match).
+  private static readonly FILMIC_LUT_WIDTH = 256
   private static readonly SHADOW_MAP_SIZE = 2048
   private shadowDepthPipeline!: GPURenderPipeline
   private shadowLightVPBuffer!: GPUBuffer
@@ -458,14 +465,21 @@ export class Engine {
   private cameraTargetBoneName = "全ての親"
   private cameraTargetOffset: Vec3 = new Vec3(0, 0, 0)
 
-  private lastFpsUpdate = performance.now()
-  private framesSinceLastUpdate = 0
   private lastFrameTime = performance.now()
-  private frameTimeSum = 0
-  private frameTimeCount = 0
+  // Smoothness metrics are computed over a ring buffer of true frame intervals
+  // (vsync-to-vsync), recomputed at STATS_REFRESH_MS so the readout doesn't flicker.
+  private static readonly STATS_WINDOW = 120
+  private static readonly STATS_REFRESH_MS = 500
+  private frameIntervals = new Float32Array(Engine.STATS_WINDOW)
+  private frameIntervalWrite = 0
+  private frameIntervalFilled = 0
+  private lastStatsCompute = performance.now()
   private stats: EngineStats = {
     fps: 0,
     frameTime: 0,
+    frameTimeMax: 0,
+    fps1PercentLow: 0,
+    jitter: 0,
   }
   private animationFrameId: number | null = null
   private renderLoopCallback: (() => void) | null = null
@@ -724,6 +738,91 @@ export class Engine {
     this.device.queue.submit([enc.finish()])
 
     ltcTemp.destroy()
+  }
+
+  // Bake the Blender 3.6 Filmic MHC tone curve into a WIDTH×1 r16float LUT sampled by the
+  // composite pass. The 14 anchors are the same as the old inline array; we fit a monotone
+  // cubic (Fritsch–Carlson) through them so the curve is C1-continuous (no Mach banding in
+  // smooth gradients) while still passing through every anchor (look preserved) and staying
+  // monotone (no tonemap overshoot/ringing). Domain is uniform in log2 space: anchor k sits
+  // at t=k, k=0..13 (t = log2(linear)+10). See composite.ts::filmic for the sampling map.
+  private bakeFilmicLut() {
+    const anchors = [
+      0.0028, 0.0068, 0.0151, 0.0313, 0.061, 0.112, 0.192, 0.306, 0.459, 0.631, 0.82, 0.907, 0.962, 0.989,
+    ]
+    const n = anchors.length
+    // Secant slopes (unit spacing, so d_k = y_{k+1} - y_k).
+    const d = new Array<number>(n - 1)
+    for (let k = 0; k < n - 1; k++) d[k] = anchors[k + 1] - anchors[k]
+    // Endpoint + interior tangents.
+    const m = new Array<number>(n)
+    m[0] = d[0]
+    m[n - 1] = d[n - 2]
+    for (let k = 1; k < n - 1; k++) m[k] = (d[k - 1] + d[k]) * 0.5
+    // Fritsch–Carlson monotonicity clamp.
+    for (let k = 0; k < n - 1; k++) {
+      if (d[k] === 0) {
+        m[k] = 0
+        m[k + 1] = 0
+        continue
+      }
+      const a = m[k] / d[k]
+      const b = m[k + 1] / d[k]
+      const s = a * a + b * b
+      if (s > 9) {
+        const tau = 3 / Math.sqrt(s)
+        m[k] = tau * a * d[k]
+        m[k + 1] = tau * b * d[k]
+      }
+    }
+    const W = Engine.FILMIC_LUT_WIDTH
+    const values = new Float32Array(W)
+    for (let j = 0; j < W; j++) {
+      const t = ((n - 1) * j) / (W - 1) // t ∈ [0, n-1]
+      const k = Math.min(Math.floor(t), n - 2)
+      const s = t - k // local param in [0,1], unit-spaced segment
+      const s2 = s * s
+      const s3 = s2 * s
+      // Hermite basis (h=1).
+      const h00 = 2 * s3 - 3 * s2 + 1
+      const h10 = s3 - 2 * s2 + s
+      const h01 = -2 * s3 + 3 * s2
+      const h11 = s3 - s2
+      values[j] = h00 * anchors[k] + h10 * m[k] + h01 * anchors[k + 1] + h11 * m[k + 1]
+    }
+
+    // f32 → f16 bits (same conversion as bakeBrdfLut).
+    const half = new Uint16Array(W)
+    const f32 = new Float32Array(1)
+    const u32 = new Uint32Array(f32.buffer)
+    for (let j = 0; j < W; j++) {
+      f32[0] = values[j]
+      const x = u32[0]
+      const sign = (x >>> 16) & 0x8000
+      const exp = ((x >>> 23) & 0xff) - 127 + 15
+      const mant = x & 0x7fffff
+      if (exp <= 0) {
+        half[j] = sign
+      } else if (exp >= 31) {
+        half[j] = sign | 0x7c00
+      } else {
+        half[j] = sign | (exp << 10) | (mant >>> 13)
+      }
+    }
+
+    this.filmicLutTexture = this.device.createTexture({
+      label: "Filmic tone LUT",
+      size: [W, 1],
+      format: "r16float",
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.filmicLutView = this.filmicLutTexture.createView()
+    this.device.queue.writeTexture(
+      { texture: this.filmicLutTexture },
+      half,
+      { bytesPerRow: W * 2, rowsPerImage: 1 },
+      { width: W, height: 1, depthOrArrayLayers: 1 },
+    )
   }
 
   private createRenderPipeline(config: {
@@ -1154,6 +1253,7 @@ export class Engine {
 
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
     this.bakeBrdfLut()
+    this.bakeFilmicLut()
 
     // Now that shadow resources exist, create the main per-frame bind group
     this.perFrameBindGroup = this.device.createBindGroup({
@@ -1436,6 +1536,8 @@ export class Engine {
         // Aux mask/alpha texture — composite reads .g to reconstruct the alpha that
         // used to live in the HDR target before the rg11b10ufloat switch.
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        // Filmic tone LUT (r16float, filterable) — sampled with the binding-2 sampler.
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
 
@@ -1781,6 +1883,7 @@ export class Engine {
             { binding: 2, resource: this.bloomSampler },
             { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
             { binding: 4, resource: this.maskResolveView },
+            { binding: 5, resource: this.filmicLutView },
           ],
         })
       }
@@ -3554,7 +3657,9 @@ export class Engine {
       this.resolvePickResult(pick.x / dpr, pick.y / dpr)
     }
 
-    this.updateStats(performance.now() - currentTime)
+    // Feed the true vsync-to-vsync interval (deltaTime, computed at frame start), not the
+    // CPU time spent in render() — that's what actually reflects perceived smoothness.
+    this.updateStats(deltaTime * 1000)
   }
 
   private drawInstanceShadow(sp: GPURenderPassEncoder, inst: ModelInstance): void {
@@ -3696,28 +3801,49 @@ export class Engine {
     })
   }
 
-  private updateStats(frameTime: number) {
-    // Simplified frame time tracking - rolling average with fixed window
-    const maxSamples = 60
-    this.frameTimeSum += frameTime
-    this.frameTimeCount++
-    if (this.frameTimeCount > maxSamples) {
-      // Maintain rolling window by subtracting oldest sample estimate
-      const avg = this.frameTimeSum / maxSamples
-      this.frameTimeSum -= avg
-      this.frameTimeCount = maxSamples
-    }
-    this.stats.frameTime = Math.round((this.frameTimeSum / this.frameTimeCount) * 100) / 100
+  // frameIntervalMs is the true vsync-to-vsync frame interval (render dt), NOT the CPU
+  // time spent in render() — the latter misses GPU cost and pacing, so it can read fast
+  // while the scene stutters. Metrics are derived from a ring buffer of these intervals.
+  private updateStats(frameIntervalMs: number) {
+    const w = Engine.STATS_WINDOW
+    this.frameIntervals[this.frameIntervalWrite] = frameIntervalMs
+    this.frameIntervalWrite = (this.frameIntervalWrite + 1) % w
+    if (this.frameIntervalFilled < w) this.frameIntervalFilled++
 
-    // FPS tracking
     const now = performance.now()
-    this.framesSinceLastUpdate++
-    const elapsed = now - this.lastFpsUpdate
+    if (now - this.lastStatsCompute < Engine.STATS_REFRESH_MS) return
+    this.lastStatsCompute = now
 
-    if (elapsed >= 1000) {
-      this.stats.fps = Math.round((this.framesSinceLastUpdate / elapsed) * 1000)
-      this.framesSinceLastUpdate = 0
-      this.lastFpsUpdate = now
+    const n = this.frameIntervalFilled
+    if (n === 0) return
+
+    let sum = 0
+    let max = 0
+    for (let i = 0; i < n; i++) {
+      const v = this.frameIntervals[i]
+      sum += v
+      if (v > max) max = v
     }
+    const mean = sum / n
+
+    let varSum = 0
+    for (let i = 0; i < n; i++) {
+      const d = this.frameIntervals[i] - mean
+      varSum += d * d
+    }
+    const stddev = Math.sqrt(varSum / n)
+
+    // 99th-percentile frame interval → "1% low" fps. TypedArray.sort is numeric.
+    const sorted = this.frameIntervals.slice(0, n).sort()
+    const p99 = sorted[Math.min(n - 1, Math.floor(n * 0.99))]
+
+    // fps from the MEAN interval is inherently bounded by the real refresh (a vsync-locked
+    // interval can't average below the refresh period), so this never reads above the
+    // monitor rate — fixing the old frame-count/window off-by-one (61 on 60Hz, 241 on 240Hz).
+    this.stats.fps = mean > 0 ? Math.round(1000 / mean) : 0
+    this.stats.frameTime = Math.round(mean * 100) / 100
+    this.stats.frameTimeMax = Math.round(max * 100) / 100
+    this.stats.fps1PercentLow = p99 > 0 ? Math.round(1000 / p99) : 0
+    this.stats.jitter = Math.round(stddev * 100) / 100
   }
 }

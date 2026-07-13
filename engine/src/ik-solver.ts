@@ -86,6 +86,12 @@ const _ikMat: Float32Array[] = [
   new Float32Array(16), new Float32Array(16), new Float32Array(16), new Float32Array(16),
 ]
 
+// An IKChain is derived purely from static link topology (bone index + angle limits +
+// solve axis), which never changes at runtime. Build the chain array once per solver and
+// reuse it — avoids reallocating the array and re-running the per-link limit/axis setup
+// (IKChain ctor) on every solve() every frame.
+const _chainCache = new WeakMap<IKSolver, IKChain[]>()
+
 export class IKSolverSystem {
   private static readonly EPSILON = 1.0e-8
   private static readonly THRESHOLD = (88 * Math.PI) / 180
@@ -118,20 +124,21 @@ export class IKSolverSystem {
     const ikBoneIndex = solver.ikBoneIndex
     const targetBoneIndex = solver.targetBoneIndex
 
-    // Reset IK rotations
+    // Reset IK rotations (in place — same object is accumulated into during solve)
     for (const link of solver.links) {
       const chainInfo = ikChainInfo[link.boneIndex]
       if (chainInfo) {
-        chainInfo.ikRotation = new Quat(0, 0, 0, 1)
+        chainInfo.ikRotation.setXYZW(0, 0, 0, 1)
       }
     }
 
     if (this.getDistance(ikBoneIndex, targetBoneIndex, worldMatrices) < this.EPSILON) return
 
-    // Build IK chains
-    const chains: IKChain[] = []
-    for (const link of solver.links) {
-      chains.push(new IKChain(link.boneIndex, link))
+    // Build IK chains (cached per solver — static topology, see _chainCache)
+    let chains = _chainCache.get(solver)
+    if (chains === undefined) {
+      chains = solver.links.map((link) => new IKChain(link.boneIndex, link))
+      _chainCache.set(solver, chains)
     }
 
     // Update chain bones and target bone world matrices (initial state, no IK yet)
@@ -278,7 +285,7 @@ export class IKSolverSystem {
 
       if (chain.minimumAngle && chain.maximumAngle) {
         const localRot = localRotations[chainBoneIndex]
-        chainInfo.localRotation = localRot.clone()
+        chainInfo.localRotation.set(localRot)
 
         // combinedRot = chainInfo.ikRotation * localRot
         Quat.multiplyInto(chainInfo.ikRotation, localRot, _ikQuat[1])
