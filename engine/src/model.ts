@@ -120,7 +120,6 @@ export interface Morph {
 
 export interface Morphing {
   morphs: Morph[]
-  offsetsBuffer: Float32Array // Dense buffer: morphCount * vertexCount * 3 floats
 }
 
 // Runtime skeleton pose state (updated each frame)
@@ -892,8 +891,14 @@ export class Model {
   }
 
   private applyMorphs(): void {
-    // Reset vertex data to base positions
-    this.vertexData.set(this.baseVertexData)
+    // Reset only the vertices morphed by the previous pass back to base — vertexData never
+    // diverges from base outside that range, so a full-buffer copy is wasted work. (First
+    // pass: prev range is empty and vertexData already equals base from construction.)
+    if (this.morphPrevMaxVert >= 0) {
+      const s = this.morphPrevMinVert * VERTEX_STRIDE
+      const e = (this.morphPrevMaxVert + 1) * VERTEX_STRIDE
+      this.vertexData.set(this.baseVertexData.subarray(s, e), s)
+    }
 
     const vertexCount = this.vertexCount
     const morphCount = this.morphing.morphs.length

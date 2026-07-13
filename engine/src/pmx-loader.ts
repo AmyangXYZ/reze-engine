@@ -1017,43 +1017,10 @@ export class PmxLoader {
       skinning = { joints, weights }
     }
 
-    // Create morphing data structure
-    const morphCount = this.morphs.length
-    // Dense buffer: morphCount * vertexCount * 3 floats (one vec3 per morph per vertex)
-    const offsetsBuffer = new Float32Array(morphCount * this.vertexCount * 3)
-
-    // Initialize all offsets to zero
-    offsetsBuffer.fill(0)
-
-    // Fill in actual offsets for vertex morphs
-    for (let morphIdx = 0; morphIdx < morphCount; morphIdx++) {
-      const morph = this.morphs[morphIdx]
-      if (morph.type === 1) {
-        // Vertex morph
-        // Store offsets in dense buffer: [morph0_v0, morph0_v1, ..., morph1_v0, ...]
-        // Each vec3 is 3 consecutive floats
-        for (const offset of morph.vertexOffsets) {
-          // Calculate index in the dense buffer
-          // Layout: morphIdx * (vertexCount * 3) + vertexIndex * 3
-          // This gives us the starting float index for this morph's vertex offset
-          const bufferIdx = morphIdx * this.vertexCount * 3 + offset.vertexIndex * 3
-          if (
-            bufferIdx >= 0 &&
-            bufferIdx + 2 < offsetsBuffer.length &&
-            offset.vertexIndex >= 0 &&
-            offset.vertexIndex < this.vertexCount
-          ) {
-            offsetsBuffer[bufferIdx] = offset.positionOffset[0]
-            offsetsBuffer[bufferIdx + 1] = offset.positionOffset[1]
-            offsetsBuffer[bufferIdx + 2] = offset.positionOffset[2]
-          }
-        }
-      }
-    }
-
+    // Morphs are applied from the sparse per-morph vertexOffsets lists (see
+    // Model.applyMorphs); no dense morphCount*vertexCount buffer is needed.
     const morphing: Morphing = {
       morphs: this.morphs,
-      offsetsBuffer,
     }
 
     return new Model(
