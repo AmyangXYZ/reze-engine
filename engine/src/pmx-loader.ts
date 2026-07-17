@@ -559,19 +559,17 @@ export class PmxLoader {
                 this.getFloat32() // x
                 this.getFloat32() // y
                 this.getFloat32() // z
-                this.getFloat32() // rx
-                this.getFloat32() // ry
-                this.getFloat32() // rz
-              } else if (morphType === 3) {
-                // UV morph
+                this.getFloat32() // rotation quaternion x
+                this.getFloat32() // rotation quaternion y
+                this.getFloat32() // rotation quaternion z
+                this.getFloat32() // rotation quaternion w
+              } else if (morphType >= 3 && morphType <= 7) {
+                // UV morph + additional UV channels 1-4; offset is always a Float4 per spec
                 this.getIndex(this.vertexIndexSize) // vertexIndex
-                this.getFloat32() // u
-                this.getFloat32() // v
-              } else if (morphType === 4 || morphType === 5 || morphType === 6 || morphType === 7) {
-                // UV morph types 4-7 (additional UV channels)
-                this.getIndex(this.vertexIndexSize) // vertexIndex
-                this.getFloat32() // u
-                this.getFloat32() // v
+                this.getFloat32() // x
+                this.getFloat32() // y
+                this.getFloat32() // z
+                this.getFloat32() // w
               } else if (morphType === 8) {
                 // Material morph
                 this.getNonVertexIndex(this.materialIndexSize) // materialIndex
@@ -604,6 +602,20 @@ export class PmxLoader {
                 this.getFloat32() // toonCoeff g
                 this.getFloat32() // toonCoeff b
                 this.getFloat32() // toonCoeff a
+              } else if (morphType === 9) {
+                // Flip morph (PMX 2.1): same layout as group morph
+                this.getNonVertexIndex(this.morphIndexSize) // morphIndex
+                this.getFloat32() // ratio
+              } else if (morphType === 10) {
+                // Impulse morph (PMX 2.1)
+                this.getNonVertexIndex(this.rigidBodyIndexSize) // rigidbodyIndex
+                this.getUint8() // local flag
+                this.getFloat32() // velocity x
+                this.getFloat32() // velocity y
+                this.getFloat32() // velocity z
+                this.getFloat32() // torque x
+                this.getFloat32() // torque y
+                this.getFloat32() // torque z
               }
             }
           }
