@@ -54,32 +54,37 @@ engine/src/
 ## Quick start
 
 ```javascript
-import { Engine, Vec3 } from "reze-engine";
+import { Engine, Vec3 } from "reze-engine"
 
 const engine = new Engine(canvas, {
   world: { color: new Vec3(0.4, 0.49, 0.65), strength: 1.0 }, // environment light
   sun: { color: new Vec3(1, 1, 1), strength: 2.0, direction: new Vec3(0, -0.5, 1) },
   bloom: { color: new Vec3(0.9, 0.1, 0.8), intensity: 0.05, threshold: 0.5 },
   camera: { distance: 31.5, target: new Vec3(0, 11.5, 0) }, // MMD units (1 unit = 8 cm)
-});
-await engine.init();
+})
+await engine.init()
 
-const model = await engine.loadModel("hero", "/models/hero/hero.pmx");
+const model = await engine.loadModel("hero", "/models/hero/hero.pmx")
 
 // Map PMX material names to NPR presets (unlisted names fall back to `default`).
 engine.setMaterialPresets("hero", {
-  face: ["face01"], body: ["skin"], hair: ["hair_f"], eye: ["eye"],
-  cloth_smooth: ["shirt", "dress", "shoes"], cloth_rough: ["jacket"],
-  stockings: ["stockings"], metal: ["earring"],
-});
+  face: ["face01"],
+  body: ["skin"],
+  hair: ["hair_f"],
+  eye: ["eye"],
+  cloth_smooth: ["shirt", "dress", "shoes"],
+  cloth_rough: ["jacket"],
+  stockings: ["stockings"],
+  metal: ["earring"],
+})
 
-await model.loadVmd("idle", "/animations/idle.vmd");
-model.show("idle");
-model.play();
+await model.loadVmd("idle", "/animations/idle.vmd")
+model.show("idle")
+model.play()
 
-engine.setCameraFollow(model, "センター", new Vec3(0, 3.5, 0));
-engine.addGround({ width: 160, height: 160 });
-engine.runRenderLoop();
+engine.setCameraFollow(model, "センター", new Vec3(0, 3.5, 0))
+engine.addGround({ width: 160, height: 160 })
+engine.runRenderLoop()
 ```
 
 ## API
@@ -139,10 +144,9 @@ Feed a `<input type="file" webkitdirectory>` `FileList` (or drag/drop) into the 
 `parsePmxFolderInput(fileList)` returns a tagged result; for `single` you get `{ files, pmxFile }` directly, for `multiple` show a picker over `pmxRelativePaths` and resolve with `pmxFileAtRelativePath(files, path)`. Then:
 
 ```javascript
-const picked = parsePmxFolderInput(e.target.files);
-e.target.value = "";
-if (picked.status === "single")
-  await engine.loadModel("m", { files: picked.files, pmxFile: picked.pmxFile });
+const picked = parsePmxFolderInput(e.target.files)
+e.target.value = ""
+if (picked.status === "single") await engine.loadModel("m", { files: picked.files, pmxFile: picked.pmxFile })
 ```
 
 VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths resolve against the PMX directory.
@@ -168,11 +172,17 @@ The gizmo consumes mouse input inside its bounding sphere so drags never fight c
 
 ```javascript
 onGizmoDrag: (e) => {
-  const model = engine.getModel(e.modelName); if (!model) return;
-  if (e.phase === "start") { model.pause(); model.setClipApplySuspended(true); return; } // stop re-sampling wiping the edit
-  if (e.phase === "end") return;
-  if (e.kind === "rotate") model.rotateBones({ [e.boneName]: e.localRotation }, 0);       // 0 = instant write
-  else model.setBoneLocalTranslation(e.boneIndex, e.localTranslation);
+  const model = engine.getModel(e.modelName)
+  if (!model) return
+  if (e.phase === "start") {
+    model.pause()
+    model.setClipApplySuspended(true)
+    return
+  } // stop re-sampling wiping the edit
+  if (e.phase === "end") return
+  if (e.kind === "rotate")
+    model.rotateBones({ [e.boneName]: e.localRotation }, 0) // 0 = instant write
+  else model.setBoneLocalTranslation(e.boneIndex, e.localTranslation)
 }
 // play()/seek() auto-clear the suspend flag (edit is lost — runtime-override semantic).
 ```
@@ -185,11 +195,13 @@ In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsu
 
 **Per substep:** `predict velocities → broad + narrowphase → solve constraints (10 iters) → split-impulse position correction → integrate`.
 
-- **Solver** — projected Gauss-Seidel, joint rows + contact rows in one loop. Joints are 6DOF springs (3 linear + 3 angular) with stop-ERP limit correction and per-axis stiffness×error impulse.
+- **Solver** — projected Gauss-Seidel, joint rows + contact rows in one loop. Joints are 6DOF springs (3 linear + 3 angular) with stop-ERP limit correction and per-axis stiffness×error impulse. Linear rows pivot on each body's own joint-frame origin (Spring2-style, not Bullet 2.7x's shared mid-anchor), so a violated joint pulls itself back together instead of degenerating into torque and "breaking".
+- **Angular limits** — hybrid: small violations (< 0.5 rad, the resting-cloth regime) use per-axis Euler stop rows, which converge cleanly and keep resting cloth still; larger violations switch to a single geodesic row toward the Euler-clamped target rotation, because per-axis Euler rows chase phantom errors near the ±90° singularity and pump energy. Ranged stops are unilateral (accumulated impulse clamped to the corrective sign) so a limit pushes back into range but never brakes natural recovery; locked axes stay bilateral equality joints. Spring rows stay per-axis, with stiffness clamped to the `k·dt² ≤ ¼` stability bound.
 - **Narrowphase** — analytical sphere-sphere / -capsule / -box and capsule-capsule / -box. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
 - **Speculative contacts** (`margin 0.04`) fire at near-touch with a push-only clamp — inert until real overlap, but they stop fast bodies tunneling thin surfaces in one substep.
-- **Split-impulse correction** resolves penetration by a mass-weighted translation *outside* the velocity solver, so joint pulls can't fight separation.
-- **Kinematic velocity propagation** — bone-driven bodies derive linear+angular velocity from the bone-pose delta each frame, so joints feel real limb motion, not a teleport.
+- **Split-impulse correction** resolves penetration by a mass-weighted translation _outside_ the velocity solver, so joint pulls can't fight separation.
+- **Kinematic advancement** — bone-driven bodies move toward the frame's bone pose incrementally per substep, with velocities derived over the fixed step, so the solver never sees more than one 60 Hz step of anchor motion regardless of render dt.
+- **Discontinuity guards** — a bone-pose jump beyond continuous motion (timeline scrub, long stall) rigidly carries each dynamic body along with its kinematic root's transform delta and zeroes momentum instead of dragging cloth across the gap; correction velocities are clamped (120 u/s linear, 30 rad/s angular), per-step travel is capped, and any body that still goes non-finite is restored to its previous substep pose.
 - Sleeping is off (cloth must always react); resting bodies bleed micro-velocity via per-PMX damping.
 
 Engine surface is just `setPhysicsEnabled` / `resetPhysics` — all tuning (mass, damping, friction, restitution, joint stiffness/limits, collision groups) lives on the PMX rig.
@@ -208,17 +220,17 @@ Each surface mixes an NPR stack with a Principled-style BSDF per material, so ch
 - **PBR core** (`eval_principled`) — GGX + Schlick Fresnel, Walter–Smith G1, Fdez-Agüera 2019 multi-scatter, Karis split-sum DFG LUT, Heitz 2016 LTC direct-spec, optional sheen.
 - **NPR toolbox** — toon ramps (constant / fwidth-AA'd), HSV warm-shadow / cool-light remaps, fresnel + layer-weight rims, value-noise bump, Voronoi metallic sparkle, BT.601-gated emission.
 
-| Preset | Notes |
-| --- | --- |
-| `default` | Plain Principled, metallic 0, rough 0.5 |
-| `eye` | Plain + post-eval emission ×1.5 |
-| `face` | Toon + warm rim + dual-fresnel rim + bright-tex gate, noise bump |
-| `body` | Toon + warm rim + fresnel + facing rim, noise bump |
-| `hair` | Toon + fresnel + bevel + bright-tex gate, 20% PBR |
-| `cloth_smooth` | Toon + bevel + emission overlay (×18) |
-| `cloth_rough` | Same NPR, live noise bump, rough 0.82 |
-| `metal` | Toon + emission overlay (×8), Voronoi base, metallic 1 |
-| `stockings` | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
+| Preset         | Notes                                                                   |
+| -------------- | ----------------------------------------------------------------------- |
+| `default`      | Plain Principled, metallic 0, rough 0.5                                 |
+| `eye`          | Plain + post-eval emission ×1.5                                         |
+| `face`         | Toon + warm rim + dual-fresnel rim + bright-tex gate, noise bump        |
+| `body`         | Toon + warm rim + fresnel + facing rim, noise bump                      |
+| `hair`         | Toon + fresnel + bevel + bright-tex gate, 20% PBR                       |
+| `cloth_smooth` | Toon + bevel + emission overlay (×18)                                   |
+| `cloth_rough`  | Same NPR, live noise bump, rough 0.82                                   |
+| `metal`        | Toon + emission overlay (×8), Voronoi base, metallic 1                  |
+| `stockings`    | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
 
 **Post & output.** Directional shadow map (2048², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → inverted-hull outline.
 
@@ -227,7 +239,11 @@ Each surface mixes an NPR stack with a Principled-style BSDF per material, so ch
 
 ## Used by
 
-[Reze Studio](https://reze.studio) (MMD animation editor) · [MiKaPo](https://mikapo.vercel.app) (motion capture) · [Popo](https://popo.love) (LLM-generated poses) · [MPL](https://mmd-mpl.vercel.app) (motion language) · [Mixamo-MMD](https://mixamo-mmd.vercel.app) (FBX→VMD retarget)
+- [Reze Studio](https://reze.studio) (MMD animation editor)
+- [MiKaPo](https://mikapo.vercel.app) (motion capture)
+- [Popo](https://popo.love) (LLM-generated poses)
+- [MPL](https://mmd-mpl.vercel.app) (motion language)
+- [Mixamo-MMD](https://mixamo-mmd.vercel.app) (FBX→VMD retarget)
 
 ## Tutorial
 

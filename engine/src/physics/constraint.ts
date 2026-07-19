@@ -37,12 +37,29 @@ export interface SixDofSpringConstraint {
   cacheLinCrossA: Float32Array    // 9: (rA × ax) per axis
   cacheLinCrossB: Float32Array    // 9
   cacheLinJacInv: Float32Array    // 3: 1/(im+im+cA²·ii+cB²·ii) per axis
-  cacheLinTargetVel: Float32Array // 3: limit ERP + spring drive, signed
+  // Limit rows are unilateral (Bullet-style): the per-substep accumulated
+  // impulse is clamped to the corrective sign, so a limit can push a body
+  // back into range but never pull it deeper / brake its natural recovery —
+  // bilateral limit rows act as motors and pump energy into swinging cloth.
+  cacheLinTargetVel: Float32Array // 3: limit ERP target, signed
   cacheLinActive: Uint8Array      // 3
-  cacheAngAxes: Float32Array      // 9
-  cacheAngTargetVel: Float32Array // 3
-  cacheAngActive: Uint8Array      // 3
-  cacheAngJacInv: number          // 1 — same for all 3 angular axes
+  cacheLinLimitImp: Float32Array  // 3: accumulated limit impulse (per substep)
+  // Spring rows are velocity-target drives; setup clamps k to the deadbeat
+  // stability bound so they cannot pump energy.
+  cacheLinSpringTarget: Float32Array // 3
+  cacheLinSpringActive: Uint8Array   // 3
+  cacheAngAxes: Float32Array      // 9 (spring rows)
+  cacheAngTargetVel: Float32Array // 3 (spring rows)
+  cacheAngActive: Uint8Array      // 3 (spring rows)
+  cacheAngJacInv: number          // 1 — same for all angular rows
+  // Single geodesic limit row: shortest rotation from the current relative
+  // orientation to the euler-clamped target. Per-axis euler limit rows are
+  // geometrically inconsistent for large violations (asin singularity) and
+  // pump energy instead of converging. Unilateral like the linear limits.
+  cacheAngLimAxis: Float32Array   // 3, world-space unit axis
+  cacheAngLimTarget: number       // target relative angular velocity along axis
+  cacheAngLimActive: number
+  cacheAngLimImp: number          // accumulated impulse (per substep)
 }
 
 export const STOP_ERP = 0.475
@@ -128,10 +145,17 @@ export function buildConstraints(
       cacheLinJacInv: new Float32Array(3),
       cacheLinTargetVel: new Float32Array(3),
       cacheLinActive: new Uint8Array(3),
+      cacheLinLimitImp: new Float32Array(3),
+      cacheLinSpringTarget: new Float32Array(3),
+      cacheLinSpringActive: new Uint8Array(3),
       cacheAngAxes: new Float32Array(9),
       cacheAngTargetVel: new Float32Array(3),
       cacheAngActive: new Uint8Array(3),
       cacheAngJacInv: 0,
+      cacheAngLimAxis: new Float32Array(3),
+      cacheAngLimTarget: 0,
+      cacheAngLimActive: 0,
+      cacheAngLimImp: 0,
     })
   }
 

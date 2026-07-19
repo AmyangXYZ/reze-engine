@@ -32,6 +32,25 @@ export class RezePhysics {
   private prevPositions: Float32Array
   private prevOrientations: Float32Array
 
+  // Per-frame kinematic body targets (boneWorld × bodyOffset). Kinematic
+  // bodies advance toward these incrementally per substep instead of jumping
+  // to the final pose before substep 1. Velocities come from the target
+  // trajectory (frame-to-frame target delta over render dt) — deriving them
+  // from the per-substep advancement instead ripples with the accumulator
+  // phase at render rates above 60 Hz and visibly excites cloth chains.
+  private kinTargetPos: Float32Array
+  private kinTargetOri: Float32Array
+  private kinTargetVel: Float32Array
+  private kinTargetAngVel: Float32Array
+
+  // For each dynamic body, the kinematic body its constraint chain roots at
+  // (-1 if unreachable). On a teleport, dynamic bodies are carried rigidly by
+  // their root's transform delta so cloth keeps its pose relative to the
+  // character instead of being dragged across the jump.
+  private kinRoot: Int32Array
+  // Kinematic bodies whose target jumped discontinuously this frame.
+  private teleportFlags: Uint8Array
+
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
     this.joints = joints
@@ -41,6 +60,41 @@ export class RezePhysics {
     this.contacts = new ContactPool()
     this.prevPositions = new Float32Array(this.store.count * 3)
     this.prevOrientations = new Float32Array(this.store.count * 4)
+    this.kinTargetPos = new Float32Array(this.store.count * 3)
+    this.kinTargetOri = new Float32Array(this.store.count * 4)
+    this.kinTargetVel = new Float32Array(this.store.count * 3)
+    this.kinTargetAngVel = new Float32Array(this.store.count * 3)
+    this.kinRoot = this.buildKinematicRoots()
+    this.teleportFlags = new Uint8Array(this.store.count)
+  }
+
+  // BFS over the joint graph from every kinematic body, assigning each
+  // reachable dynamic body the kinematic body it (transitively) hangs off.
+  private buildKinematicRoots(): Int32Array {
+    const N = this.store.count
+    const root = new Int32Array(N).fill(-1)
+    const types = this.store.type
+    const adj: number[][] = Array.from({ length: N }, () => [])
+    for (const c of this.constraints) {
+      adj[c.bodyA].push(c.bodyB)
+      adj[c.bodyB].push(c.bodyA)
+    }
+    const queue: number[] = []
+    for (let i = 0; i < N; i++) {
+      if (types[i] === RigidbodyType.Static || types[i] === RigidbodyType.Kinematic) {
+        root[i] = i
+        queue.push(i)
+      }
+    }
+    for (let h = 0; h < queue.length; h++) {
+      const i = queue[h]
+      for (const j of adj[i]) {
+        if (root[j] !== -1) continue
+        root[j] = root[i]
+        queue.push(j)
+      }
+    }
+    return root
   }
 
   // Snapshot the current body pose as the interpolation "previous" state.
@@ -96,26 +150,52 @@ export class RezePhysics {
       // that skip frame 0 don't pop bodies on first step.
       this.snapBodiesToBones(boneWorldMatrices)
       this.savePrevState()
+      // Seed kinematic targets so the first frame's target-delta velocity
+      // is zero instead of a jump from the origin.
+      this.kinTargetPos.set(this.store.positions)
+      this.kinTargetOri.set(this.store.orientations)
       this.firstFrame = false
     }
 
-    // Sync once per render frame; kinematic targets don't change between
-    // substeps. Render dt is used to derive kinematic velocities from the
-    // bone-pose delta so joints feel the kinematic motion.
-    this.syncFromBones(boneWorldMatrices, dt)
+    // Compute this frame's kinematic targets from the current bone pose. A
+    // target jump beyond what continuous motion can produce (timeline scrub)
+    // is a teleport, handled per kinematic root: rigidly carry that root's
+    // dynamic chains across the jump with zeroed momentum, snap the root,
+    // and keep simulating — dragging cloth through a discontinuity at the
+    // raw derived velocity is what used to explode the solver. Chains under
+    // unaffected roots keep their momentum untouched.
+    if (this.computeKinematicTargets(boneWorldMatrices, dt)) {
+      this.carryDynamicThroughTeleport()
+      this.snapKinematicToTargets(true)
+      this.savePrevState() // prev == curr so interpolation doesn't streak
+    }
 
     // Fixed-timestep substeps. The maxSubSteps cap prevents runaway after
     // a long stall (tab backgrounded, etc.). Snapshot the pose before each step so
     // after the loop prevState is one substep behind the live (current) state.
+    // Kinematic bodies split the remaining gap evenly across this frame's
+    // substeps (f = 1/substeps-left) and land exactly on the frame's bone
+    // pose by the last one: at 60 Hz render that reproduces the classic
+    // sync-once-per-frame behavior exactly (no fractional lag trembling
+    // against the rendered mesh), while at lower rates the per-substep
+    // constraint error stays bounded to one fixed step of bone motion.
     this.timeAccum += dt
-    let sub = 0
-    while (this.timeAccum >= this.fixedTimeStep && sub < this.maxSubSteps) {
+    let nSub = Math.floor(this.timeAccum / this.fixedTimeStep)
+    if (nSub > this.maxSubSteps) nSub = this.maxSubSteps
+    for (let k = 0; k < nSub; k++) {
       this.savePrevState()
+      this.advanceKinematicToTargets(1 / (nSub - k))
       this.world.step(this.store, this.constraints, this.contacts, this.fixedTimeStep)
+      this.restoreNonFiniteBodies()
       this.timeAccum -= this.fixedTimeStep
-      sub++
     }
-    if (sub === this.maxSubSteps) this.timeAccum = 0
+    if (this.timeAccum >= this.fixedTimeStep) {
+      // Substep budget exhausted mid-catchup: drop the remaining time and
+      // snap kinematic bodies the rest of the way (zero velocity) so they
+      // don't start next frame lagging behind their bones.
+      this.timeAccum = 0
+      this.snapKinematicToTargets(false)
+    }
 
     // Fraction into the next (not-yet-taken) step; always in [0, 1).
     const alpha = this.fixedTimeStep > 0 ? this.timeAccum / this.fixedTimeStep : 0
@@ -158,22 +238,34 @@ export class RezePhysics {
     }
   }
 
-  // Pull Static / Kinematic bodies to their bones and derive velocities
-  // from the bone-pose delta — joints attached to fast limbs need to see
-  // the kinematic motion, not just the position jump, or dependent cloth
-  // bodies lag behind quick movement.
-  private syncFromBones(boneWorldMatrices: Mat4[], dt: number): void {
+  // Fill kinTargetPos/kinTargetOri = boneWorld × bodyOffset for every bone-
+  // bound Static/Kinematic body. Returns true if any target is discontinuous
+  // with the current body pose — farther than continuous motion can carry it
+  // in one render frame, or rotated more than 90°.
+  private computeKinematicTargets(boneWorldMatrices: Mat4[], dt: number): boolean {
     const N = this.store.count
     const offsets = this.store.bodyOffsetMatrix
     const positions = this.store.positions
     const orientations = this.store.orientations
-    const lv = this.store.linearVelocities
-    const av = this.store.angularVelocities
     const types = this.store.type
     const boneIdx = this.store.boneIndex
+    const tp = this.kinTargetPos
+    const to = this.kinTargetOri
+
+    // 250 units/s scaled by frame time, floored at 4 units: far above the
+    // fastest limb motion (a false positive freezes that chain's momentum
+    // for a frame, which reads as stutter), far below any real scrub jump.
+    const maxJump = Math.max(4, 250 * dt)
+    const maxJumpSq = maxJump * maxJump
+    const flags = this.teleportFlags
+    let teleport = false
+
+    const tv = this.kinTargetVel
+    const tav = this.kinTargetAngVel
     const invDt = dt > 0 ? 1 / dt : 0
 
     for (let i = 0; i < N; i++) {
+      flags[i] = 0
       const t = types[i]
       if (t !== RigidbodyType.Static && t !== RigidbodyType.Kinematic) continue
       const b = boneIdx[i]
@@ -183,57 +275,265 @@ export class RezePhysics {
 
       const i3 = i * 3
       const i4 = i * 4
+      // Previous frame's target — the reference for the trajectory velocity.
+      const oldTx = tp[i3 + 0], oldTy = tp[i3 + 1], oldTz = tp[i3 + 2]
+      const oldOx = to[i4 + 0], oldOy = to[i4 + 1], oldOz = to[i4 + 2], oldOw = to[i4 + 3]
 
-      // Save previous transform for the velocity diff. invDt = 0 (first
-      // frame / reset) skips the diff and zeros velocities.
-      const oldPx = positions[i3 + 0],
-        oldPy = positions[i3 + 1],
-        oldPz = positions[i3 + 2]
+      tp[i3 + 0] = _bodyMat[12]
+      tp[i3 + 1] = _bodyMat[13]
+      tp[i3 + 2] = _bodyMat[14]
+      Mat4.toQuatFromArrayInto(_bodyMat, 0, _scratchQuat)
+      const nOx = _scratchQuat.x, nOy = _scratchQuat.y, nOz = _scratchQuat.z, nOw = _scratchQuat.w
+      to[i4 + 0] = nOx
+      to[i4 + 1] = nOy
+      to[i4 + 2] = nOz
+      to[i4 + 3] = nOw
+
+      const dx = tp[i3 + 0] - positions[i3 + 0]
+      const dy = tp[i3 + 1] - positions[i3 + 1]
+      const dz = tp[i3 + 2] - positions[i3 + 2]
+      // |q·q'| = cos(θ/2); below cos(45°) the body turned more than 90°.
+      const dot =
+        to[i4 + 0] * orientations[i4 + 0] +
+        to[i4 + 1] * orientations[i4 + 1] +
+        to[i4 + 2] * orientations[i4 + 2] +
+        to[i4 + 3] * orientations[i4 + 3]
+      if (dx * dx + dy * dy + dz * dz > maxJumpSq || Math.abs(dot) < 0.7071) {
+        flags[i] = 1
+        teleport = true
+        tv[i3 + 0] = 0; tv[i3 + 1] = 0; tv[i3 + 2] = 0
+        tav[i3 + 0] = 0; tav[i3 + 1] = 0; tav[i3 + 2] = 0
+        continue
+      }
+
+      tv[i3 + 0] = (tp[i3 + 0] - oldTx) * invDt
+      tv[i3 + 1] = (tp[i3 + 1] - oldTy) * invDt
+      tv[i3 + 2] = (tp[i3 + 2] - oldTz) * invDt
+      // ω ≈ 2 · qDiff.xyz / dt with qDiff = qNew · conj(qOld). Shortest-arc
+      // sign keeps qDiff and −qDiff (same rotation) from doubling ω.
+      const cox = -oldOx, coy = -oldOy, coz = -oldOz, cow = oldOw
+      const qdx = nOw * cox + nOx * cow + nOy * coz - nOz * coy
+      const qdy = nOw * coy - nOx * coz + nOy * cow + nOz * cox
+      const qdz = nOw * coz + nOx * coy - nOy * cox + nOz * cow
+      const qdw = nOw * cow - nOx * cox - nOy * coy - nOz * coz
+      const sign = qdw < 0 ? -1 : 1
+      tav[i3 + 0] = 2 * sign * qdx * invDt
+      tav[i3 + 1] = 2 * sign * qdy * invDt
+      tav[i3 + 2] = 2 * sign * qdz * invDt
+    }
+    return teleport
+  }
+
+  // Move kinematic bodies fraction f of the way to the frame target with the
+  // target-trajectory velocity, so joints see continuous anchor motion (and a
+  // smooth velocity signal) instead of a frame-sized jump on substep 1.
+  private advanceKinematicToTargets(f: number): void {
+    const N = this.store.count
+    const positions = this.store.positions
+    const orientations = this.store.orientations
+    const lv = this.store.linearVelocities
+    const av = this.store.angularVelocities
+    const types = this.store.type
+    const boneIdx = this.store.boneIndex
+    const tp = this.kinTargetPos
+    const to = this.kinTargetOri
+    const tv = this.kinTargetVel
+    const tav = this.kinTargetAngVel
+
+    for (let i = 0; i < N; i++) {
+      const t = types[i]
+      if (t !== RigidbodyType.Static && t !== RigidbodyType.Kinematic) continue
+      const b = boneIdx[i]
+      if (b < 0) continue
+
+      const i3 = i * 3
+      const i4 = i * 4
+      positions[i3 + 0] += (tp[i3 + 0] - positions[i3 + 0]) * f
+      positions[i3 + 1] += (tp[i3 + 1] - positions[i3 + 1]) * f
+      positions[i3 + 2] += (tp[i3 + 2] - positions[i3 + 2]) * f
+      lv[i3 + 0] = tv[i3 + 0]
+      lv[i3 + 1] = tv[i3 + 1]
+      lv[i3 + 2] = tv[i3 + 2]
+      av[i3 + 0] = tav[i3 + 0]
+      av[i3 + 1] = tav[i3 + 1]
+      av[i3 + 2] = tav[i3 + 2]
+
+      // Shortest-arc nlerp toward the target orientation.
       const oldOx = orientations[i4 + 0],
         oldOy = orientations[i4 + 1]
       const oldOz = orientations[i4 + 2],
         oldOw = orientations[i4 + 3]
-
-      positions[i3 + 0] = _bodyMat[12]
-      positions[i3 + 1] = _bodyMat[13]
-      positions[i3 + 2] = _bodyMat[14]
-      Mat4.toQuatFromArrayInto(_bodyMat, 0, _scratchQuat)
-      const newOx = _scratchQuat.x,
-        newOy = _scratchQuat.y
-      const newOz = _scratchQuat.z,
-        newOw = _scratchQuat.w
+      let tx = to[i4 + 0],
+        ty = to[i4 + 1],
+        tz = to[i4 + 2],
+        tw = to[i4 + 3]
+      if (oldOx * tx + oldOy * ty + oldOz * tz + oldOw * tw < 0) {
+        tx = -tx; ty = -ty; tz = -tz; tw = -tw
+      }
+      let newOx = oldOx + (tx - oldOx) * f
+      let newOy = oldOy + (ty - oldOy) * f
+      let newOz = oldOz + (tz - oldOz) * f
+      let newOw = oldOw + (tw - oldOw) * f
+      const len2 = newOx * newOx + newOy * newOy + newOz * newOz + newOw * newOw
+      if (len2 > 1e-12) {
+        const inv = 1 / Math.sqrt(len2)
+        newOx *= inv; newOy *= inv; newOz *= inv; newOw *= inv
+      } else {
+        newOx = tx; newOy = ty; newOz = tz; newOw = tw
+      }
       orientations[i4 + 0] = newOx
       orientations[i4 + 1] = newOy
       orientations[i4 + 2] = newOz
       orientations[i4 + 3] = newOw
+    }
+  }
 
-      if (invDt === 0) {
-        lv[i3 + 0] = 0
-        lv[i3 + 1] = 0
-        lv[i3 + 2] = 0
-        av[i3 + 0] = 0
-        av[i3 + 1] = 0
-        av[i3 + 2] = 0
-      } else {
-        lv[i3 + 0] = (_bodyMat[12] - oldPx) * invDt
-        lv[i3 + 1] = (_bodyMat[13] - oldPy) * invDt
-        lv[i3 + 2] = (_bodyMat[14] - oldPz) * invDt
+  // Snap kinematic bodies straight to the frame target with zero velocity.
+  // Used on teleports (onlyFlagged) and when the substep budget runs out
+  // mid-catchup (all).
+  private snapKinematicToTargets(onlyFlagged: boolean): void {
+    const N = this.store.count
+    const positions = this.store.positions
+    const orientations = this.store.orientations
+    const lv = this.store.linearVelocities
+    const av = this.store.angularVelocities
+    const types = this.store.type
+    const boneIdx = this.store.boneIndex
+    const tp = this.kinTargetPos
+    const to = this.kinTargetOri
+    const flags = this.teleportFlags
 
-        // ω ≈ 2 · qDiff.xyz / dt with qDiff = qNew · conj(qOld). Shortest-
-        // arc sign keeps qDiff and −qDiff (same rotation) from doubling ω.
-        const cox = -oldOx,
-          coy = -oldOy,
-          coz = -oldOz,
-          cow = oldOw
-        const dx = newOw * cox + newOx * cow + newOy * coz - newOz * coy
-        const dy = newOw * coy - newOx * coz + newOy * cow + newOz * cox
-        const dz = newOw * coz + newOx * coy - newOy * cox + newOz * cow
-        const dw = newOw * cow - newOx * cox - newOy * coy - newOz * coz
-        const sign = dw < 0 ? -1 : 1
-        av[i3 + 0] = 2 * sign * dx * invDt
-        av[i3 + 1] = 2 * sign * dy * invDt
-        av[i3 + 2] = 2 * sign * dz * invDt
+    for (let i = 0; i < N; i++) {
+      const t = types[i]
+      if (t !== RigidbodyType.Static && t !== RigidbodyType.Kinematic) continue
+      if (boneIdx[i] < 0) continue
+      if (onlyFlagged && !flags[i]) continue
+      const i3 = i * 3
+      const i4 = i * 4
+      positions[i3 + 0] = tp[i3 + 0]
+      positions[i3 + 1] = tp[i3 + 1]
+      positions[i3 + 2] = tp[i3 + 2]
+      orientations[i4 + 0] = to[i4 + 0]
+      orientations[i4 + 1] = to[i4 + 1]
+      orientations[i4 + 2] = to[i4 + 2]
+      orientations[i4 + 3] = to[i4 + 3]
+      lv[i3 + 0] = 0; lv[i3 + 1] = 0; lv[i3 + 2] = 0
+      av[i3 + 0] = 0; av[i3 + 1] = 0; av[i3 + 2] = 0
+    }
+  }
+
+  // Rigidly carry each dynamic body whose kinematic root teleported along
+  // with that root's current→target transform delta (velocity zeroed),
+  // preserving the cloth pose relative to the character across the jump.
+  // Must run before snapKinematicToTargets (it reads the pre-snap pose).
+  private carryDynamicThroughTeleport(): void {
+    const N = this.store.count
+    const positions = this.store.positions
+    const orientations = this.store.orientations
+    const lv = this.store.linearVelocities
+    const av = this.store.angularVelocities
+    const types = this.store.type
+    const tp = this.kinTargetPos
+    const to = this.kinTargetOri
+    const root = this.kinRoot
+    const flags = this.teleportFlags
+
+    for (let i = 0; i < N; i++) {
+      if (types[i] !== RigidbodyType.Dynamic) continue
+      const k = root[i]
+      if (k < 0 || !flags[k] || this.store.boneIndex[k] < 0) continue
+      const k3 = k * 3
+      const k4 = k * 4
+      // Root delta rotation R = qTarget · conj(qCurrent).
+      const cx = -orientations[k4 + 0],
+        cy = -orientations[k4 + 1],
+        cz = -orientations[k4 + 2],
+        cw = orientations[k4 + 3]
+      const txq = to[k4 + 0],
+        tyq = to[k4 + 1],
+        tzq = to[k4 + 2],
+        twq = to[k4 + 3]
+      const rx = twq * cx + txq * cw + tyq * cz - tzq * cy
+      const ry = twq * cy - txq * cz + tyq * cw + tzq * cx
+      const rz = twq * cz + txq * cy - tyq * cx + tzq * cw
+      const rw = twq * cw - txq * cx - tyq * cy - tzq * cz
+
+      const i3 = i * 3
+      const i4 = i * 4
+      // Position: rotate the offset from the root by R, re-anchor at target.
+      const ox = positions[i3 + 0] - positions[k3 + 0]
+      const oy = positions[i3 + 1] - positions[k3 + 1]
+      const oz = positions[i3 + 2] - positions[k3 + 2]
+      // v' = v + 2·rw·(r × v) + 2·(r × (r × v))
+      const c1x = ry * oz - rz * oy
+      const c1y = rz * ox - rx * oz
+      const c1z = rx * oy - ry * ox
+      const c2x = ry * c1z - rz * c1y
+      const c2y = rz * c1x - rx * c1z
+      const c2z = rx * c1y - ry * c1x
+      positions[i3 + 0] = tp[k3 + 0] + ox + 2 * (rw * c1x + c2x)
+      positions[i3 + 1] = tp[k3 + 1] + oy + 2 * (rw * c1y + c2y)
+      positions[i3 + 2] = tp[k3 + 2] + oz + 2 * (rw * c1z + c2z)
+
+      // Orientation: q' = R · q, renormalized.
+      const qx = orientations[i4 + 0],
+        qy = orientations[i4 + 1],
+        qz = orientations[i4 + 2],
+        qw = orientations[i4 + 3]
+      let nx = rw * qx + rx * qw + ry * qz - rz * qy
+      let ny = rw * qy - rx * qz + ry * qw + rz * qx
+      let nz = rw * qz + rx * qy - ry * qx + rz * qw
+      let nw = rw * qw - rx * qx - ry * qy - rz * qz
+      const len2 = nx * nx + ny * ny + nz * nz + nw * nw
+      if (len2 > 1e-12) {
+        const inv = 1 / Math.sqrt(len2)
+        nx *= inv; ny *= inv; nz *= inv; nw *= inv
+        orientations[i4 + 0] = nx
+        orientations[i4 + 1] = ny
+        orientations[i4 + 2] = nz
+        orientations[i4 + 3] = nw
       }
+
+      // Momentum doesn't carry across a discontinuity.
+      lv[i3 + 0] = 0; lv[i3 + 1] = 0; lv[i3 + 2] = 0
+      av[i3 + 0] = 0; av[i3 + 1] = 0; av[i3 + 2] = 0
+    }
+  }
+
+  // Backstop: if a dynamic body's state went non-finite despite the velocity
+  // caps, restore its previous-substep pose with zero velocity instead of
+  // letting NaNs spread through constraints and contacts. Runs after every
+  // substep so prevState is always a finite pose.
+  private restoreNonFiniteBodies(): void {
+    const N = this.store.count
+    const positions = this.store.positions
+    const orientations = this.store.orientations
+    const lv = this.store.linearVelocities
+    const av = this.store.angularVelocities
+    const types = this.store.type
+    const prevPos = this.prevPositions
+    const prevOri = this.prevOrientations
+
+    for (let i = 0; i < N; i++) {
+      if (types[i] !== RigidbodyType.Dynamic) continue
+      const i3 = i * 3
+      const i4 = i * 4
+      // NaN/Inf propagates through the sum, so one check covers all 13 slots.
+      const s =
+        positions[i3 + 0] + positions[i3 + 1] + positions[i3 + 2] +
+        orientations[i4 + 0] + orientations[i4 + 1] + orientations[i4 + 2] + orientations[i4 + 3] +
+        lv[i3 + 0] + lv[i3 + 1] + lv[i3 + 2] +
+        av[i3 + 0] + av[i3 + 1] + av[i3 + 2]
+      if (Number.isFinite(s)) continue
+      positions[i3 + 0] = prevPos[i3 + 0]
+      positions[i3 + 1] = prevPos[i3 + 1]
+      positions[i3 + 2] = prevPos[i3 + 2]
+      orientations[i4 + 0] = prevOri[i4 + 0]
+      orientations[i4 + 1] = prevOri[i4 + 1]
+      orientations[i4 + 2] = prevOri[i4 + 2]
+      orientations[i4 + 3] = prevOri[i4 + 3]
+      lv[i3 + 0] = 0; lv[i3 + 1] = 0; lv[i3 + 2] = 0
+      av[i3 + 0] = 0; av[i3 + 1] = 0; av[i3 + 2] = 0
     }
   }
 

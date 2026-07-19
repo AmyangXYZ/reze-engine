@@ -19,12 +19,30 @@ import type { Contact, ContactPool } from "./contact"
 
 const BOUNCE_THRESHOLD = 2.0
 
+// Ceilings on limit-correction velocity. In normal operation limit errors are
+// tiny; a large error only appears after a discontinuity (teleport, stall,
+// deep penetration), and feeding err·ERP/dt to the solver unclamped then
+// injects explosion-scale impulses into the chain.
+const MAX_LINEAR_CORRECTION_VEL = 120 // units/s
+const MAX_ANGULAR_CORRECTION_VEL = 30 // rad/s
+
+// Bullet's limit-motor softness defaults (0.7 translational, 0.5 rotational):
+// scale each iteration's limit impulse so the stop engages progressively
+// instead of as a hard velocity snap.
+const LIMIT_SOFTNESS_LINEAR = 0.7
+const LIMIT_SOFTNESS_ANGULAR = 0.5
+// Angular limit violations below this switch to per-axis euler rows; above
+// it, the single geodesic row takes over (see setupConstraint).
+const GEODESIC_THRESHOLD = 0.5 // rad
+
 // Module-level scratch (no per-iter allocations).
 const _TA = new Float32Array(16)
 const _TB = new Float32Array(16)
 const _bodyMatA = new Float32Array(16)
 const _bodyMatB = new Float32Array(16)
 const _angDiffScratch = new Float32Array(3)
+const _quatScratchA = new Float32Array(4)
+const _quatScratchB = new Float32Array(4)
 
 export function solveConstraints(
   store: RigidBodyStore,
@@ -82,21 +100,23 @@ function setupConstraint(
   Mat4.multiplyArrays(_bodyMatA, 0, con.frameA, 0, _TA, 0)
   Mat4.multiplyArrays(_bodyMatB, 0, con.frameB, 0, _TB, 0)
 
-  // Mass-weighted shared anchor (Bullet 2.75 m_AnchorPos).
+  // Per-body pivots at each body's own joint-frame origin (Spring2-style).
+  // Bullet 2.7x's shared mass-weighted anchor (m_AnchorPos) degenerates when
+  // the joint is violated by a large distance: the midpoint sits far from
+  // both bodies, the lever arms grow with the separation, the Jacobian
+  // denominator blows up as err²·invInertia, and the row applies torque
+  // instead of closing velocity — the joint "breaks" and the error runs
+  // away. Per-body pivots keep the levers bounded by the frame offsets, so
+  // the row stays effective no matter how large the violation is.
   const pos = store.positions
   const ai = a * 3
   const bi = b * 3
-  const weightA = imB === 0 ? 1 : imA / (imA + imB)
-  const weightB = 1 - weightA
-  const anchorX = _TA[12] * weightA + _TB[12] * weightB
-  const anchorY = _TA[13] * weightA + _TB[13] * weightB
-  const anchorZ = _TA[14] * weightA + _TB[14] * weightB
-  const rAx = anchorX - pos[ai + 0]
-  const rAy = anchorY - pos[ai + 1]
-  const rAz = anchorZ - pos[ai + 2]
-  const rBx = anchorX - pos[bi + 0]
-  const rBy = anchorY - pos[bi + 1]
-  const rBz = anchorZ - pos[bi + 2]
+  const rAx = _TA[12] - pos[ai + 0]
+  const rAy = _TA[13] - pos[ai + 1]
+  const rAz = _TA[14] - pos[ai + 2]
+  const rBx = _TB[12] - pos[bi + 0]
+  const rBy = _TB[13] - pos[bi + 1]
+  const rBz = _TB[14] - pos[bi + 2]
   const lA = con.cacheLeverA
   const lB = con.cacheLeverB
   lA[0] = rAx; lA[1] = rAy; lA[2] = rAz
@@ -143,23 +163,37 @@ function setupConstraint(
     const lo = con.linearMin[i]
     const hi = con.linearMax[i]
     const curr = i === 0 ? linDiff0 : i === 1 ? linDiff1 : linDiff2
+    // active: 1 = bilateral equality (locked axis — a joint, always on),
+    //         2 = unilateral stop (ranged axis in violation).
     let target = 0
     let active = 0
     if (lo <= hi) {
       let err = 0
       if (curr < lo) err = curr - lo
       else if (curr > hi) err = curr - hi
+      if (lo === hi) active = 1
+      else if (err !== 0) active = 2
       if (err !== 0) {
         target = -err * STOP_ERP * invDt
-        active = 1
+        if (target > MAX_LINEAR_CORRECTION_VEL) target = MAX_LINEAR_CORRECTION_VEL
+        else if (target < -MAX_LINEAR_CORRECTION_VEL) target = -MAX_LINEAR_CORRECTION_VEL
       }
-    }
-    if (con.springEnabled[i]) {
-      target += -con.springStiffness[i] * (curr - con.equilibriumPoint[i]) * dt
-      active = 1
     }
     tgt[i] = target
     act[i] = denom > 0 ? active : 0
+    con.cacheLinLimitImp[i] = 0
+    if (con.springEnabled[i] && denom > 0) {
+      // Clamp k to the deadbeat limit: an explicit spring with k·dt² > 1
+      // overshoots equilibrium every step and pumps energy — the classic
+      // pre-Spring2 Bullet 6dof instability this port inherited. (¼ margin
+      // for Gauss-Seidel coupling in chains.)
+      const k = Math.min(con.springStiffness[i], 0.25 * invDt * invDt)
+      const serr = curr - con.equilibriumPoint[i]
+      con.cacheLinSpringTarget[i] = -k * serr * dt
+      con.cacheLinSpringActive[i] = 1
+    } else {
+      con.cacheLinSpringActive[i] = 0
+    }
   }
 
   // Angular: TA^T · TB → Euler XYZ; axes from TA.col2 × TB.col0.
@@ -198,32 +232,91 @@ function setupConstraint(
   const angDenom = iiA + iiB
   con.cacheAngJacInv = angDenom > 0 ? 1 / angDenom : 0
 
+  // Per-axis rows carry only the springs. Sign flip vs linear:
+  // d(angDiff)/dt = −(ω_B − ω_A)·ax.
   const angTgt = con.cacheAngTargetVel
   const angAct = con.cacheAngActive
   for (let i = 0; i < 3; i++) {
     const idx = i + 3
-    const lo = con.angularMin[i]
-    const hi = con.angularMax[i]
-    const curr = _angDiffScratch[i]
-    let target = 0
-    let active = 0
-    if (lo <= hi) {
-      let err = 0
-      if (curr < lo) err = curr - lo
-      else if (curr > hi) err = curr - hi
-      // Sign flip vs linear: d(angDiff)/dt = −(ω_B − ω_A)·ax.
-      if (err !== 0) {
-        target = err * STOP_ERP * invDt
-        active = 1
+    if (con.springEnabled[idx] && angDenom > 0) {
+      // Same deadbeat clamp as the linear springs.
+      const k = Math.min(con.springStiffness[idx], 0.25 * invDt * invDt)
+      const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
+      angTgt[i] = k * serr * dt
+      angAct[i] = 1
+    } else {
+      angTgt[i] = 0
+      angAct[i] = 0
+    }
+  }
+
+  // Angular limit handling is hybrid. Small violations (the resting-cloth
+  // regime) use per-axis euler rows — they converge cleanly and keep resting
+  // cloth dead still. Large violations switch to a single geodesic row toward
+  // the euler-clamped target: per-axis euler rows (the Bullet-2.7x approach
+  // this port used) become geometrically inconsistent for large errors — near
+  // the asin singularity they chase phantom errors and pump angular velocity
+  // into the chain instead of converging.
+  con.cacheAngLimActive = 0
+  if (angDenom > 0) {
+    const ex = _angDiffScratch[0], ey = _angDiffScratch[1], ez = _angDiffScratch[2]
+    // Free axes (min > max) follow the current angle, i.e. no correction.
+    let tx = ex, ty = ey, tz = ez
+    if (con.angularMin[0] <= con.angularMax[0]) tx = ex < con.angularMin[0] ? con.angularMin[0] : ex > con.angularMax[0] ? con.angularMax[0] : ex
+    if (con.angularMin[1] <= con.angularMax[1]) ty = ey < con.angularMin[1] ? con.angularMin[1] : ey > con.angularMax[1] ? con.angularMax[1] : ey
+    if (con.angularMin[2] <= con.angularMax[2]) tz = ez < con.angularMin[2] ? con.angularMin[2] : ez > con.angularMax[2] ? con.angularMax[2] : ez
+    const errX = ex - tx, errY = ey - ty, errZ = ez - tz
+    const maxErr = Math.max(Math.abs(errX), Math.abs(errY), Math.abs(errZ))
+    if (maxErr > 0 && maxErr < GEODESIC_THRESHOLD) {
+      // Per-axis euler limit rows, folded into the per-axis row set (the
+      // spring impulse clamp must not bound a limit row — lift it).
+      for (let i = 0; i < 3; i++) {
+        const err = i === 0 ? errX : i === 1 ? errY : errZ
+        if (err === 0) continue
+        let target = err * STOP_ERP * invDt
+        if (target > MAX_ANGULAR_CORRECTION_VEL) target = MAX_ANGULAR_CORRECTION_VEL
+        else if (target < -MAX_ANGULAR_CORRECTION_VEL) target = -MAX_ANGULAR_CORRECTION_VEL
+        angTgt[i] += target
+        angAct[i] = 1
+      }
+    } else if (maxErr > 0) {
+      // Bilateral (equality) if any violated axis is locked — a locked axis
+      // is a joint, not a stop. Unilateral otherwise.
+      const bilateral =
+        (tx !== ex && con.angularMin[0] === con.angularMax[0]) ||
+        (ty !== ey && con.angularMin[1] === con.angularMax[1]) ||
+        (tz !== ez && con.angularMin[2] === con.angularMax[2])
+      // The decomposition above satisfies R_rel^T = Rx(x)·Ry(y)·Rz(z), so
+      // u = qx·qy·qz is conj(q_rel) and the error rotation (current →
+      // clamped target, expressed in TA's frame) is q_E = conj(u_t) ⊗ u.
+      eulerXYZQuatInto(ex, ey, ez, _quatScratchA)
+      eulerXYZQuatInto(tx, ty, tz, _quatScratchB)
+      const ux = _quatScratchA[0], uy = _quatScratchA[1], uz = _quatScratchA[2], uw = _quatScratchA[3]
+      const vx = _quatScratchB[0], vy = _quatScratchB[1], vz = _quatScratchB[2], vw = _quatScratchB[3]
+      // q_E = conj(v) ⊗ u
+      let qex = vw * ux - vx * uw - vy * uz + vz * uy
+      let qey = vw * uy + vx * uz - vy * uw - vz * ux
+      let qez = vw * uz - vx * uy + vy * ux - vz * uw
+      let qew = vw * uw + vx * ux + vy * uy + vz * uz
+      if (qew < 0) { qex = -qex; qey = -qey; qez = -qez; qew = -qew }
+      const sinHalf = Math.sqrt(qex * qex + qey * qey + qez * qez)
+      if (sinHalf > 1e-6) {
+        const angle = 2 * Math.atan2(sinHalf, qew)
+        const invS = 1 / sinHalf
+        const axx = qex * invS, axy = qey * invS, axz = qez * invS
+        // Axis lives in TA's frame; TA's basis columns map it to world.
+        const lim = con.cacheAngLimAxis
+        lim[0] = _TA[0] * axx + _TA[4] * axy + _TA[8] * axz
+        lim[1] = _TA[1] * axx + _TA[5] * axy + _TA[9] * axz
+        lim[2] = _TA[2] * axx + _TA[6] * axy + _TA[10] * axz
+        let target = angle * STOP_ERP * invDt
+        if (target > MAX_ANGULAR_CORRECTION_VEL) target = MAX_ANGULAR_CORRECTION_VEL
+        con.cacheAngLimTarget = target
+        con.cacheAngLimActive = bilateral ? 1 : 2
       }
     }
-    if (con.springEnabled[idx]) {
-      target += con.springStiffness[idx] * (curr - con.equilibriumPoint[idx]) * dt
-      active = 1
-    }
-    angTgt[i] = target
-    angAct[i] = angDenom > 0 ? active : 0
   }
+  con.cacheAngLimImp = 0
 }
 
 // ITER: read cache, compute relVel from current lv/av, apply impulse.
@@ -266,12 +359,40 @@ function iterateConstraint(
   const dvy = vBy - vAy
   const dvz = vBz - vAz
 
+  const sprAct = con.cacheLinSpringActive
+  const sprTgt = con.cacheLinSpringTarget
+  const limImp = con.cacheLinLimitImp
   for (let i = 0; i < 3; i++) {
-    if (!act[i]) continue
+    if (!act[i] && !sprAct[i]) continue
     const o = i * 3
     const axx = axes[o + 0], axy = axes[o + 1], axz = axes[o + 2]
     const relVel = dvx * axx + dvy * axy + dvz * axz
-    const j = (tgt[i] - relVel) * jac[i]
+    let j = 0
+
+    // Limit row. Locked axes (act 1) are bilateral equality joints; ranged
+    // axes in violation (act 2) are unilateral stops — accumulated impulse
+    // clamped to the corrective sign, so the stop pushes back into range but
+    // never pulls deeper or brakes natural recovery (a bilateral stop acts
+    // as a motor and pumps energy into swinging cloth).
+    if (act[i]) {
+      const target = tgt[i]
+      let dImp = LIMIT_SOFTNESS_LINEAR * (target - relVel) * jac[i]
+      if (act[i] === 2) {
+        const old = limImp[i]
+        let next = old + dImp
+        if (target > 0 ? next < 0 : next > 0) next = 0
+        dImp = next - old
+        limImp[i] = next
+      }
+      j += dImp
+    }
+
+    // Spring row: velocity-target drive; the deadbeat k-clamp at setup
+    // bounds its aggression.
+    if (sprAct[i]) {
+      j += (sprTgt[i] - relVel) * jac[i]
+    }
+
     if (j === 0) continue
     if (imA > 0) {
       lv[ai + 0] -= j * imA * axx
@@ -305,6 +426,8 @@ function iterateConstraint(
     const o = i * 3
     const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
     const relAv = dax * axx + day * axy + daz * axz
+    // Spring drive (deadbeat-clamped at setup) plus, for small violations,
+    // the folded per-axis limit correction.
     const j = (angTgt[i] - relAv) * angJacInv
     if (j === 0) continue
     if (iiA > 0) {
@@ -316,6 +439,39 @@ function iterateConstraint(
       av[bi + 0] += j * iiB * axx
       av[bi + 1] += j * iiB * axy
       av[bi + 2] += j * iiB * axz
+    }
+  }
+
+  // Geodesic limit row: drive (ω_B − ω_A)·axis toward the correction target.
+  // Unilateral — the accumulated impulse can only push toward the legal
+  // region (target is always ≥ 0 along the corrective axis).
+  if (con.cacheAngLimActive) {
+    const lim = con.cacheAngLimAxis
+    const nx = lim[0], ny = lim[1], nz = lim[2]
+    // Re-read relAv — the spring rows above may have changed av.
+    const relAv =
+      (av[bi + 0] - av[ai + 0]) * nx +
+      (av[bi + 1] - av[ai + 1]) * ny +
+      (av[bi + 2] - av[ai + 2]) * nz
+    let j = LIMIT_SOFTNESS_ANGULAR * (con.cacheAngLimTarget - relAv) * angJacInv
+    if (con.cacheAngLimActive === 2) {
+      const old = con.cacheAngLimImp
+      let next = old + j
+      if (next < 0) next = 0
+      j = next - old
+      con.cacheAngLimImp = next
+    }
+    if (j !== 0) {
+      if (iiA > 0) {
+        av[ai + 0] -= j * iiA * nx
+        av[ai + 1] -= j * iiA * ny
+        av[ai + 2] -= j * iiA * nz
+      }
+      if (iiB > 0) {
+        av[bi + 0] += j * iiB * nx
+        av[bi + 1] += j * iiB * ny
+        av[bi + 2] += j * iiB * nz
+      }
     }
   }
 }
@@ -550,6 +706,17 @@ function buildBodyMat(store: RigidBodyStore, i: number, out: Float32Array): void
     store.orientations[i4 + 0], store.orientations[i4 + 1], store.orientations[i4 + 2], store.orientations[i4 + 3],
     out,
   )
+}
+
+// Quaternion of qx(x) ⊗ qy(y) ⊗ qz(z) (three.js 'XYZ' order).
+function eulerXYZQuatInto(x: number, y: number, z: number, out: Float32Array): void {
+  const sx = Math.sin(x * 0.5), cx = Math.cos(x * 0.5)
+  const sy = Math.sin(y * 0.5), cy = Math.cos(y * 0.5)
+  const sz = Math.sin(z * 0.5), cz = Math.cos(z * 0.5)
+  out[0] = sx * cy * cz + cx * sy * sz
+  out[1] = cx * sy * cz - sx * cy * sz
+  out[2] = cx * cy * sz + sx * sy * cz
+  out[3] = cx * cy * cz - sx * sy * sz
 }
 
 // Euler XYZ from a 3×3 rotation matrix (row-major elements).

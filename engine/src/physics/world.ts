@@ -101,12 +101,24 @@ export class World {
 
     // 5. Integrate. Cap angular velocity at π/2 per step — a high-impulse
     //    contact spike on a low-inertia body would otherwise spin past π
-    //    in one step and trash the quaternion integration.
+    //    in one step and trash the quaternion integration. Linear velocity
+    //    is capped at 5 units per step for the same reason: an explosion
+    //    guard far above what legit cloth motion ever reaches.
     const MAX_ANGVEL_DT = Math.PI * 0.5
+    const MAX_LINVEL_DT = 5
     for (let i = 0; i < N; i++) {
       if (types[i] !== RigidbodyType.Dynamic || invMass[i] <= 0) continue
       const i3 = i * 3
       const i4 = i * 4
+
+      const vx = lv[i3 + 0], vy = lv[i3 + 1], vz = lv[i3 + 2]
+      const vmag = Math.sqrt(vx * vx + vy * vy + vz * vz)
+      if (vmag * dt > MAX_LINVEL_DT) {
+        const scale = MAX_LINVEL_DT / (vmag * dt)
+        lv[i3 + 0] = vx * scale
+        lv[i3 + 1] = vy * scale
+        lv[i3 + 2] = vz * scale
+      }
 
       pos[i3 + 0] += lv[i3 + 0] * dt
       pos[i3 + 1] += lv[i3 + 1] * dt

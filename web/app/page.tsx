@@ -46,7 +46,6 @@ export default function Home() {
     playing: false,
     paused: false,
   })
-  const seekResetRafRef = useRef<number | null>(null)
 
   // Sync progress from model (current/duration in seconds, name)
   useEffect(() => {
@@ -182,15 +181,8 @@ export default function Home() {
           current: seekTime,
           percentage: value[0],
         }))
-
-        // Same pattern as init: wait a RAF so the seeked pose is applied,
-        // then reset physics so hair/skirt don't stretch from the old pose.
-        // Cancel any pending reset so slider drags debounce to the last value.
-        if (seekResetRafRef.current !== null) cancelAnimationFrame(seekResetRafRef.current)
-        seekResetRafRef.current = requestAnimationFrame(() => {
-          seekResetRafRef.current = null
-          engineRef.current?.resetPhysics()
-        })
+        // No resetPhysics needed: the engine detects the bone-pose jump and
+        // carries dynamic bodies across the seek per kinematic root.
       }
     },
     [progress.duration],
