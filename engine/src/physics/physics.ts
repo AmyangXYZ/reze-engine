@@ -50,6 +50,15 @@ export class RezePhysics {
   private kinRoot: Int32Array
   // Kinematic bodies whose target jumped discontinuously this frame.
   private teleportFlags: Uint8Array
+  // PMX mode-2 bodies jointed *directly* to a bone-follow body (breasts,
+  // chain roots). Only these get MMD's bone-position alignment: their bone's
+  // animated matrix is trustworthy, whereas deeper chain bones' animated
+  // matrices don't include the physics deflection of their parents, so
+  // pinning those would freeze the chain.
+  private alignPinned: Uint8Array
+  // Debug counter: frames on which a teleport (scrub/jump discontinuity)
+  // was detected and settled.
+  teleportCount = 0
 
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
@@ -66,6 +75,17 @@ export class RezePhysics {
     this.kinTargetAngVel = new Float32Array(this.store.count * 3)
     this.kinRoot = this.buildKinematicRoots()
     this.teleportFlags = new Uint8Array(this.store.count)
+
+    this.alignPinned = new Uint8Array(this.store.count)
+    const types = this.store.type
+    for (const c of this.constraints) {
+      const tA = types[c.bodyA]
+      const tB = types[c.bodyB]
+      const aFollows = tA === RigidbodyType.Static || tA === RigidbodyType.Kinematic
+      const bFollows = tB === RigidbodyType.Static || tB === RigidbodyType.Kinematic
+      if (aFollows && this.store.aligned[c.bodyB]) this.alignPinned[c.bodyB] = 1
+      if (bFollows && this.store.aligned[c.bodyA]) this.alignPinned[c.bodyA] = 1
+    }
   }
 
   // BFS over the joint graph from every kinematic body, assigning each
@@ -140,6 +160,13 @@ export class RezePhysics {
     if (this.firstFrame) return
     this.snapBodiesToBones(boneWorldMatrices)
     this.savePrevState() // prev == curr after a snap, so no interpolation jump
+    // Reseed kinematic targets from the snapped pose — otherwise the next
+    // step derives the target-trajectory velocity against the pre-reset
+    // targets and feeds one frame of enormous anchor velocity to the solver.
+    this.kinTargetPos.set(this.store.positions)
+    this.kinTargetOri.set(this.store.orientations)
+    this.kinTargetVel.fill(0)
+    this.kinTargetAngVel.fill(0)
     this.timeAccum = 0
   }
 
@@ -165,6 +192,7 @@ export class RezePhysics {
     // raw derived velocity is what used to explode the solver. Chains under
     // unaffected roots keep their momentum untouched.
     if (this.computeKinematicTargets(boneWorldMatrices, dt)) {
+      this.teleportCount++
       this.carryDynamicThroughTeleport()
       this.snapKinematicToTargets(true)
       this.savePrevState() // prev == curr so interpolation doesn't streak
@@ -196,6 +224,10 @@ export class RezePhysics {
       this.timeAccum = 0
       this.snapKinematicToTargets(false)
     }
+
+    // MMD mode-2 bone alignment for pinned (depth-1) bodies: position
+    // re-pins to the animated bone, rotation stays simulated.
+    this.alignPinnedBodiesToBones(boneWorldMatrices)
 
     // Fraction into the next (not-yet-taken) step; always in [0, 1).
     const alpha = this.fixedTimeStep > 0 ? this.timeAccum / this.fixedTimeStep : 0
@@ -500,6 +532,32 @@ export class RezePhysics {
     }
   }
 
+  // Overwrite pinned mode-2 bodies' positions with boneWorld × bodyOffset
+  // from the animated bone pose, keeping simulated orientation and
+  // velocities. prevPositions follows so interpolation doesn't streak.
+  private alignPinnedBodiesToBones(boneWorldMatrices: Mat4[]): void {
+    const N = this.store.count
+    const pinned = this.alignPinned
+    const boneIdx = this.store.boneIndex
+    const offsets = this.store.bodyOffsetMatrix
+    const positions = this.store.positions
+    const prevPos = this.prevPositions
+
+    for (let i = 0; i < N; i++) {
+      if (!pinned[i]) continue
+      const b = boneIdx[i]
+      if (b < 0 || b >= boneWorldMatrices.length) continue
+      Mat4.multiplyArrays(boneWorldMatrices[b].values, 0, offsets, i * 16, _bodyMat, 0)
+      const i3 = i * 3
+      positions[i3 + 0] = _bodyMat[12]
+      positions[i3 + 1] = _bodyMat[13]
+      positions[i3 + 2] = _bodyMat[14]
+      prevPos[i3 + 0] = _bodyMat[12]
+      prevPos[i3 + 1] = _bodyMat[13]
+      prevPos[i3 + 2] = _bodyMat[14]
+    }
+  }
+
   // Backstop: if a dynamic body's state went non-finite despite the velocity
   // caps, restore its previous-substep pose with zero velocity instead of
   // letting NaNs spread through constraints and contacts. Runs after every
@@ -589,7 +647,16 @@ export class RezePhysics {
 
       // Sanity gate against NaN / extreme values — silently drop the update.
       if (Number.isFinite(_boneMat[0]) && Math.abs(_boneMat[0]) < 1e6) {
-        boneWorldMatrices[b].values.set(_boneMat)
+        const v = boneWorldMatrices[b].values
+        if (this.alignPinned[i]) {
+          // Pinned mode-2: the bone keeps its animated position, physics
+          // drives rotation only.
+          v[0] = _boneMat[0]; v[1] = _boneMat[1]; v[2] = _boneMat[2]
+          v[4] = _boneMat[4]; v[5] = _boneMat[5]; v[6] = _boneMat[6]
+          v[8] = _boneMat[8]; v[9] = _boneMat[9]; v[10] = _boneMat[10]
+        } else {
+          v.set(_boneMat)
+        }
       }
     }
   }

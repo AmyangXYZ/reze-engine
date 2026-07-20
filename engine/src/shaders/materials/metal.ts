@@ -26,7 +26,7 @@ const METAL_MIX_SHADER_FAC: f32 = 0.6967;
 const METAL_VORONOI_SCALE: f32 = 4.3;
 
 @fragment fn fs(input: VertexOutput) -> FSOut {
-  let n = normalize(input.normal);
+  let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;

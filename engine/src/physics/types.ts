@@ -6,10 +6,15 @@ export enum RigidbodyShape {
   Capsule = 2,
 }
 
+// PMX physics mode: 0 = follow bone, 1 = physics, 2 = physics + bone-position
+// alignment. Mode 2 is DYNAMIC — the loader maps it to Dynamic with
+// `aligned: true` (bone gets rotation only, body position re-pins to the
+// animated bone each frame). Mapping the raw byte 1:1 onto this enum froze
+// mode-2 bodies (most modern cloth rigs, and every 胸_回転 breast body).
 export enum RigidbodyType {
-  Static = 0,
+  Static = 0, // follows bone (anchor)
   Dynamic = 1,
-  Kinematic = 2,
+  Kinematic = 2, // follows bone (legacy alias; loader no longer emits it)
 }
 
 export interface Rigidbody {
@@ -28,6 +33,9 @@ export interface Rigidbody {
   restitution: number
   friction: number
   type: RigidbodyType
+  // PMX mode 2: dynamic body whose bone takes rotation only; the body's
+  // position re-pins to the animated bone each frame.
+  aligned?: boolean
   bodyOffsetMatrixInverse: Mat4 // Inverse of body offset matrix, used to sync rigidbody to bone
   bodyOffsetMatrix?: Mat4 // Cached non-inverse for performance (computed once during initialization)
 }

@@ -20,7 +20,7 @@ const CLOTH_R_BUMP_STR: f32 = 1.0;
 const CLOTH_R_SPEC_CLAMP: f32 = 10.0;
 
 @fragment fn fs(input: VertexOutput) -> FSOut {
-  let n = normalize(input.normal);
+  let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;

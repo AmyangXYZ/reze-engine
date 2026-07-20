@@ -37,9 +37,20 @@ export class PmxLoader {
   private vertexCount: number = 0
   private rigidbodies: Rigidbody[] = []
   private joints: Joint[] = []
+  private warnings: string[] = []
 
   private constructor(buffer: ArrayBuffer) {
     this.view = new DataView(buffer)
+  }
+
+  // Parse problems are non-fatal (the mesh may still render), but they must
+  // be queryable afterwards — a rig whose rigidbody section failed to parse
+  // silently loses physics, and console.warn alone drowns in browser log
+  // limits. Collected warnings ship on the Model (getLoadWarnings()).
+  private warn(message: string, error?: unknown): void {
+    const full = error instanceof Error ? `${message}: ${error.message}` : message
+    this.warnings.push(full)
+    console.warn(message, error ?? "")
   }
 
   static async load(url: string): Promise<Model> {
@@ -82,7 +93,7 @@ export class PmxLoader {
     const version = this.getFloat32()
     if (version < 2.0 || version > 2.2) {
       // Continue, but warn for unexpected version
-      console.warn(`PMX version ${version} may not be fully supported`)
+      this.warn(`PMX version ${version} may not be fully supported`)
     }
 
     // PMX: globals count (uint8) followed by that many bytes describing encoding and index sizes
@@ -472,7 +483,7 @@ export class PmxLoader {
       }
       this.bones = bones
     } catch (e) {
-      console.warn("Error parsing bones:", e)
+      this.warn("Error parsing bones:", e)
       this.bones = []
     }
   }
@@ -487,7 +498,7 @@ export class PmxLoader {
       const count = this.getInt32()
       if (count < 0 || count > 100000) {
         // Suspicious count, likely corrupted
-        console.warn(`Suspicious morph count: ${count}`)
+        this.warn(`Suspicious morph count: ${count}`)
         this.morphs = []
         return
       }
@@ -623,11 +634,11 @@ export class PmxLoader {
           this.morphs.push(morph)
         } catch (e) {
           // If we fail to read a morph, skip it
-          console.warn(`Error reading morph ${i}:`, e)
+          this.warn(`Error reading morph ${i}:`, e)
         }
       }
     } catch (e) {
-      console.warn("Error parsing morphs:", e)
+      this.warn("Error parsing morphs:", e)
       this.morphs = []
     }
   }
@@ -669,13 +680,13 @@ export class PmxLoader {
           }
         } catch (e) {
           // If we fail to read a frame, stop skipping
-          console.warn(`Error reading display frame ${i}:`, e)
+          this.warn(`Error reading display frame ${i}:`, e)
           return false
         }
       }
       return true
     } catch (e) {
-      console.warn("Error skipping display frames:", e)
+      this.warn("Error skipping display frames:", e)
       return false
     }
   }
@@ -685,7 +696,7 @@ export class PmxLoader {
       // Note: morphs and display frames are already skipped in parse() before calling this
       // Check bounds before reading rigidbody count
       if (this.offset + 4 > this.view.buffer.byteLength) {
-        console.warn("Not enough bytes for rigidbody count")
+        this.warn("Not enough bytes for rigidbody count")
         this.rigidbodies = []
         return
       }
@@ -693,7 +704,7 @@ export class PmxLoader {
       const count = this.getInt32()
       if (count < 0 || count > 10000) {
         // Suspicious count
-        console.warn(`Suspicious rigidbody count: ${count}`)
+        this.warn(`Suspicious rigidbody count: ${count}`)
         this.rigidbodies = []
         return
       }
@@ -704,7 +715,7 @@ export class PmxLoader {
         try {
           // Check bounds before reading each rigidbody
           if (this.offset >= this.view.buffer.byteLength) {
-            console.warn(`Reached end of buffer while reading rigidbody ${i} of ${count}`)
+            this.warn(`Reached end of buffer while reading rigidbody ${i} of ${count}`)
             break
           }
 
@@ -737,7 +748,12 @@ export class PmxLoader {
           const angularDamping = this.getFloat32()
           const restitution = this.getFloat32()
           const friction = this.getFloat32()
-          const type = this.getUint8() // 0=static, 1=dynamic, 2=kinematic
+          // PMX physics mode: 0 = follow bone, 1 = physics,
+          // 2 = physics + bone-position alignment. Mode 2 is dynamic — it
+          // must NOT be cast onto RigidbodyType (2 = Kinematic there, which
+          // freezes the body to its bone and kills physics for most modern
+          // cloth rigs and every 胸_回転 breast body).
+          const mode = this.getUint8()
 
           this.rigidbodies.push({
             name,
@@ -754,17 +770,18 @@ export class PmxLoader {
             angularDamping,
             restitution,
             friction,
-            type: type as RigidbodyType,
+            type: mode === 0 ? RigidbodyType.Static : RigidbodyType.Dynamic,
+            aligned: mode === 2,
             bodyOffsetMatrixInverse: Mat4.identity(),
           })
         } catch (e) {
-          console.warn(`Error reading rigidbody ${i} of ${count}:`, e)
+          this.warn(`Error reading rigidbody ${i} of ${count}:`, e)
           // Stop parsing if we encounter an error
           break
         }
       }
     } catch (e) {
-      console.warn("Error parsing rigidbodies:", e)
+      this.warn("Error parsing rigidbodies:", e)
       this.rigidbodies = []
     }
   }
@@ -773,14 +790,14 @@ export class PmxLoader {
     try {
       // Check bounds before reading joint count
       if (this.offset + 4 > this.view.buffer.byteLength) {
-        console.warn("Not enough bytes for joint count")
+        this.warn("Not enough bytes for joint count")
         this.joints = []
         return
       }
 
       const count = this.getInt32()
       if (count < 0 || count > 10000) {
-        console.warn(`Suspicious joint count: ${count}`)
+        this.warn(`Suspicious joint count: ${count}`)
         this.joints = []
         return
       }
@@ -791,7 +808,7 @@ export class PmxLoader {
         try {
           // Check bounds before reading each joint
           if (this.offset >= this.view.buffer.byteLength) {
-            console.warn(`Reached end of buffer while reading joint ${i} of ${count}`)
+            this.warn(`Reached end of buffer while reading joint ${i} of ${count}`)
             break
           }
 
@@ -857,13 +874,13 @@ export class PmxLoader {
             springRotation: new Vec3(springRotX, springRotY, springRotZ), // Store as Vec3 (stiffness values)
           })
         } catch (e) {
-          console.warn(`Error reading joint ${i} of ${count}:`, e)
+          this.warn(`Error reading joint ${i} of ${count}:`, e)
           // Stop parsing if we encounter an error
           break
         }
       }
     } catch (e) {
-      console.warn("Error parsing joints:", e)
+      this.warn("Error parsing joints:", e)
       this.joints = []
     }
   }
@@ -1044,7 +1061,8 @@ export class PmxLoader {
       skinning,
       morphing,
       this.rigidbodies,
-      this.joints
+      this.joints,
+      this.warnings
     )
   }
 

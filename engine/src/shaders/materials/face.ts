@@ -19,17 +19,22 @@ const FACE_WARM_STR: f32 = 0.30000001192092896;
 const FACE_BRIGHT_TEX_THRESH: f32 = 0.9300000071525574;
 
 @fragment fn fs(input: VertexOutput) -> FSOut {
-  let alpha = material.alpha;
+  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
+  // MMD alpha semantics: material alpha × texture alpha. Hair/lace/accessory
+  // textures cut their shapes in the alpha channel — ignoring it renders each
+  // card's full quad with the texture's padding color (white shimmer on dark
+  // hair for models whose textures pad with white).
+  let alpha = material.alpha * tex_s.a;
   if (alpha < 0.001) { discard; }
 
-  let n = normalize(input.normal);
+  let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;
   let amb = light.ambientColor.xyz;
   let shadow = sampleShadow(input.worldPos, n);
 
-  let tex_color = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
+  let tex_color = tex_s.rgb;
 
   // ═══ NPR STACK ═══
   let ndotl_raw = shader_to_rgb_diffuse(n, l, sun, amb, shadow);

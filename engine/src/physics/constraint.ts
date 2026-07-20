@@ -62,7 +62,12 @@ export interface SixDofSpringConstraint {
   cacheAngLimImp: number          // accumulated impulse (per substep)
 }
 
-export const STOP_ERP = 0.475
+// Stop-limit ERP. PMX rigs are tuned against MMD's stiff limit response;
+// lowering this makes cloth resting against its limits sink visibly deeper
+// (equilibrium penetration scales with 1/ERP). Rest chatter at this
+// stiffness was fixed at the source (spring double-drive, unilateral
+// stops) — don't lower ERP to paper over jitter.
+export const STOP_ERP = 0.45
 
 // Build per-joint constraints from PMX data:
 //   frameA = (bodyA_worldBind)^-1 · jointWorldBind

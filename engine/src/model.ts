@@ -235,6 +235,9 @@ export class Model {
   private rigidbodies: Rigidbody[] = []
   private joints: Joint[] = []
 
+  // Non-fatal problems collected while parsing the PMX (see PmxLoader.warn).
+  private loadWarnings: string[] = []
+
   // Runtime skeleton pose state (updated each frame)
   private runtimeSkeleton!: SkeletonRuntime
 
@@ -293,7 +296,8 @@ export class Model {
     skinning: Skinning,
     morphing: Morphing,
     rigidbodies: Rigidbody[] = [],
-    joints: Joint[] = []
+    joints: Joint[] = [],
+    loadWarnings: string[] = []
   ) {
     // Store base vertex data (original positions before morphing)
     this.baseVertexData = new Float32Array(vertexData)
@@ -307,6 +311,7 @@ export class Model {
     this.morphing = morphing
     this.rigidbodies = rigidbodies
     this.joints = joints
+    this.loadWarnings = loadWarnings
 
     if (this.skeleton.bones.length == 0) {
       throw new Error("Model has no bones")
@@ -629,6 +634,18 @@ export class Model {
 
   getSkinning(): Skinning {
     return this.skinning
+  }
+
+  // True when the PMX carried a usable rigidbody section. False means the
+  // model renders but has no physics — surface this in the UI instead of
+  // letting it read as "physics silently broken".
+  hasPhysicsData(): boolean {
+    return this.rigidbodies.length > 0
+  }
+
+  // Non-fatal PMX parse problems (truncated sections, suspicious counts…).
+  getLoadWarnings(): readonly string[] {
+    return this.loadWarnings
   }
 
   getRigidbodies(): Rigidbody[] {

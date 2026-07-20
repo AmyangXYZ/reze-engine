@@ -19,6 +19,9 @@ export class RigidBodyStore {
   readonly linearDamping: Float32Array
   readonly angularDamping: Float32Array
   readonly type: Uint8Array
+  // PMX mode-2 bodies: dynamic, but the bone takes rotation only and the
+  // body position re-pins to the animated bone each frame.
+  readonly aligned: Uint8Array
   readonly boneIndex: Int32Array
   readonly friction: Float32Array
   readonly restitution: Float32Array
@@ -59,6 +62,7 @@ export class RigidBodyStore {
     this.linearDamping = new Float32Array(N)
     this.angularDamping = new Float32Array(N)
     this.type = new Uint8Array(N)
+    this.aligned = new Uint8Array(N)
     this.boneIndex = new Int32Array(N)
     this.bodyOffsetMatrix = new Float32Array(N * 16)
     this.bodyOffsetInverse = new Float32Array(N * 16)
@@ -92,6 +96,7 @@ export class RigidBodyStore {
       this.linearDamping[i] = rb.linearDamping
       this.angularDamping[i] = rb.angularDamping
       this.type[i] = rb.type
+      this.aligned[i] = rb.aligned ? 1 : 0
       this.boneIndex[i] = rb.boneIndex
       this.friction[i] = rb.friction
       this.restitution[i] = rb.restitution

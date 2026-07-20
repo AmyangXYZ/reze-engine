@@ -17,7 +17,7 @@ const NPR_EMIT_STR: f32 = 18.200000762939453;
 const NPR_MIX_SHADER_FAC: f32 = 0.8999999761581421;
 
 @fragment fn fs(input: VertexOutput) -> FSOut {
-  let n = normalize(input.normal);
+  let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;
@@ -47,7 +47,7 @@ const NPR_MIX_SHADER_FAC: f32 = 0.8999999761581421;
   // ═══ PRINCIPLED BSDF ═══
   let principled_base = hue_sat_id(1.0, 0.800000011920929, 1.0, tex_rgb);
   let principled = eval_principled(
-    PrincipledIn(principled_base, 0.0, CLOTH_SPECULAR, CLOTH_ROUGHNESS, 1e30, 0.0, 0.0),
+    PrincipledIn(principled_base, 0.0, CLOTH_SPECULAR, CLOTH_ROUGHNESS, 10.0, 0.0, 0.0),
     n, l, v, sun, amb, shadow
   );
 

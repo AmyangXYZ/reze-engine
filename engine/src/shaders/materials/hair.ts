@@ -17,23 +17,33 @@ override IS_OVER_EYES: bool = false;
 
 const HAIR_SPECULAR: f32 = 1.0;
 const HAIR_ROUGHNESS: f32 = 0.3;
+// EEVEE Light Clamp equivalent (same value as body/face/cloth_rough). Hair
+// is the firefly-prone material: physics-animated with the noisiest blended
+// normals, so grazing NV spikes the GGX term and flashes white through
+// bloom without this.
+const HAIR_SPEC_CLAMP: f32 = 10.0;
 const HAIR_TEX_GATE_THRESH: f32 = 0.15000000596046448;
 const HAIR_RIM2_POW: f32 = 0.6300000548362732;
 const HAIR_MIX_BG: vec3f = vec3f(0.1673291176557541);
 const HAIR_MIX_NPR: f32 = 0.2;
 
 @fragment fn fs(input: VertexOutput) -> FSOut {
-  let alpha = material.alpha;
+  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
+  // MMD alpha semantics: material alpha × texture alpha. Hair/lace/accessory
+  // textures cut their shapes in the alpha channel — ignoring it renders each
+  // card's full quad with the texture's padding color (white shimmer on dark
+  // hair for models whose textures pad with white).
+  let alpha = material.alpha * tex_s.a;
   if (alpha < 0.001) { discard; }
 
-  let n = normalize(input.normal);
+  let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;
   let amb = light.ambientColor.xyz;
   let shadow = sampleShadow(input.worldPos, n);
 
-  let tex_color = textureSample(diffuseTexture, diffuseSampler, input.uv).rgb;
+  let tex_color = tex_s.rgb;
 
   // ═══ NPR STACK ═══
   let hue_sat_shadow = hue_sat_id(1.2, 0.5, 1.0, tex_color);
@@ -64,7 +74,7 @@ const HAIR_MIX_NPR: f32 = 0.2;
   // weights Principled at only 0.2 — the bumped spec × that weight is imperceptible, so we
   // drop the subtree and keep plain n (saves a tex_noise + bump_lh per hair fragment).
   let principled = eval_principled(
-    PrincipledIn(bc, 0.0, HAIR_SPECULAR, HAIR_ROUGHNESS, 1e30, 0.0, 0.0),
+    PrincipledIn(bc, 0.0, HAIR_SPECULAR, HAIR_ROUGHNESS, HAIR_SPEC_CLAMP, 0.0, 0.0),
     n, l, v, sun, amb, shadow
   );
 

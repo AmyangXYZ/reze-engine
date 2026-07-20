@@ -892,7 +892,7 @@ export class Engine {
       { texture: this.fallbackMaterialTexture },
       new Uint8Array([255, 255, 255, 255]),
       { bytesPerRow: 4 },
-      [1, 1]
+      [1, 1],
     )
 
     // Shared vertex buffer layouts
@@ -1304,7 +1304,10 @@ export class Engine {
       label: "ground shadow pipeline",
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.groundShadowBindGroupLayout] }),
       shaderModule: groundShadowShader,
-      vertexBuffers: fullVertexBuffers,
+      // Slot 0 only — the ground has no skinning, and declaring the full
+      // 3-slot layout while renderGround binds one buffer is a WebGPU
+      // validation error that invalidates the whole command buffer.
+      vertexBuffers: [fullVertexBuffers[0]],
       fragmentTargets: sceneTargets,
       cullMode: "back",
       depthStencil: { format: "depth24plus-stencil8", depthWriteEnabled: true, depthCompare: "less-equal" },
@@ -1970,12 +1973,7 @@ export class Engine {
     // axisT encodes "parameter along the axis" for axis verts (0 at center, 1
     // at tip). Ring verts use -1 as a "not an axis" flag the FS uses to skip
     // the dash + fade treatment.
-    const pushSeg = (
-      p0: [number, number, number],
-      p1: [number, number, number],
-      t0: number,
-      t1: number,
-    ) => {
+    const pushSeg = (p0: [number, number, number], p1: [number, number, number], t0: number, t1: number) => {
       const d = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]
       const dn = [-d[0], -d[1], -d[2]]
       verts.push(p0[0], p0[1], p0[2], d[0], d[1], d[2], -1, t0)
@@ -1995,8 +1993,10 @@ export class Engine {
       for (let i = 0; i < SEG; i++) {
         const t0 = (i / SEG) * Math.PI * 2
         const t1 = ((i + 1) / SEG) * Math.PI * 2
-        const c0 = Math.cos(t0) * R, s0 = Math.sin(t0) * R
-        const c1 = Math.cos(t1) * R, s1 = Math.sin(t1) * R
+        const c0 = Math.cos(t0) * R,
+          s0 = Math.sin(t0) * R
+        const c1 = Math.cos(t1) * R,
+          s1 = Math.sin(t1) * R
         if (plane === 0) pushSeg([0, c0, s0], [0, c1, s1], -1, -1)
         else if (plane === 1) pushSeg([s0, 0, c0], [s1, 0, c1], -1, -1)
         else pushSeg([c0, s0, 0], [c1, s1, 0], -1, -1)
@@ -3266,14 +3266,32 @@ export class Engine {
     const s = Engine.GIZMO_WORLD_SIZE
 
     // Column-major mat4: rotation columns × scale, then translation in col 3.
-    const xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z
-    const xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z
-    const wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z
+    const xx = q.x * q.x,
+      yy = q.y * q.y,
+      zz = q.z * q.z
+    const xy = q.x * q.y,
+      xz = q.x * q.z,
+      yz = q.y * q.z
+    const wx = q.w * q.x,
+      wy = q.w * q.y,
+      wz = q.w * q.z
     const u = new Float32Array(20)
-    u[0] = s * (1 - 2 * (yy + zz)); u[1] = s * 2 * (xy + wz);     u[2] = s * 2 * (xz - wy);     u[3] = 0
-    u[4] = s * 2 * (xy - wz);       u[5] = s * (1 - 2 * (xx + zz)); u[6] = s * 2 * (yz + wx);   u[7] = 0
-    u[8] = s * 2 * (xz + wy);       u[9] = s * 2 * (yz - wx);     u[10] = s * (1 - 2 * (xx + yy)); u[11] = 0
-    u[12] = bonePos.x; u[13] = bonePos.y; u[14] = bonePos.z; u[15] = 1
+    u[0] = s * (1 - 2 * (yy + zz))
+    u[1] = s * 2 * (xy + wz)
+    u[2] = s * 2 * (xz - wy)
+    u[3] = 0
+    u[4] = s * 2 * (xy - wz)
+    u[5] = s * (1 - 2 * (xx + zz))
+    u[6] = s * 2 * (yz + wx)
+    u[7] = 0
+    u[8] = s * 2 * (xz + wy)
+    u[9] = s * 2 * (yz - wx)
+    u[10] = s * (1 - 2 * (xx + yy))
+    u[11] = 0
+    u[12] = bonePos.x
+    u[13] = bonePos.y
+    u[14] = bonePos.z
+    u[15] = 1
     u[16] = this.canvas.width
     u[17] = this.canvas.height
     u[18] = Engine.GIZMO_THICKNESS_PX
@@ -3570,10 +3588,7 @@ export class Engine {
       const deltaAngle = currentAngle - drag.initialAngle
       const qWorld = Quat.fromAxisAngle(drag.worldAxis, deltaAngle)
       // L_new = P_inv · Q_world · P · L_initial
-      const lNew = drag.parentWorldRotInv
-        .multiply(qWorld)
-        .multiply(drag.parentWorldRot)
-        .multiply(drag.initialLocalRot)
+      const lNew = drag.parentWorldRotInv.multiply(qWorld).multiply(drag.parentWorldRot).multiply(drag.initialLocalRot)
       lNew.normalize()
       nextRot = lNew
     } else {

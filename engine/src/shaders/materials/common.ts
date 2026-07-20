@@ -73,6 +73,16 @@ struct LightVP { viewProj: mat4x4f, };
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
 
+// Four-bone blended normals can cancel to ~zero on physics-driven parts
+// (opposing bone rotations at 50/50 weights) — normalize(0) is 0/0 = NaN,
+// which poisons the whole shading stack and flashes through bloom. Fall
+// back to up for degenerate normals instead.
+fn safe_normal(nIn: vec3f) -> vec3f {
+  let l2 = dot(nIn, nIn);
+  if (l2 < 1e-12) { return vec3f(0.0, 1.0, 0.0); }
+  return nIn * inverseSqrt(l2);
+}
+
 `;
 
 // ─── Shadow sampler (3×3 PCF) ───────────────────────────────────────

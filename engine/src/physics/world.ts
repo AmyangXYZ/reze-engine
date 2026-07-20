@@ -14,6 +14,12 @@ export class World {
   readonly gravity: Vec3
   solverIterations = 10
 
+  // Per-body damping factors pow(1−damping, dt), cached because damping and
+  // the fixed dt never change — two Math.pow per body per substep otherwise.
+  private dampCacheDt = -1
+  private linDampFactor: Float32Array | null = null
+  private angDampFactor: Float32Array | null = null
+
   constructor(gravity: Vec3) {
     this.gravity = new Vec3(gravity.x, gravity.y, gravity.z)
   }
@@ -43,15 +49,26 @@ export class World {
 
     // 1. Predict — gravity + damping. The pow form (vs the linear
     //    1−damping·dt approximation) stays stable at high PMX damping
-    //    values like 0.99.
+    //    values like 0.99. Factors are cached (damping and dt are constant).
+    if (this.dampCacheDt !== dt || !this.linDampFactor || this.linDampFactor.length !== N) {
+      this.dampCacheDt = dt
+      this.linDampFactor = new Float32Array(N)
+      this.angDampFactor = new Float32Array(N)
+      for (let i = 0; i < N; i++) {
+        this.linDampFactor[i] = Math.pow(Math.max(0, 1 - ldamp[i]), dt)
+        this.angDampFactor[i] = Math.pow(Math.max(0, 1 - adamp[i]), dt)
+      }
+    }
+    const linDamp = this.linDampFactor
+    const angDamp = this.angDampFactor!
     for (let i = 0; i < N; i++) {
       if (types[i] !== RigidbodyType.Dynamic || invMass[i] <= 0) continue
       const i3 = i * 3
       lv[i3 + 0] += gx * dt
       lv[i3 + 1] += gy * dt
       lv[i3 + 2] += gz * dt
-      const ld = Math.pow(Math.max(0, 1 - ldamp[i]), dt)
-      const ad = Math.pow(Math.max(0, 1 - adamp[i]), dt)
+      const ld = linDamp[i]
+      const ad = angDamp[i]
       lv[i3 + 0] *= ld; lv[i3 + 1] *= ld; lv[i3 + 2] *= ld
       av[i3 + 0] *= ad; av[i3 + 1] *= ad; av[i3 + 2] *= ad
     }

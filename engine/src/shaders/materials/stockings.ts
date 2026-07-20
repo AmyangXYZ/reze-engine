@@ -66,7 +66,7 @@ fn ramp_ease_s(f: f32, p0: f32, p1: f32) -> f32 {
 }
 
 @fragment fn fs(input: VertexOutput) -> FSOut {
-  let n = normalize(input.normal);
+  let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;

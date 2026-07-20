@@ -182,12 +182,15 @@ function setupConstraint(
     tgt[i] = target
     act[i] = denom > 0 ? active : 0
     con.cacheLinLimitImp[i] = 0
-    if (con.springEnabled[i] && denom > 0) {
+    // A spring on a locked axis is redundant — the bilateral limit row
+    // already welds the DOF, and driving it twice overshoots every
+    // iteration (PMX rigs routinely put k=100000 springs on locked axes,
+    // which turned welded weight-bodies into energy pumps).
+    if (con.springEnabled[i] && denom > 0 && lo !== hi) {
       // Clamp k to the deadbeat limit: an explicit spring with k·dt² > 1
       // overshoots equilibrium every step and pumps energy — the classic
-      // pre-Spring2 Bullet 6dof instability this port inherited. (¼ margin
-      // for Gauss-Seidel coupling in chains.)
-      const k = Math.min(con.springStiffness[i], 0.25 * invDt * invDt)
+      // pre-Spring2 Bullet 6dof instability this port inherited.
+      const k = Math.min(con.springStiffness[i], invDt * invDt)
       const serr = curr - con.equilibriumPoint[i]
       con.cacheLinSpringTarget[i] = -k * serr * dt
       con.cacheLinSpringActive[i] = 1
@@ -238,9 +241,11 @@ function setupConstraint(
   const angAct = con.cacheAngActive
   for (let i = 0; i < 3; i++) {
     const idx = i + 3
-    if (con.springEnabled[idx] && angDenom > 0) {
+    // Springs on locked axes are skipped — the limit row welds those, and
+    // double-driving a DOF overshoots every iteration (see the linear loop).
+    if (con.springEnabled[idx] && angDenom > 0 && con.angularMin[i] !== con.angularMax[i]) {
       // Same deadbeat clamp as the linear springs.
-      const k = Math.min(con.springStiffness[idx], 0.25 * invDt * invDt)
+      const k = Math.min(con.springStiffness[idx], invDt * invDt)
       const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
       angTgt[i] = k * serr * dt
       angAct[i] = 1
@@ -388,9 +393,12 @@ function iterateConstraint(
     }
 
     // Spring row: velocity-target drive; the deadbeat k-clamp at setup
-    // bounds its aggression.
+    // bounds its aggression. relVel is refreshed with the limit impulse
+    // applied just above (j·denom = j / jac) — driving the spring off the
+    // stale value double-corrects the DOF and overshoots every iteration.
     if (sprAct[i]) {
-      j += (sprTgt[i] - relVel) * jac[i]
+      const relVelNow = j !== 0 ? relVel + j / jac[i] : relVel
+      j += (sprTgt[i] - relVelNow) * jac[i]
     }
 
     if (j === 0) continue
