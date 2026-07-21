@@ -1,5 +1,7 @@
 # Reze Engine
 
+[![npm](https://img.shields.io/npm/v/reze-engine)](https://www.npmjs.com/package/reze-engine)
+
 **Zero-runtime-dependency** WebGPU engine for real-time MMD/PMX rendering — renderer, animation, IK, and physics, all in TypeScript.
 
 ![screenshot](./screenshot.png)
