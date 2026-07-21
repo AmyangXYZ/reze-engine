@@ -132,3 +132,27 @@
     opacity: 0;
   }
 }
+
+/* Themed scrollbars — thin, rounded, matching the zinc dark palette instead of
+   the native chrome. Firefox via scrollbar-*, WebKit/Blink via ::-webkit-scrollbar. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(0.37 0.01 260) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: oklch(0.37 0.01 260);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.45 0.01 260);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
