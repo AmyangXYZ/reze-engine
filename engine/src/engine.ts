@@ -52,7 +52,13 @@ export type MaterialPreset =
   | "metal"
   | "cloth_smooth"
   | "cloth_rough"
-  | "mmd_classic"
+
+// What a draw call actually resolves to. "mmd_classic" is the automatic
+// authentic-MMD fallback for materials no preset map or name heuristic
+// covers — deliberately NOT part of MaterialPreset, so consumer-side
+// exhaustive Record<MaterialPreset, …> maps and switches don't have to
+// carry an option users never assign.
+export type ResolvedMaterialPreset = MaterialPreset | "mmd_classic"
 
 export type MaterialPresetMap = Partial<Record<MaterialPreset, string[]>>
 
@@ -102,7 +108,7 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   ],
 ]
 
-function resolvePreset(materialName: string, map: MaterialPresetMap | undefined): MaterialPreset {
+function resolvePreset(materialName: string, map: MaterialPresetMap | undefined): ResolvedMaterialPreset {
   if (map) {
     for (const [preset, names] of Object.entries(map)) {
       if (names && names.includes(materialName)) return preset as MaterialPreset
@@ -259,7 +265,7 @@ interface DrawCall {
   firstIndex: number
   bindGroup: GPUBindGroup
   materialName: string
-  preset: MaterialPreset
+  preset: ResolvedMaterialPreset
 }
 
 interface PickDrawCall {
@@ -3180,7 +3186,7 @@ export class Engine {
       "transparent-outline": 3,
       ground: 4,
     }
-    const presetRank = (p: MaterialPreset): number => (p === "hair" ? 2 : p === "eye" ? 1 : 0)
+    const presetRank = (p: ResolvedMaterialPreset): number => (p === "hair" ? 2 : p === "eye" ? 1 : 0)
     inst.drawCalls.sort((a, b) => {
       const ta = typeOrder[a.type] - typeOrder[b.type]
       if (ta !== 0) return ta
@@ -4021,7 +4027,7 @@ export class Engine {
     }
   }
 
-  private pipelineForPreset(preset: MaterialPreset): GPURenderPipeline {
+  private pipelineForPreset(preset: ResolvedMaterialPreset): GPURenderPipeline {
     if (preset === "face") return this.facePipeline
     if (preset === "hair") return this.hairPipeline
     if (preset === "cloth_smooth") return this.clothSmoothPipeline
