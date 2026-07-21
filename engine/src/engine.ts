@@ -39,6 +39,8 @@ import {
 import { COMPOSITE_SHADER_WGSL } from "./shaders/passes/composite"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
+import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
+import type { Diagnostic, StyleGraph } from "./graph/schema"
 
 // Material preset dispatch. Consumers supply a MaterialPresetMap assigning material names
 // to presets; unmapped materials fall back to "default" (Principled BSDF).
@@ -121,6 +123,33 @@ function resolvePreset(materialName: string, map: MaterialPresetMap | undefined)
     }
   }
   return "mmd_classic"
+}
+
+// Map a WGSL compile-error line back to the graph node whose `let` produced it —
+// the compiler tags every generated line with a trailing `// @node:<id>` marker.
+function nodeIdForWgslLine(wgsl: string, lineNum: number): string | undefined {
+  const lines = wgsl.split("\n")
+  for (let i = Math.min(lineNum - 1, lines.length - 1); i >= 0; i--) {
+    const m = lines[i].match(/\/\/ @node:([a-z0-9_]+)/)
+    if (m) return m[1]
+  }
+  return undefined
+}
+
+// An applied style graph on a preset slot: the swapped pipeline(s) plus the
+// slider→UBO map that setStyleParam consults for instant uniform writes.
+type StyleOverride = {
+  pipeline: GPURenderPipeline
+  /** Hair slot only: the stencil-matched IS_OVER_EYES=true variant. */
+  overEyesPipeline?: GPURenderPipeline
+  slotMap: StyleSlot[]
+}
+
+/** Result of Engine.applyStyleGraph — compile/pipeline diagnostics + slider slot map. */
+export type ApplyStyleResult = {
+  ok: boolean
+  diagnostics: Diagnostic[]
+  slotMap: StyleSlot[]
 }
 
 export type RaycastCallback = (
@@ -266,6 +295,9 @@ interface DrawCall {
   bindGroup: GPUBindGroup
   materialName: string
   preset: ResolvedMaterialPreset
+  // Bindings 0–3 kept so the bind group can be rebuilt when setMaterialPresets moves
+  // this material to a different slot (binding 4 must follow the slot's style buffer).
+  baseBindGroupEntries?: GPUBindGroupEntry[]
 }
 
 interface PickDrawCall {
@@ -333,6 +365,7 @@ export class Engine {
   private lightData = new Float32Array(64)
   private lightCount = 0
   private resizeObserver: ResizeObserver | null = null
+  private resizePending = false
   private depthTexture!: GPUTexture
   private modelPipeline!: GPURenderPipeline
   private facePipeline!: GPURenderPipeline
@@ -345,6 +378,21 @@ export class Engine {
   private hairOverEyesPipeline!: GPURenderPipeline
   private stockingsPipeline!: GPURenderPipeline
   private mmdClassicPipeline!: GPURenderPipeline
+  // ── Style graph runtime (graph/ compiler output applied to preset slots) ──
+  // Per-slot 256 B StyleUniforms buffers (group(2) binding(4)). Created eagerly so
+  // material bind groups can reference them at model-load time regardless of whether
+  // a graph is ever applied; mmd_classic materials bind the shared zero buffer.
+  private styleBuffers = new Map<MaterialPreset, GPUBuffer>()
+  private zeroStyleBuffer!: GPUBuffer
+  // Applied graphs: slot → swapped pipeline(s) + the slider→UBO map for setStyleParam.
+  private styleOverrides = new Map<MaterialPreset, StyleOverride>()
+  // Per-slot generation counter — an async compile that finishes after a newer
+  // applyStyleGraph/resetStyleSlot call on the same slot is discarded (stale guard).
+  private styleGenerations = new Map<MaterialPreset, number>()
+  // Stashed at createPipelines so applyStyleGraph can rebuild slot pipelines later.
+  private mainPipelineLayout!: GPUPipelineLayout
+  private sceneTargets!: GPUColorTargetState[]
+  private fullVertexBufferLayouts!: GPUVertexBufferLayout[]
   // 1×64 vertical ramp for shared-toon materials: lit (top) → soft shadow
   // tone (bottom). Stand-in for MMD's toon01–10.bmp, which we can't ship.
   private defaultToonRampTexture!: GPUTexture
@@ -1055,6 +1103,8 @@ export class Engine {
       },
     }
     const sceneTargets: GPUColorTargetState[] = [standardBlend, maskBlend]
+    this.sceneTargets = sceneTargets
+    this.fullVertexBufferLayouts = fullVertexBuffers
 
     const shaderModule = this.device.createShaderModule({
       label: "default model shader",
@@ -1141,8 +1191,39 @@ export class Engine {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        // StyleUniforms for compiled graph shaders (adjust-tier sliders). Hand-written
+        // presets simply don't declare it — a layout may carry bindings a shader ignores.
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
+
+    // Per-slot style buffers + shared zero buffer (mmd_classic / never-styled slots).
+    this.zeroStyleBuffer = this.device.createBuffer({
+      label: "style uniforms (zero)",
+      size: 256,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const ALL_PRESETS: MaterialPreset[] = [
+      "default",
+      "face",
+      "hair",
+      "body",
+      "eye",
+      "stockings",
+      "metal",
+      "cloth_smooth",
+      "cloth_rough",
+    ]
+    for (const preset of ALL_PRESETS) {
+      this.styleBuffers.set(
+        preset,
+        this.device.createBuffer({
+          label: `style uniforms (${preset})`,
+          size: 256,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        }),
+      )
+    }
 
     const mainPipelineLayout = this.device.createPipelineLayout({
       label: "main pipeline layout",
@@ -1152,6 +1233,7 @@ export class Engine {
         this.mainPerMaterialBindGroupLayout,
       ],
     })
+    this.mainPipelineLayout = mainPipelineLayout
 
     // perFrameBindGroup is created after shadow resources below
 
@@ -1800,9 +1882,16 @@ export class Engine {
     })
   }
 
-  // Step 3: Setup canvas resize handling
+  // Step 3: Setup canvas resize handling.
+  // The observer only flags the resize; render() applies it at the top of the next
+  // frame. Resizing inside the RO callback (post-layout) clears the canvas buffer
+  // after the frame's rAF draw already ran, so during continuous drags (resizable
+  // panels) every paint showed a stale-aspect or cleared buffer — one frame behind,
+  // reading as laggy/stretchy. Flag-and-apply keeps resize + redraw in one frame.
   private setupResize() {
-    this.resizeObserver = new ResizeObserver(() => this.handleResize())
+    this.resizeObserver = new ResizeObserver(() => {
+      this.resizePending = true
+    })
     this.resizeObserver.observe(this.canvas)
     this.handleResize()
 
@@ -2476,6 +2565,13 @@ export class Engine {
       this.resizeObserver.disconnect()
       this.resizeObserver = null
     }
+
+    // Style graph runtime: per-slot uniform buffers + swapped pipelines (pipelines
+    // are GC'd; buffers need explicit destroy).
+    this.styleOverrides.clear()
+    for (const buf of this.styleBuffers.values()) buf.destroy()
+    this.styleBuffers.clear()
+    this.zeroStyleBuffer?.destroy()
   }
 
   async loadModel(path: string): Promise<Model>
@@ -2582,8 +2678,26 @@ export class Engine {
     if (!inst) return
     inst.materialPresets = presets
     for (const dc of inst.drawCalls) {
-      dc.preset = resolvePreset(dc.materialName, presets)
+      const preset = resolvePreset(dc.materialName, presets)
+      if (preset === dc.preset) continue
+      dc.preset = preset
+      // Rebind so binding(4) follows the new slot's style buffer.
+      if (dc.baseBindGroupEntries)
+        dc.bindGroup = this.createMaterialBindGroup(`material: ${dc.materialName}`, dc.baseBindGroupEntries, preset)
     }
+  }
+
+  private createMaterialBindGroup(
+    label: string,
+    baseEntries: GPUBindGroupEntry[],
+    preset: ResolvedMaterialPreset,
+  ): GPUBindGroup {
+    const styleBuffer = preset === "mmd_classic" ? this.zeroStyleBuffer : this.styleBuffers.get(preset)!
+    return this.device.createBindGroup({
+      label,
+      layout: this.mainPerMaterialBindGroupLayout,
+      entries: [...baseEntries, { binding: 4, resource: { buffer: styleBuffer } }],
+    })
   }
 
   setMaterialVisible(modelName: string, materialName: string, visible: boolean): void {
@@ -3106,20 +3220,17 @@ export class Engine {
       const materialUniformBuffer = this.createMaterialUniformBuffer(prefix + mat.name, mat, sphereMode, headBoneIndex)
       inst.gpuBuffers.push(materialUniformBuffer)
 
+      const preset = resolvePreset(mat.name, inst.materialPresets)
       const textureView = diffuseTexture.createView()
-      const bindGroup = this.device.createBindGroup({
-        label: `${prefix}material: ${mat.name}`,
-        layout: this.mainPerMaterialBindGroupLayout,
-        entries: [
-          { binding: 0, resource: textureView },
-          { binding: 1, resource: { buffer: materialUniformBuffer } },
-          { binding: 2, resource: (toonTexture ?? this.fallbackMaterialTexture).createView() },
-          { binding: 3, resource: (sphereTexture ?? this.fallbackMaterialTexture).createView() },
-        ],
-      })
+      const baseBindGroupEntries: GPUBindGroupEntry[] = [
+        { binding: 0, resource: textureView },
+        { binding: 1, resource: { buffer: materialUniformBuffer } },
+        { binding: 2, resource: (toonTexture ?? this.fallbackMaterialTexture).createView() },
+        { binding: 3, resource: (sphereTexture ?? this.fallbackMaterialTexture).createView() },
+      ]
+      const bindGroup = this.createMaterialBindGroup(`${prefix}material: ${mat.name}`, baseBindGroupEntries, preset)
 
       const type: DrawCallType = isTransparent ? "transparent" : "opaque"
-      const preset = resolvePreset(mat.name, inst.materialPresets)
       inst.drawCalls.push({
         type,
         count: indexCount,
@@ -3127,6 +3238,7 @@ export class Engine {
         bindGroup,
         materialName: mat.name,
         preset,
+        baseBindGroupEntries,
       })
 
       if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
@@ -3895,6 +4007,11 @@ export class Engine {
   render() {
     if (!this.multisampleTexture || !this.camera || !this.device) return
 
+    if (this.resizePending) {
+      this.resizePending = false
+      this.handleResize()
+    }
+
     const currentTime = performance.now()
     const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
     this.lastFrameTime = currentTime
@@ -4027,7 +4144,165 @@ export class Engine {
     }
   }
 
+  // ─── Style graph API ──────────────────────────────────────────────
+  // Two-tier edit model: applyStyleGraph = topology tier (async compile + pipeline
+  // swap, previous look keeps rendering until the new pipeline is ready or on any
+  // error); setStyleParam = adjust tier (uniform write, instant, no pipeline touch).
+
+  /**
+   * Compile a style graph and swap it onto its preset slot. Fallback-on-error: the
+   * slot's current pipeline keeps rendering unless compilation fully succeeds.
+   * Slider defaults are written to the slot's StyleUniforms buffer on success.
+   */
+  async applyStyleGraph(graph: StyleGraph, opts?: CompileOptions): Promise<ApplyStyleResult> {
+    const result = compileGraph(graph, opts)
+    if (!result.ok) return { ok: false, diagnostics: result.diagnostics, slotMap: result.slotMap }
+
+    const slot = graph.slot
+    const generation = (this.styleGenerations.get(slot) ?? 0) + 1
+    this.styleGenerations.set(slot, generation)
+
+    this.device.pushErrorScope("validation")
+    const module = this.device.createShaderModule({ label: `style graph: ${graph.name} (${slot})`, code: result.wgsl })
+    const info = await module.getCompilationInfo()
+    const scopeError = await this.device.popErrorScope()
+    const diagnostics = [...result.diagnostics]
+    for (const msg of info.messages) {
+      if (msg.type !== "error") continue
+      diagnostics.push({
+        severity: "error",
+        nodeId: nodeIdForWgslLine(result.wgsl, msg.lineNum),
+        message: `WGSL: ${msg.message}`,
+      })
+    }
+    if (diagnostics.some((d) => d.severity === "error") || scopeError) {
+      if (scopeError && !diagnostics.some((d) => d.severity === "error"))
+        diagnostics.push({ severity: "error", message: `WGSL: ${scopeError.message}` })
+      return { ok: false, diagnostics, slotMap: result.slotMap }
+    }
+
+    let pipeline: GPURenderPipeline
+    let overEyesPipeline: GPURenderPipeline | undefined
+    try {
+      pipeline = await this.createSlotPipeline(slot, module, false)
+      if (slot === "hair") overEyesPipeline = await this.createSlotPipeline(slot, module, true)
+    } catch (e) {
+      diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
+      return { ok: false, diagnostics, slotMap: result.slotMap }
+    }
+
+    // A newer apply/reset on this slot finished (or started) while we compiled.
+    if (this.styleGenerations.get(slot) !== generation) {
+      diagnostics.push({ severity: "warning", message: "superseded by a newer edit — result discarded" })
+      return { ok: false, diagnostics, slotMap: result.slotMap }
+    }
+
+    this.styleOverrides.set(slot, { pipeline, overEyesPipeline, slotMap: result.slotMap })
+    this.writeStyleDefaults(slot, graph, result.slotMap)
+    return { ok: true, diagnostics, slotMap: result.slotMap }
+  }
+
+  /** Instant adjust-tier write: set one exposed slider on the slot's applied graph. */
+  setStyleParam(slot: MaterialPreset, paramId: string, value: number | [number, number, number]): boolean {
+    const override = this.styleOverrides.get(slot)
+    const styleSlot = override?.slotMap.find((s) => s.id === paramId)
+    const buffer = this.styleBuffers.get(slot)
+    if (!styleSlot || !buffer) return false
+    if (styleSlot.kind === "float") {
+      if (typeof value !== "number") return false
+      const offset = styleSlot.vec4Index * 16 + ["x", "y", "z", "w"].indexOf(styleSlot.component!) * 4
+      this.device.queue.writeBuffer(buffer, offset, new Float32Array([value]))
+    } else {
+      if (typeof value === "number") return false
+      this.device.queue.writeBuffer(buffer, styleSlot.vec4Index * 16, new Float32Array(value))
+    }
+    return true
+  }
+
+  /** Remove an applied style graph — the slot returns to its built-in preset shader. */
+  resetStyleSlot(slot: MaterialPreset): void {
+    this.styleGenerations.set(slot, (this.styleGenerations.get(slot) ?? 0) + 1)
+    this.styleOverrides.delete(slot)
+  }
+
+  private writeStyleDefaults(slot: MaterialPreset, graph: StyleGraph, slotMap: StyleSlot[]): void {
+    const data = new Float32Array(64) // 16 vec4f
+    for (const styleSlot of slotMap) {
+      const param = graph.params?.find((p) => p.id === styleSlot.id)
+      if (!param) continue
+      const base = styleSlot.vec4Index * 4
+      if (styleSlot.kind === "float" && typeof param.default === "number") {
+        data[base + ["x", "y", "z", "w"].indexOf(styleSlot.component!)] = param.default
+      } else if (styleSlot.kind === "color" && typeof param.default !== "number") {
+        data.set(param.default.slice(0, 3), base)
+      }
+    }
+    this.device.queue.writeBuffer(this.styleBuffers.get(slot)!, 0, data)
+  }
+
+  /**
+   * Slot pipeline states mirror createPipelines exactly — a compiled graph swaps the
+   * fragment shading of a slot, never its pass integration (stencil interplay, depth
+   * bias, cull mode stay slot-owned; see docs/graph-compiler-spec.md §6).
+   */
+  private createSlotPipeline(slot: MaterialPreset, module: GPUShaderModule, overEyes: boolean): Promise<GPURenderPipeline> {
+    const base = {
+      label: `style ${slot}${overEyes ? " (over eyes)" : ""}`,
+      layout: this.mainPipelineLayout,
+      vertex: { module, buffers: this.fullVertexBufferLayouts },
+      primitive: { cullMode: (slot === "eye" ? "front" : "none") as GPUCullMode },
+      multisample: { count: Engine.MULTISAMPLE_COUNT },
+    }
+    const plainDepth: GPUDepthStencilState = {
+      format: "depth24plus-stencil8",
+      depthWriteEnabled: true,
+      depthCompare: "less-equal",
+    }
+    let depthStencil: GPUDepthStencilState = plainDepth
+    let constants: Record<string, number> | undefined
+    if (slot === "hair" && !overEyes) {
+      depthStencil = {
+        ...plainDepth,
+        stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: 0xff,
+        stencilWriteMask: 0,
+      }
+    } else if (slot === "hair" && overEyes) {
+      constants = { IS_OVER_EYES: 1 }
+      depthStencil = {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: false,
+        depthCompare: "less-equal",
+        stencilFront: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilBack: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: 0xff,
+        stencilWriteMask: 0,
+      }
+    } else if (slot === "eye") {
+      depthStencil = {
+        ...plainDepth,
+        depthBias: -0.00005,
+        depthBiasSlopeScale: 0.0,
+        depthBiasClamp: 0.0,
+        stencilFront: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
+        stencilBack: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
+        stencilReadMask: 0xff,
+        stencilWriteMask: 0xff,
+      }
+    }
+    return this.device.createRenderPipelineAsync({
+      ...base,
+      fragment: { module, constants, targets: this.sceneTargets },
+      depthStencil,
+    })
+  }
+
   private pipelineForPreset(preset: ResolvedMaterialPreset): GPURenderPipeline {
+    // Applied style graph wins over the built-in preset shader (mmd_classic is never
+    // in the override map — it's not a stylable slot).
+    const override = this.styleOverrides.get(preset as MaterialPreset)
+    if (override) return override.pipeline
     if (preset === "face") return this.facePipeline
     if (preset === "hair") return this.hairPipeline
     if (preset === "cloth_smooth") return this.clothSmoothPipeline
@@ -4121,7 +4396,7 @@ export class Engine {
     for (const draw of inst.drawCalls) {
       if (draw.type !== "opaque" || draw.preset !== "hair" || !this.shouldRenderDrawCall(inst, draw)) continue
       if (!bound) {
-        pass.setPipeline(this.hairOverEyesPipeline)
+        pass.setPipeline(this.styleOverrides.get("hair")?.overEyesPipeline ?? this.hairOverEyesPipeline)
         pass.setBindGroup(0, this.perFrameBindGroup)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true

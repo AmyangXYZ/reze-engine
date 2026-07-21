@@ -14,6 +14,7 @@ npm install reze-engine
 
 - Anime/MMD **hybrid renderer** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
 - **9 per-material presets** assigned by material name (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`)
+- **Node-graph materials** — Blender-style style graphs (JSON) validated + compiled to WGSL at runtime; instant slider tier, async pipeline swap with fallback-on-error
 - **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, no external dependency
 - **VMD animation** with MMD IK, morphs (GPU compute path), and VMD export
@@ -190,6 +191,26 @@ onGizmoDrag: (e) => {
 ```
 
 Note the asymmetry: rotation goes through `rotateBones(…, 0)`, but translation uses `setBoneLocalTranslation(idx, v)` — `moveBones` converts VMD-relative→local, and the gizmo output is already local.
+
+## Style graphs (node-graph materials)
+
+Materials can be authored as Blender-style node graphs — plain JSON (`StyleGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE** (same functions as the hand-written presets), so community Blender NPR presets port by transcription. Seven presets ship as graph data (`HAIR_GRAPH`, `BODY_GRAPH`, `METAL_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `STOCKINGS_GRAPH`, `DEFAULT_GRAPH` — the Blender new-material template), each snapshot-tested to compile to the same shading as its built-in shader.
+
+The preset *slot* owns pass integration (hair's over-eyes stencil variant, stockings' hashed-alpha discard, draw order); the graph only restyles shading — so applied graphs inherit every built-in effect.
+
+```javascript
+import { compileGraph, validateGraph, HAIR_GRAPH } from "reze-engine"
+
+// Two-tier edits on a live engine:
+await engine.applyStyleGraph(graph) // topology change → async compile + pipeline swap
+engine.setStyleParam("hair", "rim", 0.8) // exposed param → instant uniform write
+engine.resetStyleSlot("hair") // back to the built-in preset shader
+
+// Headless (no GPU needed):
+const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH)
+```
+
+Validation catches type mismatches, cycles, and bad links with node-level diagnostics; a failed `applyStyleGraph` keeps the previous pipeline rendering. See `docs/graph-compiler-spec.md` for the schema, node registry, and compiler internals.
 
 ## Physics
 

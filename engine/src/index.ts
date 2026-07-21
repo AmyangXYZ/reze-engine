@@ -10,11 +10,36 @@ export {
   type MaterialPreset,
   type ResolvedMaterialPreset,
   type MaterialPresetMap,
+  type ApplyStyleResult,
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
+export {
+  compileGraph,
+  validateGraph,
+  assignStyleSlots,
+  type CompileOptions,
+  type CompileResult,
+  type StyleSlot,
+} from "./graph/compile"
+export type {
+  StyleGraph,
+  GraphNode,
+  GraphLink,
+  ExposedParam,
+  SocketValue,
+  Diagnostic,
+} from "./graph/schema"
+export { NODE_REGISTRY, type NodeSpec, type SockT } from "./graph/registry"
+export { HAIR_GRAPH } from "./graph/presets/hair"
+export { DEFAULT_GRAPH } from "./graph/presets/default"
+export { CLOTH_SMOOTH_GRAPH } from "./graph/presets/cloth_smooth"
+export { CLOTH_ROUGH_GRAPH } from "./graph/presets/cloth_rough"
+export { METAL_GRAPH } from "./graph/presets/metal"
+export { BODY_GRAPH } from "./graph/presets/body"
+export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 export { Model } from "./model"
 export { Vec3, Quat, Mat4 } from "./math"
 export type {

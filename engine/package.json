@@ -1,6 +1,6 @@
 {
     "name": "reze-engine",
-    "version": "0.17.1",
+    "version": "0.18.0",
     "description": "A lightweight WebGPU engine for real-time 3D MMD/PMX model rendering",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -22,6 +22,7 @@
     "scripts": {
         "build": "tsc",
         "dev": "tsc --watch",
+        "test": "node --import ./tests/register.mjs --test tests/*.test.mjs",
         "prepublishOnly": "npm run build"
     },
     "keywords": [
