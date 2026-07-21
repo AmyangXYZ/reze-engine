@@ -308,6 +308,7 @@ export class PmxLoader {
           sphereTextureIndex,
           sphereMode: sphereTextureMode,
           toonTextureIndex,
+          sharedToon: isSharedToonTexture,
           edgeFlag: flag,
           edgeColor,
           edgeSize,

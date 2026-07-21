@@ -40,10 +40,22 @@ struct LightUniforms {
 };
 
 // Per-material uniforms. Every material binds this layout even if it ignores fields;
-// the engine keeps one bind group layout across all material pipelines.
+// the engine keeps one bind group layout across all material pipelines. The PMX
+// classic-material fields (ambient/specular/toon/sphere) are consumed by the
+// mmd_classic preset; NPR presets ignore them.
 struct MaterialUniforms {
-  diffuseColor: vec3f,  // tint; reserved (currently unused by all material fs)
+  diffuseColor: vec3f,   // PMX diffuse rgb (mmd_classic); reserved for others
   alpha: f32,            // 0 → discard; <1 → transparent draw call
+  ambient: vec3f,        // PMX ambient rgb
+  shininess: f32,        // PMX specular power
+  specular: vec3f,       // PMX specular rgb
+  sphereMode: f32,       // 0 none · 1 multiply (sph) · 2 add (spa)
+  // Skeleton index of the 頭 (head) bone, or -1. Lets the eye shader gate
+  // the post-alpha-eye stencil by camera-vs-face hemisphere.
+  headBoneIndex: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 };
 
 struct VertexOutput {
@@ -72,6 +84,9 @@ struct LightVP { viewProj: mat4x4f, };
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
+// mmd_classic inputs; other presets leave them unread (fallback 1×1 whites).
+@group(2) @binding(2) var toonTexture: texture_2d<f32>;
+@group(2) @binding(3) var sphereTexture: texture_2d<f32>;
 
 // Four-bone blended normals can cancel to ~zero on physics-driven parts
 // (opposing bone rotations at 50/50 weights) — normalize(0) is 0/0 = NaN,

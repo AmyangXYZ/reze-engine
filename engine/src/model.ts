@@ -43,6 +43,9 @@ export interface Material {
   sphereTextureIndex: number
   sphereMode: number
   toonTextureIndex: number
+  // True when toonTextureIndex refers to the shared toon set (toon01–10)
+  // instead of the model's texture table.
+  sharedToon: boolean
   edgeFlag: number
   edgeColor: [number, number, number, number]
   edgeSize: number

@@ -25,6 +25,20 @@ const EYE_EMISSION_STRENGTH: f32 = 1.5;
 
   let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
+
+  // Rear-view gate for the post-alpha eye. Many PMX heads are open shells
+  // (no skull mesh), so from behind nothing occludes the eye — it would draw
+  // and stamp the see-through stencil straight through the back hair. Mesh
+  // normals/winding are unreliable (double-sided eye geometry), so gate by
+  // camera-vs-face hemisphere instead: the 頭 bone's skinning matrix carries
+  // the head's world rotation (PMX bind pose is rotationless), and PMX
+  // models face −Z locally. Discard drops color, depth, and stencil.
+  if (material.headBoneIndex >= 0.0) {
+    let hm = skinMats[u32(material.headBoneIndex)];
+    let faceDir = -normalize(hm[2].xyz);
+    if (dot(faceDir, v) < -0.15) { discard; }
+  }
+
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;
   let amb = light.ambientColor.xyz;

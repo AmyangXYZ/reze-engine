@@ -1,6 +1,6 @@
 import { Camera } from "./camera"
 import { Mat4, Quat, Vec3 } from "./math"
-import { Model } from "./model"
+import { Model, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
@@ -23,6 +23,7 @@ import { METAL_SHADER_WGSL } from "./shaders/materials/metal"
 import { BODY_SHADER_WGSL } from "./shaders/materials/body"
 import { EYE_SHADER_WGSL } from "./shaders/materials/eye"
 import { STOCKINGS_SHADER_WGSL } from "./shaders/materials/stockings"
+import { MMD_CLASSIC_SHADER_WGSL } from "./shaders/materials/mmd_classic"
 import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
@@ -51,15 +52,69 @@ export type MaterialPreset =
   | "metal"
   | "cloth_smooth"
   | "cloth_rough"
+  | "mmd_classic"
 
 export type MaterialPresetMap = Partial<Record<MaterialPreset, string[]>>
 
+// Substring hints mapping common PMX material names (JP/CN/EN) to presets,
+// tried when a material isn't in the model's explicit MaterialPresetMap.
+// Ordered: more specific families first (靴下 must hit stockings before 靴
+// hits cloth). Anything unmatched falls through to mmd_classic, which renders
+// the author-tuned PMX material data faithfully.
+const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
+  ["stockings", ["靴下", "ソックス", "タイツ", "ニーソ", "袜", "stocking", "socks", "tights"]],
+  [
+    "eye",
+    ["白目", "目影", "二重", "睫", "まつげ", "まゆ", "眉", "目", "瞳", "眼", "eye", "iris", "pupil", "lash", "brow"],
+  ],
+  ["face", ["顔", "颜", "脸", "かお", "face"]],
+  ["hair", ["前髪", "後髪", "髪", "髮", "头发", "頭髪", "もみあげ", "アホ毛", "ヘア", "hair", "ahoge", "bang"]],
+  ["body", ["肌", "皮肤", "skin"]],
+  ["metal", ["金属", "メタル", "metal"]],
+  [
+    "cloth_smooth",
+    [
+      "服",
+      "衣",
+      "裙",
+      "裤",
+      "スカート",
+      "ワンピ",
+      "リボン",
+      "袖",
+      "靴",
+      "鞋",
+      "帽",
+      "体",
+      "飾",
+      "饰",
+      "尾",
+      "skirt",
+      "dress",
+      "ribbon",
+      "sleeve",
+      "shoes",
+      "boot",
+      "hat",
+      "cloth",
+      "accessor",
+    ],
+  ],
+]
+
 function resolvePreset(materialName: string, map: MaterialPresetMap | undefined): MaterialPreset {
-  if (!map) return "default"
-  for (const [preset, names] of Object.entries(map)) {
-    if (names && names.includes(materialName)) return preset as MaterialPreset
+  if (map) {
+    for (const [preset, names] of Object.entries(map)) {
+      if (names && names.includes(materialName)) return preset as MaterialPreset
+    }
   }
-  return "default"
+  const lower = materialName.toLowerCase()
+  for (const [preset, hints] of PRESET_NAME_HINTS) {
+    for (const hint of hints) {
+      if (lower.includes(hint)) return preset
+    }
+  }
+  return "mmd_classic"
 }
 
 export type RaycastCallback = (
@@ -283,6 +338,10 @@ export class Engine {
   private eyePipeline!: GPURenderPipeline
   private hairOverEyesPipeline!: GPURenderPipeline
   private stockingsPipeline!: GPURenderPipeline
+  private mmdClassicPipeline!: GPURenderPipeline
+  // 1×64 vertical ramp for shared-toon materials: lit (top) → soft shadow
+  // tone (bottom). Stand-in for MMD's toon01–10.bmp, which we can't ship.
+  private defaultToonRampTexture!: GPUTexture
   private groundShadowPipeline!: GPURenderPipeline
   private groundShadowBindGroupLayout!: GPUBindGroupLayout
   private outlinePipeline!: GPURenderPipeline
@@ -895,6 +954,28 @@ export class Engine {
       [1, 1],
     )
 
+    // Generic shared-toon ramp: lit white down to a soft cool shadow tone with
+    // a tight terminator around the midpoint, approximating MMD's toon ramps.
+    const TOON_H = 64
+    const toonData = new Uint8Array(TOON_H * 4)
+    for (let y = 0; y < TOON_H; y++) {
+      const v = y / (TOON_H - 1)
+      // smoothstep terminator centered at 0.55, width ~0.1
+      const t = Math.min(1, Math.max(0, (v - 0.5) / 0.1))
+      const s = t * t * (3 - 2 * t)
+      toonData[y * 4 + 0] = Math.round(255 - s * (255 - 196))
+      toonData[y * 4 + 1] = Math.round(255 - s * (255 - 186))
+      toonData[y * 4 + 2] = Math.round(255 - s * (255 - 205))
+      toonData[y * 4 + 3] = 255
+    }
+    this.defaultToonRampTexture = this.device.createTexture({
+      label: "default toon ramp (1x64)",
+      size: [1, TOON_H],
+      format: "rgba8unorm-srgb",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.device.queue.writeTexture({ texture: this.defaultToonRampTexture }, toonData, { bytesPerRow: 4 }, [1, TOON_H])
+
     // Shared vertex buffer layouts
     const fullVertexBuffers: GPUVertexBufferLayout[] = [
       {
@@ -1014,6 +1095,11 @@ export class Engine {
       code: STOCKINGS_SHADER_WGSL,
     })
 
+    const mmdClassicShaderModule = this.device.createShaderModule({
+      label: "mmd classic shader",
+      code: MMD_CLASSIC_SHADER_WGSL,
+    })
+
     // group 0: per-frame (camera + light + sampler + shadow) — bound once per pass
     this.mainPerFrameBindGroupLayout = this.device.createBindGroupLayout({
       label: "main per-frame bind group layout",
@@ -1030,14 +1116,25 @@ export class Engine {
     // group 1: per-instance (skinMats) — bound once per model
     this.mainPerInstanceBindGroupLayout = this.device.createBindGroupLayout({
       label: "main per-instance bind group layout",
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }],
+      // FRAGMENT visibility: the eye shader reads the 頭 bone's skinning
+      // matrix for its rear-view gate.
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" },
+        },
+      ],
     })
-    // group 2: per-material (texture + material uniforms) — bound per draw call
+    // group 2: per-material (textures + material uniforms) — bound per draw call.
+    // Toon + sphere slots feed mmd_classic; other presets bind fallbacks.
     this.mainPerMaterialBindGroupLayout = this.device.createBindGroupLayout({
       label: "main per-material bind group layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
 
@@ -1101,10 +1198,17 @@ export class Engine {
       },
     })
 
+    // Eye-over-hair (the see-through-hair effect, inverted): after hair draws
+    // normally, the eye re-draws at 75% alpha with its depth pushed
+    // EYE_SEE_THROUGH_RANGE world units toward the camera, so it only shows
+    // through occluders within that window (bangs), never through the far
+    // side of the head. Stencil == EYE_VALUE confines it to pixels where the
+    // eye's primary draw passed depth — a hand in front of the face never
+    // stamps, so it still occludes fully.
     // Hair-over-eyes: same shader with IS_OVER_EYES=true so alpha is scaled to 25% at compile time.
     // Only fragments where eye stencil == EYE_VALUE pass; depth test still culls fragments
     // that are further from camera than the eye, so hair behind the eye never shows through.
-    // depthWriteEnabled=false keeps the eye's depth authoritative for everything drawn after.
+    // depthWriteEnabled=false keeps the eye's depth authoritative for anything drawn after.
     this.hairOverEyesPipeline = this.device.createRenderPipeline({
       label: "hair over eyes pipeline",
       layout: mainPipelineLayout,
@@ -1131,6 +1235,20 @@ export class Engine {
       label: "cloth smooth NPR pipeline",
       layout: mainPipelineLayout,
       shaderModule: clothSmoothShaderModule,
+      vertexBuffers: fullVertexBuffers,
+      fragmentTargets: sceneTargets,
+      cullMode: "none",
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: true,
+        depthCompare: "less-equal",
+      },
+    })
+
+    this.mmdClassicPipeline = this.createRenderPipeline({
+      label: "mmd classic pipeline",
+      layout: mainPipelineLayout,
+      shaderModule: mmdClassicShaderModule,
       vertexBuffers: fullVertexBuffers,
       fragmentTargets: sceneTargets,
       cullMode: "none",
@@ -2942,6 +3060,9 @@ export class Engine {
       return this.createTextureFromLogicalPath(inst, logicalPath)
     }
 
+    // 頭 bone index for the eye shader's rear-view gate (-1 when absent).
+    const headBoneIndex = model.getSkeleton().bones.findIndex((b) => b.name === "頭")
+
     let currentIndexOffset = 0
     let materialId = 0
     for (const mat of materials) {
@@ -2958,11 +3079,25 @@ export class Engine {
       const materialAlpha = mat.diffuse[3]
       const isTransparent = materialAlpha < 1.0 - 0.001
 
-      const materialUniformBuffer = this.createMaterialUniformBuffer(prefix + mat.name, materialAlpha, [
-        mat.diffuse[0],
-        mat.diffuse[1],
-        mat.diffuse[2],
-      ])
+      // Sphere map (sph=1 multiply / spa=2 add). Mode 3 (sub-texture UV) is
+      // rare and not implemented — treated as none, like a failed load.
+      let sphereMode = mat.sphereMode === 1 || mat.sphereMode === 2 ? mat.sphereMode : 0
+      let sphereTexture: GPUTexture | null = null
+      if (sphereMode !== 0) {
+        sphereTexture = await loadTextureByIndex(mat.sphereTextureIndex)
+        if (!sphereTexture) sphereMode = 0
+      }
+
+      // Toon ramp: model-local file, or the generic ramp for the shared
+      // toon01–10 set. No toon → white (no ramp modulation), MMD behavior.
+      let toonTexture: GPUTexture | null = null
+      if (mat.sharedToon) {
+        toonTexture = this.defaultToonRampTexture
+      } else if (mat.toonTextureIndex >= 0) {
+        toonTexture = await loadTextureByIndex(mat.toonTextureIndex)
+      }
+
+      const materialUniformBuffer = this.createMaterialUniformBuffer(prefix + mat.name, mat, sphereMode, headBoneIndex)
       inst.gpuBuffers.push(materialUniformBuffer)
 
       const textureView = diffuseTexture.createView()
@@ -2972,6 +3107,8 @@ export class Engine {
         entries: [
           { binding: 0, resource: textureView },
           { binding: 1, resource: { buffer: materialUniformBuffer } },
+          { binding: 2, resource: (toonTexture ?? this.fallbackMaterialTexture).createView() },
+          { binding: 3, resource: (sphereTexture ?? this.fallbackMaterialTexture).createView() },
         ],
       })
 
@@ -3055,13 +3192,28 @@ export class Engine {
     }
   }
 
-  private createMaterialUniformBuffer(label: string, alpha: number, diffuseColor: [number, number, number]): GPUBuffer {
-    // Matches WGSL `struct MaterialUniforms { diffuseColor: vec3f, alpha: f32 }` — 16 bytes.
-    const data = new Float32Array(4)
-    data[0] = diffuseColor[0]
-    data[1] = diffuseColor[1]
-    data[2] = diffuseColor[2]
-    data[3] = alpha
+  private createMaterialUniformBuffer(
+    label: string,
+    mat: Material,
+    sphereMode: number,
+    headBoneIndex: number,
+  ): GPUBuffer {
+    // Matches the WGSL MaterialUniforms struct in common.ts — 64 bytes
+    // (diffuse+alpha | ambient+shininess | specular+sphereMode | headIdx+pad).
+    const data = new Float32Array(16)
+    data[0] = mat.diffuse[0]
+    data[1] = mat.diffuse[1]
+    data[2] = mat.diffuse[2]
+    data[3] = mat.diffuse[3]
+    data[4] = mat.ambient[0]
+    data[5] = mat.ambient[1]
+    data[6] = mat.ambient[2]
+    data[7] = mat.shininess
+    data[8] = mat.specular[0]
+    data[9] = mat.specular[1]
+    data[10] = mat.specular[2]
+    data[11] = sphereMode
+    data[12] = headBoneIndex
     return this.createUniformBuffer(`material uniform: ${label}`, data)
   }
 
@@ -3878,6 +4030,7 @@ export class Engine {
     if (preset === "body") return this.bodyPipeline
     if (preset === "eye") return this.eyePipeline
     if (preset === "stockings") return this.stockingsPipeline
+    if (preset === "mmd_classic") return this.mmdClassicPipeline
     return this.modelPipeline
   }
 

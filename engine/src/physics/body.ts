@@ -12,10 +12,14 @@ export class RigidBodyStore {
   readonly angularVelocities: Float32Array // 3*N
 
   readonly invMass: Float32Array // N (0 for static / kinematic)
-  // Scalar isotropic inverse inertia. The full 3×3 tensor would be more
-  // accurate but PMX shapes are roughly compact, and a single I⁻¹ is far
-  // better than reusing invMass (which under-rotates by 100–1000×).
-  readonly invInertia: Float32Array
+  // Full anisotropic inertia. Local diagonal (body frame, Bullet's shape
+  // formulas) plus the per-substep world tensor I⁻¹ = R·diag·Rᵀ (9 floats
+  // row-major, symmetric). The old scalar approximation deposited constraint
+  // impulses into rotational modes at the wrong rates on elongated capsules
+  // (5:1 skirt/hair bodies are ~25× anisotropic), leaving cloth with several
+  // times the kinetic energy real Bullet retains — visible as perpetual boil.
+  readonly invInertiaLocal: Float32Array // 3*N
+  readonly invInertiaWorld: Float32Array // 9*N
   readonly linearDamping: Float32Array
   readonly angularDamping: Float32Array
   readonly type: Uint8Array
@@ -58,7 +62,8 @@ export class RigidBodyStore {
     this.linearVelocities = new Float32Array(N * 3)
     this.angularVelocities = new Float32Array(N * 3)
     this.invMass = new Float32Array(N)
-    this.invInertia = new Float32Array(N)
+    this.invInertiaLocal = new Float32Array(N * 3)
+    this.invInertiaWorld = new Float32Array(N * 9)
     this.linearDamping = new Float32Array(N)
     this.angularDamping = new Float32Array(N)
     this.type = new Uint8Array(N)
@@ -92,7 +97,7 @@ export class RigidBodyStore {
 
       const dynamic = rb.type === RigidbodyType.Dynamic && rb.mass > 0
       this.invMass[i] = dynamic ? 1 / rb.mass : 0
-      this.invInertia[i] = dynamic ? computeInvInertia(rb) : 0
+      if (dynamic) computeLocalInvInertia(rb, this.invInertiaLocal, i * 3)
       this.linearDamping[i] = rb.linearDamping
       this.angularDamping[i] = rb.angularDamping
       this.type[i] = rb.type
@@ -106,6 +111,47 @@ export class RigidBodyStore {
       this.size[i * 3 + 0] = rb.size.x
       this.size[i * 3 + 1] = rb.size.y
       this.size[i * 3 + 2] = rb.size.z
+    }
+  }
+
+  // Refresh I⁻¹_world = R·diag(invInertiaLocal)·Rᵀ for every dynamic body.
+  // Called once per substep before constraint setup (orientations are
+  // constant during a solve).
+  updateInvInertiaWorld(): void {
+    const N = this.count
+    const ori = this.orientations
+    const local = this.invInertiaLocal
+    const W = this.invInertiaWorld
+    const invMass = this.invMass
+
+    for (let i = 0; i < N; i++) {
+      if (invMass[i] <= 0) continue
+      const i3 = i * 3
+      const i4 = i * 4
+      const i9 = i * 9
+      const qx = ori[i4 + 0], qy = ori[i4 + 1], qz = ori[i4 + 2], qw = ori[i4 + 3]
+      const x2 = qx + qx, y2 = qy + qy, z2 = qz + qz
+      const xx = qx * x2, yy = qy * y2, zz = qz * z2
+      const xy = qx * y2, xz = qx * z2, yz = qy * z2
+      const wx = qw * x2, wy = qw * y2, wz = qw * z2
+      // R columns (column-major rotation matrix)
+      const r00 = 1 - (yy + zz), r01 = xy - wz, r02 = xz + wy
+      const r10 = xy + wz, r11 = 1 - (xx + zz), r12 = yz - wx
+      const r20 = xz - wy, r21 = yz + wx, r22 = 1 - (xx + yy)
+      const d0 = local[i3 + 0], d1 = local[i3 + 1], d2 = local[i3 + 2]
+      // W = R·diag·Rᵀ (symmetric)
+      const a0 = r00 * d0, a1 = r01 * d1, a2 = r02 * d2
+      const b0 = r10 * d0, b1 = r11 * d1, b2 = r12 * d2
+      const c0 = r20 * d0, c1 = r21 * d1, c2 = r22 * d2
+      const w00 = a0 * r00 + a1 * r01 + a2 * r02
+      const w01 = a0 * r10 + a1 * r11 + a2 * r12
+      const w02 = a0 * r20 + a1 * r21 + a2 * r22
+      const w11 = b0 * r10 + b1 * r11 + b2 * r12
+      const w12 = b0 * r20 + b1 * r21 + b2 * r22
+      const w22 = c0 * r20 + c1 * r21 + c2 * r22
+      W[i9 + 0] = w00; W[i9 + 1] = w01; W[i9 + 2] = w02
+      W[i9 + 3] = w01; W[i9 + 4] = w11; W[i9 + 5] = w12
+      W[i9 + 6] = w02; W[i9 + 7] = w12; W[i9 + 8] = w22
     }
   }
 
@@ -287,36 +333,48 @@ const _scratchA = new Float32Array(16)
 const _scratchB = new Float32Array(16)
 const _scratchC = new Float32Array(16)
 
-// Scalar isotropic inverse inertia. Returns 0 for static bodies (mass = 0).
-//   Sphere:  I = (2/5)·m·r²
-//   Box:     I = (1/3)·m·max(a,b,c)²
-//   Capsule: I = (1/12)·m·(3r² + h²)  (cylinder transverse axis)
-function computeInvInertia(rb: Rigidbody): number {
+// Diagonal local inverse inertia, matching Bullet's calculateLocalInertia
+// per shape (so behavior tracks Ammo-based MMD engines):
+//   Sphere:  I = (2/5)·m·r² on every axis
+//   Box:     Ix = m/12·(ly²+lz²), … with l = full extents (2·half)
+//   Capsule: Bullet's bounding-box approximation of the Y-axis capsule
+//            (lx = lz = 2r, ly = h + 2r)
+function computeLocalInvInertia(rb: Rigidbody, out: Float32Array, o: number): void {
   const m = rb.mass
-  if (m <= 0) return 0
-  let I: number
+  if (m <= 0) return
+  let Ix: number, Iy: number, Iz: number
   switch (rb.shape) {
     case RigidbodyShape.Sphere: {
-      const r = rb.size.x
-      I = 0.4 * m * r * r
+      const I = 0.4 * m * rb.size.x * rb.size.x
+      Ix = I; Iy = I; Iz = I
       break
     }
     case RigidbodyShape.Box: {
-      // Largest half-extent so the long axis isn't under-rotated.
-      const a = Math.max(rb.size.x, rb.size.y, rb.size.z)
-      I = (1 / 3) * m * a * a
+      const lx2 = 4 * rb.size.x * rb.size.x
+      const ly2 = 4 * rb.size.y * rb.size.y
+      const lz2 = 4 * rb.size.z * rb.size.z
+      Ix = (m / 12) * (ly2 + lz2)
+      Iy = (m / 12) * (lx2 + lz2)
+      Iz = (m / 12) * (lx2 + ly2)
       break
     }
     case RigidbodyShape.Capsule: {
-      const r = rb.size.x
-      const h = rb.size.y
-      I = (1 / 12) * m * (3 * r * r + h * h)
+      const lx = 2 * rb.size.x
+      const ly = rb.size.y + 2 * rb.size.x
+      const lx2 = lx * lx
+      const ly2 = ly * ly
+      Ix = (m / 12) * (ly2 + lx2)
+      Iy = (m / 12) * (lx2 + lx2)
+      Iz = (m / 12) * (lx2 + ly2)
       break
     }
-    default:
-      I = m
+    default: {
+      Ix = m; Iy = m; Iz = m
+    }
   }
-  return I > 0 ? 1 / I : 0
+  out[o + 0] = Ix > 0 ? 1 / Ix : 0
+  out[o + 1] = Iy > 0 ? 1 / Iy : 0
+  out[o + 2] = Iz > 0 ? 1 / Iz : 0
 }
 
 function identity16(out: Float32Array, offset: number): void {

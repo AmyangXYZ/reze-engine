@@ -31,6 +31,34 @@ const MAX_ANGULAR_CORRECTION_VEL = 30 // rad/s
 // instead of as a hard velocity snap.
 const LIMIT_SOFTNESS_LINEAR = 0.7
 const LIMIT_SOFTNESS_ANGULAR = 0.5
+
+// Bullet spring-motor velocity factor: target velocity = (fps/numIterations)
+// × spring force, with the applied impulse clamped to the real spring force
+// k·|err|·dt. The big target makes the row deliver its full physical force
+// every substep (stiff, MMD-authored hold); the clamp keeps it from ever
+// exceeding it (no energy pumping). Matches btGeneric6DofSpringConstraint
+// with springDamping=1 and the default 10 solver iterations.
+const SPRING_SOLVER_ITERATIONS = 10
+// Slack on the spring impulse clamp: MMD rigs are authored against Bullet's
+// spring motors, which deliver several times the naive k·err·dt per substep
+// through their solver-row impulse bounds. Bounded slack keeps the hold
+// stiff (breasts/hair rest near the authored pose) while still capping the
+// energy any spring can inject per substep (the slow-boil guard).
+const SPRING_FORCE_SLACK = 4
+
+// ERP scale for loop-closing constraints (see buildConstraints: joints that
+// close a cycle in the joint graph, e.g. the horizontal ring welds of
+// cross-linked skirt lattices). A loop over-determines positions — when
+// contacts push the lattice, the ring's errors cannot all reach zero, and
+// full-rate corrections chase each other around the cycle as violent
+// chatter. Loop edges keep shape at a fraction of the correction rate while
+// the spanning-tree chains stay stiff.
+const LOOP_ERP_SCALE = 1.0
+// Loop-edge LOCKED axes are converted to force-clamped springs instead of
+// weld rows: an equality row on a cycle fights the other cycle edges at any
+// ERP (the velocity system is over-determined too). A spring bounded by its
+// real force k·|err|·dt holds the ring's shape elastically without fighting.
+const LOOP_SPRING_K = 900
 // Angular limit violations below this switch to per-axis euler rows; above
 // it, the single geodesic row takes over (see setupConstraint).
 const GEODESIC_THRESHOLD = 0.5 // rad
@@ -58,21 +86,24 @@ export function solveConstraints(
   const lv = store.linearVelocities
   const av = store.angularVelocities
   const invMass = store.invMass
-  const invInertia = store.invInertia
+
+  // World-space inverse inertia tensors for this substep's poses.
+  store.updateInvInertiaWorld()
+  const W = store.invInertiaWorld
 
   for (let c = 0; c < constraints.length; c++) {
     setupConstraint(constraints[c], store, dt, invDt)
   }
   for (let ci = 0; ci < contacts.count; ci++) {
-    setupContactRow(contacts.get(ci), lv, av, invMass, invInertia)
+    setupContactRow(contacts.get(ci), lv, av, invMass, W)
   }
 
   for (let iter = 0; iter < iterations; iter++) {
     for (let c = 0; c < constraints.length; c++) {
-      iterateConstraint(constraints[c], lv, av, invMass, invInertia)
+      iterateConstraint(constraints[c], lv, av, invMass)
     }
     for (let ci = 0; ci < contacts.count; ci++) {
-      iterateContactRow(contacts.get(ci), lv, av, invMass, invInertia)
+      iterateContactRow(contacts.get(ci), lv, av, invMass)
     }
   }
 }
@@ -89,11 +120,14 @@ function setupConstraint(
   const b = con.bodyB
   const imA = store.invMass[a]
   const imB = store.invMass[b]
-  const iiA = store.invInertia[a]
-  const iiB = store.invInertia[b]
+  const W = store.invInertiaWorld
+  const a9 = a * 9
+  const b9 = b * 9
 
   con.cacheSkip = imA === 0 && imB === 0
   if (con.cacheSkip) return
+
+  const erpScale = con.isLoop ? LOOP_ERP_SCALE : 1.0
 
   buildBodyMat(store, a, _bodyMatA)
   buildBodyMat(store, b, _bodyMatB)
@@ -152,12 +186,20 @@ function setupConstraint(
     const cBx = rBy * axz - rBz * axy
     const cBy = rBz * axx - rBx * axz
     const cBz = rBx * axy - rBy * axx
-    cA[o + 0] = cAx; cA[o + 1] = cAy; cA[o + 2] = cAz
-    cB[o + 0] = cBx; cB[o + 1] = cBy; cB[o + 2] = cBz
+    // Tensor-multiplied lever crosses: cache I⁻¹·(r×ax) for application;
+    // denominator = (r×ax)ᵀ·I⁻¹·(r×ax).
+    const wAx = W[a9 + 0] * cAx + W[a9 + 1] * cAy + W[a9 + 2] * cAz
+    const wAy = W[a9 + 3] * cAx + W[a9 + 4] * cAy + W[a9 + 5] * cAz
+    const wAz = W[a9 + 6] * cAx + W[a9 + 7] * cAy + W[a9 + 8] * cAz
+    const wBx = W[b9 + 0] * cBx + W[b9 + 1] * cBy + W[b9 + 2] * cBz
+    const wBy = W[b9 + 3] * cBx + W[b9 + 4] * cBy + W[b9 + 5] * cBz
+    const wBz = W[b9 + 6] * cBx + W[b9 + 7] * cBy + W[b9 + 8] * cBz
+    cA[o + 0] = wAx; cA[o + 1] = wAy; cA[o + 2] = wAz
+    cB[o + 0] = wBx; cB[o + 1] = wBy; cB[o + 2] = wBz
 
     const denom = imA + imB +
-      (cAx * cAx + cAy * cAy + cAz * cAz) * iiA +
-      (cBx * cBx + cBy * cBy + cBz * cBz) * iiB
+      (cAx * wAx + cAy * wAy + cAz * wAz) +
+      (cBx * wBx + cBy * wBy + cBz * wBz)
     jac[i] = denom > 0 ? 1 / denom : 0
 
     const lo = con.linearMin[i]
@@ -174,7 +216,7 @@ function setupConstraint(
       if (lo === hi) active = 1
       else if (err !== 0) active = 2
       if (err !== 0) {
-        target = -err * STOP_ERP * invDt
+        target = -err * STOP_ERP * erpScale * invDt
         if (target > MAX_LINEAR_CORRECTION_VEL) target = MAX_LINEAR_CORRECTION_VEL
         else if (target < -MAX_LINEAR_CORRECTION_VEL) target = -MAX_LINEAR_CORRECTION_VEL
       }
@@ -193,8 +235,13 @@ function setupConstraint(
       const k = Math.min(con.springStiffness[i], invDt * invDt)
       const serr = curr - con.equilibriumPoint[i]
       con.cacheLinSpringTarget[i] = -k * serr * dt
+      // Boil guard: per-substep spring impulse bounded by (a slack over) the
+      // physical spring force — unbounded spring drives pump energy through
+      // the euler-axis mis-scale and slowly boil resting cloth.
+      con.cacheLinSpringMaxImp[i] = SPRING_FORCE_SLACK * Math.abs(k * serr) * dt
+      con.cacheLinSpringImp[i] = 0
       con.cacheLinSpringActive[i] = 1
-    } else {
+    } else if (!(lo === hi && con.isLoop)) {
       con.cacheLinSpringActive[i] = 0
     }
   }
@@ -232,8 +279,25 @@ function setupConstraint(
   angAxes[3] = yx; angAxes[4] = yy; angAxes[5] = yz
   angAxes[6] = zx; angAxes[7] = zy; angAxes[8] = zz
 
-  const angDenom = iiA + iiB
-  con.cacheAngJacInv = angDenom > 0 ? 1 / angDenom : 0
+  // Per-axis angular Jacobians with the full tensors: cache I⁻¹·axis per
+  // body plus 1/(axᵀ(I⁻¹A+I⁻¹B)ax) per axis.
+  const angJac = con.cacheAngJacInv
+  const angWAs = con.cacheAngWA
+  const angWBs = con.cacheAngWB
+  for (let i = 0; i < 3; i++) {
+    const o = i * 3
+    const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
+    const wAx = W[a9 + 0] * axx + W[a9 + 1] * axy + W[a9 + 2] * axz
+    const wAy = W[a9 + 3] * axx + W[a9 + 4] * axy + W[a9 + 5] * axz
+    const wAz = W[a9 + 6] * axx + W[a9 + 7] * axy + W[a9 + 8] * axz
+    const wBx = W[b9 + 0] * axx + W[b9 + 1] * axy + W[b9 + 2] * axz
+    const wBy = W[b9 + 3] * axx + W[b9 + 4] * axy + W[b9 + 5] * axz
+    const wBz = W[b9 + 6] * axx + W[b9 + 7] * axy + W[b9 + 8] * axz
+    angWAs[o + 0] = wAx; angWAs[o + 1] = wAy; angWAs[o + 2] = wAz
+    angWBs[o + 0] = wBx; angWBs[o + 1] = wBy; angWBs[o + 2] = wBz
+    const denom = axx * (wAx + wBx) + axy * (wAy + wBy) + axz * (wAz + wBz)
+    angJac[i] = denom > 0 ? 1 / denom : 0
+  }
 
   // Per-axis rows carry only the springs. Sign flip vs linear:
   // d(angDiff)/dt = −(ω_B − ω_A)·ax.
@@ -243,16 +307,17 @@ function setupConstraint(
     const idx = i + 3
     // Springs on locked axes are skipped — the limit row welds those, and
     // double-driving a DOF overshoots every iteration (see the linear loop).
-    if (con.springEnabled[idx] && angDenom > 0 && con.angularMin[i] !== con.angularMax[i]) {
-      // Same deadbeat clamp as the linear springs.
+    if (con.springEnabled[idx] && angJac[i] > 0 && con.angularMin[i] !== con.angularMax[i]) {
       const k = Math.min(con.springStiffness[idx], invDt * invDt)
       const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
       angTgt[i] = k * serr * dt
+      con.cacheAngSpringMaxImp[i] = SPRING_FORCE_SLACK * Math.abs(k * serr) * dt
       angAct[i] = 1
     } else {
       angTgt[i] = 0
       angAct[i] = 0
     }
+    con.cacheAngSpringImp[i] = 0
   }
 
   // Angular limit handling is hybrid. Small violations (the resting-cloth
@@ -263,7 +328,10 @@ function setupConstraint(
   // the asin singularity they chase phantom errors and pump angular velocity
   // into the chain instead of converging.
   con.cacheAngLimActive = 0
-  if (angDenom > 0) {
+  con.cacheAngPAActive[0] = 0
+  con.cacheAngPAActive[1] = 0
+  con.cacheAngPAActive[2] = 0
+  if (imA > 0 || imB > 0) {
     const ex = _angDiffScratch[0], ey = _angDiffScratch[1], ez = _angDiffScratch[2]
     // Free axes (min > max) follow the current angle, i.e. no correction.
     let tx = ex, ty = ey, tz = ez
@@ -273,16 +341,23 @@ function setupConstraint(
     const errX = ex - tx, errY = ey - ty, errZ = ez - tz
     const maxErr = Math.max(Math.abs(errX), Math.abs(errY), Math.abs(errZ))
     if (maxErr > 0 && maxErr < GEODESIC_THRESHOLD) {
-      // Per-axis euler limit rows, folded into the per-axis row set (the
-      // spring impulse clamp must not bound a limit row — lift it).
+      // Per-axis euler limit rows. Locked axes are bilateral joints; ranged
+      // axes are unilateral stops (sign-clamped accumulation) — a bilateral
+      // row on a ranged axis brakes natural recovery every substep and
+      // pumps energy into swinging cloth, and the pump grows WITH solver
+      // convergence (more iterations enforce the brake harder).
       for (let i = 0; i < 3; i++) {
         const err = i === 0 ? errX : i === 1 ? errY : errZ
-        if (err === 0) continue
-        let target = err * STOP_ERP * invDt
+        con.cacheAngPAImp[i] = 0
+        if (err === 0) {
+          con.cacheAngPAActive[i] = 0
+          continue
+        }
+        let target = err * STOP_ERP * erpScale * invDt
         if (target > MAX_ANGULAR_CORRECTION_VEL) target = MAX_ANGULAR_CORRECTION_VEL
         else if (target < -MAX_ANGULAR_CORRECTION_VEL) target = -MAX_ANGULAR_CORRECTION_VEL
-        angTgt[i] += target
-        angAct[i] = 1
+        con.cacheAngPATarget[i] = target
+        con.cacheAngPAActive[i] = con.angularMin[i] === con.angularMax[i] ? 1 : 2
       }
     } else if (maxErr > 0) {
       // Bilateral (equality) if any violated axis is locked — a locked axis
@@ -314,7 +389,17 @@ function setupConstraint(
         lim[0] = _TA[0] * axx + _TA[4] * axy + _TA[8] * axz
         lim[1] = _TA[1] * axx + _TA[5] * axy + _TA[9] * axz
         lim[2] = _TA[2] * axx + _TA[6] * axy + _TA[10] * axz
-        let target = angle * STOP_ERP * invDt
+        const gWA = con.cacheAngLimWA
+        const gWB = con.cacheAngLimWB
+        gWA[0] = W[a9 + 0] * lim[0] + W[a9 + 1] * lim[1] + W[a9 + 2] * lim[2]
+        gWA[1] = W[a9 + 3] * lim[0] + W[a9 + 4] * lim[1] + W[a9 + 5] * lim[2]
+        gWA[2] = W[a9 + 6] * lim[0] + W[a9 + 7] * lim[1] + W[a9 + 8] * lim[2]
+        gWB[0] = W[b9 + 0] * lim[0] + W[b9 + 1] * lim[1] + W[b9 + 2] * lim[2]
+        gWB[1] = W[b9 + 3] * lim[0] + W[b9 + 4] * lim[1] + W[b9 + 5] * lim[2]
+        gWB[2] = W[b9 + 6] * lim[0] + W[b9 + 7] * lim[1] + W[b9 + 8] * lim[2]
+        const gDenom = lim[0] * (gWA[0] + gWB[0]) + lim[1] * (gWA[1] + gWB[1]) + lim[2] * (gWA[2] + gWB[2])
+        con.cacheAngLimJacInv = gDenom > 0 ? 1 / gDenom : 0
+        let target = angle * STOP_ERP * erpScale * invDt
         if (target > MAX_ANGULAR_CORRECTION_VEL) target = MAX_ANGULAR_CORRECTION_VEL
         con.cacheAngLimTarget = target
         con.cacheAngLimActive = bilateral ? 1 : 2
@@ -330,7 +415,6 @@ function iterateConstraint(
   lv: Float32Array,
   av: Float32Array,
   invMass: Float32Array,
-  invInertia: Float32Array,
 ): void {
   if (con.cacheSkip) return
   const a = con.bodyA
@@ -339,8 +423,6 @@ function iterateConstraint(
   const bi = b * 3
   const imA = invMass[a]
   const imB = invMass[b]
-  const iiA = invInertia[a]
-  const iiB = invInertia[b]
 
   // Linear axes — relVel at the offset point: v_pivot = v_CG + ω × r.
   const lA = con.cacheLeverA
@@ -366,6 +448,8 @@ function iterateConstraint(
 
   const sprAct = con.cacheLinSpringActive
   const sprTgt = con.cacheLinSpringTarget
+  const sprMax = con.cacheLinSpringMaxImp
+  const sprImp = con.cacheLinSpringImp
   const limImp = con.cacheLinLimitImp
   for (let i = 0; i < 3; i++) {
     if (!act[i] && !sprAct[i]) continue
@@ -393,12 +477,23 @@ function iterateConstraint(
     }
 
     // Spring row: velocity-target drive; the deadbeat k-clamp at setup
-    // bounds its aggression. relVel is refreshed with the limit impulse
-    // applied just above (j·denom = j / jac) — driving the spring off the
-    // stale value double-corrects the DOF and overshoots every iteration.
+    // bounds its aggression, and maxImp bounds loop-edge springs by their
+    // real force. relVel is refreshed with the limit impulse applied just
+    // above (j·denom = j / jac) — driving the spring off the stale value
+    // double-corrects the DOF and overshoots every iteration.
     if (sprAct[i]) {
       const relVelNow = j !== 0 ? relVel + j / jac[i] : relVel
-      j += (sprTgt[i] - relVelNow) * jac[i]
+      let dImp = (sprTgt[i] - relVelNow) * jac[i]
+      const max = sprMax[i]
+      if (max !== Infinity) {
+        const old = sprImp[i]
+        let next = old + dImp
+        if (next > max) next = max
+        else if (next < -max) next = -max
+        dImp = next - old
+        sprImp[i] = next
+      }
+      j += dImp
     }
 
     if (j === 0) continue
@@ -406,47 +501,98 @@ function iterateConstraint(
       lv[ai + 0] -= j * imA * axx
       lv[ai + 1] -= j * imA * axy
       lv[ai + 2] -= j * imA * axz
-      av[ai + 0] -= j * iiA * cA[o + 0]
-      av[ai + 1] -= j * iiA * cA[o + 1]
-      av[ai + 2] -= j * iiA * cA[o + 2]
+      av[ai + 0] -= j * cA[o + 0]
+      av[ai + 1] -= j * cA[o + 1]
+      av[ai + 2] -= j * cA[o + 2]
     }
     if (imB > 0) {
       lv[bi + 0] += j * imB * axx
       lv[bi + 1] += j * imB * axy
       lv[bi + 2] += j * imB * axz
-      av[bi + 0] += j * iiB * cB[o + 0]
-      av[bi + 1] += j * iiB * cB[o + 1]
-      av[bi + 2] += j * iiB * cB[o + 2]
+      av[bi + 0] += j * cB[o + 0]
+      av[bi + 1] += j * cB[o + 1]
+      av[bi + 2] += j * cB[o + 2]
     }
   }
 
   // Angular axes — relAv = ω_B − ω_A.
-  const angJacInv = con.cacheAngJacInv
-  if (angJacInv === 0) return
   const angAxes = con.cacheAngAxes
+  const angJac = con.cacheAngJacInv
+  const angWAs = con.cacheAngWA
+  const angWBs = con.cacheAngWB
   const angTgt = con.cacheAngTargetVel
   const angAct = con.cacheAngActive
   const dax = av[bi + 0] - av[ai + 0]
   const day = av[bi + 1] - av[ai + 1]
   const daz = av[bi + 2] - av[ai + 2]
+  const angSprMax = con.cacheAngSpringMaxImp
+  const angSprImp = con.cacheAngSpringImp
   for (let i = 0; i < 3; i++) {
     if (!angAct[i]) continue
     const o = i * 3
     const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
     const relAv = dax * axx + day * axy + daz * axz
-    // Spring drive (deadbeat-clamped at setup) plus, for small violations,
-    // the folded per-axis limit correction.
-    const j = (angTgt[i] - relAv) * angJacInv
-    if (j === 0) continue
-    if (iiA > 0) {
-      av[ai + 0] -= j * iiA * axx
-      av[ai + 1] -= j * iiA * axy
-      av[ai + 2] -= j * iiA * axz
+    let j = (angTgt[i] - relAv) * angJac[i]
+    {
+      const max = angSprMax[i]
+      const old = angSprImp[i]
+      let next = old + j
+      if (next > max) next = max
+      else if (next < -max) next = -max
+      j = next - old
+      angSprImp[i] = next
     }
-    if (iiB > 0) {
-      av[bi + 0] += j * iiB * axx
-      av[bi + 1] += j * iiB * axy
-      av[bi + 2] += j * iiB * axz
+    if (j === 0) continue
+    if (imA > 0) {
+      av[ai + 0] -= j * angWAs[o + 0]
+      av[ai + 1] -= j * angWAs[o + 1]
+      av[ai + 2] -= j * angWAs[o + 2]
+    }
+    if (imB > 0) {
+      av[bi + 0] += j * angWBs[o + 0]
+      av[bi + 1] += j * angWBs[o + 1]
+      av[bi + 2] += j * angWBs[o + 2]
+    }
+  }
+
+  // Per-axis angular limit rows (small-violation regime), on the derived
+  // euler axes. Sign convention matches the springs: positive target reduces
+  // positive error via d(angDiff)/dt = −(ω_B − ω_A)·ax.
+  const paAct = con.cacheAngPAActive
+  if (paAct[0] || paAct[1] || paAct[2]) {
+    const paTgt = con.cacheAngPATarget
+    const paImp = con.cacheAngPAImp
+    for (let i = 0; i < 3; i++) {
+      if (!paAct[i]) continue
+      const o = i * 3
+      const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
+      const relAv =
+        (av[bi + 0] - av[ai + 0]) * axx +
+        (av[bi + 1] - av[ai + 1]) * axy +
+        (av[bi + 2] - av[ai + 2]) * axz
+      const target = paTgt[i]
+      // Locked axes (act 1) are welds — full gain, like the 0.16.3 fold;
+      // softness only tempers the unilateral stops.
+      const soft = paAct[i] === 2 ? LIMIT_SOFTNESS_ANGULAR : 1.0
+      let j = soft * (target - relAv) * angJac[i]
+      if (paAct[i] === 2) {
+        const old = paImp[i]
+        let next = old + j
+        if (target > 0 ? next < 0 : next > 0) next = 0
+        j = next - old
+        paImp[i] = next
+      }
+      if (j === 0) continue
+      if (imA > 0) {
+        av[ai + 0] -= j * angWAs[o + 0]
+        av[ai + 1] -= j * angWAs[o + 1]
+        av[ai + 2] -= j * angWAs[o + 2]
+      }
+      if (imB > 0) {
+        av[bi + 0] += j * angWBs[o + 0]
+        av[bi + 1] += j * angWBs[o + 1]
+        av[bi + 2] += j * angWBs[o + 2]
+      }
     }
   }
 
@@ -461,7 +607,7 @@ function iterateConstraint(
       (av[bi + 0] - av[ai + 0]) * nx +
       (av[bi + 1] - av[ai + 1]) * ny +
       (av[bi + 2] - av[ai + 2]) * nz
-    let j = LIMIT_SOFTNESS_ANGULAR * (con.cacheAngLimTarget - relAv) * angJacInv
+    let j = LIMIT_SOFTNESS_ANGULAR * (con.cacheAngLimTarget - relAv) * con.cacheAngLimJacInv
     if (con.cacheAngLimActive === 2) {
       const old = con.cacheAngLimImp
       let next = old + j
@@ -470,15 +616,17 @@ function iterateConstraint(
       con.cacheAngLimImp = next
     }
     if (j !== 0) {
-      if (iiA > 0) {
-        av[ai + 0] -= j * iiA * nx
-        av[ai + 1] -= j * iiA * ny
-        av[ai + 2] -= j * iiA * nz
+      const gWA = con.cacheAngLimWA
+      const gWB = con.cacheAngLimWB
+      if (imA > 0) {
+        av[ai + 0] -= j * gWA[0]
+        av[ai + 1] -= j * gWA[1]
+        av[ai + 2] -= j * gWA[2]
       }
-      if (iiB > 0) {
-        av[bi + 0] += j * iiB * nx
-        av[bi + 1] += j * iiB * ny
-        av[bi + 2] += j * iiB * nz
+      if (imB > 0) {
+        av[bi + 0] += j * gWB[0]
+        av[bi + 1] += j * gWB[1]
+        av[bi + 2] += j * gWB[2]
       }
     }
   }
@@ -492,30 +640,36 @@ function setupContactRow(
   lv: Float32Array,
   av: Float32Array,
   invMass: Float32Array,
-  invInertia: Float32Array,
+  W: Float32Array,
 ): void {
   const ai = c.bodyA * 3
   const bi = c.bodyB * 3
+  const a9 = c.bodyA * 9
+  const b9 = c.bodyB * 9
   const imA = invMass[c.bodyA]
   const imB = invMass[c.bodyB]
-  const iiA = invInertia[c.bodyA]
-  const iiB = invInertia[c.bodyB]
   const rAx = c.rAx, rAy = c.rAy, rAz = c.rAz
   const rBx = c.rBx, rBy = c.rBy, rBz = c.rBz
   const nx = c.nx, ny = c.ny, nz = c.nz
 
-  // Normal Jacobian.
+  // Normal Jacobian. Cached vectors are tensor-multiplied I⁻¹·(r×n).
   const cAxN = rAy * nz - rAz * ny
   const cAyN = rAz * nx - rAx * nz
   const cAzN = rAx * ny - rAy * nx
   const cBxN = rBy * nz - rBz * ny
   const cByN = rBz * nx - rBx * nz
   const cBzN = rBx * ny - rBy * nx
+  const wAxN = W[a9 + 0] * cAxN + W[a9 + 1] * cAyN + W[a9 + 2] * cAzN
+  const wAyN = W[a9 + 3] * cAxN + W[a9 + 4] * cAyN + W[a9 + 5] * cAzN
+  const wAzN = W[a9 + 6] * cAxN + W[a9 + 7] * cAyN + W[a9 + 8] * cAzN
+  const wBxN = W[b9 + 0] * cBxN + W[b9 + 1] * cByN + W[b9 + 2] * cBzN
+  const wByN = W[b9 + 3] * cBxN + W[b9 + 4] * cByN + W[b9 + 5] * cBzN
+  const wBzN = W[b9 + 6] * cBxN + W[b9 + 7] * cByN + W[b9 + 8] * cBzN
   const denomN = imA + imB +
-    (cAxN * cAxN + cAyN * cAyN + cAzN * cAzN) * iiA +
-    (cBxN * cBxN + cByN * cByN + cBzN * cBzN) * iiB
-  c.cAxN = cAxN; c.cAyN = cAyN; c.cAzN = cAzN
-  c.cBxN = cBxN; c.cByN = cByN; c.cBzN = cBzN
+    (cAxN * wAxN + cAyN * wAyN + cAzN * wAzN) +
+    (cBxN * wBxN + cByN * wByN + cBzN * wBzN)
+  c.cAxN = wAxN; c.cAyN = wAyN; c.cAzN = wAzN
+  c.cBxN = wBxN; c.cByN = wByN; c.cBzN = wBzN
   c.jacInvN = denomN > 0 ? 1 / denomN : 0
 
   // Restitution reference, captured from initial relVelN.
@@ -555,11 +709,17 @@ function setupContactRow(
   const cBxT1 = rBy * t1z - rBz * t1y
   const cByT1 = rBz * t1x - rBx * t1z
   const cBzT1 = rBx * t1y - rBy * t1x
+  const wAxT1 = W[a9 + 0] * cAxT1 + W[a9 + 1] * cAyT1 + W[a9 + 2] * cAzT1
+  const wAyT1 = W[a9 + 3] * cAxT1 + W[a9 + 4] * cAyT1 + W[a9 + 5] * cAzT1
+  const wAzT1 = W[a9 + 6] * cAxT1 + W[a9 + 7] * cAyT1 + W[a9 + 8] * cAzT1
+  const wBxT1 = W[b9 + 0] * cBxT1 + W[b9 + 1] * cByT1 + W[b9 + 2] * cBzT1
+  const wByT1 = W[b9 + 3] * cBxT1 + W[b9 + 4] * cByT1 + W[b9 + 5] * cBzT1
+  const wBzT1 = W[b9 + 6] * cBxT1 + W[b9 + 7] * cByT1 + W[b9 + 8] * cBzT1
   const denomT1 = imA + imB +
-    (cAxT1 * cAxT1 + cAyT1 * cAyT1 + cAzT1 * cAzT1) * iiA +
-    (cBxT1 * cBxT1 + cByT1 * cByT1 + cBzT1 * cBzT1) * iiB
-  c.cAxT1 = cAxT1; c.cAyT1 = cAyT1; c.cAzT1 = cAzT1
-  c.cBxT1 = cBxT1; c.cByT1 = cByT1; c.cBzT1 = cBzT1
+    (cAxT1 * wAxT1 + cAyT1 * wAyT1 + cAzT1 * wAzT1) +
+    (cBxT1 * wBxT1 + cByT1 * wByT1 + cBzT1 * wBzT1)
+  c.cAxT1 = wAxT1; c.cAyT1 = wAyT1; c.cAzT1 = wAzT1
+  c.cBxT1 = wBxT1; c.cByT1 = wByT1; c.cBzT1 = wBzT1
   c.jacInvT1 = denomT1 > 0 ? 1 / denomT1 : 0
 
   const cAxT2 = rAy * t2z - rAz * t2y
@@ -568,11 +728,17 @@ function setupContactRow(
   const cBxT2 = rBy * t2z - rBz * t2y
   const cByT2 = rBz * t2x - rBx * t2z
   const cBzT2 = rBx * t2y - rBy * t2x
+  const wAxT2 = W[a9 + 0] * cAxT2 + W[a9 + 1] * cAyT2 + W[a9 + 2] * cAzT2
+  const wAyT2 = W[a9 + 3] * cAxT2 + W[a9 + 4] * cAyT2 + W[a9 + 5] * cAzT2
+  const wAzT2 = W[a9 + 6] * cAxT2 + W[a9 + 7] * cAyT2 + W[a9 + 8] * cAzT2
+  const wBxT2 = W[b9 + 0] * cBxT2 + W[b9 + 1] * cByT2 + W[b9 + 2] * cBzT2
+  const wByT2 = W[b9 + 3] * cBxT2 + W[b9 + 4] * cByT2 + W[b9 + 5] * cBzT2
+  const wBzT2 = W[b9 + 6] * cBxT2 + W[b9 + 7] * cByT2 + W[b9 + 8] * cBzT2
   const denomT2 = imA + imB +
-    (cAxT2 * cAxT2 + cAyT2 * cAyT2 + cAzT2 * cAzT2) * iiA +
-    (cBxT2 * cBxT2 + cByT2 * cByT2 + cBzT2 * cBzT2) * iiB
-  c.cAxT2 = cAxT2; c.cAyT2 = cAyT2; c.cAzT2 = cAzT2
-  c.cBxT2 = cBxT2; c.cByT2 = cByT2; c.cBzT2 = cBzT2
+    (cAxT2 * wAxT2 + cAyT2 * wAyT2 + cAzT2 * wAzT2) +
+    (cBxT2 * wBxT2 + cByT2 * wByT2 + cBzT2 * wBzT2)
+  c.cAxT2 = wAxT2; c.cAyT2 = wAyT2; c.cAzT2 = wAzT2
+  c.cBxT2 = wBxT2; c.cByT2 = wByT2; c.cBzT2 = wBzT2
   c.jacInvT2 = denomT2 > 0 ? 1 / denomT2 : 0
 }
 
@@ -584,13 +750,10 @@ function iterateContactRow(
   lv: Float32Array,
   av: Float32Array,
   invMass: Float32Array,
-  invInertia: Float32Array,
 ): void {
   const imA = invMass[c.bodyA]
   const imB = invMass[c.bodyB]
   if (imA === 0 && imB === 0) return
-  const iiA = invInertia[c.bodyA]
-  const iiB = invInertia[c.bodyB]
   const ai = c.bodyA * 3, bi = c.bodyB * 3
   const rAx = c.rAx, rAy = c.rAy, rAz = c.rAz
   const rBx = c.rBx, rBy = c.rBy, rBz = c.rBz
@@ -622,17 +785,17 @@ function iterateContactRow(
         lv[ai + 0] -= dImpN * imA * nx
         lv[ai + 1] -= dImpN * imA * ny
         lv[ai + 2] -= dImpN * imA * nz
-        av[ai + 0] -= dImpN * iiA * cAxN
-        av[ai + 1] -= dImpN * iiA * cAyN
-        av[ai + 2] -= dImpN * iiA * cAzN
+        av[ai + 0] -= dImpN * cAxN
+        av[ai + 1] -= dImpN * cAyN
+        av[ai + 2] -= dImpN * cAzN
       }
       if (imB > 0) {
         lv[bi + 0] += dImpN * imB * nx
         lv[bi + 1] += dImpN * imB * ny
         lv[bi + 2] += dImpN * imB * nz
-        av[bi + 0] += dImpN * iiB * cBxN
-        av[bi + 1] += dImpN * iiB * cByN
-        av[bi + 2] += dImpN * iiB * cBzN
+        av[bi + 0] += dImpN * cBxN
+        av[bi + 1] += dImpN * cByN
+        av[bi + 2] += dImpN * cBzN
       }
     }
   }
@@ -656,13 +819,13 @@ function iterateContactRow(
     c, ai, bi, dvx2, dvy2, dvz2,
     c.t1x, c.t1y, c.t1z,
     c.cAxT1, c.cAyT1, c.cAzT1, c.cBxT1, c.cByT1, c.cBzT1,
-    c.jacInvT1, muNormal, imA, imB, iiA, iiB, lv, av, 1,
+    c.jacInvT1, muNormal, imA, imB, lv, av, 1,
   )
   applyFrictionTangent(
     c, ai, bi, dvx2, dvy2, dvz2,
     c.t2x, c.t2y, c.t2z,
     c.cAxT2, c.cAyT2, c.cAzT2, c.cBxT2, c.cByT2, c.cBzT2,
-    c.jacInvT2, muNormal, imA, imB, iiA, iiB, lv, av, 2,
+    c.jacInvT2, muNormal, imA, imB, lv, av, 2,
   )
 }
 
@@ -674,7 +837,7 @@ function applyFrictionTangent(
   cAx: number, cAy: number, cAz: number,
   cBx: number, cBy: number, cBz: number,
   jacInv: number, muNormal: number,
-  imA: number, imB: number, iiA: number, iiB: number,
+  imA: number, imB: number,
   lv: Float32Array, av: Float32Array,
   slot: 1 | 2,
 ): void {
@@ -693,17 +856,17 @@ function applyFrictionTangent(
     lv[ai + 0] -= dImp * imA * tx
     lv[ai + 1] -= dImp * imA * ty
     lv[ai + 2] -= dImp * imA * tz
-    av[ai + 0] -= dImp * iiA * cAx
-    av[ai + 1] -= dImp * iiA * cAy
-    av[ai + 2] -= dImp * iiA * cAz
+    av[ai + 0] -= dImp * cAx
+    av[ai + 1] -= dImp * cAy
+    av[ai + 2] -= dImp * cAz
   }
   if (imB > 0) {
     lv[bi + 0] += dImp * imB * tx
     lv[bi + 1] += dImp * imB * ty
     lv[bi + 2] += dImp * imB * tz
-    av[bi + 0] += dImp * iiB * cBx
-    av[bi + 1] += dImp * iiB * cBy
-    av[bi + 2] += dImp * iiB * cBz
+    av[bi + 0] += dImp * cBx
+    av[bi + 1] += dImp * cBy
+    av[bi + 2] += dImp * cBz
   }
 }
 
