@@ -8,6 +8,7 @@ import type { Diagnostic, ExposedParam, GraphNode, SocketValue, StyleGraph } fro
 import { NODE_REGISTRY, canConvert, convert, fmtValue, literalFits } from "./registry"
 import type { NodeSpec, SockT } from "./registry"
 import { assembleModule } from "./slots"
+import type { AlphaMode, RenderClass } from "./render-class"
 
 export type CompileOptions = {
   /** Fold exposed params to their defaults as consts (no StyleUniforms binding).
@@ -16,6 +17,11 @@ export type CompileOptions = {
   /** Override the graph output with any node's socket — Blender's node-preview
    *  (Ctrl+Shift+Click viewer) workflow for the editor. */
   previewNode?: { node: string; socket: string }
+  /** Pass-integration class the fs() shell is assembled for (stencil/cull/gate). The
+   *  graph is pure shading; the group supplies this. Default "auto". */
+  renderClass?: RenderClass
+  /** Alpha-handling axis, orthogonal to renderClass. Default "opaque". */
+  alphaMode?: AlphaMode
 }
 
 /** UBO slot for one exposed param: write `value` at style.p[vec4Index] (+ component). */
@@ -337,6 +343,6 @@ export function compileGraph(graph: StyleGraph, opts: CompileOptions = {}): Comp
   lines.push(`  let final_color = ${outputExpr(out, "color")}; // @node:${out.node}`)
 
   const fsBody = lines.join("\n")
-  const wgsl = assembleModule(graph.slot, fsBody, usesStyle.current)
+  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current)
   return { ok: true, wgsl, fsBody, slotMap, diagnostics, prunedNodes }
 }

@@ -9,7 +9,7 @@ import type { StyleGraph } from "../schema"
 export const METAL_GRAPH: StyleGraph = {
   version: 1,
   name: "Metal",
-  slot: "metal",
+  tags: ["metal"],
   nodes: [
     { id: "tex", type: "texture" },
     { id: "geo", type: "geometry" },

@@ -12,7 +12,7 @@ import type { StyleGraph } from "../schema"
 export const EYE_GRAPH: StyleGraph = {
   version: 1,
   name: "Eye",
-  slot: "eye",
+  tags: ["eye"],
   nodes: [
     { id: "tex", type: "texture" },
     {

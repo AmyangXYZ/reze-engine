@@ -51,7 +51,7 @@ test("default graph matches the hand-written default shader (Blender P-BSDF temp
       "  let final_color = n_principled; // @node:principled",
     ].join("\n"),
   )
-  // default slot: plain epilogue, no stencil overrides
+  // default renderClass: plain epilogue, no stencil overrides
   assert.ok(!r.wgsl.includes("IS_OVER_EYES"))
 })
 
@@ -146,8 +146,8 @@ test("body graph matches the hand-written shader (key terms)", () => {
   for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
 })
 
-test("stockings graph: radiance in graph, hashed alpha in slot template", () => {
-  const r = compileGraph(STOCKINGS_GRAPH, { inlineParams: true })
+test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
+  const r = compileGraph(STOCKINGS_GRAPH, { inlineParams: true, alphaMode: "hashed" })
   assert.equal(r.ok, true)
   assert.deepEqual(r.diagnostics, [])
   const expect = [
@@ -166,8 +166,8 @@ test("stockings graph: radiance in graph, hashed alpha in slot template", () => 
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
 })
 
-test("eye graph: default Principled + emission, rear-gate in slot template", () => {
-  const r = compileGraph(EYE_GRAPH, { inlineParams: true })
+test("eye graph: default Principled + emission, rear-gate from renderClass", () => {
+  const r = compileGraph(EYE_GRAPH, { inlineParams: true, renderClass: "eye" })
   assert.equal(r.ok, true)
   assert.deepEqual(r.diagnostics, [])
   assert.equal(
@@ -226,8 +226,8 @@ test("hair inline body matches the hand-written shader (snapshot)", () => {
   assert.equal(r.fsBody, HAIR_BODY_INLINE)
 })
 
-test("hair slot template: over-eyes override present, style block absent when inlined", () => {
-  const r = compileGraph(HAIR_GRAPH, { inlineParams: true })
+test("hair renderClass: over-eyes override present, style block absent when inlined", () => {
+  const r = compileGraph(HAIR_GRAPH, { inlineParams: true, renderClass: "hair" })
   assert.ok(r.wgsl.includes("override IS_OVER_EYES: bool = false;"))
   assert.ok(r.wgsl.includes("if (IS_OVER_EYES) { outAlpha = alpha * 0.25; }"))
   assert.ok(!r.wgsl.includes("StyleUniforms"))
@@ -282,7 +282,6 @@ test("exposing a hue slider disables the hue_sat_id specialization", () => {
   const graph = {
     version: 1,
     name: "t",
-    slot: "default",
     nodes: [
       { id: "tex", type: "texture" },
       { id: "hs", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.2, value: 1.0, fac: 1.0 } },
@@ -303,7 +302,6 @@ test("mix with literal fac 0/1 collapses to a passthrough", () => {
   const graph = {
     version: 1,
     name: "t",
-    slot: "default",
     nodes: [
       { id: "tex", type: "texture" },
       { id: "m0", type: "mix/blend", inputs: { fac: 0, b: [1, 0, 0] } },
@@ -324,7 +322,6 @@ test("cycles are rejected with the cycle named", () => {
   const graph = {
     version: 1,
     name: "t",
-    slot: "default",
     nodes: [
       { id: "a", type: "mix/blend", inputs: { b: [0, 0, 0] } },
       { id: "b", type: "mix/blend", inputs: { b: [0, 0, 0] } },
@@ -344,7 +341,6 @@ test("validation names the offending node", () => {
   const graph = {
     version: 1,
     name: "t",
-    slot: "default",
     nodes: [
       { id: "tex", type: "texture" },
       { id: "hs", type: "hue_sat" },
@@ -371,7 +367,6 @@ test("vector cannot implicitly feed a float socket (not a Blender conversion)", 
   const graph = {
     version: 1,
     name: "t",
-    slot: "default",
     nodes: [
       { id: "geo", type: "geometry" },
       { id: "m", type: "math/clamp01" },

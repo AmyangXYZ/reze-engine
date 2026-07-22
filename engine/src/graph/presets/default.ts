@@ -9,7 +9,7 @@ import type { StyleGraph } from "../schema"
 export const DEFAULT_GRAPH: StyleGraph = {
   version: 1,
   name: "Principled BSDF",
-  slot: "default",
+  tags: ["default"],
   nodes: [
     { id: "tex", type: "texture" },
     {

@@ -1,52 +1,24 @@
-// Per-slot WGSL templates. The graph computes only `final_color`; everything the slot
-// owns — texture sample, MMD alpha semantics, discard, lighting context, FSOut/mask
-// writes, and built-in pass effects like hair's over-eyes stencil variant — lives here,
-// always on, graph-invisible. Mirrors the hand-written material shaders line-for-line.
+// fs() shell assembly. The graph computes only `final_color`; everything around it —
+// texture sample, alpha discard, lighting context, built-in gates, and the FSOut/mask
+// write — is composed here from two orthogonal, engine-owned axes:
+//   RenderClass ("auto" | "eye" | "hair")  — stencil/cull/draw-order + eye rear-gate +
+//                                             hair over-eyes alpha. See render-class.ts.
+//   AlphaMode   ("opaque" | "hashed")       — standard threshold discard vs Wyman hashed.
+// A style group supplies both; this file turns them into the WGSL shell around fsBody.
+// See docs/style-groups-spec.md §5, §7.
 
 import { NODES_WGSL } from "../shaders/materials/nodes"
 import { COMMON_MATERIAL_PRELUDE_WGSL } from "../shaders/materials/common"
-import type { MaterialPreset } from "../engine"
+import type { AlphaMode, RenderClass } from "./render-class"
 
-export type SlotTemplate = {
-  /** Module-scope declarations (pipeline-override constants, helper fns). */
-  decls: string
-  /** Optional replacement for the standard fs() prelude (custom alpha semantics). */
-  prelude?: string
-  /** Tail of fs(): consumes `final_color` + template locals, writes FSOut. */
-  epilogue: string
-}
+// ── Module-scope declarations ──
+// hair: the over-eyes pipeline-override constant (a second pipeline is compiled with
+// IS_OVER_EYES=1). hashed: the Wyman & McGuire object-space hashed-alpha helpers.
+const HAIR_OVER_EYES_DECL = `override IS_OVER_EYES: bool = false;
 
-const DEFAULT_EPILOGUE = `  var out: FSOut;
-  out.color = vec4f(final_color, alpha);
-  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
-  return out;
 `
 
-const DEFAULT_TEMPLATE: SlotTemplate = { decls: "", epilogue: DEFAULT_EPILOGUE }
-
-// Hair's built-in over-eyes effect (see hair.ts): the engine compiles two pipeline
-// variants from the same module — normal opaque hair, and a stencil-matched re-draw
-// at 25% alpha so eyes read through the silhouette. Always on for the hair slot.
-const HAIR_TEMPLATE: SlotTemplate = {
-  decls: `override IS_OVER_EYES: bool = false;
-
-`,
-  epilogue: `  var outAlpha = alpha;
-  if (IS_OVER_EYES) { outAlpha = alpha * 0.25; }
-
-  var out: FSOut;
-  out.color = vec4f(final_color, outAlpha);
-  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
-  return out;
-`,
-}
-
-// Stockings' built-in alpha behavior (see stockings.ts): Wyman & McGuire hashed
-// alpha testing on bind-pose restPos replaces the standard threshold discard —
-// sort-independent through self-overlap, dither pinned to the fabric. The graph
-// only computes final_color; the hash gate and the alpha=1 output are slot-owned.
-const STOCKINGS_TEMPLATE: SlotTemplate = {
-  decls: `fn _hash3d_wm(a: vec3f) -> f32 {
+const HASHED_ALPHA_DECLS = `fn _hash3d_wm(a: vec3f) -> f32 {
   return _hash33(a).x * 0.5 + 0.5;
 }
 fn hashed_alpha_threshold(co: vec3f) -> f32 {
@@ -71,89 +43,48 @@ fn hashed_alpha_threshold(co: vec3f) -> f32 {
   return clamp(threshold, 1e-6, 1.0);
 }
 
-`,
-  prelude: `@fragment fn fs(input: VertexOutput) -> FSOut {
-  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
-  // Hashed alpha test (EEVEE "Hashed" blend) instead of the standard threshold.
-  let alpha = material.alpha * tex_s.a;
-  if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }
+`
 
-  let n = safe_normal(input.normal);
-  let v = normalize(camera.viewPos - input.worldPos);
-  let l = -light.lights[0].direction.xyz;
-  let sun = light.lights[0].color.xyz * light.lights[0].color.w;
-  let amb = light.ambientColor.xyz;
-  let shadow = sampleShadow(input.worldPos, n);
-  let tex_color = tex_s.rgb;
-
-`,
-  epilogue: `  var out: FSOut;
-  out.color = vec4f(final_color, 1.0);
-  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
-  return out;
-`,
-}
-
-// Eye's built-in rear-view gate (see eye.ts): open-shell PMX heads don't occlude
-// the eye from behind, so it would draw (and stamp the see-through stencil) through
-// the back of the head. Gate by camera-vs-face hemisphere via the 頭 bone's skinning
-// matrix. Discarding here drops color, depth, and the stencil stamp together. The
-// stencil-stamp pipeline state + front-face cull are slot-owned in createSlotPipeline;
-// the graph only computes the eye's shading (Principled + emission).
-const EYE_TEMPLATE: SlotTemplate = {
-  decls: "",
-  prelude: `@fragment fn fs(input: VertexOutput) -> FSOut {
-  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
-  let alpha = material.alpha * tex_s.a;
-  if (alpha < 0.001) { discard; }
-
-  let n = safe_normal(input.normal);
-  let v = normalize(camera.viewPos - input.worldPos);
-
+// Eye's built-in rear-view gate (open-shell PMX heads don't occlude the eye from behind,
+// so gate by camera-vs-face hemisphere via the 頭 bone; discard drops color + depth +
+// the stencil stamp together). Injected between the view vectors and the lighting setup.
+const EYE_REAR_GATE = `
   if (material.headBoneIndex >= 0.0) {
     let hm = skinMats[u32(material.headBoneIndex)];
     let faceDir = -normalize(hm[2].xyz);
     if (dot(faceDir, v) < -0.15) { discard; }
   }
+`
 
-  let l = -light.lights[0].direction.xyz;
-  let sun = light.lights[0].color.xyz * light.lights[0].color.w;
-  let amb = light.ambientColor.xyz;
-  let shadow = sampleShadow(input.worldPos, n);
-  let tex_color = tex_s.rgb;
-
-`,
-  epilogue: DEFAULT_EPILOGUE,
-}
-
-export const SLOT_TEMPLATES: Partial<Record<MaterialPreset, SlotTemplate>> = {
-  hair: HAIR_TEMPLATE,
-  stockings: STOCKINGS_TEMPLATE,
-  eye: EYE_TEMPLATE,
-}
-
-export function slotTemplate(slot: MaterialPreset): SlotTemplate {
-  return SLOT_TEMPLATES[slot] ?? DEFAULT_TEMPLATE
-}
-
-// Adjust-tier uniforms — fixed 16-vec4f block (256 B) so the single shared material
-// bind group layout serves every graph; non-graph presets bind a zero buffer.
+// ── Adjust-tier uniforms — fixed 16-vec4f block (256 B) shared by the single material
+// bind group layout; non-graph draws bind a zero buffer. ──
 export const STYLE_UNIFORMS_WGSL = `struct StyleUniforms { p: array<vec4f, 16> };
 @group(2) @binding(4) var<uniform> style: StyleUniforms;
 
 `
 
-// fs() prelude — identical to the hand-written materials so template locals keep the
-// exact names the registry's context nodes and emit functions reference.
-const FS_PRELUDE = `@fragment fn fs(input: VertexOutput) -> FSOut {
+function decls(renderClass: RenderClass, alphaMode: AlphaMode): string {
+  return (alphaMode === "hashed" ? HASHED_ALPHA_DECLS : "") + (renderClass === "hair" ? HAIR_OVER_EYES_DECL : "")
+}
+
+// fs() header up to and including the graph body's context locals. Composed so the
+// hand-written material shaders' local names (tex_color, n, v, l, sun, amb, shadow) are
+// preserved exactly — the registry's context nodes and emit functions reference them.
+function prelude(renderClass: RenderClass, alphaMode: AlphaMode): string {
+  const discard =
+    alphaMode === "hashed"
+      ? "  if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"
+      : "  if (alpha < 0.001) { discard; }"
+  const gate = renderClass === "eye" ? EYE_REAR_GATE : ""
+  return `@fragment fn fs(input: VertexOutput) -> FSOut {
   let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
-  // MMD alpha semantics: material alpha × texture alpha (hair/lace textures cut
-  // their shapes in the alpha channel).
+  // MMD alpha semantics: material alpha × texture alpha.
   let alpha = material.alpha * tex_s.a;
-  if (alpha < 0.001) { discard; }
+${discard}
 
   let n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);
+${gate}
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;
   let amb = light.ambientColor.xyz;
@@ -161,18 +92,50 @@ const FS_PRELUDE = `@fragment fn fs(input: VertexOutput) -> FSOut {
   let tex_color = tex_s.rgb;
 
 `
+}
 
-export function assembleModule(slot: MaterialPreset, fsBody: string, includeStyleUniforms: boolean): string {
-  const tmpl = slotTemplate(slot)
+// Tail of fs(): consumes `final_color` + locals, writes FSOut. hashed forces output
+// alpha to 1 (the discard already did the cutout); hair scales alpha for the over-eyes
+// pass when IS_OVER_EYES is compiled true.
+function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
+  const alphaBase = alphaMode === "hashed" ? "1.0" : "alpha"
+  if (renderClass === "hair") {
+    return `  var outAlpha = ${alphaBase};
+  if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
+
+  var out: FSOut;
+  out.color = vec4f(final_color, outAlpha);
+  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+  return out;
+`
+  }
+  return `  var out: FSOut;
+  out.color = vec4f(final_color, ${alphaBase});
+  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+  return out;
+`
+}
+
+/**
+ * Assemble a full WGSL module: shared node library + bindings/skinning prelude, optional
+ * StyleUniforms, render-class/alpha-mode declarations, the composed fs() shell, and the
+ * graph's node body.
+ */
+export function assembleModule(
+  renderClass: RenderClass,
+  alphaMode: AlphaMode,
+  fsBody: string,
+  includeStyleUniforms: boolean,
+): string {
   return (
     NODES_WGSL +
     COMMON_MATERIAL_PRELUDE_WGSL +
     (includeStyleUniforms ? STYLE_UNIFORMS_WGSL : "") +
-    tmpl.decls +
-    (tmpl.prelude ?? FS_PRELUDE) +
+    decls(renderClass, alphaMode) +
+    prelude(renderClass, alphaMode) +
     fsBody +
     "\n" +
-    tmpl.epilogue +
+    epilogue(renderClass, alphaMode) +
     "}\n"
   )
 }

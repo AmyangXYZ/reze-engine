@@ -8,7 +8,7 @@ import type { StyleGraph } from "../schema"
 export const CLOTH_ROUGH_GRAPH: StyleGraph = {
   version: 1,
   name: "Rough Cloth",
-  slot: "cloth_rough",
+  tags: ["cloth_rough"],
   nodes: [
     { id: "tex", type: "texture" },
     { id: "geo", type: "geometry" },

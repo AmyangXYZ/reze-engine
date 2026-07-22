@@ -11,7 +11,7 @@ import type { StyleGraph } from "../schema"
 export const FACE_GRAPH: StyleGraph = {
   version: 1,
   name: "Face",
-  slot: "face",
+  tags: ["face"],
   nodes: [
     { id: "tex", type: "texture" },
     { id: "geo", type: "geometry" },

@@ -15,7 +15,7 @@ import type { StyleGraph } from "../schema"
 export const HAIR_GRAPH: StyleGraph = {
   version: 1,
   name: "Hair",
-  slot: "hair",
+  tags: ["hair"],
   nodes: [
     { id: "tex", type: "texture" },
     { id: "geo", type: "geometry" },

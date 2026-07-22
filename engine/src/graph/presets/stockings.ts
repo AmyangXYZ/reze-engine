@@ -11,7 +11,7 @@ import type { StyleGraph } from "../schema"
 export const STOCKINGS_GRAPH: StyleGraph = {
   version: 1,
   name: "Stockings",
-  slot: "stockings",
+  tags: ["stockings"],
   nodes: [
     { id: "tex", type: "texture" },
     { id: "geo", type: "geometry" },

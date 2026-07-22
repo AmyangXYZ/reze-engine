@@ -8,7 +8,7 @@ import type { StyleGraph } from "../schema"
 export const BODY_GRAPH: StyleGraph = {
   version: 1,
   name: "Body",
-  slot: "body",
+  tags: ["body"],
   nodes: [
     { id: "tex", type: "texture" },
     { id: "geo", type: "geometry" },

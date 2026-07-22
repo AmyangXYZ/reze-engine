@@ -41,6 +41,22 @@ import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
 import type { Diagnostic, StyleGraph } from "./graph/schema"
+import type { AlphaMode, RenderClass } from "./graph/render-class"
+import type {
+  ApplyStyleGroupResult,
+  ApplyStyleGroupsResult,
+  GroupDiagnostic,
+  StyleGroup,
+} from "./graph/style-group"
+import { DEFAULT_GRAPH } from "./graph/presets/default"
+import { FACE_GRAPH } from "./graph/presets/face"
+import { HAIR_GRAPH } from "./graph/presets/hair"
+import { BODY_GRAPH } from "./graph/presets/body"
+import { EYE_GRAPH } from "./graph/presets/eye"
+import { STOCKINGS_GRAPH } from "./graph/presets/stockings"
+import { METAL_GRAPH } from "./graph/presets/metal"
+import { CLOTH_SMOOTH_GRAPH } from "./graph/presets/cloth_smooth"
+import { CLOTH_ROUGH_GRAPH } from "./graph/presets/cloth_rough"
 
 // Material preset dispatch. Consumers supply a MaterialPresetMap assigning material names
 // to presets; unmapped materials fall back to "default" (Principled BSDF).
@@ -125,6 +141,22 @@ function resolvePreset(materialName: string, map: MaterialPresetMap | undefined)
   return "mmd_classic"
 }
 
+// Default-group recipe per preset label: the shipped graph + its natural pass-integration
+// (renderClass, alphaMode). This is the auto-default-groups mapping (docs §8) — the same
+// label→integration knowledge the old fixed slots encoded, now producing editable groups.
+// mmd_classic has no entry — those materials stay ungrouped (hand-shader path).
+const PRESET_GROUP_INFO: Partial<Record<MaterialPreset, { graph: StyleGraph; renderClass: RenderClass; alphaMode: AlphaMode }>> = {
+  default: { graph: DEFAULT_GRAPH, renderClass: "auto", alphaMode: "opaque" },
+  face: { graph: FACE_GRAPH, renderClass: "auto", alphaMode: "opaque" },
+  hair: { graph: HAIR_GRAPH, renderClass: "hair", alphaMode: "opaque" },
+  body: { graph: BODY_GRAPH, renderClass: "auto", alphaMode: "opaque" },
+  eye: { graph: EYE_GRAPH, renderClass: "eye", alphaMode: "opaque" },
+  stockings: { graph: STOCKINGS_GRAPH, renderClass: "auto", alphaMode: "hashed" },
+  metal: { graph: METAL_GRAPH, renderClass: "auto", alphaMode: "opaque" },
+  cloth_smooth: { graph: CLOTH_SMOOTH_GRAPH, renderClass: "auto", alphaMode: "opaque" },
+  cloth_rough: { graph: CLOTH_ROUGH_GRAPH, renderClass: "auto", alphaMode: "opaque" },
+}
+
 // Map a WGSL compile-error line back to the graph node whose `let` produced it —
 // the compiler tags every generated line with a trailing `// @node:<id>` marker.
 function nodeIdForWgslLine(wgsl: string, lineNum: number): string | undefined {
@@ -136,20 +168,21 @@ function nodeIdForWgslLine(wgsl: string, lineNum: number): string | undefined {
   return undefined
 }
 
-// An applied style graph on a preset slot: the swapped pipeline(s) plus the
-// slider→UBO map that setStyleParam consults for instant uniform writes.
-type StyleOverride = {
+// A compiled + installed style group on a model: the swapped pipeline(s), the group's
+// StyleUniforms buffer, the slider→UBO map setStyleParam consults, and the resolved
+// render-class (draw-order + over-eyes participation). Keyed per-model by group id.
+type GroupInstall = {
+  group: StyleGroup
+  renderClass: RenderClass
+  alphaMode: AlphaMode
   pipeline: GPURenderPipeline
-  /** Hair slot only: the stencil-matched IS_OVER_EYES=true variant. */
+  /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
+  uniformBuffer: GPUBuffer
   slotMap: StyleSlot[]
-}
-
-/** Result of Engine.applyStyleGraph — compile/pipeline diagnostics + slider slot map. */
-export type ApplyStyleResult = {
-  ok: boolean
-  diagnostics: Diagnostic[]
-  slotMap: StyleSlot[]
+  /** Serialized (graph + renderClass + alphaMode) — lets applyStyleGroups skip recompiling
+   *  an unchanged group. */
+  signature: string
 }
 
 export type RaycastCallback = (
@@ -295,8 +328,13 @@ interface DrawCall {
   bindGroup: GPUBindGroup
   materialName: string
   preset: ResolvedMaterialPreset
-  // Bindings 0–3 kept so the bind group can be rebuilt when setMaterialPresets moves
-  // this material to a different slot (binding 4 must follow the slot's style buffer).
+  // Style group this material belongs to, or null (ungrouped → hand-shader path).
+  // Outline/ground draw calls are never grouped and leave this null.
+  groupId: string | null
+  // Bindings 0–3 kept so the bind group can be rebuilt when the material's group changes
+  // (binding 4 must follow the group's style buffer, or the zero buffer when ungrouped).
+  // Present only for material draw calls (opaque/transparent) — the grouping walk skips
+  // any draw call without it.
   baseBindGroupEntries?: GPUBindGroupEntry[]
 }
 
@@ -329,6 +367,13 @@ interface ModelInstance {
   physics: RezePhysics | null
   vertexBufferNeedsUpdate: boolean
   gpuMorph: GpuMorph | null
+  // Style groups applied to this model: group id → compiled install.
+  styleGroups: Map<string, GroupInstall>
+  // Material name → group id (each material in ≤1 group). Drives draw-call assignment.
+  materialToGroup: Map<string, string>
+  // Per-group compile generation — an async compile finishing after a newer edit/remove
+  // on the same id is discarded (stale-write guard).
+  styleGroupGen: Map<string, number>
 }
 
 // Per-model GPU vertex-morph compute state. Present only for models with vertex morphs.
@@ -378,18 +423,12 @@ export class Engine {
   private hairOverEyesPipeline!: GPURenderPipeline
   private stockingsPipeline!: GPURenderPipeline
   private mmdClassicPipeline!: GPURenderPipeline
-  // ── Style graph runtime (graph/ compiler output applied to preset slots) ──
-  // Per-slot 256 B StyleUniforms buffers (group(2) binding(4)). Created eagerly so
-  // material bind groups can reference them at model-load time regardless of whether
-  // a graph is ever applied; mmd_classic materials bind the shared zero buffer.
-  private styleBuffers = new Map<MaterialPreset, GPUBuffer>()
+  // ── Style group runtime ──
+  // Shared 256 B zero StyleUniforms buffer (group(2) binding(4)) bound by every ungrouped
+  // material; grouped materials rebind to their group's own buffer (per-model, in the
+  // ModelInstance's styleGroups map). See docs/style-groups-spec.md §6.
   private zeroStyleBuffer!: GPUBuffer
-  // Applied graphs: slot → swapped pipeline(s) + the slider→UBO map for setStyleParam.
-  private styleOverrides = new Map<MaterialPreset, StyleOverride>()
-  // Per-slot generation counter — an async compile that finishes after a newer
-  // applyStyleGraph/resetStyleSlot call on the same slot is discarded (stale guard).
-  private styleGenerations = new Map<MaterialPreset, number>()
-  // Stashed at createPipelines so applyStyleGraph can rebuild slot pipelines later.
+  // Stashed at createPipelines so group pipelines can be compiled later.
   private mainPipelineLayout!: GPUPipelineLayout
   private sceneTargets!: GPUColorTargetState[]
   private fullVertexBufferLayouts!: GPUVertexBufferLayout[]
@@ -1197,33 +1236,13 @@ export class Engine {
       ],
     })
 
-    // Per-slot style buffers + shared zero buffer (mmd_classic / never-styled slots).
+    // Shared zero StyleUniforms buffer — bound by every ungrouped material; grouped
+    // materials rebind binding(4) to their group's own buffer (per model, per group).
     this.zeroStyleBuffer = this.device.createBuffer({
       label: "style uniforms (zero)",
       size: 256,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
-    const ALL_PRESETS: MaterialPreset[] = [
-      "default",
-      "face",
-      "hair",
-      "body",
-      "eye",
-      "stockings",
-      "metal",
-      "cloth_smooth",
-      "cloth_rough",
-    ]
-    for (const preset of ALL_PRESETS) {
-      this.styleBuffers.set(
-        preset,
-        this.device.createBuffer({
-          label: `style uniforms (${preset})`,
-          size: 256,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        }),
-      )
-    }
 
     const mainPipelineLayout = this.device.createPipelineLayout({
       label: "main pipeline layout",
@@ -2509,6 +2528,7 @@ export class Engine {
       bindGroup: this.groundShadowBindGroup!,
       materialName: "Ground",
       preset: "cloth_rough",
+      groupId: null,
     }
   }
 
@@ -2566,11 +2586,13 @@ export class Engine {
       this.resizeObserver = null
     }
 
-    // Style graph runtime: per-slot uniform buffers + swapped pipelines (pipelines
-    // are GC'd; buffers need explicit destroy).
-    this.styleOverrides.clear()
-    for (const buf of this.styleBuffers.values()) buf.destroy()
-    this.styleBuffers.clear()
+    // Style group runtime: per-group uniform buffers (pipelines are GC'd; buffers need
+    // explicit destroy). Per-model group buffers are torn down in removeModel; the shared
+    // zero buffer is engine-owned.
+    this.forEachInstance((inst) => {
+      for (const install of inst.styleGroups.values()) install.uniformBuffer.destroy()
+      inst.styleGroups.clear()
+    })
     this.zeroStyleBuffer?.destroy()
   }
 
@@ -2629,6 +2651,8 @@ export class Engine {
     for (const buf of inst.gpuBuffers) {
       buf.destroy()
     }
+    // Per-group StyleUniforms buffers aren't in gpuBuffers (allocated post-load).
+    for (const install of inst.styleGroups.values()) install.uniformBuffer.destroy()
     this.modelInstances.delete(name)
   }
 
@@ -2677,22 +2701,15 @@ export class Engine {
     const inst = this.modelInstances.get(modelName)
     if (!inst) return
     inst.materialPresets = presets
-    for (const dc of inst.drawCalls) {
-      const preset = resolvePreset(dc.materialName, presets)
-      if (preset === dc.preset) continue
-      dc.preset = preset
-      // Rebind so binding(4) follows the new slot's style buffer.
-      if (dc.baseBindGroupEntries)
-        dc.bindGroup = this.createMaterialBindGroup(`material: ${dc.materialName}`, dc.baseBindGroupEntries, preset)
-    }
+    // Only updates the ungrouped fallback preset; grouped materials render via their
+    // group regardless. binding(4) is unaffected (ungrouped always binds the zero
+    // buffer; grouped bindings are owned by applyStyleGroups).
+    for (const dc of inst.drawCalls) dc.preset = resolvePreset(dc.materialName, presets)
   }
 
-  private createMaterialBindGroup(
-    label: string,
-    baseEntries: GPUBindGroupEntry[],
-    preset: ResolvedMaterialPreset,
-  ): GPUBindGroup {
-    const styleBuffer = preset === "mmd_classic" ? this.zeroStyleBuffer : this.styleBuffers.get(preset)!
+  // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
+  // (the group's buffer when grouped, or the shared zero buffer when ungrouped).
+  private createMaterialBindGroup(label: string, baseEntries: GPUBindGroupEntry[], styleBuffer: GPUBuffer): GPUBindGroup {
     return this.device.createBindGroup({
       label,
       layout: this.mainPerMaterialBindGroupLayout,
@@ -2941,6 +2958,9 @@ export class Engine {
       physics,
       vertexBufferNeedsUpdate: false,
       gpuMorph,
+      styleGroups: new Map(),
+      materialToGroup: new Map(),
+      styleGroupGen: new Map(),
     }
     await this.setupMaterialsForInstance(inst)
     this.modelInstances.set(name, inst)
@@ -3228,7 +3248,12 @@ export class Engine {
         { binding: 2, resource: (toonTexture ?? this.fallbackMaterialTexture).createView() },
         { binding: 3, resource: (sphereTexture ?? this.fallbackMaterialTexture).createView() },
       ]
-      const bindGroup = this.createMaterialBindGroup(`${prefix}material: ${mat.name}`, baseBindGroupEntries, preset)
+      // Ungrouped at load — binding(4) = zero buffer. applyStyleGroups rebinds grouped ones.
+      const bindGroup = this.createMaterialBindGroup(
+        `${prefix}material: ${mat.name}`,
+        baseBindGroupEntries,
+        this.zeroStyleBuffer,
+      )
 
       const type: DrawCallType = isTransparent ? "transparent" : "opaque"
       inst.drawCalls.push({
@@ -3238,6 +3263,7 @@ export class Engine {
         bindGroup,
         materialName: mat.name,
         preset,
+        groupId: null,
         baseBindGroupEntries,
       })
 
@@ -3267,6 +3293,7 @@ export class Engine {
           bindGroup: outlineBindGroup,
           materialName: mat.name,
           preset,
+          groupId: null,
         })
       }
 
@@ -3285,29 +3312,14 @@ export class Engine {
       currentIndexOffset += indexCount
     }
 
-    // Sort so the opaque bucket is emitted in the order the stencil-based
-    // see-through-hair effect requires: {non-hair, non-eye} → {eye} → {hair}.
-    // Eye writes stencil=EYE_VALUE; hair's pipeline stencil-tests "not equal" so
-    // it skips eye pixels; a follow-up hairOverEyes pass (see renderOneModel)
-    // re-fills those skipped pixels alpha-blended. Array.sort is stable in
-    // ES2019+, so within a bucket the PMX material order is preserved.
-    const typeOrder: Record<DrawCallType, number> = {
-      opaque: 0,
-      "opaque-outline": 1,
-      transparent: 2,
-      "transparent-outline": 3,
-      ground: 4,
-    }
-    const presetRank = (p: ResolvedMaterialPreset): number => (p === "hair" ? 2 : p === "eye" ? 1 : 0)
-    inst.drawCalls.sort((a, b) => {
-      const ta = typeOrder[a.type] - typeOrder[b.type]
-      if (ta !== 0) return ta
-      return presetRank(a.preset) - presetRank(b.preset)
-    })
-
-    for (const d of inst.drawCalls) {
-      if (d.type === "opaque") inst.shadowDrawCalls.push(d)
-    }
+    // Sort so the opaque bucket is emitted in the order the stencil-based see-through-hair
+    // effect requires: {non-hair, non-eye} → {eye} → {hair}. Eye writes stencil=EYE_VALUE;
+    // hair stencil-tests "not equal" and skips eye pixels; the follow-up hairOverEyes pass
+    // re-fills them alpha-blended. sortDrawCalls also (re)builds shadowDrawCalls. All draws
+    // are ungrouped at setup, so the rank comes from the preset; applyStyleGroups re-sorts
+    // by render-class when groups are assigned. Array.sort is stable → PMX order preserved
+    // within a bucket.
+    this.sortDrawCalls(inst)
   }
 
   private createMaterialUniformBuffer(
@@ -4144,36 +4156,201 @@ export class Engine {
     }
   }
 
-  // ─── Style graph API ──────────────────────────────────────────────
-  // Two-tier edit model: applyStyleGraph = topology tier (async compile + pipeline
-  // swap, previous look keeps rendering until the new pipeline is ready or on any
-  // error); setStyleParam = adjust tier (uniform write, instant, no pipeline touch).
+  // ─── Style group API ──────────────────────────────────────────────
+  // Two-tier edits: applyStyleGroups/upsert = topology (async compile + pipeline swap,
+  // fallback-on-error, per-group stale guard); setStyleParam = adjust (instant uniform
+  // write). Overlay-first: grouped materials render via their group's compiled graph;
+  // ungrouped ones keep the hand-written preset path. See docs/style-groups-spec.md.
+
+  /** Read a model's current style groups (including auto-created defaults) for editor
+   *  round-trip. The host owns group state; this is bootstrap/read, not a second store. */
+  getStyleGroups(modelName: string): StyleGroup[] {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return []
+    return [...inst.styleGroups.values()].map((g) => g.group)
+  }
 
   /**
-   * Compile a style graph and swap it onto its preset slot. Fallback-on-error: the
-   * slot's current pipeline keeps rendering unless compilation fully succeeds.
-   * Slider defaults are written to the slot's StyleUniforms buffer on success.
+   * Create default style groups from the model's material→preset resolution
+   * (`setMaterialPresets` map first, then name hints), so a freshly loaded model comes up
+   * editably grouped with zero interaction. Materials resolving to `mmd_classic` (no map
+   * entry, no hint) stay ungrouped. The returned promise resolves after grouping AND the
+   * async graph compiles, so `getStyleGroups` is populated the moment it resolves. Opt-in:
+   * call it explicitly (typically after `setMaterialPresets`); a bare load stays ungrouped
+   * / byte-identical to before.
    */
-  async applyStyleGraph(graph: StyleGraph, opts?: CompileOptions): Promise<ApplyStyleResult> {
-    const result = compileGraph(graph, opts)
+  async autoStyleGroups(modelName: string): Promise<ApplyStyleGroupsResult> {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return { ok: false, groups: [], unknownMaterials: [], conflicts: [] }
+
+    const buckets = new Map<MaterialPreset, string[]>()
+    for (const dc of inst.drawCalls) {
+      if (!dc.baseBindGroupEntries) continue // material draw calls only (skip outlines)
+      const preset = resolvePreset(dc.materialName, inst.materialPresets)
+      if (preset === "mmd_classic") continue // unmatched → ungrouped
+      const arr = buckets.get(preset) ?? []
+      if (!arr.includes(dc.materialName)) arr.push(dc.materialName)
+      buckets.set(preset, arr)
+    }
+
+    const groups: StyleGroup[] = []
+    for (const [preset, materials] of buckets) {
+      const info = PRESET_GROUP_INFO[preset]
+      if (!info) continue
+      groups.push({
+        id: preset,
+        label: info.graph.name,
+        materials,
+        graph: info.graph,
+        renderClass: info.renderClass,
+        alphaMode: info.alphaMode,
+      })
+    }
+    return this.applyStyleGroups(modelName, groups)
+  }
+
+  /**
+   * Replace a model's full style-group set. Unchanged groups (same graph + renderClass +
+   * alphaMode) keep their pipeline; new/changed ones compile and swap; removed ones are
+   * torn down and their materials revert to the ungrouped hand-shader path. A group whose
+   * compile fails is not installed and its materials stay ungrouped (fallback-on-error).
+   */
+  async applyStyleGroups(modelName: string, groups: StyleGroup[]): Promise<ApplyStyleGroupsResult> {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return { ok: false, groups: [], unknownMaterials: [], conflicts: [] }
+
+    // Whole-set validation: material claims (last group in array order wins), unknowns.
+    const modelMaterials = new Set(inst.drawCalls.map((d) => d.materialName))
+    const claimed = new Map<string, string>()
+    const conflicts = new Set<string>()
+    const unknownMaterials = new Set<string>()
+    for (const g of groups) {
+      for (const m of g.materials) {
+        if (!modelMaterials.has(m)) unknownMaterials.add(m)
+        if (claimed.has(m)) conflicts.add(m)
+        claimed.set(m, g.id)
+      }
+    }
+
+    // Tear down installs no longer present.
+    const nextIds = new Set(groups.map((g) => g.id))
+    for (const [id, install] of inst.styleGroups) {
+      if (!nextIds.has(id)) {
+        inst.styleGroupGen.set(id, (inst.styleGroupGen.get(id) ?? 0) + 1)
+        install.uniformBuffer.destroy()
+        inst.styleGroups.delete(id)
+      }
+    }
+
+    const groupResults: GroupDiagnostic[] = []
+    for (const g of groups) {
+      const r = await this.compileAndInstallGroup(inst, g)
+      groupResults.push({ groupId: g.id, diagnostics: r.diagnostics, ok: r.ok })
+    }
+
+    this.assignDrawCallGroups(inst, claimed)
+    return {
+      ok: groupResults.every((r) => r.ok),
+      groups: groupResults,
+      unknownMaterials: [...unknownMaterials],
+      conflicts: [...conflicts],
+    }
+  }
+
+  /** Add or replace a single style group by id. `opts` may carry a `previewNode` for the
+   *  editor's node-output preview workflow. */
+  async upsertStyleGroup(modelName: string, group: StyleGroup, opts?: CompileOptions): Promise<ApplyStyleGroupResult> {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst)
+      return { ok: false, diagnostics: [{ severity: "error", message: `unknown model "${modelName}"` }], slotMap: [] }
+    const r = await this.compileAndInstallGroup(inst, group, opts)
+    this.assignDrawCallGroups(inst, this.currentClaims(inst))
+    return r
+  }
+
+  /** Remove a style group; its materials revert to the ungrouped hand-shader path. */
+  removeStyleGroup(modelName: string, groupId: string): void {
+    const inst = this.modelInstances.get(modelName)
+    const install = inst?.styleGroups.get(groupId)
+    if (!inst || !install) return
+    inst.styleGroupGen.set(groupId, (inst.styleGroupGen.get(groupId) ?? 0) + 1) // discard in-flight compile
+    install.uniformBuffer.destroy()
+    inst.styleGroups.delete(groupId)
+    this.assignDrawCallGroups(inst, this.currentClaims(inst))
+  }
+
+  /** Clear all style groups on a model — every material returns to the hand-shader path. */
+  resetStyleGroups(modelName: string): void {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return
+    for (const [id, install] of inst.styleGroups) {
+      inst.styleGroupGen.set(id, (inst.styleGroupGen.get(id) ?? 0) + 1)
+      install.uniformBuffer.destroy()
+    }
+    inst.styleGroups.clear()
+    this.assignDrawCallGroups(inst, new Map())
+  }
+
+  /** Instant adjust-tier write: set one exposed slider on a group's applied graph. */
+  setStyleParam(
+    modelName: string,
+    groupId: string,
+    paramId: string,
+    value: number | [number, number, number],
+  ): boolean {
+    const install = this.modelInstances.get(modelName)?.styleGroups.get(groupId)
+    const styleSlot = install?.slotMap.find((s) => s.id === paramId)
+    if (!install || !styleSlot) return false
+    if (styleSlot.kind === "float") {
+      if (typeof value !== "number") return false
+      const offset = styleSlot.vec4Index * 16 + ["x", "y", "z", "w"].indexOf(styleSlot.component!) * 4
+      this.device.queue.writeBuffer(install.uniformBuffer, offset, new Float32Array([value]))
+    } else {
+      if (typeof value === "number") return false
+      this.device.queue.writeBuffer(install.uniformBuffer, styleSlot.vec4Index * 16, new Float32Array(value))
+    }
+    return true
+  }
+
+  // Materials claimed by the model's currently-installed groups (for upsert/remove paths;
+  // applyStyleGroups derives claims from its input array instead).
+  private currentClaims(inst: ModelInstance): Map<string, string> {
+    const claimed = new Map<string, string>()
+    for (const install of inst.styleGroups.values())
+      for (const m of install.group.materials) claimed.set(m, install.group.id)
+    return claimed
+  }
+
+  // Compile a group's graph → WGSL → pipeline(s), install keyed by group id. Reuses the
+  // install (pipeline + uniform buffer) when the graph/integration is byte-unchanged.
+  private async compileAndInstallGroup(
+    inst: ModelInstance,
+    group: StyleGroup,
+    opts?: CompileOptions,
+  ): Promise<ApplyStyleGroupResult> {
+    const renderClass = group.renderClass ?? "auto"
+    const alphaMode = group.alphaMode ?? "opaque"
+    const signature = JSON.stringify({ g: group.graph, rc: renderClass, am: alphaMode, o: opts?.previewNode ?? null })
+    const existing = inst.styleGroups.get(group.id)
+    if (existing && existing.signature === signature) {
+      existing.group = group // refresh def (label/materials) without recompiling
+      return { ok: true, diagnostics: [], slotMap: existing.slotMap }
+    }
+
+    const result = compileGraph(group.graph, { ...opts, renderClass, alphaMode })
     if (!result.ok) return { ok: false, diagnostics: result.diagnostics, slotMap: result.slotMap }
 
-    const slot = graph.slot
-    const generation = (this.styleGenerations.get(slot) ?? 0) + 1
-    this.styleGenerations.set(slot, generation)
+    const generation = (inst.styleGroupGen.get(group.id) ?? 0) + 1
+    inst.styleGroupGen.set(group.id, generation)
 
     this.device.pushErrorScope("validation")
-    const module = this.device.createShaderModule({ label: `style graph: ${graph.name} (${slot})`, code: result.wgsl })
+    const module = this.device.createShaderModule({ label: `style group: ${group.id} (${renderClass})`, code: result.wgsl })
     const info = await module.getCompilationInfo()
     const scopeError = await this.device.popErrorScope()
     const diagnostics = [...result.diagnostics]
     for (const msg of info.messages) {
       if (msg.type !== "error") continue
-      diagnostics.push({
-        severity: "error",
-        nodeId: nodeIdForWgslLine(result.wgsl, msg.lineNum),
-        message: `WGSL: ${msg.message}`,
-      })
+      diagnostics.push({ severity: "error", nodeId: nodeIdForWgslLine(result.wgsl, msg.lineNum), message: `WGSL: ${msg.message}` })
     }
     if (diagnostics.some((d) => d.severity === "error") || scopeError) {
       if (scopeError && !diagnostics.some((d) => d.severity === "error"))
@@ -4184,51 +4361,66 @@ export class Engine {
     let pipeline: GPURenderPipeline
     let overEyesPipeline: GPURenderPipeline | undefined
     try {
-      pipeline = await this.createSlotPipeline(slot, module, false)
-      if (slot === "hair") overEyesPipeline = await this.createSlotPipeline(slot, module, true)
+      pipeline = await this.createRenderClassPipeline(renderClass, module, false)
+      if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true)
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
       return { ok: false, diagnostics, slotMap: result.slotMap }
     }
 
-    // A newer apply/reset on this slot finished (or started) while we compiled.
-    if (this.styleGenerations.get(slot) !== generation) {
+    // Stale guard: a newer compile/remove for this id happened while we awaited.
+    if (inst.styleGroupGen.get(group.id) !== generation) {
       diagnostics.push({ severity: "warning", message: "superseded by a newer edit — result discarded" })
       return { ok: false, diagnostics, slotMap: result.slotMap }
     }
 
-    this.styleOverrides.set(slot, { pipeline, overEyesPipeline, slotMap: result.slotMap })
-    this.writeStyleDefaults(slot, graph, result.slotMap)
+    const uniformBuffer =
+      existing?.uniformBuffer ??
+      this.device.createBuffer({
+        label: `style uniforms: ${group.id}`,
+        size: 256,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+
+    inst.styleGroups.set(group.id, {
+      group,
+      renderClass,
+      alphaMode,
+      pipeline,
+      overEyesPipeline,
+      uniformBuffer,
+      slotMap: result.slotMap,
+      signature,
+    })
+    this.writeGroupDefaults(uniformBuffer, group, result.slotMap)
     return { ok: true, diagnostics, slotMap: result.slotMap }
   }
 
-  /** Instant adjust-tier write: set one exposed slider on the slot's applied graph. */
-  setStyleParam(slot: MaterialPreset, paramId: string, value: number | [number, number, number]): boolean {
-    const override = this.styleOverrides.get(slot)
-    const styleSlot = override?.slotMap.find((s) => s.id === paramId)
-    const buffer = this.styleBuffers.get(slot)
-    if (!styleSlot || !buffer) return false
-    if (styleSlot.kind === "float") {
-      if (typeof value !== "number") return false
-      const offset = styleSlot.vec4Index * 16 + ["x", "y", "z", "w"].indexOf(styleSlot.component!) * 4
-      this.device.queue.writeBuffer(buffer, offset, new Float32Array([value]))
-    } else {
-      if (typeof value === "number") return false
-      this.device.queue.writeBuffer(buffer, styleSlot.vec4Index * 16, new Float32Array(value))
+  // Rebind each material draw call to its (successfully-installed) group's uniform buffer,
+  // or the zero buffer when ungrouped, then re-sort by render-class draw order.
+  private assignDrawCallGroups(inst: ModelInstance, claimed: Map<string, string>): void {
+    inst.materialToGroup.clear()
+    for (const dc of inst.drawCalls) {
+      if (!dc.baseBindGroupEntries) continue // outlines/ground are never grouped
+      const wantId = claimed.get(dc.materialName)
+      const install = wantId ? inst.styleGroups.get(wantId) : undefined
+      const groupId = install ? wantId! : null
+      if (groupId) inst.materialToGroup.set(dc.materialName, groupId)
+      if (dc.groupId === groupId) continue
+      dc.groupId = groupId
+      dc.bindGroup = this.createMaterialBindGroup(
+        `material: ${dc.materialName}`,
+        dc.baseBindGroupEntries,
+        install ? install.uniformBuffer : this.zeroStyleBuffer,
+      )
     }
-    return true
+    this.sortDrawCalls(inst)
   }
 
-  /** Remove an applied style graph — the slot returns to its built-in preset shader. */
-  resetStyleSlot(slot: MaterialPreset): void {
-    this.styleGenerations.set(slot, (this.styleGenerations.get(slot) ?? 0) + 1)
-    this.styleOverrides.delete(slot)
-  }
-
-  private writeStyleDefaults(slot: MaterialPreset, graph: StyleGraph, slotMap: StyleSlot[]): void {
+  private writeGroupDefaults(buffer: GPUBuffer, group: StyleGroup, slotMap: StyleSlot[]): void {
     const data = new Float32Array(64) // 16 vec4f
     for (const styleSlot of slotMap) {
-      const param = graph.params?.find((p) => p.id === styleSlot.id)
+      const param = group.graph.params?.find((p) => p.id === styleSlot.id)
       if (!param) continue
       const base = styleSlot.vec4Index * 4
       if (styleSlot.kind === "float" && typeof param.default === "number") {
@@ -4237,20 +4429,46 @@ export class Engine {
         data.set(param.default.slice(0, 3), base)
       }
     }
-    this.device.queue.writeBuffer(this.styleBuffers.get(slot)!, 0, data)
+    this.device.queue.writeBuffer(buffer, 0, data)
+  }
+
+  // Draw-order rank within a bucket: eye stamps before hair reads. A grouped call ranks by
+  // its group's render-class; an ungrouped call by its preset (the hand-shader path).
+  private drawCallRank(inst: ModelInstance, dc: DrawCall): number {
+    const rc = dc.groupId ? (inst.styleGroups.get(dc.groupId)?.renderClass ?? "auto") : undefined
+    if (rc) return rc === "hair" ? 2 : rc === "eye" ? 1 : 0
+    return dc.preset === "hair" ? 2 : dc.preset === "eye" ? 1 : 0
+  }
+
+  private sortDrawCalls(inst: ModelInstance): void {
+    const typeOrder: Record<DrawCallType, number> = {
+      opaque: 0,
+      "opaque-outline": 1,
+      transparent: 2,
+      "transparent-outline": 3,
+      ground: 4,
+    }
+    inst.drawCalls.sort(
+      (a, b) => typeOrder[a.type] - typeOrder[b.type] || this.drawCallRank(inst, a) - this.drawCallRank(inst, b),
+    )
+    inst.shadowDrawCalls = inst.drawCalls.filter((d) => d.type === "opaque")
   }
 
   /**
-   * Slot pipeline states mirror createPipelines exactly — a compiled graph swaps the
-   * fragment shading of a slot, never its pass integration (stencil interplay, depth
-   * bias, cull mode stay slot-owned; see docs/graph-compiler-spec.md §6).
+   * Render-class pipeline state. A group's compiled graph swaps the fragment shading; the
+   * render-class owns pass integration (stencil interplay, depth bias, cull). auto = plain;
+   * eye = stamp + front cull + bias; hair = stencil-test (+ the over-eyes variant).
    */
-  private createSlotPipeline(slot: MaterialPreset, module: GPUShaderModule, overEyes: boolean): Promise<GPURenderPipeline> {
+  private createRenderClassPipeline(
+    renderClass: RenderClass,
+    module: GPUShaderModule,
+    overEyes: boolean,
+  ): Promise<GPURenderPipeline> {
     const base = {
-      label: `style ${slot}${overEyes ? " (over eyes)" : ""}`,
+      label: `style ${renderClass}${overEyes ? " (over eyes)" : ""}`,
       layout: this.mainPipelineLayout,
       vertex: { module, buffers: this.fullVertexBufferLayouts },
-      primitive: { cullMode: (slot === "eye" ? "front" : "none") as GPUCullMode },
+      primitive: { cullMode: (renderClass === "eye" ? "front" : "none") as GPUCullMode },
       multisample: { count: Engine.MULTISAMPLE_COUNT },
     }
     const plainDepth: GPUDepthStencilState = {
@@ -4260,7 +4478,7 @@ export class Engine {
     }
     let depthStencil: GPUDepthStencilState = plainDepth
     let constants: Record<string, number> | undefined
-    if (slot === "hair" && !overEyes) {
+    if (renderClass === "hair" && !overEyes) {
       depthStencil = {
         ...plainDepth,
         stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
@@ -4268,7 +4486,7 @@ export class Engine {
         stencilReadMask: 0xff,
         stencilWriteMask: 0,
       }
-    } else if (slot === "hair" && overEyes) {
+    } else if (renderClass === "hair" && overEyes) {
       constants = { IS_OVER_EYES: 1 }
       depthStencil = {
         format: "depth24plus-stencil8",
@@ -4279,7 +4497,7 @@ export class Engine {
         stencilReadMask: 0xff,
         stencilWriteMask: 0,
       }
-    } else if (slot === "eye") {
+    } else if (renderClass === "eye") {
       depthStencil = {
         ...plainDepth,
         depthBias: -0.00005,
@@ -4298,11 +4516,17 @@ export class Engine {
     })
   }
 
+  // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
+  // the built-in preset (hand-shader) pipeline.
+  private pipelineForDrawCall(inst: ModelInstance, dc: DrawCall): GPURenderPipeline {
+    if (dc.groupId) {
+      const install = inst.styleGroups.get(dc.groupId)
+      if (install) return install.pipeline
+    }
+    return this.pipelineForPreset(dc.preset)
+  }
+
   private pipelineForPreset(preset: ResolvedMaterialPreset): GPURenderPipeline {
-    // Applied style graph wins over the built-in preset shader (mmd_classic is never
-    // in the override map — it's not a stylable slot).
-    const override = this.styleOverrides.get(preset as MaterialPreset)
-    if (override) return override.pipeline
     if (preset === "face") return this.facePipeline
     if (preset === "hair") return this.hairPipeline
     if (preset === "cloth_smooth") return this.clothSmoothPipeline
@@ -4331,7 +4555,7 @@ export class Engine {
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true
       }
-      const pipeline = this.pipelineForPreset(draw.preset)
+      const pipeline = this.pipelineForDrawCall(inst, draw)
       if (pipeline !== currentPipeline) {
         pass.setPipeline(pipeline)
         currentPipeline = pipeline
@@ -4386,24 +4610,39 @@ export class Engine {
   }
 
   /**
-   * Second hair pass for the see-through-hair effect. Re-draws every hair opaque
-   * draw using `hairOverEyesPipeline` — which stencil-matches `EYE_VALUE` and runs
-   * the hair shader with `IS_OVER_EYES=true` so alpha is scaled to 25%. depthWriteEnabled
-   * is off, so the eye's depth stays authoritative for anything drawn after.
+   * Second hair pass for the see-through-hair effect. Re-draws every hair-class opaque
+   * draw with its over-eyes pipeline — stencil-matched to `EYE_VALUE`, `IS_OVER_EYES=true`
+   * (25% alpha), depth-write off. Covers both grouped hair-class draws (their compiled
+   * over-eyes pipeline) and ungrouped hair-preset draws (the hand `hairOverEyesPipeline`).
    */
   private drawHairOverEyes(pass: GPURenderPassEncoder, inst: ModelInstance): void {
     let bound = false
+    let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
-      if (draw.type !== "opaque" || draw.preset !== "hair" || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (draw.type !== "opaque" || !this.shouldRenderDrawCall(inst, draw)) continue
+      const overEyes = this.overEyesPipelineFor(inst, draw)
+      if (!overEyes) continue
       if (!bound) {
-        pass.setPipeline(this.styleOverrides.get("hair")?.overEyesPipeline ?? this.hairOverEyesPipeline)
         pass.setBindGroup(0, this.perFrameBindGroup)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true
       }
+      if (overEyes !== currentPipeline) {
+        pass.setPipeline(overEyes)
+        currentPipeline = overEyes
+      }
       pass.setBindGroup(2, draw.bindGroup)
       pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
     }
+  }
+
+  // The over-eyes pipeline for a hair draw call, or null if it isn't hair-class.
+  private overEyesPipelineFor(inst: ModelInstance, dc: DrawCall): GPURenderPipeline | null {
+    if (dc.groupId) {
+      const install = inst.styleGroups.get(dc.groupId)
+      return install?.renderClass === "hair" ? (install.overEyesPipeline ?? null) : null
+    }
+    return dc.preset === "hair" ? this.hairOverEyesPipeline : null
   }
 
   private updateCameraUniforms() {

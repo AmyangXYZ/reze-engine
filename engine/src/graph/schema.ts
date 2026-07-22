@@ -3,8 +3,6 @@
 // time (Blender Normal Z → engine Y), the compiler never sees Blender conventions.
 // See docs/graph-compiler-spec.md.
 
-import type { MaterialPreset } from "../engine"
-
 export type SocketValue = number | [number, number, number] | [number, number, number, number]
 
 export type GraphNode = {
@@ -39,15 +37,15 @@ export type ExposedParam = {
 export type StyleGraph = {
   version: 1
   name: string
-  /** Which preset slot this style targets. The slot owns pass integration (stencil
-   *  variants like hair-over-eyes, alpha semantics, draw order) — always on,
-   *  graph-invisible. The graph only restyles the slot's shading. */
-  slot: MaterialPreset
   nodes: GraphNode[]
   links: GraphLink[]
   /** Must resolve to a color (vec3f) or float (auto-splatted) socket. */
   output: { node: string; socket: string }
   params?: ExposedParam[]
+  /** Soft, host-only hints for library filtering and smart default-group / render-class
+   *  matching (e.g. ["hair"]). Ignored by the compiler; round-tripped. A graph is pure
+   *  shading — pass integration lives on the style group's renderClass, not here. */
+  tags?: string[]
 }
 
 export type Diagnostic = {

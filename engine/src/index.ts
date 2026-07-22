@@ -10,7 +10,6 @@ export {
   type MaterialPreset,
   type ResolvedMaterialPreset,
   type MaterialPresetMap,
-  type ApplyStyleResult,
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,
@@ -33,6 +32,13 @@ export type {
   Diagnostic,
 } from "./graph/schema"
 export { NODE_REGISTRY, type NodeSpec, type SockT } from "./graph/registry"
+export { RENDER_CLASSES, type RenderClass, type AlphaMode, type RenderClassInfo } from "./graph/render-class"
+export type {
+  StyleGroup,
+  GroupDiagnostic,
+  ApplyStyleGroupsResult,
+  ApplyStyleGroupResult,
+} from "./graph/style-group"
 export { HAIR_GRAPH } from "./graph/presets/hair"
 export { DEFAULT_GRAPH } from "./graph/presets/default"
 export { CLOTH_SMOOTH_GRAPH } from "./graph/presets/cloth_smooth"
