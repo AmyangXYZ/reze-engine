@@ -13,6 +13,8 @@ import { CLOTH_ROUGH_GRAPH } from "../dist/graph/presets/cloth_rough.js"
 import { METAL_GRAPH } from "../dist/graph/presets/metal.js"
 import { BODY_GRAPH } from "../dist/graph/presets/body.js"
 import { STOCKINGS_GRAPH } from "../dist/graph/presets/stockings.js"
+import { EYE_GRAPH } from "../dist/graph/presets/eye.js"
+import { FACE_GRAPH } from "../dist/graph/presets/face.js"
 
 const HAIR_BODY_INLINE = [
   "  let n_fres = fresnel(1.45, n, v); // @node:fres",
@@ -162,6 +164,54 @@ test("stockings graph: radiance in graph, hashed alpha in slot template", () => 
   assert.ok(r.wgsl.includes("if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"))
   assert.ok(r.wgsl.includes("out.color = vec4f(final_color, 1.0);"))
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
+})
+
+test("eye graph: default Principled + emission, rear-gate in slot template", () => {
+  const r = compileGraph(EYE_GRAPH, { inlineParams: true })
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.diagnostics, [])
+  assert.equal(
+    r.fsBody,
+    [
+      "  let n_emission = tex_color * 1.5; // @node:emission",
+      "  let n_principled = eval_principled(PrincipledIn(tex_color, 0.0, 0.5, 0.5, 1e+30, 0.0, 0.0), n, l, v, sun, amb, shadow); // @node:principled",
+      "  let n_add = n_principled + n_emission; // @node:add",
+      "  let final_color = n_add; // @node:add",
+    ].join("\n"),
+  )
+  // Slot-owned: rear-view gate in the prelude, standard alpha epilogue.
+  assert.ok(r.wgsl.includes("if (dot(faceDir, v) < -0.15) { discard; }"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color, alpha);"))
+})
+
+test("face graph matches the hand-written shader (key terms)", () => {
+  const r = compileGraph(FACE_GRAPH, { inlineParams: true })
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.diagnostics, [])
+  const expect = [
+    "let n_toon = ramp_constant_edge_aa(n_str, 0.2966, vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0));",
+    "let n_shadow_tint = hue_sat(0.46000000834465027, 2.0, 0.3499999940395355, 1.0, tex_color);",
+    "let n_lit_tint = hue_sat(0.46000000834465027, 1.600000023841858, 1.5, 1.0, tex_color);",
+    "let n_toon_color = mix_blend(n_toon.r, n_shadow_tint, n_lit_tint);",
+    "let n_emission3 = n_bc * 2.5;",
+    "let n_warm_mul = math_multiply(n_toon.r, 0.5);",
+    "let n_warm_add = math_add(n_warm_mul, 0.5);",
+    "let n_warm_emit = n_warm_ramp.rgb * 0.30000001192092896;",
+    "let n_rim1 = vec3f(0.984157919883728, 0.6110184788703918, 0.5736401677131653) * n_rim1_str;",
+    "let n_rim2_raw = math_multiply(n_rim2_fres, n_rim2_lw);",
+    "let n_rim2_pow = math_power(n_rim2_raw, 0.6300000548362732);",
+    "let n_rim2_mix = mix(n_emission3, vec3f(1.0, 0.4684903025627136, 0.3698573112487793), n_rim2_pow);",
+    "let n_gate = math_greater_than(color_to_value(tex_color), 0.9300000071525574);",
+    "let n_npr_add2 = n_npr_add1 + vec3f(n_gate_scale);",
+    "let n_map = mapping_point(input.restPos, vec3f(0.0), vec3f(0.0), vec3f(1.0, 1.0, 1.5));",
+    "let n_noise = tex_noise_d2(n_map, 1.0);",
+    "let n_bump = bump_lh(0.324644535779953, n_noise_ramp.r, n, input.worldPos);",
+    "let n_principled_base = mix_blend(n_noise_ramp.r, n_bc, vec3f(0.6832, 0.1947, 0.1373));",
+    "eval_principled(PrincipledIn(n_principled_base, 0.0, 0.5, 0.3, 10.0, 0.0, 0.0), n_bump, l, v, sun, amb, shadow)",
+    "let n_p_sum = n_principled + n_p_emit;",
+    "let n_mix_shader_001 = mix(n_npr_stack, n_p_sum, 0.5);",
+  ]
+  for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
 })
 
 test("hair graph compiles clean, nothing pruned", () => {

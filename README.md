@@ -194,7 +194,7 @@ Note the asymmetry: rotation goes through `rotateBones(…, 0)`, but translation
 
 ## Style graphs (node-graph materials)
 
-Materials can be authored as Blender-style node graphs — plain JSON (`StyleGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE** (same functions as the hand-written presets), so community Blender NPR presets port by transcription. Seven presets ship as graph data (`HAIR_GRAPH`, `BODY_GRAPH`, `METAL_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `STOCKINGS_GRAPH`, `DEFAULT_GRAPH` — the Blender new-material template), each snapshot-tested to compile to the same shading as its built-in shader.
+Materials can be authored as Blender-style node graphs — plain JSON (`StyleGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE** (same functions as the hand-written presets), so community Blender NPR presets port by transcription. All nine presets ship as graph data (`FACE_GRAPH`, `HAIR_GRAPH`, `BODY_GRAPH`, `EYE_GRAPH`, `METAL_GRAPH`, `STOCKINGS_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `DEFAULT_GRAPH` — the Blender new-material template), each snapshot-tested to compile to the same shading as its built-in shader.
 
 The preset *slot* owns pass integration (hair's over-eyes stencil variant, stockings' hashed-alpha discard, draw order); the graph only restyles shading — so applied graphs inherit every built-in effect.
 

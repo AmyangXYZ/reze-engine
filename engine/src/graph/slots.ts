@@ -94,9 +94,42 @@ fn hashed_alpha_threshold(co: vec3f) -> f32 {
 `,
 }
 
+// Eye's built-in rear-view gate (see eye.ts): open-shell PMX heads don't occlude
+// the eye from behind, so it would draw (and stamp the see-through stencil) through
+// the back of the head. Gate by camera-vs-face hemisphere via the 頭 bone's skinning
+// matrix. Discarding here drops color, depth, and the stencil stamp together. The
+// stencil-stamp pipeline state + front-face cull are slot-owned in createSlotPipeline;
+// the graph only computes the eye's shading (Principled + emission).
+const EYE_TEMPLATE: SlotTemplate = {
+  decls: "",
+  prelude: `@fragment fn fs(input: VertexOutput) -> FSOut {
+  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
+  let alpha = material.alpha * tex_s.a;
+  if (alpha < 0.001) { discard; }
+
+  let n = safe_normal(input.normal);
+  let v = normalize(camera.viewPos - input.worldPos);
+
+  if (material.headBoneIndex >= 0.0) {
+    let hm = skinMats[u32(material.headBoneIndex)];
+    let faceDir = -normalize(hm[2].xyz);
+    if (dot(faceDir, v) < -0.15) { discard; }
+  }
+
+  let l = -light.lights[0].direction.xyz;
+  let sun = light.lights[0].color.xyz * light.lights[0].color.w;
+  let amb = light.ambientColor.xyz;
+  let shadow = sampleShadow(input.worldPos, n);
+  let tex_color = tex_s.rgb;
+
+`,
+  epilogue: DEFAULT_EPILOGUE,
+}
+
 export const SLOT_TEMPLATES: Partial<Record<MaterialPreset, SlotTemplate>> = {
   hair: HAIR_TEMPLATE,
   stockings: STOCKINGS_TEMPLATE,
+  eye: EYE_TEMPLATE,
 }
 
 export function slotTemplate(slot: MaterialPreset): SlotTemplate {

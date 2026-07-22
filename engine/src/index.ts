@@ -40,6 +40,8 @@ export { CLOTH_ROUGH_GRAPH } from "./graph/presets/cloth_rough"
 export { METAL_GRAPH } from "./graph/presets/metal"
 export { BODY_GRAPH } from "./graph/presets/body"
 export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
+export { EYE_GRAPH } from "./graph/presets/eye"
+export { FACE_GRAPH } from "./graph/presets/face"
 export { Model } from "./model"
 export { Vec3, Quat, Mat4 } from "./math"
 export type {
