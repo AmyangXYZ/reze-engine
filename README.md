@@ -12,14 +12,13 @@ npm install reze-engine
 
 ## Features
 
-- Anime/MMD **hybrid renderer** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
-- **Shader-graph materials + style groups** — every look is a Blender-style **shader graph** (JSON) compiled to WGSL at runtime; **style groups** bind any set of materials to any graph (unlimited, user-defined). 9 NPR graphs ship built-in (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`); fully customizable — see [reze-design](https://reze.design) for the visual shader-graph editor
+- **Anime-style rendering** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
+- **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
-- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, no external dependency
-- **VMD animation** with MMD IK, morphs (GPU compute path), and VMD export
-- **PMX textures** — browser-native formats plus a built-in TGA decoder (common in MMD sphere/eye maps); unsupported files log and fall back, never crash
+- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, zero dependencies
+- **VMD animation** — MMD IK, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
-- Orbit camera with bone-follow, ground + PCF shadows, multi-model
+- **Orbit camera** — bone-follow, ground + PCF shadows, multi-model scenes
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
@@ -31,6 +30,25 @@ See [Physics](#physics) and [Rendering](#rendering) for the internals.
 - [Popo](https://popo.love) (LLM-generated poses)
 - [MPL](https://mmd-mpl.vercel.app) (motion language)
 - [Mixamo-MMD](https://mixamo-mmd.vercel.app) (FBX→VMD retarget)
+
+## Quick start
+
+```javascript
+import { Engine } from "reze-engine"
+
+const engine = new Engine(canvas)
+await engine.init()
+
+const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
+await engine.autoStyleGroups("reze")
+
+await model.loadVmd("idle", "/animations/idle.vmd")
+model.show("idle")
+model.play()
+
+engine.addGround()
+engine.runRenderLoop()
+```
 
 ## Codebase map
 
@@ -70,25 +88,6 @@ engine/src/
                      common.ts (bindings, skinning VS, fs() shell)
     passes/          shadow, morph (GPU vertex-morph compute), bloom, composite (Filmic),
                      outline, selection, gizmo, pick, ground, mipmap
-```
-
-## Quick start
-
-```javascript
-import { Engine } from "reze-engine"
-
-const engine = new Engine(canvas)
-await engine.init()
-
-const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
-await engine.autoStyleGroups("reze") // one-tap NPR styling from material names
-
-await model.loadVmd("idle", "/animations/idle.vmd")
-model.show("idle")
-model.play()
-
-engine.addGround()
-engine.runRenderLoop()
 ```
 
 ## API
