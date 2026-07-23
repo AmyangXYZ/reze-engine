@@ -205,7 +205,9 @@ export default function Home() {
 
       modelsRef.current = [m1]
 
-      engine.setMaterialPresets(SCENE_MODELS[0].id, {
+      // Group materials into their default style graphs (custom names → categories the
+      // built-in hints miss). Ungrouped materials would render the neutral default.
+      await engine.autoStyleGroups(SCENE_MODELS[0].id, {
         eye: ["眼睛", "眼白", "目白", "右瞳", "左瞳", "眉毛"],
         face: ["脸", "face01"],
         body: ["皮肤", "skin"],

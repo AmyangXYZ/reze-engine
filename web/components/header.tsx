@@ -2,7 +2,7 @@ import Image from "next/image"
 import Link from "next/link"
 import { Button } from "./ui/button"
 import { EngineStats } from "reze-engine"
-import { BookOpenText, Rocket } from "lucide-react"
+import { BookOpenText, Rocket, WandSparkles } from "lucide-react"
 
 export default function Header({ stats }: { stats: EngineStats | null }) {
   return (
@@ -33,6 +33,11 @@ export default function Header({ stats }: { stats: EngineStats | null }) {
       )}
 
       <div className="pointer-events-auto flex flex-row items-center gap-0 px-1 bg-black/30 backdrop-blur-sm rounded-full h-7 ">
+        <Button variant="ghost" size="icon" asChild className="hover:bg-black hover:text-white rounded-full">
+          <Link href="https://reze.design" target="_blank">
+            <WandSparkles />
+          </Link>
+        </Button>
         <Button variant="ghost" size="icon" asChild className="hover:bg-black hover:text-white rounded-full">
           <Link href="https://reze.studio" target="_blank">
             <Rocket />
