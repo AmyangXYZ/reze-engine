@@ -15,16 +15,6 @@ import {
   normalizeAssetPath,
   type AssetReader,
 } from "./asset-reader"
-import { DEFAULT_SHADER_WGSL } from "./shaders/materials/default"
-import { FACE_SHADER_WGSL } from "./shaders/materials/face"
-import { HAIR_SHADER_WGSL } from "./shaders/materials/hair"
-import { CLOTH_SMOOTH_SHADER_WGSL } from "./shaders/materials/cloth_smooth"
-import { CLOTH_ROUGH_SHADER_WGSL } from "./shaders/materials/cloth_rough"
-import { METAL_SHADER_WGSL } from "./shaders/materials/metal"
-import { BODY_SHADER_WGSL } from "./shaders/materials/body"
-import { EYE_SHADER_WGSL } from "./shaders/materials/eye"
-import { STOCKINGS_SHADER_WGSL } from "./shaders/materials/stockings"
-import { MMD_CLASSIC_SHADER_WGSL } from "./shaders/materials/mmd_classic"
 import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
@@ -328,8 +318,7 @@ interface DrawCall {
   firstIndex: number
   bindGroup: GPUBindGroup
   materialName: string
-  preset: ResolvedMaterialPreset
-  // Style group this material belongs to, or null (ungrouped → hand-shader path).
+  // Style group this material belongs to, or null (ungrouped → neutral base pipeline).
   // Outline/ground draw calls are never grouped and leave this null.
   groupId: string | null
   // Bindings 0–3 kept so the bind group can be rebuilt when the material's group changes
@@ -364,7 +353,6 @@ interface ModelInstance {
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
   hiddenMaterials: Set<string>
-  materialPresets: MaterialPresetMap | undefined
   physics: RezePhysics | null
   vertexBufferNeedsUpdate: boolean
   gpuMorph: GpuMorph | null
@@ -413,17 +401,9 @@ export class Engine {
   private resizeObserver: ResizeObserver | null = null
   private resizePending = false
   private depthTexture!: GPUTexture
-  private modelPipeline!: GPURenderPipeline
-  private facePipeline!: GPURenderPipeline
-  private hairPipeline!: GPURenderPipeline
-  private clothSmoothPipeline!: GPURenderPipeline
-  private clothRoughPipeline!: GPURenderPipeline
-  private metalPipeline!: GPURenderPipeline
-  private bodyPipeline!: GPURenderPipeline
-  private eyePipeline!: GPURenderPipeline
-  private hairOverEyesPipeline!: GPURenderPipeline
-  private stockingsPipeline!: GPURenderPipeline
-  private mmdClassicPipeline!: GPURenderPipeline
+  // The one base shading model: ungrouped materials render this (compiled DEFAULT_GRAPH).
+  // Grouped materials use their group's own compiled pipeline.
+  private neutralPipeline!: GPURenderPipeline
   // ── Style group runtime ──
   // Shared 256 B zero StyleUniforms buffer (group(2) binding(4)) bound by every ungrouped
   // material; grouped materials rebind to their group's own buffer (per-model, in the
@@ -1146,56 +1126,6 @@ export class Engine {
     this.sceneTargets = sceneTargets
     this.fullVertexBufferLayouts = fullVertexBuffers
 
-    const shaderModule = this.device.createShaderModule({
-      label: "default model shader",
-      code: DEFAULT_SHADER_WGSL,
-    })
-
-    const faceShaderModule = this.device.createShaderModule({
-      label: "face NPR shader",
-      code: FACE_SHADER_WGSL,
-    })
-
-    const hairShaderModule = this.device.createShaderModule({
-      label: "hair NPR shader",
-      code: HAIR_SHADER_WGSL,
-    })
-
-    const clothSmoothShaderModule = this.device.createShaderModule({
-      label: "cloth smooth NPR shader",
-      code: CLOTH_SMOOTH_SHADER_WGSL,
-    })
-
-    const clothRoughShaderModule = this.device.createShaderModule({
-      label: "cloth rough NPR shader",
-      code: CLOTH_ROUGH_SHADER_WGSL,
-    })
-
-    const metalShaderModule = this.device.createShaderModule({
-      label: "metal NPR shader",
-      code: METAL_SHADER_WGSL,
-    })
-
-    const bodyShaderModule = this.device.createShaderModule({
-      label: "body NPR shader",
-      code: BODY_SHADER_WGSL,
-    })
-
-    const eyeShaderModule = this.device.createShaderModule({
-      label: "eye shader",
-      code: EYE_SHADER_WGSL,
-    })
-
-    const stockingsShaderModule = this.device.createShaderModule({
-      label: "stockings NPR shader",
-      code: STOCKINGS_SHADER_WGSL,
-    })
-
-    const mmdClassicShaderModule = this.device.createShaderModule({
-      label: "mmd classic shader",
-      code: MMD_CLASSIC_SHADER_WGSL,
-    })
-
     // group 0: per-frame (camera + light + sampler + shadow) — bound once per pass
     this.mainPerFrameBindGroupLayout = this.device.createBindGroupLayout({
       label: "main per-frame bind group layout",
@@ -1223,7 +1153,8 @@ export class Engine {
       ],
     })
     // group 2: per-material (textures + material uniforms) — bound per draw call.
-    // Toon + sphere slots feed mmd_classic; other presets bind fallbacks.
+    // Toon + sphere texture slots (bindings 2/3) are reserved for future sphere/toon graph
+    // nodes; graphs that don't read them just bind the 1×1 white fallback.
     this.mainPerMaterialBindGroupLayout = this.device.createBindGroupLayout({
       label: "main per-material bind group layout",
       entries: [
@@ -1257,189 +1188,17 @@ export class Engine {
 
     // perFrameBindGroup is created after shadow resources below
 
-    this.modelPipeline = this.createRenderPipeline({
-      label: "model pipeline",
+    // Ungrouped materials render this neutral base — the compiled DEFAULT_GRAPH (diffuse
+    // texture x material color -> Principled BSDF). Grouped materials use their group's
+    // compiled pipeline instead. This is the single base shading model; the per-preset
+    // hand shaders are retired in favor of graphs.
+    const neutral = compileGraph(DEFAULT_GRAPH, { renderClass: "auto", alphaMode: "opaque" })
+    if (!neutral.ok) throw new Error("failed to compile the neutral default graph")
+    const neutralModule = this.device.createShaderModule({ label: "neutral base (default graph)", code: neutral.wgsl })
+    this.neutralPipeline = this.createRenderPipeline({
+      label: "neutral base pipeline",
       layout: mainPipelineLayout,
-      shaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    this.facePipeline = this.createRenderPipeline({
-      label: "face NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: faceShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    // Hair opaque: stencil != EYE_VALUE so fragments on top of eyes are skipped entirely —
-    // depth and color stay as the eye wrote them; the follow-up hairOverEyesPipeline then
-    // draws those skipped fragments alpha-blended so the eye reads through the hair.
-    this.hairPipeline = this.createRenderPipeline({
-      label: "hair NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: hairShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-        stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
-        stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
-        stencilReadMask: 0xff,
-        stencilWriteMask: 0,
-      },
-    })
-
-    // Eye-over-hair (the see-through-hair effect, inverted): after hair draws
-    // normally, the eye re-draws at 75% alpha with its depth pushed
-    // EYE_SEE_THROUGH_RANGE world units toward the camera, so it only shows
-    // through occluders within that window (bangs), never through the far
-    // side of the head. Stencil == EYE_VALUE confines it to pixels where the
-    // eye's primary draw passed depth — a hand in front of the face never
-    // stamps, so it still occludes fully.
-    // Hair-over-eyes: same shader with IS_OVER_EYES=true so alpha is scaled to 25% at compile time.
-    // Only fragments where eye stencil == EYE_VALUE pass; depth test still culls fragments
-    // that are further from camera than the eye, so hair behind the eye never shows through.
-    // depthWriteEnabled=false keeps the eye's depth authoritative for anything drawn after.
-    this.hairOverEyesPipeline = this.device.createRenderPipeline({
-      label: "hair over eyes pipeline",
-      layout: mainPipelineLayout,
-      vertex: { module: hairShaderModule, buffers: fullVertexBuffers },
-      fragment: {
-        module: hairShaderModule,
-        constants: { IS_OVER_EYES: 1 },
-        targets: sceneTargets,
-      },
-      primitive: { cullMode: "none" },
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: false,
-        depthCompare: "less-equal",
-        stencilFront: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
-        stencilBack: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
-        stencilReadMask: 0xff,
-        stencilWriteMask: 0,
-      },
-      multisample: { count: Engine.MULTISAMPLE_COUNT },
-    })
-
-    this.clothSmoothPipeline = this.createRenderPipeline({
-      label: "cloth smooth NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: clothSmoothShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    this.mmdClassicPipeline = this.createRenderPipeline({
-      label: "mmd classic pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: mmdClassicShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    this.clothRoughPipeline = this.createRenderPipeline({
-      label: "cloth rough NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: clothRoughShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    this.metalPipeline = this.createRenderPipeline({
-      label: "metal NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: metalShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    this.bodyPipeline = this.createRenderPipeline({
-      label: "body NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: bodyShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-      },
-    })
-
-    // Eye: stamps stencil = EYE_VALUE on every fragment it writes. Later hair passes read
-    // this stamp to split into "draw normally (not over eye)" vs "draw alpha-blended".
-    // cullMode="front" + small negative depthBias is the MMD post-alpha-eye trick: only the
-    // back half of the eye sphere renders, it passes depth against the face (via bias) when
-    // viewed from the front, and it gets culled when viewed from behind — so eye fragments
-    // can't leak through the back of the head without needing a per-model skull occluder.
-    this.eyePipeline = this.createRenderPipeline({
-      label: "eye pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: eyeShaderModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "front",
-      depthStencil: {
-        format: "depth24plus-stencil8",
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-        depthBias: -0.00005,
-        depthBiasSlopeScale: 0.0,
-        depthBiasClamp: 0.0,
-        stencilFront: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
-        stencilBack: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
-        stencilReadMask: 0xff,
-        stencilWriteMask: 0xff,
-      },
-    })
-
-    this.stockingsPipeline = this.createRenderPipeline({
-      label: "stockings NPR pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: stockingsShaderModule,
+      shaderModule: neutralModule,
       vertexBuffers: fullVertexBuffers,
       fragmentTargets: sceneTargets,
       cullMode: "none",
@@ -2528,7 +2287,6 @@ export class Engine {
       firstIndex: 0,
       bindGroup: this.groundShadowBindGroup!,
       materialName: "Ground",
-      preset: "cloth_rough",
       groupId: null,
     }
   }
@@ -2696,16 +2454,6 @@ export class Engine {
     }
     const boneIndex = inst.model.getSkeleton().bones.findIndex((b) => b.name === boneName)
     this.selectedBone = boneIndex >= 0 ? { modelName, boneName, boneIndex } : null
-  }
-
-  setMaterialPresets(modelName: string, presets: MaterialPresetMap): void {
-    const inst = this.modelInstances.get(modelName)
-    if (!inst) return
-    inst.materialPresets = presets
-    // Only updates the ungrouped fallback preset; grouped materials render via their
-    // group regardless. binding(4) is unaffected (ungrouped always binds the zero
-    // buffer; grouped bindings are owned by applyStyleGroups).
-    for (const dc of inst.drawCalls) dc.preset = resolvePreset(dc.materialName, presets)
   }
 
   // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
@@ -2955,7 +2703,6 @@ export class Engine {
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
       hiddenMaterials: new Set(),
-      materialPresets: undefined,
       physics,
       vertexBufferNeedsUpdate: false,
       gpuMorph,
@@ -3241,7 +2988,6 @@ export class Engine {
       const materialUniformBuffer = this.createMaterialUniformBuffer(prefix + mat.name, mat, sphereMode, headBoneIndex)
       inst.gpuBuffers.push(materialUniformBuffer)
 
-      const preset = resolvePreset(mat.name, inst.materialPresets)
       const textureView = diffuseTexture.createView()
       const baseBindGroupEntries: GPUBindGroupEntry[] = [
         { binding: 0, resource: textureView },
@@ -3249,7 +2995,8 @@ export class Engine {
         { binding: 2, resource: (toonTexture ?? this.fallbackMaterialTexture).createView() },
         { binding: 3, resource: (sphereTexture ?? this.fallbackMaterialTexture).createView() },
       ]
-      // Ungrouped at load — binding(4) = zero buffer. applyStyleGroups rebinds grouped ones.
+      // Ungrouped at load — binding(4) = zero buffer, neutral base pipeline. autoStyleGroups
+      // / applyStyleGroups rebind grouped materials to their group's buffer + pipeline.
       const bindGroup = this.createMaterialBindGroup(
         `${prefix}material: ${mat.name}`,
         baseBindGroupEntries,
@@ -3263,7 +3010,6 @@ export class Engine {
         firstIndex: currentIndexOffset,
         bindGroup,
         materialName: mat.name,
-        preset,
         groupId: null,
         baseBindGroupEntries,
       })
@@ -3293,7 +3039,6 @@ export class Engine {
           firstIndex: currentIndexOffset,
           bindGroup: outlineBindGroup,
           materialName: mat.name,
-          preset,
           groupId: null,
         })
       }
@@ -4212,22 +3957,21 @@ export class Engine {
   }
 
   /**
-   * Create default style groups from the model's material→preset resolution
-   * (`setMaterialPresets` map first, then name hints), so a freshly loaded model comes up
-   * editably grouped with zero interaction. Materials resolving to `mmd_classic` (no map
-   * entry, no hint) stay ungrouped. The returned promise resolves after grouping AND the
-   * async graph compiles, so `getStyleGroups` is populated the moment it resolves. Opt-in:
-   * call it explicitly (typically after `setMaterialPresets`); a bare load stays ungrouped
-   * / byte-identical to before.
+   * Create default style groups from each material's resolved style category — `overrides`
+   * (material name → category) first, then the built-in JP/CN/EN name hints. So a
+   * standard-named model auto-groups with no overrides; a custom-named one passes a map for
+   * the materials the hints miss. Unmatched materials (no override, no hint) stay ungrouped
+   * (neutral default). The category picks the default graph + render-class + alpha-mode.
+   * Resolves after grouping AND the async compiles, so `getStyleGroups` is then populated.
    */
-  async autoStyleGroups(modelName: string): Promise<ApplyStyleGroupsResult> {
+  async autoStyleGroups(modelName: string, overrides?: MaterialPresetMap): Promise<ApplyStyleGroupsResult> {
     const inst = this.modelInstances.get(modelName)
     if (!inst) return { ok: false, groups: [], unknownMaterials: [], conflicts: [] }
 
     const buckets = new Map<MaterialPreset, string[]>()
     for (const dc of inst.drawCalls) {
       if (!dc.baseBindGroupEntries) continue // material draw calls only (skip outlines)
-      const preset = resolvePreset(dc.materialName, inst.materialPresets)
+      const preset = resolvePreset(dc.materialName, overrides)
       if (preset === "mmd_classic") continue // unmatched → ungrouped
       const arr = buckets.get(preset) ?? []
       if (!arr.includes(dc.materialName)) arr.push(dc.materialName)
@@ -4473,12 +4217,11 @@ export class Engine {
     this.device.queue.writeBuffer(buffer, 0, data)
   }
 
-  // Draw-order rank within a bucket: eye stamps before hair reads. A grouped call ranks by
-  // its group's render-class; an ungrouped call by its preset (the hand-shader path).
+  // Draw-order rank within a bucket: eye stamps before hair reads. Purely from the group's
+  // render-class — ungrouped materials are neutral (rank 0, no stencil interplay).
   private drawCallRank(inst: ModelInstance, dc: DrawCall): number {
-    const rc = dc.groupId ? (inst.styleGroups.get(dc.groupId)?.renderClass ?? "auto") : undefined
-    if (rc) return rc === "hair" ? 2 : rc === "eye" ? 1 : 0
-    return dc.preset === "hair" ? 2 : dc.preset === "eye" ? 1 : 0
+    const rc = dc.groupId ? (inst.styleGroups.get(dc.groupId)?.renderClass ?? "auto") : "auto"
+    return rc === "hair" ? 2 : rc === "eye" ? 1 : 0
   }
 
   private sortDrawCalls(inst: ModelInstance): void {
@@ -4558,26 +4301,13 @@ export class Engine {
   }
 
   // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
-  // the built-in preset (hand-shader) pipeline.
+  // the neutral base (ungrouped materials render the default graph).
   private pipelineForDrawCall(inst: ModelInstance, dc: DrawCall): GPURenderPipeline {
     if (dc.groupId) {
       const install = inst.styleGroups.get(dc.groupId)
       if (install) return install.pipeline
     }
-    return this.pipelineForPreset(dc.preset)
-  }
-
-  private pipelineForPreset(preset: ResolvedMaterialPreset): GPURenderPipeline {
-    if (preset === "face") return this.facePipeline
-    if (preset === "hair") return this.hairPipeline
-    if (preset === "cloth_smooth") return this.clothSmoothPipeline
-    if (preset === "cloth_rough") return this.clothRoughPipeline
-    if (preset === "metal") return this.metalPipeline
-    if (preset === "body") return this.bodyPipeline
-    if (preset === "eye") return this.eyePipeline
-    if (preset === "stockings") return this.stockingsPipeline
-    if (preset === "mmd_classic") return this.mmdClassicPipeline
-    return this.modelPipeline
+    return this.neutralPipeline
   }
 
   /**
@@ -4651,10 +4381,10 @@ export class Engine {
   }
 
   /**
-   * Second hair pass for the see-through-hair effect. Re-draws every hair-class opaque
-   * draw with its over-eyes pipeline — stencil-matched to `EYE_VALUE`, `IS_OVER_EYES=true`
-   * (25% alpha), depth-write off. Covers both grouped hair-class draws (their compiled
-   * over-eyes pipeline) and ungrouped hair-preset draws (the hand `hairOverEyesPipeline`).
+   * Second hair pass for the see-through-hair effect. Re-draws every hair-class grouped
+   * opaque draw with its compiled over-eyes pipeline — stencil-matched to `EYE_VALUE`,
+   * `IS_OVER_EYES=true` (25% alpha), depth-write off. Ungrouped materials are neutral and
+   * never participate.
    */
   private drawHairOverEyes(pass: GPURenderPassEncoder, inst: ModelInstance): void {
     let bound = false
@@ -4677,13 +4407,12 @@ export class Engine {
     }
   }
 
-  // The over-eyes pipeline for a hair draw call, or null if it isn't hair-class.
+  // The over-eyes pipeline for a hair-class grouped draw call, or null. Ungrouped
+  // materials are neutral — no see-through pass.
   private overEyesPipelineFor(inst: ModelInstance, dc: DrawCall): GPURenderPipeline | null {
-    if (dc.groupId) {
-      const install = inst.styleGroups.get(dc.groupId)
-      return install?.renderClass === "hair" ? (install.overEyesPipeline ?? null) : null
-    }
-    return dc.preset === "hair" ? this.hairOverEyesPipeline : null
+    if (!dc.groupId) return null
+    const install = inst.styleGroups.get(dc.groupId)
+    return install?.renderClass === "hair" ? (install.overEyesPipeline ?? null) : null
   }
 
   private updateCameraUniforms() {

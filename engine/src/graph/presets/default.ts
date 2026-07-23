@@ -1,8 +1,9 @@
-// Default material as a StyleGraph — Blender's new-material template verbatim:
-// Image Texture → Principled BSDF (Metallic 0, Specular 0.5, Roughness 0.5) → Output.
-// This is both the port of shaders/materials/default.ts (must match it pixel-for-pixel;
-// see tests/graph.test.mjs) and the blank-canvas starter graph an editor offers when
-// the user creates a new style.
+// Default material — the neutral base used two ways: the ungrouped fallback (a material
+// in no style group renders this) and the blank-canvas starter the editor's "New graph"
+// begins from, so the two always agree. MMD-correct PBSDF base: diffuse texture × the
+// PMX material diffuse color → Principled BSDF (Metallic 0, Specular 0.5, Roughness 0.5).
+// The material-color multiply is what keeps untextured/solid-color materials from
+// rendering white (they carry their color in material.diffuse, not a texture).
 
 import type { StyleGraph } from "../schema"
 
@@ -12,12 +13,18 @@ export const DEFAULT_GRAPH: StyleGraph = {
   tags: ["default"],
   nodes: [
     { id: "tex", type: "texture" },
+    { id: "mat", type: "material_diffuse" },
+    { id: "base", type: "mix/multiply", inputs: { fac: 1.0 } }, // texture × material diffuse
     {
       id: "principled",
       type: "principled",
       inputs: { metallic: 0.0, specular: 0.5, roughness: 0.5, spec_clamp: 10.0, sheen: 0.0, sheen_tint: 0.0 },
     },
   ],
-  links: [{ from: { node: "tex", socket: "color" }, to: { node: "principled", socket: "base" } }],
+  links: [
+    { from: { node: "tex", socket: "color" }, to: { node: "base", socket: "a" } },
+    { from: { node: "mat", socket: "color" }, to: { node: "base", socket: "b" } },
+    { from: { node: "base", socket: "color" }, to: { node: "principled", socket: "base" } },
+  ],
   output: { node: "principled", socket: "color" },
 }

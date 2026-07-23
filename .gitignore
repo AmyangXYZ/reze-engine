@@ -3,6 +3,13 @@ bullet_src
 # Local Claude Code settings
 .claude/
 
+# Internal design docs / handoff notes — kept locally, not published. Public info lives
+# in the root README.
+docs/
+
+# Engine's npm README is generated from the root README at publish time (prepublishOnly).
+engine/README.md
+
 # Blender preset reference dumps + extraction scripts (used during shader porting,
 # kept locally for future material work; recoverable from git history if needed)
 m_graphs.json

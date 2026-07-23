@@ -137,6 +137,14 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       reflection: "reflect(-v, n)",
     },
   },
+  // PMX material's diffuse color (the authored base tint). Multiply the diffuse texture
+  // by this for the MMD-correct base — untextured materials carry their color here, so a
+  // texture-only base would render them white.
+  material_diffuse: {
+    inputs: {},
+    outputs: { color: "color" },
+    contextOutputs: { color: "material.diffuseColor" },
+  },
 
   // ── Literals as nodes (for editor ergonomics; inlined literals work too) ──
   value: { inputs: { value: F(0) }, outputs: { value: "float" }, emit: (a) => a.value },

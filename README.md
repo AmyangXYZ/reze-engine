@@ -1,10 +1,10 @@
 # Reze Engine
 
-[![npm](https://img.shields.io/npm/v/reze-engine)](https://www.npmjs.com/package/reze-engine)
+[npm](https://www.npmjs.com/package/reze-engine)
 
 **Zero-runtime-dependency** WebGPU engine for real-time MMD/PMX rendering — renderer, animation, IK, and physics, all in TypeScript.
 
-![screenshot](./screenshot.png)
+screenshot
 
 ```bash
 npm install reze-engine
@@ -23,6 +23,15 @@ npm install reze-engine
 - Orbit camera with bone-follow, ground + PCF shadows, multi-model
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
+
+## Used by
+
+- [Reze Design](https://reze.design) (web-native scene composer & node-graph styling)
+- [Reze Studio](https://reze.studio) (MMD animation editor)
+- [MiKaPo](https://mikapo.vercel.app) (motion capture)
+- [Popo](https://popo.love) (LLM-generated poses)
+- [MPL](https://mmd-mpl.vercel.app) (motion language)
+- [Mixamo-MMD](https://mixamo-mmd.vercel.app) (FBX→VMD retarget)
 
 ## Codebase map
 
@@ -68,10 +77,14 @@ const engine = new Engine(canvas, {
 })
 await engine.init()
 
-const model = await engine.loadModel("hero", "/models/hero/hero.pmx")
+const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
 
-// Map PMX material names to NPR presets (unlisted names fall back to `default`).
-engine.setMaterialPresets("hero", {
+// One-tap styling: bucket materials into the engine's built-in default style graphs
+// (face / hair / eye / cloth / stockings / metal). These categories are just the shipped
+// starter graphs — NOT fixed slots. `overrides` maps names the built-in JP/CN/EN hints
+// miss; standard-named models need no map. Unmatched materials stay ungrouped (neutral).
+// For arbitrary groups with any graph, use applyStyleGroups (see "Style graphs & groups").
+await engine.autoStyleGroups("reze", {
   face: ["face01"],
   body: ["skin"],
   hair: ["hair_f"],
@@ -102,7 +115,8 @@ engine.init()
 engine.loadModel(name, path)                 // or ({ files, pmxFile? }) for folder upload
 engine.getModel(name) / getModelNames() / removeModel(name)
 
-engine.setMaterialPresets(name, presetMap)   // assign NPR presets by material name
+engine.autoStyleGroups(name, overrides?)     // default style groups by material name
+engine.applyStyleGroups(name, groups) / upsertStyleGroup / removeStyleGroup / getStyleGroups
 engine.setMaterialVisible(name, material, visible) / toggleMaterialVisible / isMaterialVisible
 
 engine.setIKEnabled(enabled)
@@ -195,28 +209,32 @@ Note the asymmetry: rotation goes through `rotateBones(…, 0)`, but translation
 
 ## Style graphs & groups (node-graph materials)
 
-Materials can be authored as Blender-style node graphs — plain JSON (`StyleGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE** (same functions as the hand-written presets), so community Blender NPR presets port by transcription. All nine presets ship as graph data (`FACE_GRAPH`, `HAIR_GRAPH`, `BODY_GRAPH`, `EYE_GRAPH`, `METAL_GRAPH`, `STOCKINGS_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `DEFAULT_GRAPH` — the Blender new-material template), each snapshot-tested to compile to the same shading as its built-in shader.
+Materials are styled by **node graphs** — plain JSON (`StyleGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE**, so community Blender NPR presets port by transcription. Nine graphs ship built-in (`FACE_GRAPH`, `HAIR_GRAPH`, `BODY_GRAPH`, `EYE_GRAPH`, `METAL_GRAPH`, `STOCKINGS_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `DEFAULT_GRAPH` — the neutral base) as a starter library; you can also author or import your own.
 
-**Style groups** bind a set of materials to a graph. The user decides which materials go in which group and which graph each group uses — unlimited groups, arbitrary grouping. The engine owns only a tiny closed vocabulary for pass integration: `renderClass` (`auto` / `eye` / `hair` — stencil, cull, draw order) and `alphaMode` (`opaque` / `hashed`). A graph is pure shading; the group's render-class carries the built-in effects (hair's over-eyes stencil variant, the eye see-through stamp), so applied graphs inherit them automatically. Grouped materials render via the compiled graph; ungrouped ones fall back to the hand-written preset path.
+A **style group** binds `{ materials, graph, renderClass?, alphaMode? }` — a set of materials, the graph that shades them, and the engine's small pass-integration vocabulary (`renderClass`: `auto`/`eye`/`hair` for stencil/cull/draw-order; `alphaMode`: `opaque`/`hashed`). **Groups are user-defined and unlimited** — any materials, any graph. A graph is pure shading; `renderClass` carries the built-in effects (hair's over-eyes stencil, the eye see-through stamp), so any graph in an `eye`/`hair` group inherits them. **Every group needs a valid graph**; a material in no group renders the **neutral default** (`DEFAULT_GRAPH`).
+
+Two ways to make groups:
 
 ```javascript
-import { compileGraph, HAIR_GRAPH, RENDER_CLASSES } from "reze-engine"
+import { HAIR_GRAPH, compileGraph } from "reze-engine"
 
-// Auto-create default groups from material-name resolution (map first, then hints):
-await engine.autoStyleGroups("miku") // resolves after grouping + compiles
+// 1. autoStyleGroups — one default group per built-in category (each backed by its shipped
+//    graph), bucketed by material-name hints (+ optional overrides). The "just works" path.
+await engine.autoStyleGroups("reze")
 
-// Or push groups explicitly — full-set replace, incremental upsert, or remove:
-await engine.applyStyleGroups("miku", [
+// 2. applyStyleGroups — define ARBITRARY groups: any id, any materials, any graph.
+await engine.applyStyleGroups("reze", [
   { id: "hair", materials: ["髪", "前髪"], graph: HAIR_GRAPH, renderClass: "hair" },
+  { id: "visor", materials: ["visor", "hud"], graph: myCustomGraph }, // your own graph
 ])
-engine.setStyleParam("miku", "hair", "rim", 0.8) // exposed param → instant uniform write
-engine.removeStyleGroup("miku", "hair") // back to the hand-shader path
+engine.setStyleParam("reze", "hair", "rim", 0.8) // exposed param → instant uniform write
+engine.removeStyleGroup("reze", "hair") // its materials drop to the neutral default
 
 // Headless (no GPU needed):
 const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH, { renderClass: "hair" })
 ```
 
-Validation catches material conflicts, type mismatches, cycles, and bad links with node-level diagnostics; a failed compile keeps the previous pipeline rendering (fallback-on-error). See `docs/graph-compiler-spec.md` and `docs/style-groups-spec.md` for the schema, node registry, render-class contracts, and internals.
+Validation catches material conflicts, type mismatches, cycles, and bad links with node-level diagnostics; a failed compile keeps the previous pipeline rendering (fallback-on-error).
 
 ## Physics
 
@@ -228,7 +246,7 @@ In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsu
 - **Angular limits** — hybrid: small violations (< 0.5 rad, the resting-cloth regime) use per-axis Euler stop rows, which converge cleanly and keep resting cloth still; larger violations switch to a single geodesic row toward the Euler-clamped target rotation, because per-axis Euler rows chase phantom errors near the ±90° singularity and pump energy. Ranged stops are unilateral (accumulated impulse clamped to the corrective sign) so a limit pushes back into range but never brakes natural recovery; locked axes stay bilateral equality joints. Spring rows stay per-axis, with stiffness clamped to the `k·dt² ≤ ¼` stability bound.
 - **Narrowphase** — analytical sphere-sphere / -capsule / -box and capsule-capsule / -box. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
 - **Speculative contacts** (`margin 0.04`) fire at near-touch with a push-only clamp — inert until real overlap, but they stop fast bodies tunneling thin surfaces in one substep.
-- **Split-impulse correction** resolves penetration by a mass-weighted translation _outside_ the velocity solver, so joint pulls can't fight separation.
+- **Split-impulse correction** resolves penetration by a mass-weighted translation *outside* the velocity solver, so joint pulls can't fight separation.
 - **Kinematic advancement** — bone-driven bodies move toward the frame's bone pose incrementally per substep, with velocities derived over the fixed step, so the solver never sees more than one 60 Hz step of anchor motion regardless of render dt.
 - **Discontinuity guards** — a bone-pose jump beyond continuous motion (timeline scrub, long stall) rigidly carries each dynamic body along with its kinematic root's transform delta and zeroes momentum instead of dragging cloth across the gap; correction velocities are clamped (120 u/s linear, 30 rad/s angular), per-step travel is capped, and any body that still goes non-finite is restored to its previous substep pose.
 - Sleeping is off (cloth must always react); resting bodies bleed micro-velocity via per-PMX damping.
@@ -249,6 +267,7 @@ Each surface mixes an NPR stack with a Principled-style BSDF per material, so ch
 - **PBR core** (`eval_principled`) — GGX + Schlick Fresnel, Walter–Smith G1, Fdez-Agüera 2019 multi-scatter, Karis split-sum DFG LUT, Heitz 2016 LTC direct-spec, optional sheen.
 - **NPR toolbox** — toon ramps (constant / fwidth-AA'd), HSV warm-shadow / cool-light remaps, fresnel + layer-weight rims, value-noise bump, Voronoi metallic sparkle, BT.601-gated emission.
 
+
 | Preset         | Notes                                                                   |
 | -------------- | ----------------------------------------------------------------------- |
 | `default`      | Plain Principled, metallic 0, rough 0.5                                 |
@@ -261,18 +280,11 @@ Each surface mixes an NPR stack with a Principled-style BSDF per material, so ch
 | `metal`        | Toon + emission overlay (×8), Voronoi base, metallic 1                  |
 | `stockings`    | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
 
+
 **Post & output.** Directional shadow map (2048², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → inverted-hull outline.
 
 - **Alpha-hashed transparency** (`stockings`) — Wyman & McGuire 2017 derivative-aware stochastic discard in object space, so self-overlapping meshes resolve under MSAA with opaque depth writes and the dither doesn't swim.
 - **See-through hair over eyes** — stencil-gated extra pass: the eye stamps `EYE_VALUE`, main hair skips it, an extra pass matches it and blends hair at 25% in linear HDR so eyes stay readable.
-
-## Used by
-
-- [Reze Studio](https://reze.studio) (MMD animation editor)
-- [MiKaPo](https://mikapo.vercel.app) (motion capture)
-- [Popo](https://popo.love) (LLM-generated poses)
-- [MPL](https://mmd-mpl.vercel.app) (motion language)
-- [Mixamo-MMD](https://mixamo-mmd.vercel.app) (FBX→VMD retarget)
 
 ## Tutorial
 

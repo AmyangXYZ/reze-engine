@@ -40,18 +40,19 @@ const HAIR_BODY_INLINE = [
   "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
 ].join("\n")
 
-test("default graph matches the hand-written default shader (Blender P-BSDF template)", () => {
+test("default graph: MMD-correct neutral base (texture × material diffuse → PBSDF)", () => {
   const r = compileGraph(DEFAULT_GRAPH, { inlineParams: true })
   assert.equal(r.ok, true)
   assert.deepEqual(r.diagnostics, [])
   assert.equal(
     r.fsBody,
     [
-      "  let n_principled = eval_principled(PrincipledIn(tex_color, 0.0, 0.5, 0.5, 10.0, 0.0, 0.0), n, l, v, sun, amb, shadow); // @node:principled",
+      "  let n_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:base",
+      "  let n_principled = eval_principled(PrincipledIn(n_base, 0.0, 0.5, 0.5, 10.0, 0.0, 0.0), n, l, v, sun, amb, shadow); // @node:principled",
       "  let final_color = n_principled; // @node:principled",
     ].join("\n"),
   )
-  // default renderClass: plain epilogue, no stencil overrides
+  // The ungrouped default renders neutral — no stencil / render-class overrides.
   assert.ok(!r.wgsl.includes("IS_OVER_EYES"))
 })
 
