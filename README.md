@@ -87,11 +87,8 @@ await engine.init()
 
 const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
 
-// One-tap styling: bucket materials into the engine's built-in default shader graphs
-// (face / hair / eye / cloth / stockings / metal). These categories are just the shipped
-// starter graphs — NOT fixed slots. `overrides` maps names the built-in JP/CN/EN hints
-// miss; standard-named models need no map. Unmatched materials stay ungrouped (neutral).
-// For arbitrary groups with any graph, use applyStyleGroups (see "Shader graphs & style groups").
+// Auto-group materials into the built-in style graphs. `overrides` handles names the
+// built-in hints miss; standard-named models need none. (Full rules + keyword table below.)
 await engine.autoStyleGroups("reze", {
   face: ["face01"],
   body: ["skin"],
@@ -226,11 +223,10 @@ Two ways to make groups:
 ```javascript
 import { HAIR_GRAPH, compileGraph } from "reze-engine"
 
-// 1. autoStyleGroups — one default group per built-in category (each backed by its shipped
-//    graph), bucketed by material-name hints (+ optional overrides). The "just works" path.
+// 1. autoStyleGroups — one default group per matched category (its shipped graph). Easy path.
 await engine.autoStyleGroups("reze")
 
-// 2. applyStyleGroups — define ARBITRARY groups: any id, any materials, any graph.
+// 2. applyStyleGroups — arbitrary groups: any id, any materials, any graph.
 await engine.applyStyleGroups("reze", [
   { id: "hair", materials: ["髪", "前髪"], graph: HAIR_GRAPH, renderClass: "hair" },
   { id: "visor", materials: ["visor", "hud"], graph: myCustomGraph }, // your own graph
@@ -248,7 +244,19 @@ const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH, { renderClass: "hair"
 2. **Then built-in name hints** — a case-insensitive **substring** match of the material name against per-category JP/CN/EN keyword lists, ordered **most-specific-first** so families don't collide (`靴下`/`stocking` resolves to `stockings` before `靴`/`shoes` would hit `cloth_smooth`). This covers standard-named models with no overrides at all.
 3. **No match → ungrouped** — the material renders the neutral default. "Unmatched" is a real, intended outcome, not a catch-all bucket.
 
-Each category carries its shipped graph **and** pass-integration: `eye` → `EYE_GRAPH` + `renderClass: "eye"`, `hair` → `HAIR_GRAPH` + `"hair"`, `stockings` → `STOCKINGS_GRAPH` + `alphaMode: "hashed"`, the rest → their graph + `auto`/`opaque`. The group `id` is the category name (`hair`, `eye`, …), so re-running is idempotent. The returned promise resolves after grouping **and** every graph compiles, so `getStyleGroups(model)` is populated the moment it resolves — seed your own store from it and edit with `applyStyleGroups` afterward.
+The **built-in name hints**, checked top-to-bottom (first match wins), with the graph and pass-integration each category carries:
+
+| Category | Graph · render-class / alpha | Matches a name containing (case-insensitive substring) |
+| --- | --- | --- |
+| `stockings` | `STOCKINGS_GRAPH` · `hashed` alpha | 靴下 · ソックス · タイツ · ニーソ · 袜 · stocking · socks · tights |
+| `eye` | `EYE_GRAPH` · `eye` | 白目 · 目影 · 二重 · 睫 · まつげ · まゆ · 眉 · 目 · 瞳 · 眼 · eye · iris · pupil · lash · brow |
+| `face` | `FACE_GRAPH` | 顔 · 颜 · 脸 · かお · face |
+| `hair` | `HAIR_GRAPH` · `hair` | 前髪 · 後髪 · 髪 · 髮 · 头发 · 頭髪 · もみあげ · アホ毛 · ヘア · hair · ahoge · bang |
+| `body` | `BODY_GRAPH` | 肌 · 皮肤 · skin |
+| `metal` | `METAL_GRAPH` | 金属 · メタル · metal |
+| `cloth_smooth` | `CLOTH_SMOOTH_GRAPH` | 服 · 衣 · 裙 · 裤 · スカート · ワンピ · リボン · 袖 · 靴 · 鞋 · 帽 · 体 · 飾 · 饰 · 尾 · skirt · dress · ribbon · sleeve · shoes · boot · hat · cloth · accessor |
+
+`cloth_rough` and `default` have **no** name hints — a material reaches them only via an explicit `overrides` entry. The group `id` is the category name, so re-running `autoStyleGroups` is idempotent; its promise resolves after every graph compiles, so `getStyleGroups(model)` is ready the moment it resolves — seed your own store from it, then edit with `applyStyleGroups`.
 
 Validation catches material conflicts, type mismatches, cycles, and bad links with node-level diagnostics; a failed compile keeps the previous pipeline rendering (fallback-on-error).
 
