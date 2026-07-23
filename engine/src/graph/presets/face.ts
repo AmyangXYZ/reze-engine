@@ -1,4 +1,4 @@
-// M_Face as a StyleGraph — port of shaders/materials/face.ts (仿深空之眼 "M_Face").
+// M_Face as a ShaderGraph — port of shaders/materials/face.ts (仿深空之眼 "M_Face").
 // Toon + warm rim + dual fresnel rim + BT.601 bright-tex gate, mixed 50/50 against a
 // Principled BSDF with noise bump. Structurally close to body, but: the toon uses the
 // edge-AA ramp, hue tints are 0.46 (full hue_sat, not the 0.5 _id specialization),
@@ -6,9 +6,9 @@
 // near-white texture gate that emits (freckle/highlight paint). Plain material — no
 // built-in slot effect, so it uses the default prelude/epilogue.
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const FACE_GRAPH: StyleGraph = {
+export const FACE_GRAPH: ShaderGraph = {
   version: 1,
   name: "Face",
   tags: ["face"],

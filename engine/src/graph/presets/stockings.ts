@@ -1,4 +1,4 @@
-// M_Stockings as a StyleGraph — port of shaders/materials/stockings.ts.
+// M_Stockings as a ShaderGraph — port of shaders/materials/stockings.ts.
 // A bbox-gradient × facing-rim mask drives a Mix Shader between an HSV-boosted
 // emission (val 5×) and a sheen Principled. The hashed-alpha discard and the
 // alpha=1 output are slot-owned (see STOCKINGS_TEMPLATE in slots.ts) — the graph
@@ -6,9 +6,9 @@
 // as in the hand port. The grayscale mask feeds Mix Shader Fac through Blender's
 // implicit BT.601 color→float conversion (equal-component vector → same scalar).
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const STOCKINGS_GRAPH: StyleGraph = {
+export const STOCKINGS_GRAPH: ShaderGraph = {
   version: 1,
   name: "Stockings",
   tags: ["stockings"],

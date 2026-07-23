@@ -13,8 +13,7 @@ npm install reze-engine
 ## Features
 
 - Anime/MMD **hybrid renderer** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
-- **Node-graph materials** — every look is a Blender-style **style graph** (JSON) validated + compiled to WGSL at runtime; instant slider tier, async pipeline swap with fallback-on-error
-- **Style groups** — bind any set of materials to any graph, unlimited and user-defined; 9 NPR graphs ship built-in (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`)
+- **Shader-graph materials + style groups** — every look is a Blender-style **shader graph** (JSON) compiled to WGSL at runtime; **style groups** bind any set of materials to any graph (unlimited, user-defined). 9 NPR graphs ship built-in (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`); fully customizable — see [reze-design](https://reze.design) for the visual shader-graph editor
 - **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, no external dependency
 - **VMD animation** with MMD IK, morphs (GPU compute path), and VMD export
@@ -26,7 +25,7 @@ See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
 ## Used by
 
-- [Reze Design](https://reze.design) (web-native scene composer & node-graph styling)
+- [Reze Design](https://reze.design) (web-native scene composer & shader-graph styling)
 - [Reze Studio](https://reze.studio) (MMD animation editor)
 - [MiKaPo](https://mikapo.vercel.app) (motion capture)
 - [Popo](https://popo.love) (LLM-generated poses)
@@ -51,13 +50,13 @@ engine/src/
   tga-loader.ts      TGA decoder (formats createImageBitmap can't read)
   index.ts           public exports
 
-  graph/             style-graph → WGSL compiler — materials as data
-    schema.ts          StyleGraph / StyleGroup / param types + validation
+  graph/             shader-graph → WGSL compiler — materials as data
+    schema.ts          ShaderGraph / StyleGroup / param types + validation
     registry.ts        node registry (Blender node → WGSL) + socket conversions
     compile.ts         validate → prune → toposort → peephole → emit
     render-class.ts    RenderClass / AlphaMode + the RENDER_CLASSES manifest
     slots.ts           per-render-class fs() shell (stencil/alpha) around the graph body
-    presets/           the 9 built-in style graphs (hair, face, eye, cloth, …)
+    presets/           the 9 built-in shader graphs (hair, face, eye, cloth, …)
 
   physics/           in-house rigid-body solver (~2.5k lines)
     physics.ts         RezePhysics: bone↔body sync, fixed-step accumulator + interpolation
@@ -89,11 +88,11 @@ await engine.init()
 
 const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
 
-// One-tap styling: bucket materials into the engine's built-in default style graphs
+// One-tap styling: bucket materials into the engine's built-in default shader graphs
 // (face / hair / eye / cloth / stockings / metal). These categories are just the shipped
 // starter graphs — NOT fixed slots. `overrides` maps names the built-in JP/CN/EN hints
 // miss; standard-named models need no map. Unmatched materials stay ungrouped (neutral).
-// For arbitrary groups with any graph, use applyStyleGroups (see "Style graphs & groups").
+// For arbitrary groups with any graph, use applyStyleGroups (see "Shader graphs & style groups").
 await engine.autoStyleGroups("reze", {
   face: ["face01"],
   body: ["skin"],
@@ -217,9 +216,9 @@ onGizmoDrag: (e) => {
 
 Note the asymmetry: rotation goes through `rotateBones(…, 0)`, but translation uses `setBoneLocalTranslation(idx, v)` — `moveBones` converts VMD-relative→local, and the gizmo output is already local.
 
-## Style graphs & groups (node-graph materials)
+## Shader graphs & style groups
 
-Materials are styled by **node graphs** — plain JSON (`StyleGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE**, so community Blender NPR presets port by transcription. Nine graphs ship built-in (`FACE_GRAPH`, `HAIR_GRAPH`, `BODY_GRAPH`, `EYE_GRAPH`, `METAL_GRAPH`, `STOCKINGS_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `DEFAULT_GRAPH` — the neutral base) as a starter library; you can also author or import your own.
+Materials are styled by **shader graphs** — plain JSON (`ShaderGraph`) validated and compiled to WGSL at runtime. Node semantics are frozen **Blender 3.6 legacy-EEVEE**, so community Blender NPR presets port by transcription. Nine graphs ship built-in (`FACE_GRAPH`, `HAIR_GRAPH`, `BODY_GRAPH`, `EYE_GRAPH`, `METAL_GRAPH`, `STOCKINGS_GRAPH`, `CLOTH_SMOOTH_GRAPH`, `CLOTH_ROUGH_GRAPH`, `DEFAULT_GRAPH` — the neutral base) as a starter library; you can also author or import your own.
 
 A **style group** binds `{ materials, graph, renderClass?, alphaMode? }` — a set of materials, the graph that shades them, and the engine's small pass-integration vocabulary (`renderClass`: `auto`/`eye`/`hair` for stencil/cull/draw-order; `alphaMode`: `opaque`/`hashed`). **Groups are user-defined and unlimited** — any materials, any graph. A graph is pure shading; `renderClass` carries the built-in effects (hair's over-eyes stencil, the eye see-through stamp), so any graph in an `eye`/`hair` group inherits them. **Every group needs a valid graph**; a material in no group renders the **neutral default** (`DEFAULT_GRAPH`).
 
@@ -265,7 +264,7 @@ Engine surface is just `setPhysicsEnabled` / `resetPhysics` — all tuning (mass
 
 ## Rendering
 
-Each built-in style graph mixes an NPR stack with a Principled-style BSDF, so characters keep a flat illustrated look while highlights and reflections stay grounded. A graph compiles to a fragment shader following one 7-stage layout (node primitives from `nodes.ts`, the fs() shell from `common.ts`):
+Each built-in shader graph mixes an NPR stack with a Principled-style BSDF, so characters keep a flat illustrated look while highlights and reflections stay grounded. A graph compiles to a fragment shader following one 7-stage layout (node primitives from `nodes.ts`, the fs() shell from `common.ts`):
 
 ```
 (A) setup → (B) texture + alpha → (C) NPR stack → (D) optional bump

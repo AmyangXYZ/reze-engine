@@ -1,11 +1,11 @@
-// M_Smooth_Cloth as a StyleGraph — port of shaders/materials/cloth_smooth.ts.
+// M_Smooth_Cloth as a ShaderGraph — port of shaders/materials/cloth_smooth.ts.
 // NPR toon + bevel + overlay-boosted emission (18.2×) mixed 10/90 against a plain
 // Principled BSDF. The Blender graph's dead bump subtree is omitted (as in the hand
 // port). hue_sat nodes with hue=0.5 compile to the hue_sat_id specialization.
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const CLOTH_SMOOTH_GRAPH: StyleGraph = {
+export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
   version: 1,
   name: "Smooth Cloth",
   tags: ["cloth_smooth"],

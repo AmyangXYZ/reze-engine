@@ -31,7 +31,7 @@ import { COMPOSITE_SHADER_WGSL } from "./shaders/passes/composite"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
-import type { Diagnostic, StyleGraph } from "./graph/schema"
+import type { Diagnostic, ShaderGraph } from "./graph/schema"
 import type { AlphaMode, RenderClass } from "./graph/render-class"
 import type {
   ApplyStyleGroupResult,
@@ -136,7 +136,7 @@ function resolvePreset(materialName: string, map: MaterialPresetMap | undefined)
 // (renderClass, alphaMode). This is the auto-default-groups mapping (docs §8) — the same
 // label→integration knowledge the old fixed slots encoded, now producing editable groups.
 // mmd_classic has no entry — those materials stay ungrouped (hand-shader path).
-const PRESET_GROUP_INFO: Partial<Record<MaterialPreset, { graph: StyleGraph; renderClass: RenderClass; alphaMode: AlphaMode }>> = {
+const PRESET_GROUP_INFO: Partial<Record<MaterialPreset, { graph: ShaderGraph; renderClass: RenderClass; alphaMode: AlphaMode }>> = {
   default: { graph: DEFAULT_GRAPH, renderClass: "auto", alphaMode: "opaque" },
   face: { graph: FACE_GRAPH, renderClass: "auto", alphaMode: "opaque" },
   hair: { graph: HAIR_GRAPH, renderClass: "hair", alphaMode: "opaque" },

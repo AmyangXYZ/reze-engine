@@ -24,7 +24,7 @@ export {
   type StyleSlot,
 } from "./graph/compile"
 export type {
-  StyleGraph,
+  ShaderGraph,
   GraphNode,
   GraphLink,
   ExposedParam,

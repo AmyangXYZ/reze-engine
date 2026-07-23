@@ -1,4 +1,4 @@
-// M_Hair — 仿深空之眼渲染预设v1.0_by_小绿毛猫, as a StyleGraph. Node ids mirror the
+// M_Hair — 仿深空之眼渲染预设v1.0_by_小绿毛猫, as a ShaderGraph. Node ids mirror the
 // Blender node names referenced in shaders/materials/hair.ts comments; compiled with
 // { inlineParams: true } this graph must reproduce HAIR_SHADER_WGSL's fragment body
 // (golden test #1 — see tests/graph.test.mjs).
@@ -10,9 +10,9 @@
 // The object is pure JSON (no functions/undefined) — JSON.stringify round-trips it,
 // which is how reze.design will ship additional presets.
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const HAIR_GRAPH: StyleGraph = {
+export const HAIR_GRAPH: ShaderGraph = {
   version: 1,
   name: "Hair",
   tags: ["hair"],

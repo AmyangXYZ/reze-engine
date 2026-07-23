@@ -1,11 +1,11 @@
-// M_Body as a StyleGraph — port of shaders/materials/body.ts (仿深空之眼 "M_Body").
+// M_Body as a ShaderGraph — port of shaders/materials/body.ts (仿深空之眼 "M_Body").
 // Toon + warm rim + rim1/rim2 stack mixed 50/50 against a Principled BSDF with
 // noise-bumped normal. The hand port's local ramp_ease is ramp_cardinal (identical
 // smoothstep form); the Mapping node's zero loc/rot folds to a scale multiply.
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const BODY_GRAPH: StyleGraph = {
+export const BODY_GRAPH: ShaderGraph = {
   version: 1,
   name: "Body",
   tags: ["body"],

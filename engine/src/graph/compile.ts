@@ -4,7 +4,7 @@
 // See docs/graph-compiler-spec.md.
 
 import { MAX_NODES, MAX_PARAMS } from "./schema"
-import type { Diagnostic, ExposedParam, GraphNode, SocketValue, StyleGraph } from "./schema"
+import type { Diagnostic, ExposedParam, GraphNode, SocketValue, ShaderGraph } from "./schema"
 import { NODE_REGISTRY, canConvert, convert, fmtValue, literalFits } from "./registry"
 import type { NodeSpec, SockT } from "./registry"
 import { assembleModule } from "./slots"
@@ -83,7 +83,7 @@ export function assignStyleSlots(params: ExposedParam[]): StyleSlot[] {
 
 // ─── Validation ─────────────────────────────────────────────────────
 
-export function validateGraph(graph: StyleGraph, opts: CompileOptions = {}): Diagnostic[] {
+export function validateGraph(graph: ShaderGraph, opts: CompileOptions = {}): Diagnostic[] {
   const d: Diagnostic[] = []
   const nodes = new Map<string, GraphNode>()
 
@@ -188,7 +188,7 @@ export function validateGraph(graph: StyleGraph, opts: CompileOptions = {}): Dia
 
 // ─── Compile ────────────────────────────────────────────────────────
 
-export function compileGraph(graph: StyleGraph, opts: CompileOptions = {}): CompileResult {
+export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): CompileResult {
   const fail = (diagnostics: Diagnostic[]): CompileResult => ({
     ok: false,
     wgsl: "",

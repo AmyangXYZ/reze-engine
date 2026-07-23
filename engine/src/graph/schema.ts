@@ -1,4 +1,4 @@
-// Material style graph — JSON-serializable node graph compiled to WGSL by compile.ts.
+// ShaderGraph — a JSON-serializable graph of shading nodes, compiled to WGSL by compile.ts.
 // Engine-space (LH, Y-up): porting a Blender graph converts coordinates at authoring
 // time (Blender Normal Z → engine Y), the compiler never sees Blender conventions.
 // See docs/graph-compiler-spec.md.
@@ -34,7 +34,7 @@ export type ExposedParam = {
   default: SocketValue
 }
 
-export type StyleGraph = {
+export type ShaderGraph = {
   version: 1
   name: string
   nodes: GraphNode[]

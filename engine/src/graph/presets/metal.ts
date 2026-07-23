@@ -1,12 +1,12 @@
-// M_Metal as a StyleGraph — port of shaders/materials/metal.ts.
+// M_Metal as a ShaderGraph — port of shaders/materials/metal.ts.
 // Metallic Principled (Metallic=1, Specular=1, Roughness=0.3) with a
 // reflection-coord voronoi driving base color (metallic sparkle), plus an NPR
 // toon/overlay emission stack mixed at Fac=0.6967. The voronoi Color→ramp Fac
 // link goes through Blender's implicit BT.601 conversion (color_to_value).
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const METAL_GRAPH: StyleGraph = {
+export const METAL_GRAPH: ShaderGraph = {
   version: 1,
   name: "Metal",
   tags: ["metal"],

@@ -1,5 +1,5 @@
 // Render-class + alpha-mode: the small, closed, engine-owned vocabularies that carry
-// pass integration for a style group. A group's node graph is pure shading; these select
+// pass integration for a style group. A group's shader graph is pure shading; these select
 // how the engine wires that shading into the passes. Not user-extensible — this is where
 // rendering correctness lives (stencil, cull, draw order, alpha test). See
 // docs/style-groups-spec.md §5.

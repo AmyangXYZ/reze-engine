@@ -5,9 +5,9 @@
 // The material-color multiply is what keeps untextured/solid-color materials from
 // rendering white (they carry their color in material.diffuse, not a texture).
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const DEFAULT_GRAPH: StyleGraph = {
+export const DEFAULT_GRAPH: ShaderGraph = {
   version: 1,
   name: "Principled BSDF",
   tags: ["default"],

@@ -1,4 +1,4 @@
-// Eye as a StyleGraph — port of shaders/materials/eye.ts. The published preset
+// Eye as a ShaderGraph — port of shaders/materials/eye.ts. The published preset
 // author's instruction: "keep eyes in the default nodegraph, add emission 1.5".
 // So it's the default Principled BSDF plus an Emission of the diffuse texture at
 // 1.5× (Blender's Principled Emission socket, decomposed as a separate Emission +
@@ -7,9 +7,9 @@
 // The rear-view gate and the see-through stencil stamp are slot-owned (built-in eye
 // behavior, see EYE_TEMPLATE in slots.ts + createSlotPipeline) — not in this graph.
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const EYE_GRAPH: StyleGraph = {
+export const EYE_GRAPH: ShaderGraph = {
   version: 1,
   name: "Eye",
   tags: ["eye"],

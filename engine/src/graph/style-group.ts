@@ -1,10 +1,10 @@
 // Style groups — the user-facing unit of material styling. A group binds a set of
-// materials to a node graph (pure shading) plus the engine-owned pass-integration axes
+// materials to a shader graph (pure shading) plus the engine-owned pass-integration axes
 // (renderClass + alphaMode). Each material belongs to at most one group; grouped
 // materials render via the group's compiled-graph pipeline, ungrouped ones fall back to
 // the hand-written preset path. See docs/style-groups-spec.md.
 
-import type { Diagnostic, StyleGraph } from "./schema"
+import type { Diagnostic, ShaderGraph } from "./schema"
 import type { AlphaMode, RenderClass } from "./render-class"
 import type { StyleSlot } from "./compile"
 
@@ -16,8 +16,8 @@ export type StyleGroup = {
   label?: string
   /** Material names in this group; each material is in AT MOST one group. */
   materials: string[]
-  /** Pure shading (StyleGraph has no `slot` — integration lives here on the group). */
-  graph: StyleGraph
+  /** Pure shading (ShaderGraph has no `slot` — integration lives here on the group). */
+  graph: ShaderGraph
   /** Pass-integration class: stencil/cull/draw-order. Default "auto". */
   renderClass?: RenderClass
   /** Alpha-handling axis, orthogonal to renderClass. Default "opaque". */

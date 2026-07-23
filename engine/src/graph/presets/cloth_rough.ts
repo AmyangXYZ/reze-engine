@@ -1,11 +1,11 @@
-// M_Rough_Cloth as a StyleGraph — port of shaders/materials/cloth_rough.ts.
+// M_Rough_Cloth as a ShaderGraph — port of shaders/materials/cloth_rough.ts.
 // NPR graph identical to M_Smooth_Cloth, but the noise bump subtree IS live on
 // Principled.Normal (weave bump in rest space) and Roughness is raised to 0.8187.
 // The tex_noise node hits the detail=2 peephole → tex_noise_d2.
 
-import type { StyleGraph } from "../schema"
+import type { ShaderGraph } from "../schema"
 
-export const CLOTH_ROUGH_GRAPH: StyleGraph = {
+export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
   version: 1,
   name: "Rough Cloth",
   tags: ["cloth_rough"],
