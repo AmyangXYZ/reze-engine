@@ -13,8 +13,8 @@ npm install reze-engine
 ## Features
 
 - Anime/MMD **hybrid renderer** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
-- **9 per-material presets** assigned by material name (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`)
-- **Node-graph materials** — Blender-style style graphs (JSON) validated + compiled to WGSL at runtime; instant slider tier, async pipeline swap with fallback-on-error
+- **Node-graph materials** — every look is a Blender-style **style graph** (JSON) validated + compiled to WGSL at runtime; instant slider tier, async pipeline swap with fallback-on-error
+- **Style groups** — bind any set of materials to any graph, unlimited and user-defined; 9 NPR graphs ship built-in (`face` / `hair` / `body` / `eye` / `stockings` / `metal` / `cloth_smooth` / `cloth_rough` / `default`)
 - **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, no external dependency
 - **VMD animation** with MMD IK, morphs (GPU compute path), and VMD export
@@ -48,7 +48,16 @@ engine/src/
   pmx-loader.ts      PMX parser: mesh, bones, morphs, rigid bodies, joints
   vmd-loader.ts      VMD motion parser  ·  vmd-writer.ts  VMD export (Shift-JIS)
   asset-reader.ts    URL + local-folder asset resolution  ·  folder-upload.ts
+  tga-loader.ts      TGA decoder (formats createImageBitmap can't read)
   index.ts           public exports
+
+  graph/             style-graph → WGSL compiler — materials as data
+    schema.ts          StyleGraph / StyleGroup / param types + validation
+    registry.ts        node registry (Blender node → WGSL) + socket conversions
+    compile.ts         validate → prune → toposort → peephole → emit
+    render-class.ts    RenderClass / AlphaMode + the RENDER_CLASSES manifest
+    slots.ts           per-render-class fs() shell (stencil/alpha) around the graph body
+    presets/           the 9 built-in style graphs (hair, face, eye, cloth, …)
 
   physics/           in-house rigid-body solver (~2.5k lines)
     physics.ts         RezePhysics: bone↔body sync, fixed-step accumulator + interpolation
@@ -58,8 +67,9 @@ engine/src/
     body.ts            SoA rigid-body store  ·  types.ts
 
   shaders/
-    materials/       nodes.ts (Blender-node WGSL library) + common.ts (bindings, skinning VS)
-                     + one file per preset (face, hair, body, eye, stockings, …)
+    materials/       nodes.ts (Blender-node WGSL library the graph compiler emits into) +
+                     common.ts (bindings, skinning VS); the per-material .ts files are the
+                     original hand shaders, kept as the graph-port reference
     passes/          shadow, morph (GPU vertex-morph compute), bloom, composite (Filmic),
                      outline, selection, gizmo, pick, ground, mipmap
 ```
@@ -255,20 +265,20 @@ Engine surface is just `setPhysicsEnabled` / `resetPhysics` — all tuning (mass
 
 ## Rendering
 
-Each surface mixes an NPR stack with a Principled-style BSDF per material, so characters keep a flat illustrated look while highlights and reflections stay grounded. Shaders live in `engine/src/shaders/materials/`; each fragment shader follows one 7-stage layout (shared stages from `nodes.ts` / `common.ts`):
+Each built-in style graph mixes an NPR stack with a Principled-style BSDF, so characters keep a flat illustrated look while highlights and reflections stay grounded. A graph compiles to a fragment shader following one 7-stage layout (node primitives from `nodes.ts`, the fs() shell from `common.ts`):
 
 ```
 (A) setup → (B) texture + alpha → (C) NPR stack → (D) optional bump
 → (E) Principled BSDF → (F) NPR↔PBR mix → (G) FSOut
 ```
 
-`default` uses only A/B/E/G; NPR presets add C (and sometimes D), with F choosing how NPR-leaning the result is.
+`default` uses only A/B/E/G; the NPR graphs add C (and sometimes D), with F choosing how NPR-leaning the result is.
 
 - **PBR core** (`eval_principled`) — GGX + Schlick Fresnel, Walter–Smith G1, Fdez-Agüera 2019 multi-scatter, Karis split-sum DFG LUT, Heitz 2016 LTC direct-spec, optional sheen.
 - **NPR toolbox** — toon ramps (constant / fwidth-AA'd), HSV warm-shadow / cool-light remaps, fresnel + layer-weight rims, value-noise bump, Voronoi metallic sparkle, BT.601-gated emission.
 
 
-| Preset         | Notes                                                                   |
+| Built-in graph | Notes                                                                   |
 | -------------- | ----------------------------------------------------------------------- |
 | `default`      | Plain Principled, metallic 0, rough 0.5                                 |
 | `eye`          | Plain + post-eval emission ×1.5                                         |
