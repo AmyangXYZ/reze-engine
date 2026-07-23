@@ -2,6 +2,7 @@ import { Camera } from "./camera"
 import { Mat4, Quat, Vec3 } from "./math"
 import { Model, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
+import { decodeTga } from "./tga-loader"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
 import {
@@ -3368,34 +3369,74 @@ export class Engine {
       return cached
     }
 
+    let buffer: ArrayBuffer
     try {
-      const buffer = await inst.assetReader.readBinary(logicalPath)
-      const imageBitmap = await createImageBitmap(new Blob([buffer]), {
-        premultiplyAlpha: "none",
-        colorSpaceConversion: "none",
-      })
-
-      const mipLevelCount = Math.floor(Math.log2(Math.max(imageBitmap.width, imageBitmap.height))) + 1
-      const texture = this.device.createTexture({
-        label: `texture: ${cacheKey}`,
-        size: [imageBitmap.width, imageBitmap.height],
-        format: "rgba8unorm-srgb",
-        mipLevelCount,
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-      })
-      this.device.queue.copyExternalImageToTexture({ source: imageBitmap }, { texture }, [
-        imageBitmap.width,
-        imageBitmap.height,
-      ])
-
-      if (mipLevelCount > 1) this.generateMipmaps(texture, mipLevelCount)
-
-      this.textureCache.set(cacheKey, texture)
-      inst.textureCacheKeys.push(cacheKey)
-      return texture
-    } catch {
+      buffer = await inst.assetReader.readBinary(logicalPath)
+    } catch (e) {
+      console.warn(`[reze] texture read failed: ${logicalPath}`, e instanceof Error ? e.message : e)
       return null
     }
+
+    // Decode to either an ImageBitmap (web-native formats) or raw RGBA (TGA). .tga skips
+    // straight to the TGA decoder (createImageBitmap can't read it); other extensions try
+    // the browser decoder first, then fall back to TGA in case a .spa/.sph/etc. is TGA
+    // under its extension. Every failure is logged and soft — never throws to the caller.
+    let source: ImageBitmap | null = null
+    let rgba: Uint8Array | null = null
+    let width: number
+    let height: number
+
+    const isTga = logicalPath.toLowerCase().endsWith(".tga")
+    if (!isTga) {
+      try {
+        source = await createImageBitmap(new Blob([buffer]), { premultiplyAlpha: "none", colorSpaceConversion: "none" })
+      } catch {
+        source = null // not a browser-native image — try TGA below
+      }
+    }
+
+    if (source) {
+      width = source.width
+      height = source.height
+    } else {
+      try {
+        const img = decodeTga(buffer)
+        rgba = img.rgba
+        width = img.width
+        height = img.height
+      } catch (e) {
+        console.warn(
+          `[reze] texture decode failed (unsupported format?): ${logicalPath}`,
+          e instanceof Error ? e.message : e,
+        )
+        return null
+      }
+    }
+
+    const mipLevelCount = Math.floor(Math.log2(Math.max(width, height))) + 1
+    const texture = this.device.createTexture({
+      label: `texture: ${cacheKey}`,
+      size: [width, height],
+      format: "rgba8unorm-srgb",
+      mipLevelCount,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    if (source) {
+      this.device.queue.copyExternalImageToTexture({ source }, { texture }, [width, height])
+    } else {
+      this.device.queue.writeTexture(
+        { texture },
+        rgba! as ArrayBufferView<ArrayBuffer>,
+        { bytesPerRow: width * 4, rowsPerImage: height },
+        [width, height],
+      )
+    }
+
+    if (mipLevelCount > 1) this.generateMipmaps(texture, mipLevelCount)
+
+    this.textureCache.set(cacheKey, texture)
+    inst.textureCacheKeys.push(cacheKey)
+    return texture
   }
 
   // Bilinear box-filter downsample per level. Reads srgb view (hardware linearizes on sample,

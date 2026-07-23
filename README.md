@@ -18,6 +18,7 @@ npm install reze-engine
 - **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, no external dependency
 - **VMD animation** with MMD IK, morphs (GPU compute path), and VMD export
+- **PMX textures** — browser-native formats plus a built-in TGA decoder (common in MMD sphere/eye maps); unsupported files log and fall back, never crash
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - Orbit camera with bone-follow, ground + PCF shadows, multi-model
 
