@@ -75,37 +75,19 @@ engine/src/
 ## Quick start
 
 ```javascript
-import { Engine, Vec3 } from "reze-engine"
+import { Engine } from "reze-engine"
 
-const engine = new Engine(canvas, {
-  world: { color: new Vec3(0.4, 0.49, 0.65), strength: 1.0 }, // environment light
-  sun: { color: new Vec3(1, 1, 1), strength: 2.0, direction: new Vec3(0, -0.5, 1) },
-  bloom: { color: new Vec3(0.9, 0.1, 0.8), intensity: 0.05, threshold: 0.5 },
-  camera: { distance: 31.5, target: new Vec3(0, 11.5, 0) }, // MMD units (1 unit = 8 cm)
-})
+const engine = new Engine(canvas)
 await engine.init()
 
 const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
-
-// Auto-group materials into the built-in style graphs. `overrides` handles names the
-// built-in hints miss; standard-named models need none. (Full rules + keyword table below.)
-await engine.autoStyleGroups("reze", {
-  face: ["face01"],
-  body: ["skin"],
-  hair: ["hair_f"],
-  eye: ["eye"],
-  cloth_smooth: ["shirt", "dress", "shoes"],
-  cloth_rough: ["jacket"],
-  stockings: ["stockings"],
-  metal: ["earring"],
-})
+await engine.autoStyleGroups("reze") // one-tap NPR styling from material names
 
 await model.loadVmd("idle", "/animations/idle.vmd")
 model.show("idle")
 model.play()
 
-engine.setCameraFollow(model, "センター", new Vec3(0, 3.5, 0))
-engine.addGround({ width: 160, height: 160 })
+engine.addGround()
 engine.runRenderLoop()
 ```
 
