@@ -41,10 +41,10 @@ struct LightUniforms {
 
 // Per-material uniforms. Every material binds this layout even if it ignores fields;
 // the engine keeps one bind group layout across all material pipelines. The PMX
-// classic-material fields (ambient/specular/toon/sphere) are consumed by the
-// mmd_classic preset; NPR presets ignore them.
+// classic-material fields (ambient/specular/shininess) are carried for graph nodes that
+// want them; most graphs read only diffuseColor + alpha.
 struct MaterialUniforms {
-  diffuseColor: vec3f,   // PMX diffuse rgb (mmd_classic); reserved for others
+  diffuseColor: vec3f,   // PMX diffuse rgb — the material_diffuse node reads this
   alpha: f32,            // 0 → discard; <1 → transparent draw call
   ambient: vec3f,        // PMX ambient rgb
   shininess: f32,        // PMX specular power
@@ -84,7 +84,8 @@ struct LightVP { viewProj: mat4x4f, };
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
-// mmd_classic inputs; other presets leave them unread (fallback 1×1 whites).
+// Reserved for future sphere/toon graph nodes; graphs that don't read them get the
+// 1×1 white fallback bound here.
 @group(2) @binding(2) var toonTexture: texture_2d<f32>;
 @group(2) @binding(3) var sphereTexture: texture_2d<f32>;
 

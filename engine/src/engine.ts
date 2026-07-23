@@ -62,20 +62,12 @@ export type MaterialPreset =
   | "cloth_smooth"
   | "cloth_rough"
 
-// What a draw call actually resolves to. "mmd_classic" is the automatic
-// authentic-MMD fallback for materials no preset map or name heuristic
-// covers — deliberately NOT part of MaterialPreset, so consumer-side
-// exhaustive Record<MaterialPreset, …> maps and switches don't have to
-// carry an option users never assign.
-export type ResolvedMaterialPreset = MaterialPreset | "mmd_classic"
-
 export type MaterialPresetMap = Partial<Record<MaterialPreset, string[]>>
 
-// Substring hints mapping common PMX material names (JP/CN/EN) to presets,
-// tried when a material isn't in the model's explicit MaterialPresetMap.
-// Ordered: more specific families first (靴下 must hit stockings before 靴
-// hits cloth). Anything unmatched falls through to mmd_classic, which renders
-// the author-tuned PMX material data faithfully.
+// Substring hints mapping common PMX material names (JP/CN/EN) to a style category,
+// tried when a material isn't in the caller's explicit override map. Ordered: more
+// specific families first (靴下 must hit stockings before 靴 hits cloth). A material
+// matching nothing resolves to null — it stays ungrouped (neutral default).
 const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   ["stockings", ["靴下", "ソックス", "タイツ", "ニーソ", "袜", "stocking", "socks", "tights"]],
   [
@@ -117,7 +109,9 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   ],
 ]
 
-function resolvePreset(materialName: string, map: MaterialPresetMap | undefined): ResolvedMaterialPreset {
+// Resolve a material name to a style category (override map first, then name hints), or
+// null if nothing matches — a null-resolving material stays ungrouped (neutral default).
+function resolvePreset(materialName: string, map: MaterialPresetMap | undefined): MaterialPreset | null {
   if (map) {
     for (const [preset, names] of Object.entries(map)) {
       if (names && names.includes(materialName)) return preset as MaterialPreset
@@ -129,13 +123,12 @@ function resolvePreset(materialName: string, map: MaterialPresetMap | undefined)
       if (lower.includes(hint)) return preset
     }
   }
-  return "mmd_classic"
+  return null
 }
 
-// Default-group recipe per preset label: the shipped graph + its natural pass-integration
-// (renderClass, alphaMode). This is the auto-default-groups mapping (docs §8) — the same
-// label→integration knowledge the old fixed slots encoded, now producing editable groups.
-// mmd_classic has no entry — those materials stay ungrouped (hand-shader path).
+// Default-group recipe per style category: the shipped graph + its natural pass-integration
+// (renderClass, alphaMode). This is the auto-default-groups mapping — the same
+// category→integration knowledge the old fixed slots encoded, now producing editable groups.
 const PRESET_GROUP_INFO: Partial<Record<MaterialPreset, { graph: ShaderGraph; renderClass: RenderClass; alphaMode: AlphaMode }>> = {
   default: { graph: DEFAULT_GRAPH, renderClass: "auto", alphaMode: "opaque" },
   face: { graph: FACE_GRAPH, renderClass: "auto", alphaMode: "opaque" },
@@ -3972,7 +3965,7 @@ export class Engine {
     for (const dc of inst.drawCalls) {
       if (!dc.baseBindGroupEntries) continue // material draw calls only (skip outlines)
       const preset = resolvePreset(dc.materialName, overrides)
-      if (preset === "mmd_classic") continue // unmatched → ungrouped
+      if (!preset) continue // unmatched → stays ungrouped (neutral default)
       const arr = buckets.get(preset) ?? []
       if (!arr.includes(dc.materialName)) arr.push(dc.materialName)
       buckets.set(preset, arr)

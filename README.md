@@ -67,8 +67,7 @@ engine/src/
 
   shaders/
     materials/       nodes.ts (Blender-node WGSL library the graph compiler emits into) +
-                     common.ts (bindings, skinning VS); the per-material .ts files are the
-                     original hand shaders, kept as the graph-port reference
+                     common.ts (bindings, skinning VS, fs() shell)
     passes/          shadow, morph (GPU vertex-morph compute), bloom, composite (Filmic),
                      outline, selection, gizmo, pick, ground, mipmap
 ```
@@ -242,6 +241,14 @@ engine.removeStyleGroup("reze", "hair") // its materials drop to the neutral def
 // Headless (no GPU needed):
 const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH, { renderClass: "hair" })
 ```
+
+**How `autoStyleGroups(model, overrides?)` resolves** — it assigns each material a *style category*, then buckets materials by category into one group each:
+
+1. **`overrides` first** — an explicit `{ category: [materialNames] }` map (the arg). Use it for the names the built-in hints can't read.
+2. **Then built-in name hints** — a case-insensitive **substring** match of the material name against per-category JP/CN/EN keyword lists, ordered **most-specific-first** so families don't collide (`靴下`/`stocking` resolves to `stockings` before `靴`/`shoes` would hit `cloth_smooth`). This covers standard-named models with no overrides at all.
+3. **No match → ungrouped** — the material renders the neutral default. "Unmatched" is a real, intended outcome, not a catch-all bucket.
+
+Each category carries its shipped graph **and** pass-integration: `eye` → `EYE_GRAPH` + `renderClass: "eye"`, `hair` → `HAIR_GRAPH` + `"hair"`, `stockings` → `STOCKINGS_GRAPH` + `alphaMode: "hashed"`, the rest → their graph + `auto`/`opaque`. The group `id` is the category name (`hair`, `eye`, …), so re-running is idempotent. The returned promise resolves after grouping **and** every graph compiles, so `getStyleGroups(model)` is populated the moment it resolves — seed your own store from it and edit with `applyStyleGroups` afterward.
 
 Validation catches material conflicts, type mismatches, cycles, and bad links with node-level diagnostics; a failed compile keeps the previous pipeline rendering (fallback-on-error).
 
