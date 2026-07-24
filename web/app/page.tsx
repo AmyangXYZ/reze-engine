@@ -207,35 +207,7 @@ export default function Home() {
 
       // Group materials into their default style graphs (custom names → categories the
       // built-in hints miss). Ungrouped materials would render the neutral default.
-      await engine.autoStyleGroups(SCENE_MODELS[0].id, {
-        eye: ["眼睛", "眼白", "目白", "右瞳", "左瞳", "眉毛"],
-        face: ["脸", "face01"],
-        body: ["皮肤", "skin"],
-        hair: ["头发", "hair_f"],
-        cloth_smooth: [
-          "衣服",
-          "裙子",
-          "裙带",
-          "裙布",
-          "外套",
-          "外套饰",
-          "裤子",
-          "裤子0",
-          "腿环",
-          "发饰",
-          "鞋子",
-          "鞋子饰",
-          "shirt",
-          "shoes",
-          "shorts",
-          "trigger",
-          "dress",
-          "hair_accessory",
-          "cloth01_shoes",
-        ],
-        stockings: ["袜子", "stockings"],
-        metal: ["metal01", "earring"],
-      })
+      await engine.autoStyleGroups(SCENE_MODELS[0].id)
 
       engine.addGround({
         diffuseColor: new Vec3(1, 0.3, 0.6),

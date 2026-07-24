@@ -34,20 +34,20 @@ See [Physics](#physics) and [Rendering](#rendering) for the internals.
 ## Quick start
 
 ```javascript
-import { Engine } from "reze-engine"
+import { Engine } from "reze-engine";
 
-const engine = new Engine(canvas)
-await engine.init()
+const engine = new Engine(canvas);
+await engine.init();
 
-const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
-await engine.autoStyleGroups("reze")
+const model = await engine.loadModel("reze", "/models/reze/reze.pmx");
+await engine.autoStyleGroups("reze");
 
-await model.loadVmd("idle", "/animations/idle.vmd")
-model.show("idle")
-model.play()
+await model.loadVmd("idle", "/animations/idle.vmd");
+model.show("idle");
+model.play();
 
-engine.addGround()
-engine.runRenderLoop()
+engine.addGround();
+engine.runRenderLoop();
 ```
 
 ## Codebase map
@@ -114,7 +114,7 @@ engine.setCameraFollow(model, bone?, offset?) / setCameraFollow(null)
 engine.setCameraTarget(vec3) / setCameraDistance(d) / setCameraAlpha(a) / setCameraBeta(b)
 
 engine.loadCameraVmd(url) / loadCameraVmdFromBuffer(buffer)   // MMD camera track (dedicated file or a VMD's camera block) drives target/rotation/distance/fov — default-on once loaded
-engine.setCameraVmdEnabled(on) / isCameraVmdEnabled() / hasCameraVmd() / clearCameraVmd()   // toggle the shot; off falls back to orbit / follow-bone
+engine.setCameraVmdEnabled(on) / isCameraVmdEnabled() / hasCameraVmd() / clearCameraVmd()   // toggle the shot; while it drives, orbit/pan/zoom is inert — toggle off to hand control back
 
 engine.setWorld({ color?, strength? }) / setSun({ color?, strength?, direction? })   // runtime lighting
 engine.addGround(options?)
@@ -152,9 +152,10 @@ Feed a `<input type="file" webkitdirectory>` `FileList` (or drag/drop) into the 
 `parsePmxFolderInput(fileList)` returns a tagged result; for `single` you get `{ files, pmxFile }` directly, for `multiple` show a picker over `pmxRelativePaths` and resolve with `pmxFileAtRelativePath(files, path)`. Then:
 
 ```javascript
-const picked = parsePmxFolderInput(e.target.files)
-e.target.value = ""
-if (picked.status === "single") await engine.loadModel("m", { files: picked.files, pmxFile: picked.pmxFile })
+const picked = parsePmxFolderInput(e.target.files);
+e.target.value = "";
+if (picked.status === "single")
+  await engine.loadModel("m", { files: picked.files, pmxFile: picked.pmxFile });
 ```
 
 VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths resolve against the PMX directory.
@@ -180,18 +181,18 @@ The gizmo consumes mouse input inside its bounding sphere so drags never fight c
 
 ```javascript
 onGizmoDrag: (e) => {
-  const model = engine.getModel(e.modelName)
-  if (!model) return
+  const model = engine.getModel(e.modelName);
+  if (!model) return;
   if (e.phase === "start") {
-    model.pause()
-    model.setClipApplySuspended(true)
-    return
+    model.pause();
+    model.setClipApplySuspended(true);
+    return;
   } // stop re-sampling wiping the edit
-  if (e.phase === "end") return
+  if (e.phase === "end") return;
   if (e.kind === "rotate")
-    model.rotateBones({ [e.boneName]: e.localRotation }, 0) // 0 = instant write
-  else model.setBoneLocalTranslation(e.boneIndex, e.localTranslation)
-}
+    model.rotateBones({ [e.boneName]: e.localRotation }, 0); // 0 = instant write
+  else model.setBoneLocalTranslation(e.boneIndex, e.localTranslation);
+};
 // play()/seek() auto-clear the suspend flag (edit is lost — runtime-override semantic).
 ```
 
@@ -206,24 +207,31 @@ A **style group** binds `{ materials, graph, renderClass?, alphaMode? }` — a s
 Two ways to make groups:
 
 ```javascript
-import { HAIR_GRAPH, compileGraph } from "reze-engine"
+import { HAIR_GRAPH, compileGraph } from "reze-engine";
 
 // 1. autoStyleGroups — one default group per matched category (its shipped graph). Easy path.
-await engine.autoStyleGroups("reze")
+await engine.autoStyleGroups("reze");
 
 // 2. applyStyleGroups — arbitrary groups: any id, any materials, any graph.
 await engine.applyStyleGroups("reze", [
-  { id: "hair", materials: ["髪", "前髪"], graph: HAIR_GRAPH, renderClass: "hair" },
+  {
+    id: "hair",
+    materials: ["髪", "前髪"],
+    graph: HAIR_GRAPH,
+    renderClass: "hair",
+  },
   { id: "visor", materials: ["visor", "hud"], graph: myCustomGraph }, // your own graph
-])
-engine.setStyleParam("reze", "hair", "rim", 0.8) // exposed param → instant uniform write
-engine.removeStyleGroup("reze", "hair") // its materials drop to the neutral default
+]);
+engine.setStyleParam("reze", "hair", "rim", 0.8); // exposed param → instant uniform write
+engine.removeStyleGroup("reze", "hair"); // its materials drop to the neutral default
 
 // Headless (no GPU needed):
-const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH, { renderClass: "hair" })
+const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH, {
+  renderClass: "hair",
+});
 ```
 
-**How `autoStyleGroups(model, overrides?)` resolves** — it assigns each material a *style category*, then buckets materials by category into one group each:
+**How `autoStyleGroups(model, overrides?)` resolves** — it assigns each material a _style category_, then buckets materials by category into one group each:
 
 1. **`overrides` first** — an explicit `{ category: [materialNames] }` map (the arg). Use it for the names the built-in hints can't read.
 2. **Then built-in name hints** — a case-insensitive **substring** match of the material name against per-category JP/CN/EN keyword lists, ordered **most-specific-first** so families don't collide (`靴下`/`stocking` resolves to `stockings` before `靴`/`shoes` would hit `cloth_smooth`). This covers standard-named models with no overrides at all.
@@ -231,15 +239,15 @@ const { ok, wgsl, diagnostics } = compileGraph(HAIR_GRAPH, { renderClass: "hair"
 
 The **built-in name hints**, checked top-to-bottom (first match wins), with the graph and pass-integration each category carries:
 
-| Category | Graph · render-class / alpha | Matches a name containing (case-insensitive substring) |
-| --- | --- | --- |
-| `stockings` | `STOCKINGS_GRAPH` · `hashed` alpha | 靴下 · ソックス · タイツ · ニーソ · 袜 · stocking · socks · tights |
-| `eye` | `EYE_GRAPH` · `eye` | 白目 · 目影 · 二重 · 睫 · まつげ · まゆ · 眉 · 目 · 瞳 · 眼 · eye · iris · pupil · lash · brow |
-| `face` | `FACE_GRAPH` | 顔 · 颜 · 脸 · かお · face · 舌 · tongue · 牙 · 牙齿 · 歯 · teeth · tooth · 口腔 · 口内 · mouth · 嘴 · 歯茎 · gums |
-| `hair` | `HAIR_GRAPH` · `hair` | 前髪 · 後髪 · 髪 · 髮 · 头发 · 頭髪 · もみあげ · アホ毛 · ヘア · hair · ahoge · bang |
-| `body` | `BODY_GRAPH` | 肌 · 皮肤 · skin |
-| `metal` | `METAL_GRAPH` | 金属 · メタル · metal |
-| `cloth_smooth` | `CLOTH_SMOOTH_GRAPH` | 服 · 衣 · 裙 · 裤 · スカート · ワンピ · リボン · 袖 · 靴 · 鞋 · 帽 · 体 · 飾 · 饰 · 尾 · skirt · dress · ribbon · sleeve · shoes · boot · hat · cloth · accessor |
+| Category       | Graph · render-class / alpha       | Matches a name containing (case-insensitive substring)                                                                                                           |
+| -------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stockings`    | `STOCKINGS_GRAPH` · `hashed` alpha | 靴下 · ソックス · タイツ · ニーソ · 袜 · stocking · socks · tights                                                                                               |
+| `eye`          | `EYE_GRAPH` · `eye`                | 白目 · 目影 · 二重 · 睫 · まつげ · まゆ · 眉 · 目 · 瞳 · 眼 · eye · iris · pupil · lash · brow                                                                   |
+| `face`         | `FACE_GRAPH`                       | 顔 · 颜 · 脸 · かお · face · 舌 · tongue · 牙 · 牙齿 · 歯 · teeth · tooth · 口腔 · 口内 · mouth · 嘴 · 歯茎 · gums                                              |
+| `hair`         | `HAIR_GRAPH` · `hair`              | 前髪 · 後髪 · 髪 · 髮 · 头发 · 頭髪 · もみあげ · アホ毛 · ヘア · hair · ahoge · bang                                                                             |
+| `body`         | `BODY_GRAPH`                       | 肌 · 皮肤 · skin                                                                                                                                                 |
+| `metal`        | `METAL_GRAPH`                      | 金属 · メタル · metal · earring · 耳环 · 耳環                                                                                                                    |
+| `cloth_smooth` | `CLOTH_SMOOTH_GRAPH`               | 服 · 衣 · 裙 · 裤 · スカート · ワンピ · リボン · 袖 · 靴 · 鞋 · 帽 · 体 · 飾 · 饰 · 尾 · 套 · 腿 · skirt · dress · ribbon · sleeve · shoes · shirt · short · boot · hat · cloth · accessor · trigger |
 
 `cloth_rough` and `default` have **no** name hints — a material reaches them only via an explicit `overrides` entry. The group `id` is the category name, so re-running `autoStyleGroups` is idempotent; its promise resolves after every graph compiles, so `getStyleGroups(model)` is ready the moment it resolves — seed your own store from it, then edit with `applyStyleGroups`.
 
@@ -255,7 +263,7 @@ In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsu
 - **Angular limits** — hybrid: small violations (< 0.5 rad, the resting-cloth regime) use per-axis Euler stop rows, which converge cleanly and keep resting cloth still; larger violations switch to a single geodesic row toward the Euler-clamped target rotation, because per-axis Euler rows chase phantom errors near the ±90° singularity and pump energy. Ranged stops are unilateral (accumulated impulse clamped to the corrective sign) so a limit pushes back into range but never brakes natural recovery; locked axes stay bilateral equality joints. Spring rows stay per-axis, with stiffness clamped to the `k·dt² ≤ ¼` stability bound.
 - **Narrowphase** — analytical sphere-sphere / -capsule / -box and capsule-capsule / -box. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
 - **Speculative contacts** (`margin 0.04`) fire at near-touch with a push-only clamp — inert until real overlap, but they stop fast bodies tunneling thin surfaces in one substep.
-- **Split-impulse correction** resolves penetration by a mass-weighted translation *outside* the velocity solver, so joint pulls can't fight separation.
+- **Split-impulse correction** resolves penetration by a mass-weighted translation _outside_ the velocity solver, so joint pulls can't fight separation.
 - **Kinematic advancement** — bone-driven bodies move toward the frame's bone pose incrementally per substep, with velocities derived over the fixed step, so the solver never sees more than one 60 Hz step of anchor motion regardless of render dt.
 - **Discontinuity guards** — a bone-pose jump beyond continuous motion (timeline scrub, long stall) rigidly carries each dynamic body along with its kinematic root's transform delta and zeroes momentum instead of dragging cloth across the gap; correction velocities are clamped (120 u/s linear, 30 rad/s angular), per-step travel is capped, and any body that still goes non-finite is restored to its previous substep pose.
 - Sleeping is off (cloth must always react); resting bodies bleed micro-velocity via per-PMX damping.
@@ -276,7 +284,6 @@ Each built-in shader graph mixes an NPR stack with a Principled-style BSDF, so c
 - **PBR core** (`eval_principled`) — GGX + Schlick Fresnel, Walter–Smith G1, Fdez-Agüera 2019 multi-scatter, Karis split-sum DFG LUT, Heitz 2016 LTC direct-spec, optional sheen.
 - **NPR toolbox** — toon ramps (constant / fwidth-AA'd), HSV warm-shadow / cool-light remaps, fresnel + layer-weight rims, value-noise bump, Voronoi metallic sparkle, BT.601-gated emission.
 
-
 | Built-in graph | Notes                                                                   |
 | -------------- | ----------------------------------------------------------------------- |
 | `default`      | Plain Principled, metallic 0, rough 0.5                                 |
@@ -288,7 +295,6 @@ Each built-in shader graph mixes an NPR stack with a Principled-style BSDF, so c
 | `cloth_rough`  | Same NPR, live noise bump, rough 0.82                                   |
 | `metal`        | Toon + emission overlay (×8), Voronoi base, metallic 1                  |
 | `stockings`    | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
-
 
 **Post & output.** Directional shadow map (2048², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → inverted-hull outline.
 

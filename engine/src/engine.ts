@@ -84,7 +84,7 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   ],
   ["hair", ["前髪", "後髪", "髪", "髮", "头发", "頭髪", "もみあげ", "アホ毛", "ヘア", "hair", "ahoge", "bang"]],
   ["body", ["肌", "皮肤", "skin"]],
-  ["metal", ["金属", "メタル", "metal"]],
+  ["metal", ["金属", "メタル", "metal", "earring", "耳环", "耳環"]],
   [
     "cloth_smooth",
     [
@@ -103,15 +103,20 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
       "飾",
       "饰",
       "尾",
+      "套", // 外套 (coat), 手套 (gloves)
+      "腿", // 腿环 (leg ring/garter) and other leg-wear accessories
       "skirt",
       "dress",
       "ribbon",
       "sleeve",
       "shoes",
+      "shirt",
+      "short", // shorts
       "boot",
       "hat",
       "cloth",
       "accessor",
+      "trigger",
     ],
   ],
 ]

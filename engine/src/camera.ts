@@ -101,10 +101,11 @@ export class Camera {
       // MMD camera: look at `target` from `distance` back, oriented by the euler rotation.
       // forward = q·(0,0,1) (LH), up = q·(0,1,0) — read as columns 2 and 1 of the rot matrix.
       // eye = target + forward·distance (distance is negative in VMD, so eye sits behind).
-      // NOTE: euler sign/order follows the engine's fromEuler; if a loaded shot looks
-      // mirrored or rolled, this is the one line to flip (negate axes / reorder).
+      // Euler is NEGATED on all three axes: babylon-mmd builds the shot with
+      // RotationYawPitchRoll(-ry, -rx, -rz), and our fromEuler(rx,ry,rz) equals
+      // RotationYawPitchRoll(ry,rx,rz) — so the MMD-authentic rotation is fromEuler(-r).
       const r = this._vmdRotation
-      const q = Quat.fromEuler(r.x, r.y, r.z)
+      const q = Quat.fromEuler(-r.x, -r.y, -r.z)
       Mat4.fromQuatInto(q.x, q.y, q.z, q.w, this._quatScratch, 0)
       const s = this._quatScratch
       const t = this._vmdTarget
@@ -244,7 +245,7 @@ export class Camera {
   }
 
   private onMouseMove(e: MouseEvent) {
-    if (this.inputLocked) return
+    if (this.inputLocked || this.vmdDriven) return // VMD owns the camera; orbit/pan is inert
     if (!this.isDragging) return
 
     const deltaX = e.clientX - this.lastMousePos.x
@@ -272,6 +273,7 @@ export class Camera {
 
   private onWheel(e: WheelEvent) {
     e.preventDefault()
+    if (this.vmdDriven) return // VMD owns the camera; zoom is inert
 
     // Update camera radius (zoom)
     this.radius += e.deltaY * this.wheelPrecision
@@ -318,6 +320,7 @@ export class Camera {
   private onTouchMove(e: TouchEvent) {
     if (this.inputLocked) return
     e.preventDefault()
+    if (this.vmdDriven) return // VMD owns the camera; pinch/pan/rotate is inert
 
     if (this.isPinching && e.touches.length === 2) {
       // Two-finger gesture: can be pinch zoom or pan
