@@ -74,7 +74,12 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
     "eye",
     ["白目", "目影", "二重", "睫", "まつげ", "まゆ", "眉", "目", "瞳", "眼", "eye", "iris", "pupil", "lash", "brow"],
   ],
-  ["face", ["顔", "颜", "脸", "かお", "face"]],
+  // face also catches mouth-interior parts (tongue / teeth / gums / oral cavity), which
+  // share the face material family. Bare 口 is omitted — it collides with 袖口 (cuff).
+  [
+    "face",
+    ["顔", "颜", "脸", "かお", "face", "舌", "tongue", "牙", "牙齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "歯茎", "gums"],
+  ],
   ["hair", ["前髪", "後髪", "髪", "髮", "头发", "頭髪", "もみあげ", "アホ毛", "ヘア", "hair", "ahoge", "bang"]],
   ["body", ["肌", "皮肤", "skin"]],
   ["metal", ["金属", "メタル", "metal"]],

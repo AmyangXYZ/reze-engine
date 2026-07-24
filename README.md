@@ -231,7 +231,7 @@ The **built-in name hints**, checked top-to-bottom (first match wins), with the 
 | --- | --- | --- |
 | `stockings` | `STOCKINGS_GRAPH` · `hashed` alpha | 靴下 · ソックス · タイツ · ニーソ · 袜 · stocking · socks · tights |
 | `eye` | `EYE_GRAPH` · `eye` | 白目 · 目影 · 二重 · 睫 · まつげ · まゆ · 眉 · 目 · 瞳 · 眼 · eye · iris · pupil · lash · brow |
-| `face` | `FACE_GRAPH` | 顔 · 颜 · 脸 · かお · face |
+| `face` | `FACE_GRAPH` | 顔 · 颜 · 脸 · かお · face · 舌 · tongue · 牙 · 牙齿 · 歯 · teeth · tooth · 口腔 · 口内 · mouth · 嘴 · 歯茎 · gums |
 | `hair` | `HAIR_GRAPH` · `hair` | 前髪 · 後髪 · 髪 · 髮 · 头发 · 頭髪 · もみあげ · アホ毛 · ヘア · hair · ahoge · bang |
 | `body` | `BODY_GRAPH` | 肌 · 皮肤 · skin |
 | `metal` | `METAL_GRAPH` | 金属 · メタル · metal |
