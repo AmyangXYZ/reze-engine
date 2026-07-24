@@ -535,6 +535,23 @@ export class Mat4 {
     out[14] = pz
   }
 
+  // Position + rotation + UNIFORM scale. Scales the rotation basis (columns 0–2) by s;
+  // uniform scale keeps normals correct after the shader's normalize() (no inverse-transpose).
+  static fromPositionRotationScaleInto(
+    px: number, py: number, pz: number,
+    qx: number, qy: number, qz: number, qw: number,
+    s: number,
+    out: Float32Array
+  ): void {
+    Mat4.fromQuatInto(qx, qy, qz, qw, out, 0)
+    out[0] *= s; out[1] *= s; out[2] *= s
+    out[4] *= s; out[5] *= s; out[6] *= s
+    out[8] *= s; out[9] *= s; out[10] *= s
+    out[12] = px
+    out[13] = py
+    out[14] = pz
+  }
+
   // In-place 4x4 inverse into out array. Returns true on success, false if singular (out untouched).
   static inverseInto(m: Float32Array, out: Float32Array): boolean {
     const a00 = m[0], a01 = m[1], a02 = m[2], a03 = m[3]

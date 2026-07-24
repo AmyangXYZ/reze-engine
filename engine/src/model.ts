@@ -199,6 +199,17 @@ export class Model {
     return this._rotation
   }
 
+  /** Uniform scale (default 1). Used to fit a stage.pmx to the character. */
+  get scale(): number {
+    return this._scale
+  }
+
+  /** Whether this model renders. Hidden models skip the main, shadow, and pick passes;
+   *  physics keeps running so they resume consistently. */
+  get visible(): boolean {
+    return this._visible
+  }
+
   setPosition(position: Vec3): void {
     this._position.set(position)
     this.rootMatrixDirty = true
@@ -207,6 +218,15 @@ export class Model {
   setRotation(rotation: Quat): void {
     this._rotation.set(rotation)
     this.rootMatrixDirty = true
+  }
+
+  setScale(scale: number): void {
+    this._scale = scale
+    this.rootMatrixDirty = true
+  }
+
+  setVisible(visible: boolean): void {
+    this._visible = visible
   }
 
   private vertexData: Float32Array<ArrayBuffer>
@@ -254,6 +274,8 @@ export class Model {
   // Skip-when-identity flag avoids the extra mat mul per bone when unused.
   private _position: Vec3 = Vec3.zeros()
   private _rotation: Quat = Quat.identity()
+  private _scale: number = 1
+  private _visible: boolean = true
   private rootMatrixValues: Float32Array = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
   private rootMatrixDirty: boolean = false
   private rootIsIdentity: boolean = true
@@ -851,11 +873,11 @@ export class Model {
 
     // Rebuild root matrix + cache identity-shortcut flag only when pos/rot changed.
     if (this.rootMatrixDirty) {
-      const p = this._position, r = this._rotation
-      Mat4.fromPositionRotationInto(p.x, p.y, p.z, r.x, r.y, r.z, r.w, this.rootMatrixValues)
+      const p = this._position, r = this._rotation, s = this._scale
+      Mat4.fromPositionRotationScaleInto(p.x, p.y, p.z, r.x, r.y, r.z, r.w, s, this.rootMatrixValues)
       this.rootIsIdentity =
         p.x === 0 && p.y === 0 && p.z === 0 &&
-        r.x === 0 && r.y === 0 && r.z === 0 && r.w === 1
+        r.x === 0 && r.y === 0 && r.z === 0 && r.w === 1 && s === 1
       this.rootMatrixDirty = false
     }
 

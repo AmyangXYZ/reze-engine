@@ -9,6 +9,7 @@ export {
   type LoadModelFromFilesOptions,
   type MaterialPreset,
   type MaterialPresetMap,
+  type ModelTransform,
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,

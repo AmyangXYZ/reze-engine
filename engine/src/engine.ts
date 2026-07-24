@@ -197,6 +197,16 @@ export type WorldOptions = {
   strength?: number
 }
 
+/** A model's scene placement — root offset baked into skinning + visibility. Serializable
+ *  into a scene descriptor via getModelTransform. */
+export type ModelTransform = {
+  position: Vec3
+  rotation: Quat
+  /** Uniform scale (default 1). */
+  scale: number
+  visible: boolean
+}
+
 export type SunOptions = {
   /** Linear color of the sun lamp (Blender: Light > Color). */
   color?: Vec3
@@ -2421,6 +2431,35 @@ export class Engine {
     return this.modelInstances.get(name)?.model ?? null
   }
 
+  /**
+   * Place a model in the scene — position, rotation, uniform scale, visibility. The
+   * transform is a root offset baked into skinning (moves the whole rig), so it composes
+   * with animation. Use it to sit a `stage.pmx` with a character, or to fit/hide either.
+   * Scale is **uniform** (normals renormalize in-shader). Don't scale a physics-driven
+   * character — its colliders won't scale; scale stages (which are typically physics-free).
+   */
+  setModelTransform(name: string, transform: Partial<ModelTransform>): void {
+    const model = this.modelInstances.get(name)?.model
+    if (!model) return
+    if (transform.position) model.setPosition(transform.position)
+    if (transform.rotation) model.setRotation(transform.rotation)
+    if (transform.scale !== undefined) model.setScale(transform.scale)
+    if (transform.visible !== undefined) model.setVisible(transform.visible)
+  }
+
+  /** Read a model's scene transform (for serialization into a scene descriptor). */
+  getModelTransform(name: string): ModelTransform | null {
+    const model = this.modelInstances.get(name)?.model
+    if (!model) return null
+    const p = model.position
+    return {
+      position: new Vec3(p.x, p.y, p.z),
+      rotation: model.rotation.clone(),
+      scale: model.scale,
+      visible: model.visible,
+    }
+  }
+
   markVertexBufferDirty(modelNameOrModel?: string | Model): void {
     if (modelNameOrModel === undefined) return
     if (typeof modelNameOrModel === "string") {
@@ -3727,6 +3766,7 @@ export class Engine {
     pass.setBindGroup(0, this.pickPerFrameBindGroup)
 
     this.forEachInstance((inst) => {
+      if (!inst.model.visible) return // hidden models aren't pickable
       pass.setVertexBuffer(0, inst.vertexBuffer)
       pass.setVertexBuffer(1, inst.jointsBuffer)
       pass.setVertexBuffer(2, inst.weightsBuffer)
@@ -3848,12 +3888,17 @@ export class Engine {
         },
       })
       sp.setPipeline(this.shadowDepthPipeline)
-      this.forEachInstance((inst) => this.drawInstanceShadow(sp, inst))
+      this.forEachInstance((inst) => {
+        if (inst.model.visible) this.drawInstanceShadow(sp, inst)
+      })
       sp.end()
     }
 
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
-    if (hasModels) this.forEachInstance((inst) => this.renderOneModel(pass, inst))
+    if (hasModels)
+      this.forEachInstance((inst) => {
+        if (inst.model.visible) this.renderOneModel(pass, inst)
+      })
     if (this.hasGround) this.renderGround(pass)
     pass.end()
 
