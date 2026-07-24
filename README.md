@@ -18,7 +18,7 @@ npm install reze-engine
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, zero dependencies
 - **VMD animation** — MMD IK, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
-- **Orbit camera** — bone-follow, ground + PCF shadows, multi-model scenes
+- **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
@@ -100,6 +100,7 @@ One WebGPU **Engine** per page (singleton after `init()`). Models load by URL **
 engine.init()
 engine.loadModel(name, path)                 // or ({ files, pmxFile? }) for folder upload
 engine.getModel(name) / getModelNames() / removeModel(name)
+engine.setModelTransform(name, { position?, rotation?, scale?, visible? }) / getModelTransform(name)  // place a stage, scale or hide a model (scale is uniform)
 
 engine.autoStyleGroups(name, overrides?)     // default style groups by material name
 engine.applyStyleGroups(name, groups) / upsertStyleGroup / removeStyleGroup / getStyleGroups
@@ -111,6 +112,9 @@ engine.resetPhysics()                        // re-pose bodies from animation + 
 
 engine.setCameraFollow(model, bone?, offset?) / setCameraFollow(null)
 engine.setCameraTarget(vec3) / setCameraDistance(d) / setCameraAlpha(a) / setCameraBeta(b)
+
+engine.loadCameraVmd(url) / loadCameraVmdFromBuffer(buffer)   // MMD camera track (dedicated file or a VMD's camera block) drives target/rotation/distance/fov — default-on once loaded
+engine.setCameraVmdEnabled(on) / isCameraVmdEnabled() / hasCameraVmd() / clearCameraVmd()   // toggle the shot; off falls back to orbit / follow-bone
 
 engine.setWorld({ color?, strength? }) / setSun({ color?, strength?, direction? })   // runtime lighting
 engine.addGround(options?)

@@ -17,11 +17,13 @@ export interface CameraPose {
   fov: number
 }
 
-// MMD camera interpolation is stored interleaved across the 6 channels:
-// bytes [x1×6][x2×6][y1×6][y2×6]. Channel c's bezier is (ip[c], ip[6+c], ip[12+c], ip[18+c]).
-// Channels: 0=posX 1=posY 2=posZ 3=rotation 4=distance 5=fov.
+// MMD camera interpolation is 24 bytes, stored CONTIGUOUS per channel — each channel's 4
+// bezier bytes are [x1, x2, y1, y2] in order. Channels: 0=posX 1=posY 2=posZ 3=rotation
+// 4=distance 5=fov. So channel c lives at bytes [4c .. 4c+3]. (Matches babylon-mmd, which
+// slices these into position/rotation/distance/fov interpolation buffers.)
 function bez(ip: Uint8Array, c: number, t: number): number {
-  return bezierInterpolate(ip[c] / 127, ip[6 + c] / 127, ip[12 + c] / 127, ip[18 + c] / 127, t)
+  const b = c * 4
+  return bezierInterpolate(ip[b] / 127, ip[b + 1] / 127, ip[b + 2] / 127, ip[b + 3] / 127, t)
 }
 
 const lerp = (a: number, b: number, w: number): number => a + (b - a) * w
