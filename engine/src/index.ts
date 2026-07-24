@@ -60,4 +60,6 @@ export type {
   ControlPoint,
 } from "./animation"
 export { FPS } from "./animation"
+export { VMDLoader, type CameraKeyframe } from "./vmd-loader"
+export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"

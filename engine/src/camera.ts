@@ -1,4 +1,5 @@
-import { Mat4, Vec3 } from "./math"
+import { Mat4, Quat, Vec3 } from "./math"
+import type { CameraPose } from "./camera-animation"
 
 /** Far cap / zoom limit; large enough for wide shots without clipping distant ground */
 const FAR_CAP = 8000
@@ -41,6 +42,16 @@ export class Camera {
   private _viewMat = new Mat4(new Float32Array(16))
   private _projMat = new Mat4(new Float32Array(16))
 
+  // ── VMD camera drive ──
+  // When vmdDriven, getViewMatrix builds the shot from a sampled MMD camera pose (target /
+  // rotation-euler / distance / fov) instead of the orbit params. Toggled by the engine.
+  vmdDriven: boolean = false
+  private _vmdTarget = new Vec3(0, 0, 0)
+  private _vmdRotation = new Vec3(0, 0, 0) // euler radians
+  private _vmdDistance = -45
+  private _savedFov = Math.PI / 4
+  private _quatScratch = new Float32Array(16)
+
   constructor(alpha: number, beta: number, radius: number, target: Vec3, fov: number = Math.PI / 4) {
     this.alpha = alpha
     this.beta = beta
@@ -68,7 +79,40 @@ export class Camera {
     return new Vec3(x, y, z)
   }
 
+  /** Enter/leave VMD-camera drive. Backs up the orbit fov on enter, restores it on leave
+   *  (the VMD camera animates fov, so orbit's value would otherwise be clobbered). */
+  setVmdDriven(enabled: boolean): void {
+    if (enabled === this.vmdDriven) return
+    if (enabled) this._savedFov = this.fov
+    else this.fov = this._savedFov
+    this.vmdDriven = enabled
+  }
+
+  /** Feed the next sampled MMD camera pose (engine calls this each frame while driving). */
+  setVmdPose(pose: CameraPose): void {
+    this._vmdTarget.set(pose.target)
+    this._vmdRotation.set(pose.rotation)
+    this._vmdDistance = pose.distance
+    this.fov = pose.fov // drives the projection
+  }
+
   getViewMatrix(): Mat4 {
+    if (this.vmdDriven) {
+      // MMD camera: look at `target` from `distance` back, oriented by the euler rotation.
+      // forward = q·(0,0,1) (LH), up = q·(0,1,0) — read as columns 2 and 1 of the rot matrix.
+      // eye = target + forward·distance (distance is negative in VMD, so eye sits behind).
+      // NOTE: euler sign/order follows the engine's fromEuler; if a loaded shot looks
+      // mirrored or rolled, this is the one line to flip (negate axes / reorder).
+      const r = this._vmdRotation
+      const q = Quat.fromEuler(r.x, r.y, r.z)
+      Mat4.fromQuatInto(q.x, q.y, q.z, q.w, this._quatScratch, 0)
+      const s = this._quatScratch
+      const t = this._vmdTarget
+      const d = this._vmdDistance
+      const ex = t.x + s[8] * d, ey = t.y + s[9] * d, ez = t.z + s[10] * d
+      Mat4.lookAtInto(this._viewMat.values, ex, ey, ez, t.x, t.y, t.z, s[4], s[5], s[6])
+      return this._viewMat
+    }
     const eye = this.getPosition()
     const t = this.target
     Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, t.x, t.y, t.z, 0, 1, 0)

@@ -3,6 +3,8 @@ import { Mat4, Quat, Vec3 } from "./math"
 import { Model, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { decodeTga } from "./tga-loader"
+import { VMDLoader } from "./vmd-loader"
+import { CameraAnimation } from "./camera-animation"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
 import {
@@ -615,6 +617,10 @@ export class Engine {
   private physicsEnabled = true
   // GPU vertex-morph path. Set false BEFORE loadModel to fall back to the CPU path (A/B).
   private useGpuMorphs = true
+
+  // VMD camera track (a dedicated camera VMD). When loaded + enabled it drives the shot,
+  // sampled off the animated model's clock so it stays synced to the dance.
+  private cameraAnimation: CameraAnimation | null = null
 
   // Camera target binding (Babylon/Three style: camera follows model)
   private cameraTargetModel: Model | null = null
@@ -2169,6 +2175,59 @@ export class Engine {
     this.cameraTargetOffset.x = offset?.x ?? 0
     this.cameraTargetOffset.y = offset?.y ?? 0
     this.cameraTargetOffset.z = offset?.z ?? 0
+  }
+
+  // ── VMD camera track ──
+  // A dedicated camera VMD (target / rotation / distance / fov animated). Motion VMDs loaded
+  // via model.loadVmd never touch the camera — the camera shot is opt-in through here.
+
+  /** Load a camera VMD (dedicated camera file, or any VMD's camera block) and drive the shot
+   *  from it. Default-on once a non-empty track loads; toggle with setCameraVmdEnabled. */
+  async loadCameraVmd(url: string): Promise<void> {
+    const frames = await VMDLoader.loadCamera(url)
+    this.cameraAnimation = frames.length ? new CameraAnimation(frames) : null
+    this.camera.setVmdDriven(this.cameraAnimation !== null)
+  }
+
+  /** Load a camera VMD from an already-fetched buffer (e.g. a File the user dropped). */
+  loadCameraVmdFromBuffer(buffer: ArrayBuffer): void {
+    const frames = VMDLoader.loadCameraFromBuffer(buffer)
+    this.cameraAnimation = frames.length ? new CameraAnimation(frames) : null
+    this.camera.setVmdDriven(this.cameraAnimation !== null)
+  }
+
+  /** Turn the loaded camera VMD on/off (falls back to orbit when off). No-op if none loaded. */
+  setCameraVmdEnabled(enabled: boolean): void {
+    this.camera.setVmdDriven(enabled && this.cameraAnimation !== null)
+  }
+
+  /** True while the loaded camera VMD is actively driving the shot. */
+  isCameraVmdEnabled(): boolean {
+    return this.camera.vmdDriven
+  }
+
+  /** True if a (non-empty) camera VMD is loaded, regardless of enabled state. */
+  hasCameraVmd(): boolean {
+    return this.cameraAnimation !== null
+  }
+
+  /** Drop the loaded camera VMD and return to orbit control. */
+  clearCameraVmd(): void {
+    this.cameraAnimation = null
+    this.camera.setVmdDriven(false)
+  }
+
+  // Clock the camera VMD runs on: the first model with an active clip (playing or scrubbed),
+  // so a static stage in the scene never freezes the shot at frame 0. Falls back to the first
+  // model, then to 0 (empty scene).
+  private cameraClockTime(): number {
+    let first: number | null = null
+    for (const inst of this.modelInstances.values()) {
+      const p = inst.model.getAnimationProgress()
+      if (first === null) first = p.current
+      if (p.playing || p.paused) return p.current
+    }
+    return first ?? 0
   }
 
   getCameraDistance(): number {
@@ -3866,6 +3925,12 @@ export class Engine {
         this.camera.target.y = py + this.cameraTargetOffset.y
         this.camera.target.z = pz + this.cameraTargetOffset.z
       }
+    }
+
+    // Drive the shot from the camera VMD (synced to the animated model's clock).
+    if (this.camera.vmdDriven && this.cameraAnimation) {
+      const pose = this.cameraAnimation.sample(this.cameraClockTime())
+      if (pose) this.camera.setVmdPose(pose)
     }
 
     this.updateCameraUniforms()

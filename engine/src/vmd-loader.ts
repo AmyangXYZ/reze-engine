@@ -20,6 +20,18 @@ export interface VMDKeyFrame {
   morphFrames: MorphFrame[]
 }
 
+/** One MMD camera keyframe. The camera looks at `target` from `distance` away, oriented by
+ *  `rotation` (euler radians), with `fov` degrees. `interpolation` is 24 bytes: 6 channels
+ *  (posX, posY, posZ, rotation, distance, fov) × 4 bezier bytes (x1, x2, y1, y2). */
+export interface CameraKeyframe {
+  frame: number
+  distance: number
+  target: Vec3
+  rotation: Vec3 // euler radians
+  fov: number // degrees
+  interpolation: Uint8Array // 24 bytes
+}
+
 export class VMDLoader {
   private view: DataView
   private offset = 0
@@ -44,6 +56,48 @@ export class VMDLoader {
   static loadFromBuffer(buffer: ArrayBuffer): VMDKeyFrame[] {
     const loader = new VMDLoader(buffer)
     return loader.parse()
+  }
+
+  /** Parse only the camera track (a dedicated camera VMD, or the camera block of any VMD).
+   *  Returns [] if the file has no camera block (motion-only VMDs end after the morph block). */
+  static async loadCamera(url: string): Promise<CameraKeyframe[]> {
+    const loader = new VMDLoader(await fetch(url).then((r) => r.arrayBuffer()))
+    return loader.parseCamera()
+  }
+
+  static loadCameraFromBuffer(buffer: ArrayBuffer): CameraKeyframe[] {
+    return new VMDLoader(buffer).parseCamera()
+  }
+
+  // Seek past the bone + morph blocks (fixed record sizes) to the camera block, then read it.
+  // bone frame = 111 B (15 name + 4 frame + 12 pos + 16 rot + 64 interp); morph = 23 B
+  // (15 name + 4 frame + 4 weight); camera = 61 B.
+  private parseCamera(): CameraKeyframe[] {
+    this.offset = 0
+    const header = this.getString(30)
+    if (!header.startsWith("Vocaloid Motion Data")) throw new Error("Invalid VMD file header")
+    this.skip(20)
+    const boneCount = this.getUint32()
+    this.skip(boneCount * 111)
+    const morphCount = this.getUint32()
+    this.skip(morphCount * 23)
+    if (this.offset + 4 > this.view.buffer.byteLength) return [] // no camera block
+    const cameraCount = this.getUint32()
+
+    const frames: CameraKeyframe[] = []
+    for (let i = 0; i < cameraCount; i++) {
+      const frame = this.getUint32()
+      const distance = this.getFloat32()
+      const target = new Vec3(this.getFloat32(), this.getFloat32(), this.getFloat32())
+      const rotation = new Vec3(this.getFloat32(), this.getFloat32(), this.getFloat32())
+      const interpolation = new Uint8Array(24)
+      for (let j = 0; j < 24; j++) interpolation[j] = this.getUint8()
+      const fov = this.getUint32()
+      this.skip(1) // perspective flag (0 = perspective) — unused
+      frames.push({ frame, distance, target, rotation, fov, interpolation })
+    }
+    frames.sort((a, b) => a.frame - b.frame)
+    return frames
   }
 
   private parse(): VMDKeyFrame[] {
