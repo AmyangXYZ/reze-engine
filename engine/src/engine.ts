@@ -545,9 +545,15 @@ export class Engine {
   private compositeBindGroup!: GPUBindGroup
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
-  private readonly compositeUniformData = new Float32Array(12)
+  private readonly compositeUniformData = new Float32Array(24)
   /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
   private backgroundColor: Vec3 | null = null
+  // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
+  private backdropEquirectTexture: GPUTexture | null = null
+  private backdropEquirectView: GPUTextureView | null = null
+  private fallbackEquirectTexture!: GPUTexture
+  private fallbackEquirectView!: GPUTextureView
+  private compositeBloomView: GPUTextureView | null = null
 
   // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
   //   blit (HDR → half-res, 4-tap Karis + soft threshold/knee)
@@ -753,12 +759,14 @@ export class Engine {
     u[6] = b.color.z
     u[7] = effIntensity
     // Background composited UNDER the scene in display space (post-tonemap), so it
-    // matches a CSS color of the same value exactly. a=0 → transparent (DOM shows).
+    // matches a CSS color of the same value exactly. Mode (u[11]): 0 = transparent
+    // (DOM shows), 1 = solid color, 2 = 360 equirect (sampled by view ray; the
+    // camera basis at u[12..23] is refreshed per frame by updateCameraUniforms).
     const bg = this.backgroundColor
     u[8] = bg?.x ?? 0
     u[9] = bg?.y ?? 0
     u[10] = bg?.z ?? 0
-    u[11] = bg ? 1 : 0
+    u[11] = this.backdropEquirectView ? 2 : bg ? 1 : 0
     this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
   }
 
@@ -767,9 +775,71 @@ export class Engine {
    * same value a CSS background of that color shows, applied after tonemapping).
    * Pass null for a transparent canvas (the page/DOM shows through — e.g. when a
    * backdrop image layer sits behind the canvas). Applies on the next frame.
+   * A 360 backdrop (setBackdropEquirect) takes precedence while set.
    */
   setBackgroundColor(color: Vec3 | null): void {
     this.backgroundColor = color ? new Vec3(color.x, color.y, color.z) : null
+    if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
+  private rebuildCompositeBindGroup(): void {
+    if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView) return
+    this.compositeBindGroup = this.device.createBindGroup({
+      label: "composite bind group",
+      layout: this.compositeBindGroupLayout,
+      entries: [
+        { binding: 0, resource: this.hdrResolveTexture.createView() },
+        { binding: 1, resource: this.compositeBloomView },
+        { binding: 2, resource: this.bloomSampler },
+        { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
+        { binding: 4, resource: this.maskResolveView },
+        { binding: 5, resource: this.filmicLutView },
+        { binding: 6, resource: this.backdropEquirectView ?? this.fallbackEquirectView },
+      ],
+    })
+  }
+
+  /**
+   * Set a 360° backdrop from an equirectangular (2:1) image — a PhotoDome-style
+   * skybox at infinity, sampled per-pixel by view direction so it follows the
+   * camera. Display-only: composited in display space behind the scene, it never
+   * affects lighting, bloom, or tonemapping. Pass null to remove (the background
+   * color, or transparency, takes over again).
+   */
+  setBackdropEquirect(source: ImageBitmap | HTMLImageElement | HTMLCanvasElement | null): void {
+    this.backdropEquirectTexture?.destroy()
+    this.backdropEquirectTexture = null
+    this.backdropEquirectView = null
+    if (source && this.device) {
+      let width = Math.max(1, "naturalWidth" in source ? source.naturalWidth : source.width)
+      let height = Math.max(1, "naturalHeight" in source ? source.naturalHeight : source.height)
+      let upload: ImageBitmap | HTMLImageElement | HTMLCanvasElement | OffscreenCanvas = source
+      // Panoramas routinely exceed maxTextureDimension2D (e.g. 10000×5000 vs the
+      // default 8192) — quietly downscale to fit rather than surfacing an error.
+      const limit = this.device.limits.maxTextureDimension2D
+      if (width > limit || height > limit) {
+        const scale = Math.min(limit / width, limit / height)
+        const w = Math.max(1, Math.floor(width * scale))
+        const h = Math.max(1, Math.floor(height * scale))
+        const canvas = new OffscreenCanvas(w, h)
+        const cx = canvas.getContext("2d")!
+        cx.imageSmoothingQuality = "high"
+        cx.drawImage(source, 0, 0, w, h)
+        upload = canvas
+        width = w
+        height = h
+      }
+      const tex = this.device.createTexture({
+        label: "backdrop equirect",
+        size: [width, height],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.device.queue.copyExternalImageToTexture({ source: upload }, { texture: tex }, [width, height])
+      this.backdropEquirectTexture = tex
+      this.backdropEquirectView = tex.createView()
+    }
+    this.rebuildCompositeBindGroup()
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
 
@@ -1570,7 +1640,9 @@ export class Engine {
     // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      size: 48, // 3 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) · (bg rgb, bg a)
+      // 6 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
+      // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray.
+      size: 96,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.compositeBindGroupLayout = this.device.createBindGroupLayout({
@@ -1585,8 +1657,17 @@ export class Engine {
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         // Filmic tone LUT (r16float, filterable) — sampled with the binding-2 sampler.
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        // 360 backdrop equirect (PhotoDome-style skybox) — 1×1 fallback when unset.
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
+    this.fallbackEquirectTexture = this.device.createTexture({
+      label: "equirect fallback",
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.fallbackEquirectView = this.fallbackEquirectTexture.createView()
 
     const compositeShader = this.device.createShaderModule({
       label: "composite shader",
@@ -1974,19 +2055,8 @@ export class Engine {
           )
         }
         // Composite reads bloomUp mip 0 (full pyramid collapsed); fallback to bloomDown mip 0 if no upsample level.
-        const compositeBloomView = this.bloomMipCount > 1 ? this.bloomUpMipViews[0] : this.bloomDownMipViews[0]
-        this.compositeBindGroup = this.device.createBindGroup({
-          label: "composite bind group",
-          layout: this.compositeBindGroupLayout,
-          entries: [
-            { binding: 0, resource: this.hdrResolveTexture.createView() },
-            { binding: 1, resource: compositeBloomView },
-            { binding: 2, resource: this.bloomSampler },
-            { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
-            { binding: 4, resource: this.maskResolveView },
-            { binding: 5, resource: this.filmicLutView },
-          ],
-        })
+        this.compositeBloomView = this.bloomMipCount > 1 ? this.bloomUpMipViews[0] : this.bloomDownMipViews[0]
+        this.rebuildCompositeBindGroup()
       }
 
       this.writeCompositeViewUniforms()
@@ -4607,6 +4677,31 @@ export class Engine {
     this.cameraMatrixData[33] = cameraPos.y
     this.cameraMatrixData[34] = cameraPos.z
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
+
+    // 360 backdrop: the composite reconstructs each pixel's view ray from the
+    // camera basis — refresh it every frame the skybox is active. The view matrix
+    // is LEFT-HANDED (+Z forward, see Mat4.lookAtInto), so the world-space
+    // right/up/FORWARD vectors are rows 0/1/2 of its rotation block directly
+    // (column-major storage: row i = values[i], values[i+4], values[i+8]).
+    if (this.backdropEquirectView && this.compositeUniformBuffer) {
+      const v = viewMatrix.values
+      const u = this.compositeUniformData
+      const tanHalf = Math.tan((this.camera.fov ?? Math.PI / 4) / 2)
+      const aspect = this.canvas.width / Math.max(1, this.canvas.height)
+      u[12] = v[0]
+      u[13] = v[4]
+      u[14] = v[8]
+      u[15] = tanHalf * aspect
+      u[16] = v[1]
+      u[17] = v[5]
+      u[18] = v[9]
+      u[19] = tanHalf
+      u[20] = v[2]
+      u[21] = v[6]
+      u[22] = v[10]
+      u[23] = 0
+      this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
+    }
   }
 
   private updateSkinMatrices() {

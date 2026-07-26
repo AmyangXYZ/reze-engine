@@ -86,16 +86,20 @@ struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
   var baseColor = material.diffuseColor * sun * (1.0 - dark * 0.65);
   baseColor *= noiseTint;
   let finalColor = mix(baseColor, material.gridLineColor, gridLine * material.gridLineOpacity * edgeFade);
-  // Whole-ground opacity rides the same alpha path as the radial edge fade —
-  // 1 = solid (default), 0 = invisible shadow-catcher-less floor.
-  let fade = edgeFade * material.opacity;
+  // Whole-ground opacity fades the SURFACE (color, grid) but the shadow stays —
+  // as opacity drops, the received shadow becomes a translucent dark layer
+  // (Blender's Shadow Catcher), so models still feel grounded on a photo or
+  // 360 backdrop. At opacity 1 this reduces exactly to the plain surface.
+  let surfA = edgeFade * material.opacity;
+  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity);
+  let outA = surfA + catchA;
   var out: FSOut;
-  out.color = vec4f(finalColor * fade, fade);
+  out.color = vec4f(finalColor * surfA, outA);
   // mask.r = 0: ground never contributes to bloom. mask.g = 1.0 with src.a =
-  // fade turns the aux blend into alpha-over, so the drawable alpha goes
-  // from fade at the center to 0 at the radial edge — letting the page
+  // outA turns the aux blend into alpha-over, so the drawable alpha goes
+  // from outA at the center to 0 at the radial edge — letting the page
   // background show through under the premultiplied canvas alphaMode.
-  out.mask = vec4f(0.0, 1.0, 0.0, fade);
+  out.mask = vec4f(0.0, 1.0, 0.0, outA);
   return out;
 }
 `

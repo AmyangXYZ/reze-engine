@@ -12,7 +12,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 3>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 6>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -28,9 +28,13 @@ override APPLY_GAMMA: bool = true;
 // continuity kills the banding — sampled with hardware linear filtering.
 @group(0) @binding(5) var filmicLut: texture_2d<f32>;
 // viewU[0] = (exposure, invGamma, _, _);  viewU[1] = (tint.rgb, intensity)
-// viewU[2] = (background.rgb, background.a) — display-space sRGB, composited
-//            UNDER the scene post-tonemap (a=0 → transparent canvas, DOM shows).
+// viewU[2] = (background.rgb, mode) — display-space sRGB, composited UNDER the
+//            scene post-tonemap. mode: 0 transparent (DOM shows), 1 solid color,
+//            2 = 360 equirect skybox sampled by view ray.
+// viewU[3] = (camera right, tanHalfFov·aspect); viewU[4] = (camera up, tanHalfFov);
+// viewU[5] = (camera forward, _) — refreshed per frame while the skybox is active.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
+@group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
 const FILMIC_LUT_W: f32 = 256.0;
@@ -72,8 +76,21 @@ fn filmic(x: f32) -> f32 {
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));
   }
-  // Composite over the background color in display space (premultiplied out).
+  // Composite over the background in display space (premultiplied out).
   let bg = viewU[2];
-  return vec4f(disp * alpha + bg.rgb * bg.a * (1.0 - alpha), alpha + bg.a * (1.0 - alpha));
+  var bgRgb = bg.rgb;
+  var bgA = select(0.0, 1.0, bg.w > 0.5);
+  if (bg.w > 1.5) {
+    // 360 equirect: rebuild this pixel's world-space view ray from the camera
+    // basis, then latitude/longitude-map into the panorama. The dome sits at
+    // infinity (no parallax) — PhotoDome-style, display-only.
+    let ndc = vec2f(fragCoord.x / fullSz.x * 2.0 - 1.0, 1.0 - fragCoord.y / fullSz.y * 2.0);
+    let dir = normalize(viewU[5].xyz + ndc.x * viewU[3].w * viewU[3].xyz + ndc.y * viewU[4].w * viewU[4].xyz);
+    // LH world (+Z forward): longitude = atan2(x, z), Babylon-PhotoDome convention.
+    let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
+    let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
+    bgRgb = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
+  }
+  return vec4f(disp * alpha + bgRgb * bgA * (1.0 - alpha), alpha + bgA * (1.0 - alpha));
 }
 `
