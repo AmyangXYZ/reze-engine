@@ -319,6 +319,11 @@ export class Camera {
 
   private onTouchMove(e: TouchEvent) {
     if (this.inputLocked) return
+    // This listener lives on window (so drags keep tracking off-canvas), but the
+    // camera only OWNS a gesture that started on the canvas (touchstart sets
+    // isDragging/isPinching there). preventDefault-ing unconditionally cancelled
+    // native touch scrolling in every UI panel layered above the canvas.
+    if (!this.isDragging && !this.isPinching) return
     e.preventDefault()
     if (this.vmdDriven) return // VMD owns the camera; pinch/pan/rotate is inert
 
