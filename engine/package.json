@@ -23,7 +23,7 @@
         "build": "tsc",
         "dev": "tsc --watch",
         "test": "node --import ./tests/register.mjs --test tests/*.test.mjs",
-        "prepublishOnly": "cp ../README.md ./README.md && npm run build"
+        "prepublishOnly": "node -e \"require('fs').copyFileSync('../README.md','README.md')\" && npm run build"
     },
     "keywords": [
         "webgpu",
