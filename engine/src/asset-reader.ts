@@ -73,7 +73,11 @@ export function createFileMapAssetReader(files: Map<string, File>): AssetReader 
 export function fileListToMap(files: FileList | File[]): Map<string, File> {
   const m = new Map<string, File>()
   for (const f of Array.from(files)) {
-    const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath ?? f.name
+    // `||`, NOT `??`: files from a non-directory input (flat multi-select, drag
+    // & drop) have webkitRelativePath === "" — `"" ?? name` keeps the empty
+    // string, which keyed EVERY file at "" (each overwriting the last) and broke
+    // all flat uploads ("no pmx" / textureless white models).
+    const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name
     m.set(normalizeAssetPath(rel), f)
   }
   return m
@@ -83,8 +87,8 @@ export function findFirstPmxFileInList(files: FileList | File[]): File | null {
   const list = Array.from(files).filter((f) => f.name.toLowerCase().endsWith(".pmx"))
   if (list.length === 0) return null
   list.sort((a, b) => {
-    const pa = (a as File & { webkitRelativePath?: string }).webkitRelativePath ?? a.name
-    const pb = (b as File & { webkitRelativePath?: string }).webkitRelativePath ?? b.name
+    const pa = (a as File & { webkitRelativePath?: string }).webkitRelativePath || a.name
+    const pb = (b as File & { webkitRelativePath?: string }).webkitRelativePath || b.name
     return pa.localeCompare(pb)
   })
   return list[0] ?? null

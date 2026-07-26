@@ -1303,6 +1303,13 @@ export class Model {
     this.animationState.stop()
   }
 
+  /** Deactivate the current clip entirely (stop + forget). Unlike stop(), the
+   *  pose is no longer re-applied each frame afterwards — follow with
+   *  resetAllBones()/resetAllMorphs() to return to the bind pose. */
+  clearAnimation(): void {
+    this.animationState.clear()
+  }
+
   // Seek by absolute timeline seconds, not frame index.
   seek(seconds: number): void {
     this.clipApplySuspended = false

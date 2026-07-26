@@ -2559,8 +2559,10 @@ export class Engine {
       const pmxFile = pathOrOptions.pmxFile ?? findFirstPmxFileInList(pathOrOptions.files)
       if (!pmxFile) throw new Error("No .pmx file found in the selected folder")
       const map = fileListToMap(pathOrOptions.files)
+      // `||`, not `??`: flat-picked files carry webkitRelativePath === "" (see
+      // fileListToMap) — `""` must fall through to the filename.
       const pmxKey = normalizeAssetPath(
-        (pmxFile as File & { webkitRelativePath?: string }).webkitRelativePath ?? pmxFile.name,
+        (pmxFile as File & { webkitRelativePath?: string }).webkitRelativePath || pmxFile.name,
       )
       const reader = createFileMapAssetReader(map)
       const model = await PmxLoader.loadFromReader(reader, pmxKey)

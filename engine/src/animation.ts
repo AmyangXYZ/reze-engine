@@ -192,6 +192,14 @@ export class AnimationState {
     this.nextAnimation = null
   }
 
+  /** stop() + deactivate the clip entirely. stop() deliberately keeps the clip
+   *  current (transport re-play resumes it); clear() forgets it, so the pose
+   *  stops being re-applied each frame and bone/morph resets actually show. */
+  clear(): void {
+    this.stop()
+    this.currentAnimationName = null
+  }
+
   // Seek by absolute timeline seconds, not frame index.
   seek(seconds: number): void {
     const clip = this.getCurrentClip()

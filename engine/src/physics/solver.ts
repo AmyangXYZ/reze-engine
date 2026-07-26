@@ -32,19 +32,17 @@ const MAX_ANGULAR_CORRECTION_VEL = 30 // rad/s
 const LIMIT_SOFTNESS_LINEAR = 0.7
 const LIMIT_SOFTNESS_ANGULAR = 0.5
 
-// Bullet spring-motor velocity factor: target velocity = (fps/numIterations)
-// × spring force, with the applied impulse clamped to the real spring force
-// k·|err|·dt. The big target makes the row deliver its full physical force
-// every substep (stiff, MMD-authored hold); the clamp keeps it from ever
-// exceeding it (no energy pumping). Matches btGeneric6DofSpringConstraint
-// with springDamping=1 and the default 10 solver iterations.
-const SPRING_SOLVER_ITERATIONS = 10
-// Slack on the spring impulse clamp: MMD rigs are authored against Bullet's
-// spring motors, which deliver several times the naive k·err·dt per substep
-// through their solver-row impulse bounds. Bounded slack keeps the hold
-// stiff (breasts/hair rest near the authored pose) while still capping the
-// energy any spring can inject per substep (the slow-boil guard).
-const SPRING_FORCE_SLACK = 4
+// Spring rows are IMPLICIT spring-dampers (Spring2/ODE-style soft
+// constraints): each axis solves
+//   relVel⁺ + (k/γ)·err + s·λ = 0,   γ = c + h·k,   s = 1/(h·γ)
+// which is the backward-Euler update of that axis's spring-damper —
+// unconditionally stable for ANY authored k (no deadbeat clamp, no force
+// clamp). The previous clamped velocity-drive could inject velocity far from
+// equilibrium but not absorb it near equilibrium (its clamp shrank with the
+// error), so resting chains rang forever — the "static dress slowly boils"
+// bug. c is derived per row from a fixed damping ratio against the row's
+// effective mass: c = 2ζ√(k·m_eff).
+const SPRING_DAMPING_ZETA = 0.7
 
 // ERP scale for loop-closing constraints (see buildConstraints: joints that
 // close a cycle in the joint graph, e.g. the horizontal ring welds of
@@ -229,16 +227,16 @@ function setupConstraint(
     // iteration (PMX rigs routinely put k=100000 springs on locked axes,
     // which turned welded weight-bodies into energy pumps).
     if (con.springEnabled[i] && denom > 0 && lo !== hi) {
-      // Clamp k to the deadbeat limit: an explicit spring with k·dt² > 1
-      // overshoots equilibrium every step and pumps energy — the classic
-      // pre-Spring2 Bullet 6dof instability this port inherited.
-      const k = Math.min(con.springStiffness[i], invDt * invDt)
+      // Implicit spring-damper (see SPRING_DAMPING_ZETA). Stored per axis:
+      // cacheLinSpringTarget = −(k/γ)·err (the bias, in velocity units) and
+      // cacheLinSpringMaxImp = s (the CFM softness — NOT a clamp anymore).
+      const k = con.springStiffness[i]
       const serr = curr - con.equilibriumPoint[i]
-      con.cacheLinSpringTarget[i] = -k * serr * dt
-      // Boil guard: per-substep spring impulse bounded by (a slack over) the
-      // physical spring force — unbounded spring drives pump energy through
-      // the euler-axis mis-scale and slowly boil resting cloth.
-      con.cacheLinSpringMaxImp[i] = SPRING_FORCE_SLACK * Math.abs(k * serr) * dt
+      const meff = 1 / denom
+      const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * meff)
+      const gamma = c + dt * k
+      con.cacheLinSpringTarget[i] = -(k / gamma) * serr
+      con.cacheLinSpringMaxImp[i] = 1 / (dt * gamma)
       con.cacheLinSpringImp[i] = 0
       con.cacheLinSpringActive[i] = 1
     } else if (!(lo === hi && con.isLoop)) {
@@ -308,10 +306,16 @@ function setupConstraint(
     // Springs on locked axes are skipped — the limit row welds those, and
     // double-driving a DOF overshoots every iteration (see the linear loop).
     if (con.springEnabled[idx] && angJac[i] > 0 && con.angularMin[i] !== con.angularMax[i]) {
-      const k = Math.min(con.springStiffness[idx], invDt * invDt)
+      // Implicit spring-damper, angular flavor. angJac[i] = 1/denom IS the
+      // row's effective inertia. Sign flip vs linear: d(err)/dt = −relAv, so
+      // the bias is positive for positive error. cacheAngSpringMaxImp holds
+      // the CFM softness s (not a clamp).
+      const k = con.springStiffness[idx]
       const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
-      angTgt[i] = k * serr * dt
-      con.cacheAngSpringMaxImp[i] = SPRING_FORCE_SLACK * Math.abs(k * serr) * dt
+      const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * angJac[i])
+      const gamma = c + dt * k
+      angTgt[i] = (k / gamma) * serr
+      con.cacheAngSpringMaxImp[i] = 1 / (dt * gamma)
       angAct[i] = 1
     } else {
       angTgt[i] = 0
@@ -476,23 +480,15 @@ function iterateConstraint(
       j += dImp
     }
 
-    // Spring row: velocity-target drive; the deadbeat k-clamp at setup
-    // bounds its aggression, and maxImp bounds loop-edge springs by their
-    // real force. relVel is refreshed with the limit impulse applied just
-    // above (j·denom = j / jac) — driving the spring off the stale value
-    // double-corrects the DOF and overshoots every iteration.
+    // Implicit spring-damper row (soft constraint, see setup): CFM-softened
+    // with accumulated λ, dissipative by construction. relVel is refreshed
+    // with the limit impulse applied just above (j·denom = j / jac) — driving
+    // the spring off the stale value double-corrects the DOF.
     if (sprAct[i]) {
       const relVelNow = j !== 0 ? relVel + j / jac[i] : relVel
-      let dImp = (sprTgt[i] - relVelNow) * jac[i]
-      const max = sprMax[i]
-      if (max !== Infinity) {
-        const old = sprImp[i]
-        let next = old + dImp
-        if (next > max) next = max
-        else if (next < -max) next = -max
-        dImp = next - old
-        sprImp[i] = next
-      }
+      const s = sprMax[i] // CFM softness
+      const dImp = (sprTgt[i] - relVelNow - s * sprImp[i]) / (1 / jac[i] + s)
+      sprImp[i] += dImp
       j += dImp
     }
 
@@ -532,16 +528,10 @@ function iterateConstraint(
     const o = i * 3
     const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
     const relAv = dax * axx + day * axy + daz * axz
-    let j = (angTgt[i] - relAv) * angJac[i]
-    {
-      const max = angSprMax[i]
-      const old = angSprImp[i]
-      let next = old + j
-      if (next > max) next = max
-      else if (next < -max) next = -max
-      j = next - old
-      angSprImp[i] = next
-    }
+    // Implicit spring-damper row (soft constraint, see setup).
+    const s = angSprMax[i] // CFM softness
+    const j = (angTgt[i] - relAv - s * angSprImp[i]) / (1 / angJac[i] + s)
+    angSprImp[i] += j
     if (j === 0) continue
     if (imA > 0) {
       av[ai + 0] -= j * angWAs[o + 0]

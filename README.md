@@ -15,7 +15,7 @@ npm install reze-engine
 - **Anime-style rendering** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
-- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs, zero dependencies
+- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
 - **VMD animation** — MMD IK, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
@@ -137,6 +137,7 @@ await model.loadVmd(name, url) / model.loadClip(name, clip)
 model.show(name)
 model.play(name, { priority?, loop? })       // priority: higher wins when clips compete (0 = default)
 model.pause() / stop() / seek(time)
+model.clearAnimation()                       // stop + DEACTIVATE the clip (stop() keeps it current for re-play; clear() forgets it, so resetAllBones/Morphs actually shows the bind pose)
 model.getAnimationProgress()                 // { current, duration (s), playing, paused, looping, … }
 model.exportVmd(name)                        // → ArrayBuffer (Shift-JIS bone/morph names)
 
@@ -165,7 +166,7 @@ if (picked.status === "single")
 
 VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths resolve against the PMX directory.
 
-**Flat multi-file picks work too** (mobile pickers can't select folders): files map by name, and texture paths fall back to **basename matching** — a PMX referencing `tex/body.png` finds a flat-selected `body.png`. The same fallback rescues wrongly-cased directory names.
+**Any `File[]` works, not just folder picks** — files from plain multi-select or drag & drop carry `webkitRelativePath === ""` and key by **filename** instead (which may itself contain a path: hosts that extract a model `.zip` in-app can synthesize `new File(data, "model/tex/body.png")` and paths resolve exactly like a folder pick). Texture paths additionally fall back to **basename matching** — a PMX referencing `tex/body.png` finds a flat `body.png`; the same fallback rescues wrongly-cased directory names.
 
 ### Interactive pose editing
 
@@ -266,7 +267,8 @@ In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsu
 
 **Per substep:** `predict velocities → broad + narrowphase → solve constraints (10 iters) → split-impulse position correction → integrate`.
 
-- **Solver** — projected Gauss-Seidel, joint rows + contact rows in one loop. Joints are 6DOF springs (3 linear + 3 angular) with stop-ERP limit correction and per-axis stiffness×error impulse. Linear rows pivot on each body's own joint-frame origin (Spring2-style, not Bullet 2.7x's shared mid-anchor), so a violated joint pulls itself back together instead of degenerating into torque and "breaking".
+- **Solver** — projected Gauss-Seidel, joint rows + contact rows in one loop. Joints are 6DOF spring constraints (3 linear + 3 angular) with stop-ERP limit correction. Linear rows pivot on each body's own joint-frame origin (Spring2-style, not Bullet 2.7x's shared mid-anchor), so a violated joint pulls itself back together instead of degenerating into torque and "breaking".
+- **Implicit spring-dampers** — each sprung axis solves the backward-Euler soft constraint `relVel⁺ + (k/γ)·err + s·λ = 0` (`γ = c + h·k`, `s = 1/(h·γ)`), unconditionally stable for any authored stiffness, with damping `c = 2ζ√(k·m_eff)` intrinsic to the row. Resting cloth genuinely settles: the previous clamped velocity-drive could inject energy far from equilibrium but not absorb it near it, so static dresses slowly "boiled" — measured 15× lower resting velocity after the change, with authored stiffness now delivered in full (no deadbeat clamp).
 - **Angular limits** — hybrid: small violations (< 0.5 rad, the resting-cloth regime) use per-axis Euler stop rows, which converge cleanly and keep resting cloth still; larger violations switch to a single geodesic row toward the Euler-clamped target rotation, because per-axis Euler rows chase phantom errors near the ±90° singularity and pump energy. Ranged stops are unilateral (accumulated impulse clamped to the corrective sign) so a limit pushes back into range but never brakes natural recovery; locked axes stay bilateral equality joints. Spring rows stay per-axis, with stiffness clamped to the `k·dt² ≤ ¼` stability bound.
 - **Narrowphase** — analytical sphere-sphere / -capsule / -box and capsule-capsule / -box. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
 - **Speculative contacts** (`margin 0.04`) fire at near-touch with a push-only clamp — inert until real overlap, but they stop fast bodies tunneling thin surfaces in one substep.
