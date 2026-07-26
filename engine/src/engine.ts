@@ -1708,13 +1708,35 @@ export class Engine {
     window.addEventListener("mouseup", this.handleGizmoMouseUp)
   }
 
-  private handleResize() {
-    const displayWidth = this.canvas.clientWidth
-    const displayHeight = this.canvas.clientHeight
+  /** When set, render resolution is pinned to this size instead of tracking the
+   *  canvas's CSS size × devicePixelRatio (see setRenderSize). */
+  private fixedRenderSize: { width: number; height: number } | null = null
 
+  /**
+   * Pin the render resolution (canvas backing store + every render target) to an
+   * explicit size, decoupled from the canvas's CSS layout size — for offline
+   * rendering at arbitrary resolution (video export). On screen the browser scales
+   * the buffer to the layout box, so the canvas may display letterboxed/stretched
+   * while pinned; hosts typically cover it with an export overlay. Pass null to
+   * return to CSS-size × devicePixelRatio tracking. Applies immediately (targets
+   * rebuild before this returns), so the next render() is at the new size.
+   */
+  setRenderSize(width: number, height: number): void
+  setRenderSize(size: null): void
+  setRenderSize(widthOrNull: number | null, height?: number): void {
+    this.fixedRenderSize =
+      widthOrNull === null
+        ? null
+        : { width: Math.max(1, Math.floor(widthOrNull)), height: Math.max(1, Math.floor(height ?? 1)) }
+    this.resizePending = false
+    this.handleResize()
+  }
+
+  private handleResize() {
+    // Fixed override (offline/video rendering) wins; otherwise track CSS size × dpr.
     const dpr = window.devicePixelRatio || 1
-    const width = Math.floor(displayWidth * dpr)
-    const height = Math.floor(displayHeight * dpr)
+    const width = this.fixedRenderSize ? this.fixedRenderSize.width : Math.floor(this.canvas.clientWidth * dpr)
+    const height = this.fixedRenderSize ? this.fixedRenderSize.height : Math.floor(this.canvas.clientHeight * dpr)
 
     if (!this.multisampleTexture || this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width
@@ -3907,14 +3929,31 @@ export class Engine {
   render() {
     if (!this.multisampleTexture || !this.camera || !this.device) return
 
+    const currentTime = performance.now()
+    const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
+    this.lastFrameTime = currentTime
+    this.renderWithDelta(deltaTime)
+  }
+
+  /**
+   * Render one frame advancing every clock — animation, physics, tweens, and the
+   * camera VMD — by exactly `deltaSeconds`, independent of wall time. This is the
+   * offline-rendering primitive (video export): call it N times with 1/fps and the
+   * result is deterministic whether the machine renders faster or slower than
+   * realtime. Also resets the realtime clock so a later render() (returning to the
+   * live loop) doesn't see the export's wall-clock gap as one giant delta.
+   */
+  renderFrame(deltaSeconds: number) {
+    if (!this.multisampleTexture || !this.camera || !this.device) return
+    this.lastFrameTime = performance.now()
+    this.renderWithDelta(deltaSeconds)
+  }
+
+  private renderWithDelta(deltaTime: number) {
     if (this.resizePending) {
       this.resizePending = false
       this.handleResize()
     }
-
-    const currentTime = performance.now()
-    const deltaTime = this.lastFrameTime > 0 ? (currentTime - this.lastFrameTime) / 1000 : 0.016
-    this.lastFrameTime = currentTime
 
     const hasModels = this.modelInstances.size > 0
     if (hasModels) {
