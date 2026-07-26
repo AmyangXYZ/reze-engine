@@ -19,6 +19,7 @@ npm install reze-engine
 - **VMD animation** — MMD IK, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
+- **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
@@ -117,13 +118,17 @@ engine.loadCameraVmd(url) / loadCameraVmdFromBuffer(buffer)   // MMD camera trac
 engine.setCameraVmdEnabled(on) / isCameraVmdEnabled() / hasCameraVmd() / clearCameraVmd()   // toggle the shot; while it drives, orbit/pan/zoom is inert — toggle off to hand control back
 
 engine.setWorld({ color?, strength? }) / setSun({ color?, strength?, direction? })   // runtime lighting
-engine.addGround(options?)
+engine.setBackgroundColor(color | null)      // canvas background (display-space sRGB 0–1, composited post-tonemap so it matches a CSS color of the same value exactly); null = transparent canvas (DOM shows through)
+engine.setBackdropEquirect(source | null)    // 360° backdrop from an equirect (2:1) image — PhotoDome-style dome at infinity, follows the camera, display-only (no lighting/bloom influence); oversized panoramas auto-downscale to the device texture limit
+engine.addGround(options?)                   // options include opacity (0–1): fades the SURFACE while the received shadow persists (shadow catcher — models stay grounded on photo backdrops); shadowStrength 0 disables the shadow
 engine.runRenderLoop(callback?) / stopRenderLoop()
+engine.renderFrame(deltaSeconds)             // offline rendering: render one frame advancing EVERY clock (animation, physics, camera VMD) by exactly dt — wall-clock independent; call N times with 1/fps for deterministic video export
+engine.setRenderSize(w, h) / setRenderSize(null)   // pin render resolution (all targets) independent of the canvas CSS size, e.g. 3840×2160 for export; null returns to CSS-size × devicePixelRatio tracking
 engine.getStats()                            // fps + smoothness metrics (frameTimeMax, fps1PercentLow, jitter)
 engine.dispose()
 ```
 
-**Options** — Blender-style scene config: `world` = environment lighting, `sun` = directional lamp (`direction` points from sun into the scene), `camera` = framing (`fov` in radians). Callbacks: `onRaycast`, `onGizmoDrag`. The shadow map is cast from `sun.direction` — the same vector the shader lights with — so shading and cast shadows stay coupled.
+**Options** — Blender-style scene config: `world` = environment lighting, `sun` = directional lamp (`direction` points from sun into the scene), `camera` = framing (`fov` in radians), `background` = canvas background (display-space sRGB, same semantics as `setBackgroundColor`). Callbacks: `onRaycast`, `onGizmoDrag`. The shadow map is cast from `sun.direction` — the same vector the shader lights with — so shading and cast shadows stay coupled.
 
 ### Model
 
@@ -159,6 +164,8 @@ if (picked.status === "single")
 ```
 
 VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths resolve against the PMX directory.
+
+**Flat multi-file picks work too** (mobile pickers can't select folders): files map by name, and texture paths fall back to **basename matching** — a PMX referencing `tex/body.png` finds a flat-selected `body.png`. The same fallback rescues wrongly-cased directory names.
 
 ### Interactive pose editing
 
@@ -296,7 +303,7 @@ Each built-in shader graph mixes an NPR stack with a Principled-style BSDF, so c
 | `metal`        | Toon + emission overlay (×8), Voronoi base, metallic 1                  |
 | `stockings`    | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
 
-**Post & output.** Directional shadow map (2048², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → inverted-hull outline.
+**Post & output.** Directional shadow map (4096², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → composite over the background color / 360 equirect backdrop (display space) → inverted-hull outline.
 
 - **Alpha-hashed transparency** (`stockings`) — Wyman & McGuire 2017 derivative-aware stochastic discard in object space, so self-overlapping meshes resolve under MSAA with opaque depth writes and the dither doesn't swim.
 - **See-through hair over eyes** — stencil-gated extra pass: the eye stamps `EYE_VALUE`, main hair skips it, an extra pass matches it and blends hair at 25% in linear HDR so eyes stay readable.

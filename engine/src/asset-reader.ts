@@ -52,6 +52,18 @@ export function createFileMapAssetReader(files: Map<string, File>): AssetReader 
           }
         }
       }
+      if (!file) {
+        // Last resort: basename match. Mobile pickers can't select folders — a flat
+        // multi-file selection loses directory structure, so `tex/body.png` must
+        // find a bare `body.png`. Also rescues wrongly-cased directory names.
+        const base = key.split("/").pop()!.toLowerCase()
+        for (const [k, f] of files) {
+          if (k.split("/").pop()!.toLowerCase() === base) {
+            file = f
+            break
+          }
+        }
+      }
       if (!file) throw new Error(`Missing file in folder: ${key}`)
       return file.arrayBuffer()
     },

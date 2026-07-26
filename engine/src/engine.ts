@@ -596,7 +596,10 @@ export class Engine {
   private filmicLutView!: GPUTextureView
   // Width of the baked Filmic tone LUT (composite.ts FILMIC_LUT_W must match).
   private static readonly FILMIC_LUT_WIDTH = 256
-  private static readonly SHADOW_MAP_SIZE = 2048
+  // 4096² over the 64-unit light box ≈ 64 texels/world-unit — crisp contact
+  // shadows on the ground catcher (2048 read visibly blurry). ~64 MB depth,
+  // acceptable for WebGPU-class hardware; deliberately NOT user-configurable.
+  private static readonly SHADOW_MAP_SIZE = 4096
   private shadowDepthPipeline!: GPURenderPipeline
   private shadowLightVPBuffer!: GPUBuffer
   private shadowLightVPMatrix = new Float32Array(16)
