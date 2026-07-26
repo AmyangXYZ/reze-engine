@@ -12,7 +12,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 2>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 3>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -28,6 +28,8 @@ override APPLY_GAMMA: bool = true;
 // continuity kills the banding — sampled with hardware linear filtering.
 @group(0) @binding(5) var filmicLut: texture_2d<f32>;
 // viewU[0] = (exposure, invGamma, _, _);  viewU[1] = (tint.rgb, intensity)
+// viewU[2] = (background.rgb, background.a) — display-space sRGB, composited
+//            UNDER the scene post-tonemap (a=0 → transparent canvas, DOM shows).
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
@@ -70,6 +72,8 @@ fn filmic(x: f32) -> f32 {
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));
   }
-  return vec4f(disp * alpha, alpha);
+  // Composite over the background color in display space (premultiplied out).
+  let bg = viewU[2];
+  return vec4f(disp * alpha + bg.rgb * bg.a * (1.0 - alpha), alpha + bg.a * (1.0 - alpha));
 }
 `

@@ -8,7 +8,7 @@ struct LightUniforms { ambientColor: vec4f, lights: array<Light, 4>, };
 struct GroundShadowMat {
   diffuseColor: vec3f, fadeStart: f32,
   fadeEnd: f32, shadowStrength: f32, pcfTexel: f32, gridSpacing: f32,
-  gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, _pad: f32,
+  gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, _pad2: f32,
 };
 struct LightVP { viewProj: mat4x4f, };
@@ -86,13 +86,16 @@ struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
   var baseColor = material.diffuseColor * sun * (1.0 - dark * 0.65);
   baseColor *= noiseTint;
   let finalColor = mix(baseColor, material.gridLineColor, gridLine * material.gridLineOpacity * edgeFade);
+  // Whole-ground opacity rides the same alpha path as the radial edge fade —
+  // 1 = solid (default), 0 = invisible shadow-catcher-less floor.
+  let fade = edgeFade * material.opacity;
   var out: FSOut;
-  out.color = vec4f(finalColor * edgeFade, edgeFade);
+  out.color = vec4f(finalColor * fade, fade);
   // mask.r = 0: ground never contributes to bloom. mask.g = 1.0 with src.a =
-  // edgeFade turns the aux blend into alpha-over, so the drawable alpha fades
-  // from edgeFade at the center to 0 at the radial edge — letting the page
+  // fade turns the aux blend into alpha-over, so the drawable alpha goes
+  // from fade at the center to 0 at the radial edge — letting the page
   // background show through under the premultiplied canvas alphaMode.
-  out.mask = vec4f(0.0, 1.0, 0.0, edgeFade);
+  out.mask = vec4f(0.0, 1.0, 0.0, fade);
   return out;
 }
 `

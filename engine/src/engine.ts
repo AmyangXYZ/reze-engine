@@ -301,6 +301,9 @@ export type EngineOptions = {
   world?: WorldOptions
   sun?: SunOptions
   camera?: CameraOptions
+  /** Canvas background (display-space sRGB 0–1), composited under the scene after
+   *  tonemapping. Omit/null = transparent canvas (see setBackgroundColor). */
+  background?: Vec3 | null
   /** Initial EEVEE-style bloom; tune at runtime with `setBloomOptions`. */
   bloom?: Partial<BloomOptions>
   /** View transform (exposure/gamma) applied in composite before/after Filmic. */
@@ -542,7 +545,9 @@ export class Engine {
   private compositeBindGroup!: GPUBindGroup
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
-  private readonly compositeUniformData = new Float32Array(8)
+  private readonly compositeUniformData = new Float32Array(12)
+  /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
+  private backgroundColor: Vec3 | null = null
 
   // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
   //   blit (HDR → half-res, 4-tap Karis + soft threshold/knee)
@@ -674,6 +679,8 @@ export class Engine {
     this.onGizmoDrag = options?.onGizmoDrag
     this.bloomSettings = Engine.mergeBloomDefaults(options?.bloom)
     this.viewTransform = Engine.mergeViewTransformDefaults(options?.view)
+    const bg = options?.background
+    this.backgroundColor = bg ? new Vec3(bg.x, bg.y, bg.z) : null
   }
 
   /** Merge partial bloom with EEVEE defaults (same as constructor). */
@@ -745,7 +752,25 @@ export class Engine {
     u[5] = b.color.y
     u[6] = b.color.z
     u[7] = effIntensity
+    // Background composited UNDER the scene in display space (post-tonemap), so it
+    // matches a CSS color of the same value exactly. a=0 → transparent (DOM shows).
+    const bg = this.backgroundColor
+    u[8] = bg?.x ?? 0
+    u[9] = bg?.y ?? 0
+    u[10] = bg?.z ?? 0
+    u[11] = bg ? 1 : 0
     this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
+  }
+
+  /**
+   * Set the canvas background color (display-space sRGB, 0–1 per channel — the
+   * same value a CSS background of that color shows, applied after tonemapping).
+   * Pass null for a transparent canvas (the page/DOM shows through — e.g. when a
+   * backdrop image layer sits behind the canvas). Applies on the next frame.
+   */
+  setBackgroundColor(color: Vec3 | null): void {
+    this.backgroundColor = color ? new Vec3(color.x, color.y, color.z) : null
+    if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
 
   /** Patch bloom; GPU uniforms update immediately if `init()` has run. */
@@ -1545,7 +1570,7 @@ export class Engine {
     // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      size: 32,
+      size: 48, // 3 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) · (bg rgb, bg a)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.compositeBindGroupLayout = this.device.createBindGroupLayout({
@@ -2357,6 +2382,8 @@ export class Engine {
     gridLineOpacity?: number
     gridLineColor?: Vec3
     noiseStrength?: number
+    /** Whole-ground opacity, 0–1 (multiplies the radial edge fade). Default 1. */
+    opacity?: number
   }): void {
     const opts = {
       width: 160,
@@ -2370,6 +2397,7 @@ export class Engine {
       gridLineOpacity: 0.4,
       gridLineColor: new Vec3(0.85, 0.85, 0.85),
       noiseStrength: 0.05,
+      opacity: 1.0,
       ...options,
     }
     this.createGroundGeometry(opts.width, opts.height)
@@ -2990,6 +3018,7 @@ export class Engine {
     gridLineOpacity: number
     gridLineColor: Vec3
     noiseStrength: number
+    opacity: number
   }) {
     const {
       diffuseColor,
@@ -3001,6 +3030,7 @@ export class Engine {
       gridLineOpacity,
       gridLineColor,
       noiseStrength,
+      opacity,
     } = opts
     // Shadow map is already created in setupPipelines()
     const gb = new Float32Array(16)
@@ -3015,7 +3045,7 @@ export class Engine {
     gb[8] = gridLineWidth
     gb[9] = gridLineOpacity
     gb[10] = noiseStrength
-    gb[11] = 0
+    gb[11] = opacity
     gb[12] = gridLineColor.x
     gb[13] = gridLineColor.y
     gb[14] = gridLineColor.z
