@@ -22,6 +22,7 @@ import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { GROUND_SHADOW_SHADER_WGSL } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
+import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
 import { GIZMO_SHADER_WGSL } from "./shaders/passes/gizmo"
 import {
@@ -172,6 +173,8 @@ type GroupInstall = {
   renderClass: RenderClass
   alphaMode: AlphaMode
   pipeline: GPURenderPipeline
+  /** Depth-write-off twin, used when this group's material draws in the transparent bucket. */
+  pipelineNoDepthWrite: GPURenderPipeline
   /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
   uniformBuffer: GPUBuffer
@@ -354,6 +357,8 @@ interface DrawCall {
   // Present only for material draw calls (opaque/transparent) — the grouping walk skips
   // any draw call without it.
   baseBindGroupEntries?: GPUBindGroupEntry[]
+  /** Material draws only: false = excluded from the shadow map (fully sheer). */
+  castsShadow?: boolean
 }
 
 interface PickDrawCall {
@@ -448,21 +453,30 @@ function buildAlphaSampler(
   }
 }
 
-/** Average texture alpha over ≤400 of the material's triangle centroids —
- *  below the threshold the material renders as a transparent-bucket draw. */
+/** Texture-alpha statistics over ≤400 of the material's triangle centroids:
+ *  `avg` (0..1) and `translucentFrac` — the fraction of samples that are
+ *  neither fully opaque nor fully cut out (alpha in ~0.03..0.97). Together
+ *  they classify two distinct things:
+ *    sheer   (avg low)            — a veil: mostly see-through everywhere
+ *    partial (translucentFrac up) — mostly-opaque cloth with sheer REGIONS,
+ *                                   e.g. a lace skirt panel
+ *  Both route to the transparent bucket; only `sheer` is excluded from the
+ *  shadow map and outline pass. */
 const SHEER_ALPHA_THRESHOLD = 0.7
-function materialIsSheer(
+const PARTIAL_TRANSLUCENT_FRAC = 0.15
+function materialAlphaStats(
   verts: Float32Array,
   indices: Uint32Array,
   firstIndex: number,
   count: number,
   sampler: { a: Uint8ClampedArray; w: number; h: number } | null | undefined,
-): boolean {
-  if (!sampler) return false
+): { avg: number; translucentFrac: number } {
+  if (!sampler) return { avg: 1, translucentFrac: 0 }
   const triCount = Math.floor(count / 3)
-  if (triCount === 0) return false
+  if (triCount === 0) return { avg: 1, translucentFrac: 0 }
   const step = Math.max(1, Math.floor(triCount / 400))
   let sum = 0
+  let translucent = 0
   let n = 0
   for (let t = 0; t < triCount; t += step) {
     const i0 = indices[firstIndex + t * 3]
@@ -473,10 +487,13 @@ function materialIsSheer(
     // Wrap (MMD UVs may tile), then nearest-sample the downsampled plane.
     const x = Math.min(sampler.w - 1, Math.max(0, Math.floor((u - Math.floor(u)) * sampler.w)))
     const y = Math.min(sampler.h - 1, Math.max(0, Math.floor((v - Math.floor(v)) * sampler.h)))
-    sum += sampler.a[y * sampler.w + x]
+    const a = sampler.a[y * sampler.w + x]
+    sum += a
+    if (a > 8 && a < 247) translucent++
     n++
   }
-  return n > 0 && sum / n < SHEER_ALPHA_THRESHOLD * 255
+  if (n === 0) return { avg: 1, translucentFrac: 0 }
+  return { avg: sum / n / 255, translucentFrac: translucent / n }
 }
 
 export class Engine {
@@ -509,6 +526,8 @@ export class Engine {
   // The one base shading model: ungrouped materials render this (compiled DEFAULT_GRAPH).
   // Grouped materials use their group's own compiled pipeline.
   private neutralPipeline!: GPURenderPipeline
+  private neutralPipelineNoDepthWrite!: GPURenderPipeline
+  private transparentDepthPrepassPipeline!: GPURenderPipeline
   // ── Style group runtime ──
   // Shared 256 B zero StyleUniforms buffer (group(2) binding(4)) bound by every ungrouped
   // material; grouped materials rebind to their group's own buffer (per-model, in the
@@ -895,6 +914,12 @@ export class Engine {
   setBackgroundColor(color: Vec3 | null): void {
     this.backgroundColor = color ? new Vec3(color.x, color.y, color.z) : null
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
+  /** Debug/diagnostic: skip every inverted-hull outline draw. */
+  private outlineEnabled = true
+  setOutlineEnabled(on: boolean): void {
+    this.outlineEnabled = on
   }
 
   private rebuildCompositeBindGroup(): void {
@@ -1600,6 +1625,44 @@ export class Engine {
         depthCompare: "less-equal",
       },
     })
+    // Depth-write-off twin for transparent-bucket draws (see pipelineForDrawCall).
+    this.neutralPipelineNoDepthWrite = this.createRenderPipeline({
+      label: "neutral base pipeline (no depth write)",
+      layout: mainPipelineLayout,
+      shaderModule: neutralModule,
+      vertexBuffers: fullVertexBuffers,
+      fragmentTargets: sceneTargets,
+      cullMode: "none",
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: false,
+        depthCompare: "less-equal",
+      },
+    })
+    // Depth-only prepass for transparent draws (see depth-prepass.ts): writes the
+    // fabric's depth AFTER its color blended, so outlines drawn later are
+    // occluded behind it. Color targets kept for pass compatibility, writeMask 0.
+    const prepassModule = this.device.createShaderModule({
+      label: "transparent depth prepass",
+      code: TRANSPARENT_DEPTH_PREPASS_WGSL,
+    })
+    this.transparentDepthPrepassPipeline = this.device.createRenderPipeline({
+      label: "transparent depth prepass",
+      layout: mainPipelineLayout,
+      vertex: { module: prepassModule, entryPoint: "vs", buffers: fullVertexBuffers as GPUVertexBufferLayout[] },
+      fragment: {
+        module: prepassModule,
+        entryPoint: "fs",
+        targets: sceneTargets.map((t) => ({ format: (t as GPUColorTargetState).format, writeMask: 0 })),
+      },
+      primitive: { cullMode: "none" },
+      multisample: { count: Engine.MULTISAMPLE_COUNT },
+      depthStencil: {
+        format: "depth24plus-stencil8",
+        depthWriteEnabled: true,
+        depthCompare: "less-equal",
+      },
+    })
 
     this.shadowLightVPBuffer = this.device.createBuffer({
       size: 64,
@@ -1737,6 +1800,16 @@ export class Engine {
         // Don’t write outline into depth buffer — stops z-fighting / black cracks vs body (MMD-style; body depth stays authoritative)
         depthWriteEnabled: false,
         depthCompare: "less-equal",
+        // CONFIRMED fix (bisected live via setOutlineEnabled): hull fragments
+        // carry their surface's exact depth, so against this model's paired
+        // near-coplanar skirt layers the hulls WON depth ties in patches —
+        // the black shapes on the dress. A small constant bias makes hulls lose
+        // every tie; silhouette rims compare against the far background and are
+        // unaffected. No slope term — slope explodes at silhouettes and would
+        // erase the rims themselves (previous regression).
+        depthBias: 4,
+        depthBiasSlopeScale: 0,
+        depthBiasClamp: 0,
         // Skip fragments where the eye stamped stencil=EYE_VALUE. Those pixels are owned by
         // the see-through-hair blend (hair-over-eyes), so letting the outline's near-black
         // edge color overwrite them would re-introduce the dark almond we just killed.
@@ -3491,9 +3564,20 @@ export class Engine {
       // casting the solid shadow of an opaque sheet.
       const diffusePath = texLogicalPath(mat.diffuseTextureIndex)
       const alphaSampler = diffusePath ? this.textureAlphaCache.get(diffusePath) : null
-      const isTransparent =
-        materialAlpha < 1.0 - 0.001 ||
-        materialIsSheer(meshVertices, meshIndices, currentIndexOffset, indexCount, alphaSampler)
+      const stats = materialAlphaStats(meshVertices, meshIndices, currentIndexOffset, indexCount, alphaSampler)
+      const sheer = stats.avg < SHEER_ALPHA_THRESHOLD
+      const partial = !sheer && stats.translucentFrac > PARTIAL_TRANSLUCENT_FRAC
+      // Transparent bucket: drawn after the opaque bucket (and hair) with depth
+      // WRITE OFF, so a lace panel folded in front of itself blends both layers
+      // consistently instead of a triangle-order patchwork of single/double
+      // coverage. Partial-sheer cloth still casts shadows and keeps its outline;
+      // fully sheer cloth (veil) does neither.
+      const isTransparent = materialAlpha < 1.0 - 0.001 || sheer || partial
+      // Load-time classification log — one line per material, cheap and
+      // invaluable when a model renders wrong (bucket/outline/sheer disputes).
+      console.info(
+        `[reze] ${mat.name}: alpha=${materialAlpha.toFixed(2)} avg=${stats.avg.toFixed(2)} sheerFrac=${stats.translucentFrac.toFixed(2)} ${sheer ? "SHEER" : partial ? "PARTIAL" : "opaque"} bucket=${isTransparent ? "transparent" : "opaque"} edge=${(mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0 ? (sheer ? "skipped(sheer)" : "on") : "off"}`,
+      )
 
       // Sphere map (sph=1 multiply / spa=2 add). Mode 3 (sub-texture UV) is
       // rare and not implemented — treated as none, like a failed load.
@@ -3540,9 +3624,15 @@ export class Engine {
         materialName: mat.name,
         groupId: null,
         baseBindGroupEntries,
+        castsShadow: !sheer,
       })
 
-      if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
+      // No inverted-hull outline for SHEER materials: the outline shader draws a
+      // solid edgeColor silhouette (it never samples texture alpha), so a
+      // see-through veil dragged a near-black hull over the cloth behind it —
+      // broken black shapes that waved with physics and flickered with camera
+      // angle. A solid rim on see-through fabric is wrong in principle.
+      if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0 && !sheer) {
         const materialUniformData = new Float32Array([
           mat.edgeColor[0],
           mat.edgeColor[1],
@@ -4711,9 +4801,13 @@ export class Engine {
     }
 
     let pipeline: GPURenderPipeline
+    let pipelineNoDepthWrite: GPURenderPipeline
     let overEyesPipeline: GPURenderPipeline | undefined
     try {
       pipeline = await this.createRenderClassPipeline(renderClass, module, false)
+      // Transparent-bucket draws don't write depth (self-overlap must blend, not
+      // patchwork) — same shading, different depth state.
+      pipelineNoDepthWrite = await this.createRenderClassPipeline(renderClass, module, false, false)
       if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true)
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
@@ -4739,6 +4833,7 @@ export class Engine {
       renderClass,
       alphaMode,
       pipeline,
+      pipelineNoDepthWrite,
       overEyesPipeline,
       uniformBuffer,
       slotMap: result.slotMap,
@@ -4802,7 +4897,9 @@ export class Engine {
     inst.drawCalls.sort(
       (a, b) => typeOrder[a.type] - typeOrder[b.type] || this.drawCallRank(inst, a) - this.drawCallRank(inst, b),
     )
-    inst.shadowDrawCalls = inst.drawCalls.filter((d) => d.type === "opaque")
+    inst.shadowDrawCalls = inst.drawCalls.filter(
+      (d) => (d.type === "opaque" || d.type === "transparent") && d.castsShadow === true,
+    )
   }
 
   /**
@@ -4814,6 +4911,7 @@ export class Engine {
     renderClass: RenderClass,
     module: GPUShaderModule,
     overEyes: boolean,
+    depthWrite = true,
   ): Promise<GPURenderPipeline> {
     const base = {
       label: `style ${renderClass}${overEyes ? " (over eyes)" : ""}`,
@@ -4824,7 +4922,7 @@ export class Engine {
     }
     const plainDepth: GPUDepthStencilState = {
       format: "depth24plus-stencil8",
-      depthWriteEnabled: true,
+      depthWriteEnabled: depthWrite,
       depthCompare: "less-equal",
     }
     let depthStencil: GPUDepthStencilState = plainDepth
@@ -4870,6 +4968,12 @@ export class Engine {
   // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
   // the neutral base (ungrouped materials render the default graph).
   private pipelineForDrawCall(inst: ModelInstance, dc: DrawCall): GPURenderPipeline {
+    // Transparent draws WRITE depth — MMD semantics: PMX triangle/material order
+    // is the author's compositing order, and a fold HIDES its far side rather
+    // than blending it (the far side shades dark — light-averted — so letting it
+    // show through read as gray fold-shaped stains; depth-write-off made every
+    // fold do that). The no-write twins stay available for a future true-OIT
+    // path but are deliberately unused.
     if (dc.groupId) {
       const install = inst.styleGroups.get(dc.groupId)
       if (install) return install.pipeline
@@ -4910,6 +5014,7 @@ export class Engine {
    * rebind group 0/1 correctly if needed.
    */
   private drawOutlines(pass: GPURenderPassEncoder, inst: ModelInstance, type: DrawCallType): void {
+    if (!this.outlineEnabled) return
     let bound = false
     for (const draw of inst.drawCalls) {
       if (draw.type !== type || !this.shouldRenderDrawCall(inst, draw)) continue
@@ -4940,11 +5045,34 @@ export class Engine {
     // and hairOverEyes (read equal). Non-stencil pipelines ignore the value.
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
 
+    // Order matters (the black-hull saga): transparent color draws don't write
+    // depth (self-overlap must double-blend, not patchwork), so ALL outlines
+    // draw after the transparent depth PREPASS has recorded the fabric's depth
+    // — otherwise every hull behind a sheer skirt shows straight through it.
     this.drawMaterials(pass, inst, "opaque")
-    this.drawOutlines(pass, inst, "opaque-outline")
     this.drawHairOverEyes(pass, inst)
     this.drawMaterials(pass, inst, "transparent")
+    this.drawOutlines(pass, inst, "opaque-outline")
     this.drawOutlines(pass, inst, "transparent-outline")
+  }
+
+  /** Depth-only re-draw of transparent-bucket materials (see depth-prepass.ts).
+   *  Unused while transparent draws write depth themselves (MMD parity) — kept
+   *  for the dormant no-write/OIT path. */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected drawTransparentDepthPrepass(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+    let bound = false
+    for (const draw of inst.drawCalls) {
+      if (draw.type !== "transparent" || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (!bound) {
+        pass.setPipeline(this.transparentDepthPrepassPipeline)
+        pass.setBindGroup(0, this.perFrameBindGroup)
+        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        bound = true
+      }
+      pass.setBindGroup(2, draw.bindGroup)
+      pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+    }
   }
 
   /**

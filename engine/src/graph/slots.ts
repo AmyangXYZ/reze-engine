@@ -76,14 +76,23 @@ function prelude(renderClass: RenderClass, alphaMode: AlphaMode): string {
       ? "  if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"
       : "  if (alpha < 0.001) { discard; }"
   const gate = renderClass === "eye" ? EYE_REAR_GATE : ""
+  // Double-sided shading, winding-independent: a normal pointing away from the
+  // camera means we're seeing the surface's other side — flip it. Only genuinely
+  // camera-averted fragments change (front surfaces have dot(n,v) > 0 and are
+  // untouched), unlike a front_facing test, which PMX's clockwise winding
+  // inverts. Fixes inner skirt linings (裙子白1-style flipped-normal copies)
+  // shading near-black through sheer outer layers. Eye is exempt: it FRONT-culls
+  // by design, so its visible fragments are back faces with intended normals.
+  const flip =
+    renderClass === "eye" ? "" : "\n  n = select(-n, n, dot(n, v) >= 0.0);"
   return `@fragment fn fs(input: VertexOutput) -> FSOut {
   let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
   // MMD alpha semantics: material alpha × texture alpha.
   let alpha = material.alpha * tex_s.a;
 ${discard}
 
-  let n = safe_normal(input.normal);
-  let v = normalize(camera.viewPos - input.worldPos);
+  var n = safe_normal(input.normal);
+  let v = normalize(camera.viewPos - input.worldPos);${flip}
 ${gate}
   let l = -light.lights[0].direction.xyz;
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;

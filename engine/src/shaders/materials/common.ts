@@ -102,9 +102,11 @@ fn safe_normal(nIn: vec3f) -> vec3f {
 `;
 
 // ─── Shadow sampler (3×3 PCF) ───────────────────────────────────────
-// 2048-map, normal-bias 0.08, depth-bias 0.001. Unrolled — Safari's Metal backend
-// doesn't unroll nested shadow loops reliably, and the early out on back-facing
-// fragments saves 9 texture taps per skipped pixel.
+// 4096-map (MUST match Engine.SHADOW_MAP_SIZE), normal-bias 0.08, depth-bias
+// 0.001. Unrolled — Safari's Metal backend doesn't unroll nested shadow loops
+// reliably. The texel size was stale at 1/2048 after the map grew to 4096:
+// PCF taps landed TWO texels apart, quantizing self-shadow edges into
+// texel-sized gray/black squares that crawled with the animation.
 
 export const SAMPLE_SHADOW_WGSL = /* wgsl */ `
 
@@ -115,7 +117,7 @@ fn sampleShadow(worldPos: vec3f, n: vec3f) -> f32 {
   let ndc = lclip.xyz / max(lclip.w, 1e-6);
   let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
   let cmpZ = ndc.z - 0.001;
-  let ts = 1.0 / 2048.0;
+  let ts = 1.0 / 4096.0;
   let s00 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(-ts, -ts), cmpZ);
   let s10 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(0.0, -ts), cmpZ);
   let s20 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f( ts, -ts), cmpZ);
