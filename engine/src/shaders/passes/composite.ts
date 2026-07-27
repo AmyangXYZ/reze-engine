@@ -1,7 +1,34 @@
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
+//
+// The shader is a TEMPLATE: buildCompositeShader() emits either the base pass or
+// a variant with a user background effect injected (setBackgroundEffect). The
+// effect is background mode 3, a sibling of the 360 equirect (mode 2) — it reuses
+// the same per-pixel view-ray reconstruction and composites in display space
+// under the scene, so it never affects lighting, bloom, or tonemapping.
 
-export const COMPOSITE_SHADER_WGSL = /* wgsl */ `
+/** What a user background effect must define, documented once:
+ *
+ *    fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f
+ *
+ *  - `ray`  — normalized world-space view direction of this pixel (left-handed,
+ *             +Z forward; identical to what the 360 skybox samples by).
+ *  - `uv`   — 0..1 across the canvas, origin bottom-left (shadertoy-style).
+ *  - `time` — seconds since the effect was applied.
+ *  - `bgResolution()` — canvas size in pixels, for aspect correction.
+ *  - declared params arrive as `params.<name>` (f32 or vec3f).
+ *  Return display-space sRGB + alpha, 0..1. The effect is a LAYER: it is
+ *  over-composited onto the base background (solid color / 360 equirect /
+ *  transparent) and sits behind the scene — alpha 0 lets the base show
+ *  through, so e.g. a starfield returns stars with a transparent sky. */
+export type CompositeEffectSource = {
+  /** User WGSL defining `background(...)` (plus any helpers it wants). */
+  wgsl: string
+  /** Codegen'd `struct BgParams {...}` + binding decl; empty when no params. */
+  paramsDecl: string
+}
+
+const COMPOSITE_HEAD = /* wgsl */ `
 // Pipeline-override constant: the engine creates two composite pipelines, one
 // with APPLY_GAMMA=false (gamma=1 fast path) and one with APPLY_GAMMA=true.
 // The 'if (APPLY_GAMMA)' below is resolved at pipeline-compile time — the
@@ -12,7 +39,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 6>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 7>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -29,10 +56,12 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(5) var filmicLut: texture_2d<f32>;
 // viewU[0] = (exposure, invGamma, _, _);  viewU[1] = (tint.rgb, intensity)
 // viewU[2] = (background.rgb, mode) — display-space sRGB, composited UNDER the
-//            scene post-tonemap. mode: 0 transparent (DOM shows), 1 solid color,
-//            2 = 360 equirect skybox sampled by view ray.
+//            scene post-tonemap. BASE-layer mode: 0 transparent (DOM shows),
+//            1 solid color, 2 = 360 equirect skybox sampled by view ray. A user
+//            WGSL effect is a separate LAYER over the base (viewU[6].y flag).
 // viewU[3] = (camera right, tanHalfFov·aspect); viewU[4] = (camera up, tanHalfFov);
-// viewU[5] = (camera forward, _) — refreshed per frame while the skybox is active.
+// viewU[5] = (camera forward, _) — refreshed per frame while skybox/effect active.
+// viewU[6] = (time seconds, effect on/off, canvas width, canvas height).
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 
@@ -50,6 +79,11 @@ fn filmic(x: f32) -> f32 {
   return textureSampleLevel(filmicLut, bloomSamp, vec2f(u, 0.5), 0.0).r;
 }
 
+/** Canvas size in pixels — for user background effects (aspect correction). */
+fn bgResolution() -> vec2f { return viewU[6].zw; }
+`
+
+const COMPOSITE_BODY = /* wgsl */ `
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let x = f32((vi & 1u) << 2u) - 1.0;
   let y = f32((vi & 2u) << 1u) - 1.0;
@@ -76,21 +110,60 @@ fn filmic(x: f32) -> f32 {
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));
   }
-  // Composite over the background in display space (premultiplied out).
+  // Composite over the background in display space (premultiplied out). The
+  // background is TWO layers: a base (transparent / solid color / 360 equirect)
+  // and an optional user WGSL effect over-composited onto it.
   let bg = viewU[2];
-  var bgRgb = bg.rgb;
   var bgA = select(0.0, 1.0, bg.w > 0.5);
-  if (bg.w > 1.5) {
-    // 360 equirect: rebuild this pixel's world-space view ray from the camera
-    // basis, then latitude/longitude-map into the panorama. The dome sits at
-    // infinity (no parallax) — PhotoDome-style, display-only.
+  var bgPm = bg.rgb * bgA;  // premultiplied accumulator
+  let fxOn = viewU[6].y > 0.5;
+  if (bg.w > 1.5 || fxOn) {
+    // The equirect and any effect both need this pixel's world-space view ray,
+    // rebuilt from the camera basis. The dome sits at infinity (no parallax) —
+    // PhotoDome-style, display-only.
     let ndc = vec2f(fragCoord.x / fullSz.x * 2.0 - 1.0, 1.0 - fragCoord.y / fullSz.y * 2.0);
     let dir = normalize(viewU[5].xyz + ndc.x * viewU[3].w * viewU[3].xyz + ndc.y * viewU[4].w * viewU[4].xyz);
-    // LH world (+Z forward): longitude = atan2(x, z), Babylon-PhotoDome convention.
-    let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
-    let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
-    bgRgb = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
+    if (bg.w > 1.5) {
+      // LH world (+Z forward): longitude = atan2(x, z), Babylon-PhotoDome convention.
+      let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
+      let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
+      bgPm = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
+    }
+    BG_EFFECT_CALL
   }
-  return vec4f(disp * alpha + bgRgb * bgA * (1.0 - alpha), alpha + bgA * (1.0 - alpha));
+  return vec4f(disp * alpha + bgPm * (1.0 - alpha), alpha + bgA * (1.0 - alpha));
 }
 `
+
+// Base variant: no effect installed, the flag is never set — the ray block only
+// runs for the equirect, and there is nothing to add. (`dir` may go unused when
+// this compiles with mode<2 shaders; WGSL is fine with an unused let.)
+const NO_EFFECT_CALL = `_ = dir;`
+
+// uv flipped to bottom-left origin (shadertoy convention); clamped so a stray
+// effect can't push negatives/NaN into the premultiplied composite. Standard
+// OVER onto the base layer.
+const EFFECT_CALL = /* wgsl */ `
+    if (fxOn) {
+      let bgUv = vec2f(fragCoord.x / fullSz.x, 1.0 - fragCoord.y / fullSz.y);
+      let fx = clamp(background(dir, bgUv, viewU[6].x), vec4f(0.0), vec4f(1.0));
+      bgPm = fx.rgb * fx.a + bgPm * (1.0 - fx.a);
+      bgA = fx.a + bgA * (1.0 - fx.a);
+    }
+`
+
+export function buildCompositeShader(effect?: CompositeEffectSource | null): string {
+  if (!effect) return COMPOSITE_HEAD + COMPOSITE_BODY.replace("BG_EFFECT_CALL", NO_EFFECT_CALL)
+  return (
+    COMPOSITE_HEAD +
+    "\n// ── user background effect (setBackgroundEffect) ──\n" +
+    effect.paramsDecl +
+    "\n" +
+    effect.wgsl +
+    "\n" +
+    COMPOSITE_BODY.replace("BG_EFFECT_CALL", EFFECT_CALL.trim())
+  )
+}
+
+/** Kept for compatibility with existing imports (the base, no-effect shader). */
+export const COMPOSITE_SHADER_WGSL = buildCompositeShader(null)

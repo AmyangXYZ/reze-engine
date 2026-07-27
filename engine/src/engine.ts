@@ -29,7 +29,7 @@ import {
   BLOOM_DOWNSAMPLE_SHADER_WGSL,
   BLOOM_UPSAMPLE_SHADER_WGSL,
 } from "./shaders/passes/bloom"
-import { COMPOSITE_SHADER_WGSL } from "./shaders/passes/composite"
+import { buildCompositeShader } from "./shaders/passes/composite"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
@@ -223,6 +223,16 @@ export type SunOptions = {
   direction?: Vec3
 }
 
+/** A background-effect param: number → f32, vector-like → vec3f (see
+ *  setBackgroundEffect). Structural {x,y,z} rather than the Vec3 class so
+ *  JSON-derived values (a shared scene document's params) pass straight in. */
+export type BackgroundEffectParamValue = number | { x: number; y: number; z: number }
+export type BackgroundEffectResult = {
+  ok: boolean
+  /** Compile/validation errors, line:col relative to the USER's WGSL. */
+  diagnostics: string[]
+}
+
 export type CameraOptions = {
   /** Orbit distance from target. */
   distance?: number
@@ -392,6 +402,83 @@ interface GpuMorph {
   dispatchNeeded: boolean
 }
 
+// ── Sheer-material detection ──────────────────────────────────────────────────
+// PMX carries no "translucent" flag: a see-through veil usually has diffuse
+// alpha 1.0 and does its transparency entirely in the TEXTURE's alpha channel.
+// Classifying by material alpha alone put such cloth in the opaque bucket,
+// where it draws in PMX order with depth writes — anything the engine draws
+// after it (the hair render-class draws LAST for the eye-stencil effect) got
+// depth-rejected behind the veil, so you saw the body through it but not the
+// hair. These helpers measure a material's real coverage by sampling the
+// texture's alpha at the material's own triangle CENTROIDS — centroids, not
+// vertices, because hair-card corners sit in transparent texture margins and
+// vertex sampling would misclassify hair (which must stay opaque-bucket for
+// stencil interplay and shadows).
+
+/** Downsampled alpha plane of a decoded texture (≤128², nearest-sampled). */
+function buildAlphaSampler(
+  source: ImageBitmap | null,
+  rgba: Uint8Array | null,
+  width: number,
+  height: number,
+): { a: Uint8ClampedArray; w: number; h: number } | null {
+  try {
+    const w = Math.max(1, Math.min(128, width))
+    const h = Math.max(1, Math.min(128, height))
+    const canvas = new OffscreenCanvas(w, h)
+    const cx = canvas.getContext("2d", { willReadFrequently: true })
+    if (!cx) return null
+    if (source) {
+      cx.drawImage(source, 0, 0, w, h)
+    } else if (rgba) {
+      const tmp = new OffscreenCanvas(width, height)
+      const tcx = tmp.getContext("2d")
+      if (!tcx) return null
+      tcx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0)
+      cx.drawImage(tmp, 0, 0, w, h)
+    } else {
+      return null
+    }
+    const img = cx.getImageData(0, 0, w, h).data
+    const a = new Uint8ClampedArray(w * h)
+    for (let i = 0; i < w * h; i++) a[i] = img[i * 4 + 3]
+    return { a, w, h }
+  } catch {
+    return null
+  }
+}
+
+/** Average texture alpha over ≤400 of the material's triangle centroids —
+ *  below the threshold the material renders as a transparent-bucket draw. */
+const SHEER_ALPHA_THRESHOLD = 0.7
+function materialIsSheer(
+  verts: Float32Array,
+  indices: Uint32Array,
+  firstIndex: number,
+  count: number,
+  sampler: { a: Uint8ClampedArray; w: number; h: number } | null | undefined,
+): boolean {
+  if (!sampler) return false
+  const triCount = Math.floor(count / 3)
+  if (triCount === 0) return false
+  const step = Math.max(1, Math.floor(triCount / 400))
+  let sum = 0
+  let n = 0
+  for (let t = 0; t < triCount; t += step) {
+    const i0 = indices[firstIndex + t * 3]
+    const i1 = indices[firstIndex + t * 3 + 1]
+    const i2 = indices[firstIndex + t * 3 + 2]
+    const u = (verts[i0 * 8 + 6] + verts[i1 * 8 + 6] + verts[i2 * 8 + 6]) / 3
+    const v = (verts[i0 * 8 + 7] + verts[i1 * 8 + 7] + verts[i2 * 8 + 7]) / 3
+    // Wrap (MMD UVs may tile), then nearest-sample the downsampled plane.
+    const x = Math.min(sampler.w - 1, Math.max(0, Math.floor((u - Math.floor(u)) * sampler.w)))
+    const y = Math.min(sampler.h - 1, Math.max(0, Math.floor((v - Math.floor(v)) * sampler.h)))
+    sum += sampler.a[y * sampler.w + x]
+    n++
+  }
+  return n > 0 && sum / n < SHEER_ALPHA_THRESHOLD * 255
+}
+
 export class Engine {
   private static instance: Engine | null = null
 
@@ -545,7 +632,7 @@ export class Engine {
   private compositeBindGroup!: GPUBindGroup
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
-  private readonly compositeUniformData = new Float32Array(24)
+  private readonly compositeUniformData = new Float32Array(28)
   /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
   private backgroundColor: Vec3 | null = null
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
@@ -553,6 +640,21 @@ export class Engine {
   private backdropEquirectView: GPUTextureView | null = null
   private fallbackEquirectTexture!: GPUTexture
   private fallbackEquirectView!: GPUTextureView
+  // User WGSL background effect (background mode 3, setBackgroundEffect). The
+  // composite pipelines are REBUILT with the user code injected; params live in
+  // their own uniform buffer so setBackgroundEffectParam is a write, not a
+  // recompile (the same instant tier as setStyleParam).
+  private backgroundEffect: {
+    wgsl: string
+    paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
+    paramsBuffer: GPUBuffer | null
+    paramsData: Float32Array<ArrayBuffer>
+  } | null = null
+  /** Bound at composite binding 7 when no effect (or a param-less one) is set. */
+  private bgParamsDummyBuffer!: GPUBuffer
+  private compositePipelineLayout!: GPUPipelineLayout
+  /** time=0 origin for the active effect — reset each setBackgroundEffect. */
+  private bgEffectEpochMs = 0
   private compositeBloomView: GPUTextureView | null = null
 
   // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
@@ -627,6 +729,11 @@ export class Engine {
   private materialSampler!: GPUSampler
   private fallbackMaterialTexture!: GPUTexture
   private textureCache = new Map<string, GPUTexture>()
+  // Downsampled CPU alpha channel per texture (≤128², ~16KB) — kept so materials
+  // can be classified as SHEER at load by sampling alpha at their own UVs (the
+  // GPU texture can't be read back cheaply, and PMX diffuse alpha is usually 1.0
+  // even for see-through cloth: the translucency lives in the texture).
+  private textureAlphaCache = new Map<string, { a: Uint8ClampedArray; w: number; h: number } | null>()
   private mipBlitPipeline: GPURenderPipeline | null = null
   private mipBlitSampler: GPUSampler | null = null
   private _nextDefaultModelId = 0
@@ -769,7 +876,12 @@ export class Engine {
     u[8] = bg?.x ?? 0
     u[9] = bg?.y ?? 0
     u[10] = bg?.z ?? 0
+    // Base-layer mode; a user effect is a separate LAYER flagged at u[25] and
+    // over-composited onto whichever base is active.
     u[11] = this.backdropEquirectView ? 2 : bg ? 1 : 0
+    u[25] = this.backgroundEffect ? 1 : 0
+    u[26] = this.canvas.width
+    u[27] = this.canvas.height
     this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
   }
 
@@ -798,6 +910,7 @@ export class Engine {
         { binding: 4, resource: this.maskResolveView },
         { binding: 5, resource: this.filmicLutView },
         { binding: 6, resource: this.backdropEquirectView ?? this.fallbackEquirectView },
+        { binding: 7, resource: { buffer: this.backgroundEffect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
       ],
     })
   }
@@ -844,6 +957,168 @@ export class Engine {
     }
     this.rebuildCompositeBindGroup()
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
+  private makeCompositePipeline(module: GPUShaderModule, applyGamma: boolean, label: string): GPURenderPipeline {
+    return this.device.createRenderPipeline({
+      label,
+      layout: this.compositePipelineLayout,
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        constants: { APPLY_GAMMA: applyGamma ? 1 : 0 },
+        targets: [{ format: this.presentationFormat }],
+      },
+      primitive: { topology: "triangle-list" },
+    })
+  }
+
+  /**
+   * Install a WGSL background effect (shadertoy-style) as a LAYER between the
+   * base background and the scene: rendered per-pixel in the composite pass and
+   * over-composited onto whichever base is active (solid color, 360 equirect,
+   * or transparency) — its alpha lets the base show through, so a starfield is
+   * stars over the user's background color. Display-space: never affects
+   * lighting, bloom, or tonemapping, and is captured by offline export like any
+   * background.
+   *
+   * `wgsl` must define:
+   *
+   *     fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f
+   *
+   * where `ray` is the pixel's normalized world-space view direction (LH, +Z
+   * forward — what the skybox samples by), `uv` is 0..1 bottom-left origin,
+   * `time` is seconds since apply, and `bgResolution()` gives the canvas size.
+   * Return sRGB + alpha. Declared `params` arrive as `params.<name>` (number →
+   * f32, Vec3 → vec3f) and are later tweaked without recompiling via
+   * setBackgroundEffectParam.
+   *
+   * Compiles off the hot path (async pipelines): on failure the previous
+   * background is KEPT and diagnostics are returned with line numbers relative
+   * to the user's WGSL. Pass null to remove the effect.
+   */
+  async setBackgroundEffect(
+    wgsl: string | null,
+    params?: Record<string, BackgroundEffectParamValue>,
+  ): Promise<BackgroundEffectResult> {
+    if (!this.device) return { ok: false, diagnostics: ["setBackgroundEffect requires init() to have run"] }
+
+    if (wgsl === null) {
+      this.backgroundEffect?.paramsBuffer?.destroy()
+      this.backgroundEffect = null
+      const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
+      this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
+      this.compositePipelineGamma = this.makeCompositePipeline(module, true, "composite pipeline (gamma!=1)")
+      this.rebuildCompositeBindGroup()
+      this.writeCompositeViewUniforms()
+      return { ok: true, diagnostics: [] }
+    }
+
+    // ── Params: codegen a WGSL struct and mirror its uniform layout on the CPU.
+    // Fields are emitted in declaration order; offsets follow WGSL's natural
+    // uniform rules (f32 align 4, vec3f align 16 size 12), computed identically
+    // on both sides so no reordering is needed.
+    const entries = Object.entries(params ?? {})
+    const layout = new Map<string, { offset: number; comps: 1 | 3 }>()
+    const fields: string[] = []
+    let cursor = 0
+    for (const [name, value] of entries) {
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
+        return { ok: false, diagnostics: [`invalid param name "${name}" (must be a WGSL identifier)`] }
+      }
+      const isVec = typeof value !== "number"
+      const align = isVec ? 16 : 4
+      const offset = Math.ceil(cursor / align) * align
+      layout.set(name, { offset: offset / 4, comps: isVec ? 3 : 1 })
+      fields.push(`  ${name}: ${isVec ? "vec3f" : "f32"},`)
+      cursor = offset + (isVec ? 12 : 4)
+    }
+    const paramsData = new Float32Array(Math.max(4, Math.ceil(cursor / 16) * 4))
+    for (const [name, value] of entries) {
+      const slot = layout.get(name)!
+      if (typeof value === "number") paramsData[slot.offset] = value
+      else {
+        paramsData[slot.offset] = value.x
+        paramsData[slot.offset + 1] = value.y
+        paramsData[slot.offset + 2] = value.z
+      }
+    }
+    const paramsDecl = entries.length
+      ? `struct BgParams {\n${fields.join("\n")}\n}\n@group(0) @binding(7) var<uniform> params: BgParams;\n`
+      : ""
+
+    // ── Compile with validation captured, not thrown at the console. Line
+    // numbers in diagnostics are rebased to the USER's source.
+    const source = buildCompositeShader({ wgsl, paramsDecl })
+    const userLineOffset = source.slice(0, source.indexOf(wgsl)).split("\n").length - 1
+    this.device.pushErrorScope("validation")
+    const module = this.device.createShaderModule({ label: "composite shader (bg effect)", code: source })
+    const info = await module.getCompilationInfo()
+    const scopeErr = await this.device.popErrorScope()
+    const diagnostics = info.messages
+      .filter((m) => m.type === "error")
+      .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
+    if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
+    if (diagnostics.length > 0) return { ok: false, diagnostics }
+    let identity: GPURenderPipeline
+    let gamma: GPURenderPipeline
+    try {
+      const make = (applyGamma: boolean, label: string) =>
+        this.device.createRenderPipelineAsync({
+          label,
+          layout: this.compositePipelineLayout,
+          vertex: { module, entryPoint: "vs" },
+          fragment: {
+            module,
+            entryPoint: "fs",
+            constants: { APPLY_GAMMA: applyGamma ? 1 : 0 },
+            targets: [{ format: this.presentationFormat }],
+          },
+          primitive: { topology: "triangle-list" },
+        })
+      ;[identity, gamma] = await Promise.all([
+        make(false, "composite pipeline (bg effect, gamma=1)"),
+        make(true, "composite pipeline (bg effect, gamma!=1)"),
+      ])
+    } catch (e) {
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
+    }
+
+    // ── Swap — only now does the old effect (and its params buffer) go away.
+    this.backgroundEffect?.paramsBuffer?.destroy()
+    let paramsBuffer: GPUBuffer | null = null
+    if (entries.length) {
+      paramsBuffer = this.device.createBuffer({
+        label: "bg effect params",
+        size: paramsData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(paramsBuffer, 0, paramsData)
+    }
+    this.backgroundEffect = { wgsl, paramLayout: layout, paramsBuffer, paramsData }
+    this.compositePipelineIdentity = identity
+    this.compositePipelineGamma = gamma
+    this.bgEffectEpochMs = performance.now()
+    this.rebuildCompositeBindGroup()
+    this.writeCompositeViewUniforms()
+    return { ok: true, diagnostics: [] }
+  }
+
+  /** Write one background-effect param (declared at setBackgroundEffect) — a
+   *  uniform write, no recompile; the instant tier, like setStyleParam. */
+  setBackgroundEffectParam(name: string, value: BackgroundEffectParamValue): void {
+    const fx = this.backgroundEffect
+    if (!fx || !fx.paramsBuffer) return
+    const slot = fx.paramLayout.get(name)
+    if (!slot) return
+    if (typeof value === "number") fx.paramsData[slot.offset] = value
+    else {
+      fx.paramsData[slot.offset] = value.x
+      fx.paramsData[slot.offset + 1] = value.y
+      fx.paramsData[slot.offset + 2] = value.z
+    }
+    this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
   }
 
   /** Patch bloom; GPU uniforms update immediately if `init()` has run. */
@@ -1643,9 +1918,15 @@ export class Engine {
     // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      // 6 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
-      // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray.
-      size: 96,
+      // 7 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
+      // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray ·
+      // (time, _, canvas width, canvas height) for user background effects.
+      size: 112,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.bgParamsDummyBuffer = this.device.createBuffer({
+      label: "bg effect params (dummy)",
+      size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.compositeBindGroupLayout = this.device.createBindGroupLayout({
@@ -1662,6 +1943,9 @@ export class Engine {
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         // 360 backdrop equirect (PhotoDome-style skybox) — 1×1 fallback when unset.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        // User background-effect params — dummy buffer when no effect is set. The
+        // layout is explicit, so the base shader legally ignores the binding.
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({
@@ -1672,29 +1956,15 @@ export class Engine {
     })
     this.fallbackEquirectView = this.fallbackEquirectTexture.createView()
 
-    const compositeShader = this.device.createShaderModule({
-      label: "composite shader",
-      code: COMPOSITE_SHADER_WGSL,
-    })
-
-    const compositePipelineLayout = this.device.createPipelineLayout({
+    this.compositePipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [this.compositeBindGroupLayout],
     })
-    const makeCompositePipeline = (applyGamma: boolean, label: string): GPURenderPipeline =>
-      this.device.createRenderPipeline({
-        label,
-        layout: compositePipelineLayout,
-        vertex: { module: compositeShader, entryPoint: "vs" },
-        fragment: {
-          module: compositeShader,
-          entryPoint: "fs",
-          constants: { APPLY_GAMMA: applyGamma ? 1 : 0 },
-          targets: [{ format: this.presentationFormat }],
-        },
-        primitive: { topology: "triangle-list" },
-      })
-    this.compositePipelineIdentity = makeCompositePipeline(false, "composite pipeline (gamma=1)")
-    this.compositePipelineGamma = makeCompositePipeline(true, "composite pipeline (gamma!=1)")
+    const compositeShader = this.device.createShaderModule({
+      label: "composite shader",
+      code: buildCompositeShader(null),
+    })
+    this.compositePipelineIdentity = this.makeCompositePipeline(compositeShader, false, "composite pipeline (gamma=1)")
+    this.compositePipelineGamma = this.makeCompositePipeline(compositeShader, true, "composite pipeline (gamma!=1)")
 
     // GPU vertex-morph compute pipeline (shared by all models; per-model bind groups).
     // Bindings: 0-4 read-only storage (base pos, CSR rowStart/colMorph/colOffset, weights),
@@ -2613,6 +2883,7 @@ export class Engine {
       if (!shared) {
         tex.destroy()
         this.textureCache.delete(path)
+        this.textureAlphaCache.delete(path)
       }
     }
     for (const buf of inst.gpuBuffers) {
@@ -3181,11 +3452,18 @@ export class Engine {
     // 1-based so that (0,0) = clear color = "no hit"
     const modelId = this.modelInstances.size + 1
 
+    const texLogicalPath = (texIndex: number): string | null =>
+      texIndex < 0 || texIndex >= textures.length
+        ? null
+        : joinAssetPath(inst.basePath, normalizeAssetPath(textures[texIndex].path))
     const loadTextureByIndex = async (texIndex: number): Promise<GPUTexture | null> => {
-      if (texIndex < 0 || texIndex >= textures.length) return null
-      const logicalPath = joinAssetPath(inst.basePath, normalizeAssetPath(textures[texIndex].path))
-      return this.createTextureFromLogicalPath(inst, logicalPath)
+      const logicalPath = texLogicalPath(texIndex)
+      return logicalPath ? this.createTextureFromLogicalPath(inst, logicalPath) : null
     }
+    // Mesh data for sheerness sampling (8 floats/vertex; uv at +6). See
+    // materialIsSheer — classification happens per material below.
+    const meshVertices = model.getVertices()
+    const meshIndices = model.getIndices()
 
     // 頭 bone index for the eye shader's rear-view gate (-1 when absent).
     const headBoneIndex = model.getSkeleton().bones.findIndex((b) => b.name === "頭")
@@ -3204,7 +3482,18 @@ export class Engine {
       }
 
       const materialAlpha = mat.diffuse[3]
-      const isTransparent = materialAlpha < 1.0 - 0.001
+      // Transparent bucket when the MATERIAL says so — or when the TEXTURE does
+      // (sheer cloth almost always ships with diffuse alpha 1.0 and carries its
+      // translucency in texture alpha). Transparent-bucket draws happen after
+      // the opaque bucket (and after the late-drawn hair render-class), so a
+      // veil composites over the hair behind it instead of depth-rejecting it;
+      // they are also excluded from the shadow map, so sheer cloth stops
+      // casting the solid shadow of an opaque sheet.
+      const diffusePath = texLogicalPath(mat.diffuseTextureIndex)
+      const alphaSampler = diffusePath ? this.textureAlphaCache.get(diffusePath) : null
+      const isTransparent =
+        materialAlpha < 1.0 - 0.001 ||
+        materialIsSheer(meshVertices, meshIndices, currentIndexOffset, indexCount, alphaSampler)
 
       // Sphere map (sph=1 multiply / spa=2 add). Mode 3 (sub-texture UV) is
       // rare and not implemented — treated as none, like a failed load.
@@ -3402,6 +3691,10 @@ export class Engine {
         return null
       }
     }
+
+    // CPU alpha sampler for sheerness classification (see textureAlphaCache).
+    // Canvas 2D premultiplies RGB on readback, but the ALPHA channel is exact.
+    this.textureAlphaCache.set(cacheKey, buildAlphaSampler(source, rgba, width, height))
 
     const mipLevelCount = Math.floor(Math.log2(Math.max(width, height))) + 1
     const texture = this.device.createTexture({
@@ -4705,7 +4998,7 @@ export class Engine {
     // is LEFT-HANDED (+Z forward, see Mat4.lookAtInto), so the world-space
     // right/up/FORWARD vectors are rows 0/1/2 of its rotation block directly
     // (column-major storage: row i = values[i], values[i+4], values[i+8]).
-    if (this.backdropEquirectView && this.compositeUniformBuffer) {
+    if ((this.backdropEquirectView || this.backgroundEffect) && this.compositeUniformBuffer) {
       const v = viewMatrix.values
       const u = this.compositeUniformData
       const tanHalf = Math.tan((this.camera.fov ?? Math.PI / 4) / 2)
@@ -4722,6 +5015,10 @@ export class Engine {
       u[21] = v[6]
       u[22] = v[10]
       u[23] = 0
+      // Effect clock + canvas size (viewU[6]) — written on the same refresh.
+      u[24] = (performance.now() - this.bgEffectEpochMs) / 1000
+      u[26] = this.canvas.width
+      u[27] = this.canvas.height
       this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
     }
   }

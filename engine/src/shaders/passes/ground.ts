@@ -67,6 +67,14 @@ struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
     }
   }
   vis *= 0.04;
+  // Outside the light's frustum there IS no shadow information — the clamped
+  // border samples above compare against unrelated depths and read "shadowed",
+  // darkening the whole far plane with a visible band at the frustum edge
+  // (masked by the opaque surface normally, glaring in green-screen mode where
+  // only the shadow-catcher term renders). Fade to fully lit near the border.
+  let inZ = select(0.0, 1.0, ndc.z > 0.0 && ndc.z < 1.0);
+  let frustum = (1.0 - smoothstep(0.88, 0.96, abs(ndc.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc.y))) * inZ;
+  vis = mix(1.0, vis, frustum);
 
   // Frosted/matte micro-texture
   let noiseVal = fbmNoise(i.worldPos.xz * 3.0);

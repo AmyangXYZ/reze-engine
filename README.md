@@ -20,6 +20,7 @@ npm install reze-engine
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 - **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
+- **WGSL background effects** — a user shader layer (shadertoy-style) composited between the background and the scene, with compile diagnostics and live-tweakable uniform params
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
@@ -120,6 +121,8 @@ engine.setCameraVmdEnabled(on) / isCameraVmdEnabled() / hasCameraVmd() / clearCa
 engine.setWorld({ color?, strength? }) / setSun({ color?, strength?, direction? })   // runtime lighting
 engine.setBackgroundColor(color | null)      // canvas background (display-space sRGB 0–1, composited post-tonemap so it matches a CSS color of the same value exactly); null = transparent canvas (DOM shows through)
 engine.setBackdropEquirect(source | null)    // 360° backdrop from an equirect (2:1) image — PhotoDome-style dome at infinity, follows the camera, display-only (no lighting/bloom influence); oversized panoramas auto-downscale to the device texture limit
+engine.setBackgroundEffect(wgsl | null, params?)  // WGSL effect LAYER between the base background (color/equirect/transparent) and the scene. The code defines fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f — ray = the pixel's world-space view direction (pans with the orbit, same mapping the skybox samples by), uv = 0..1 bottom-left origin, alpha = layer mask over the base. Compiles async off the hot path; on failure the previous background is KEPT and {ok, diagnostics} returns line:col errors rebased to the user's code. Declared params ({name: number | {x,y,z}}) become a params.<name> uniform struct
+engine.setBackgroundEffectParam(name, value) // write one declared param — a uniform write, no recompile (live slider tier)
 engine.addGround(options?)                   // options include opacity (0–1): fades the SURFACE while the received shadow persists (shadow catcher — models stay grounded on photo backdrops); shadowStrength 0 disables the shadow
 engine.runRenderLoop(callback?) / stopRenderLoop()
 engine.renderFrame(deltaSeconds)             // offline rendering: render one frame advancing EVERY clock (animation, physics, camera VMD) by exactly dt — wall-clock independent; call N times with 1/fps for deterministic video export
@@ -305,9 +308,10 @@ Each built-in shader graph mixes an NPR stack with a Principled-style BSDF, so c
 | `metal`        | Toon + emission overlay (×8), Voronoi base, metallic 1                  |
 | `stockings`    | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
 
-**Post & output.** Directional shadow map (4096², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → composite over the background color / 360 equirect backdrop (display space) → inverted-hull outline.
+**Post & output.** Directional shadow map (4096², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → composite over the background (base color / 360 equirect, then the optional user WGSL effect layer over-composited by its alpha, display space) → inverted-hull outline.
 
 - **Alpha-hashed transparency** (`stockings`) — Wyman & McGuire 2017 derivative-aware stochastic discard in object space, so self-overlapping meshes resolve under MSAA with opaque depth writes and the dither doesn't swim.
+- **Sheer-material detection** — PMX has no "translucent" flag (a see-through veil usually ships diffuse alpha 1.0 with the transparency in its texture), so at load each material samples its texture's alpha at its own triangle centroids; genuinely sheer materials route to the transparent bucket — drawn after the opaque + hair passes so a veil composites over the hair behind it, and excluded from the shadow map so sheer cloth doesn't cast the solid shadow of an opaque sheet. Centroids, not vertices: hair-card corners sit in transparent texture margins, and hair must stay opaque-bucket for stencil interplay and shadows.
 - **See-through hair over eyes** — stencil-gated extra pass: the eye stamps `EYE_VALUE`, main hair skips it, an extra pass matches it and blends hair at 25% in linear HDR so eyes stay readable.
 
 ## Tutorial

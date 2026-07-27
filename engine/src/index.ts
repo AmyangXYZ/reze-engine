@@ -13,6 +13,8 @@ export {
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,
+  type BackgroundEffectParamValue,
+  type BackgroundEffectResult,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export {
