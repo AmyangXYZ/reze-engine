@@ -80,7 +80,7 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   // share the face material family. Bare 口 is omitted — it collides with 袖口 (cuff).
   [
     "face",
-    ["顔", "颜", "脸", "かお", "face", "舌", "tongue", "牙", "牙齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "歯茎", "gums"],
+    ["顔", "颜", "顏", "脸", "臉", "かお", "face", "舌", "tongue", "牙", "牙齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "歯茎", "gums"],
   ],
   ["hair", ["前髪", "後髪", "髪", "髮", "头发", "頭髪", "もみあげ", "アホ毛", "ヘア", "hair", "ahoge", "bang"]],
   ["body", ["肌", "皮肤", "skin"]],
@@ -2599,7 +2599,18 @@ export class Engine {
     inst.model.stopAnimation()
     for (const path of inst.textureCacheKeys) {
       const tex = this.textureCache.get(path)
-      if (tex) {
+      if (!tex) continue
+      // The texture cache is shared across models — destroy only when no OTHER
+      // live instance references the key, else the survivor submits with a
+      // destroyed texture.
+      let shared = false
+      for (const other of this.modelInstances.values()) {
+        if (other !== inst && other.textureCacheKeys.includes(path)) {
+          shared = true
+          break
+        }
+      }
+      if (!shared) {
         tex.destroy()
         this.textureCache.delete(path)
       }
@@ -3339,6 +3350,12 @@ export class Engine {
     const cacheKey = logicalPath
     const cached = this.textureCache.get(cacheKey)
     if (cached) {
+      // Record the reference on THIS instance too — the cache is engine-global
+      // (two PMX in one folder share texture paths), and removeModel decides
+      // destruction by who still references a key. Without this, a cache-hit
+      // borrower kept rendering a texture the creator's removal destroyed
+      // ("Destroyed texture used in a submit").
+      if (!inst.textureCacheKeys.includes(cacheKey)) inst.textureCacheKeys.push(cacheKey)
       return cached
     }
 
