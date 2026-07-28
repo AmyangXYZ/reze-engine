@@ -14,7 +14,7 @@ npm install reze-engine
 
 - **Anime-style rendering** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
-- **HDR pipeline** — bloom, Filmic tone mapping, 4× MSAA, Apple-TBDR-friendly targets
+- **HDR pipeline** — bloom, Filmic tone mapping, ASC CDL colour grading, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
 - **VMD animation** — MMD IK, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
@@ -123,6 +123,8 @@ engine.setBackgroundColor(color | null)      // canvas background (display-space
 engine.setBackdropEquirect(source | null)    // 360° backdrop from an equirect (2:1) image — PhotoDome-style dome at infinity, follows the camera, display-only (no lighting/bloom influence); oversized panoramas auto-downscale to the device texture limit
 engine.setBackgroundEffect(wgsl | null, params?)  // WGSL effect LAYER between the base background (color/equirect/transparent) and the scene. The code defines fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f — ray = the pixel's world-space view direction (pans with the orbit, same mapping the skybox samples by), uv = 0..1 bottom-left origin, alpha = layer mask over the base. Compiles async off the hot path; on failure the previous background is KEPT and {ok, diagnostics} returns line:col errors rebased to the user's code. Declared params ({name: number | {x,y,z}}) become a params.<name> uniform struct
 engine.setBackgroundEffectParam(name, value) // write one declared param — a uniform write, no recompile (live slider tier)
+engine.setColorGrading({ shadows?, midtones?, highlights?, contrast?, saturation? })   // ASC CDL grade on the TONEMAPPED scene: the three tonal colours are display-space sRGB with mid-grey (0.5,0.5,0.5) neutral — direction from neutral is the hue that range is pushed toward, distance is the amount, and going darker/lighter than 0.5 crushes or lifts it (shadows→CDL offset, midtones→power, highlights→slope). contrast pivots on 0.5; saturation is Rec.709. Uniforms-only, no pipeline rebuild — safe to call per frame from a slider. A neutral grade is flagged off and costs nothing per pixel
+engine.getColorGrading()                     // current grade, for serialising into a scene descriptor
 engine.addGround(options?)                   // options include opacity (0–1): fades the SURFACE while the received shadow persists (shadow catcher — models stay grounded on photo backdrops); shadowStrength 0 disables the shadow
 engine.runRenderLoop(callback?) / stopRenderLoop()
 engine.renderFrame(deltaSeconds)             // offline rendering: render one frame advancing EVERY clock (animation, physics, camera VMD) by exactly dt — wall-clock independent; call N times with 1/fps for deterministic video export
@@ -308,7 +310,7 @@ Each built-in shader graph mixes an NPR stack with a Principled-style BSDF, so c
 | `metal`        | Toon + emission overlay (×8), Voronoi base, metallic 1                  |
 | `stockings`    | Gradient × facing mask + HSV emission (×5), sheen 0.7, **alpha-hashed** |
 
-**Post & output.** Directional shadow map (4096², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → composite over the background (base color / 360 equirect, then the optional user WGSL effect layer over-composited by its alpha, display space) → inverted-hull outline.
+**Post & output.** Directional shadow map (4096², depth32float, PCF) → HDR main pass at 4× MSAA (`rg11b10ufloat` color + `rg8unorm` aux MRT for bloom mask + alpha; fits Apple-Silicon TBDR tile memory so MSAA resolves in-tile, `rgba16float` fallback) → bloom mip pyramid → Filmic tone map (Blender 3.6 "Filmic / Medium High Contrast" LUT) → ASC CDL colour grade (`setColorGrading`, scene only — the background layer and any green-screen key are deliberately left ungraded) → composite over the background (base color / 360 equirect, then the optional user WGSL effect layer over-composited by its alpha, display space) → inverted-hull outline.
 
 - **Alpha-hashed transparency** (`stockings`) — Wyman & McGuire 2017 derivative-aware stochastic discard in object space, so self-overlapping meshes resolve under MSAA with opaque depth writes and the dither doesn't swim.
 - **Sheer-material detection** — PMX has no "translucent" flag (a see-through veil usually ships diffuse alpha 1.0 with the transparency in its texture), so at load each material samples its texture's alpha at its own triangle centroids; genuinely sheer materials route to the transparent bucket — drawn after the opaque + hair passes so a veil composites over the hair behind it, and excluded from the shadow map so sheer cloth doesn't cast the solid shadow of an opaque sheet. Centroids, not vertices: hair-card corners sit in transparent texture margins, and hair must stay opaque-bucket for stencil interplay and shadows.

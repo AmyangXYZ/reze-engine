@@ -283,6 +283,34 @@ export const DEFAULT_VIEW_TRANSFORM: ViewTransformOptions = {
   look: "medium_high_contrast",
 }
 
+/** Color grading applied to the tonemapped scene (ASC CDL — see grade() in
+ *  composite.ts). The three tonal controls are expressed as COLORS with
+ *  mid-gray (0.5, 0.5, 0.5) as neutral: the direction from neutral is the hue
+ *  you push toward, and the distance from neutral is the amount — so no
+ *  separate strength slider is needed. Display-space sRGB, since grading runs
+ *  after the view transform. */
+export type ColorGradingOptions = {
+  /** Lifts/tints the dark end (CDL offset). */
+  shadows: Vec3
+  /** Bends the midtones (CDL power) — brighter above neutral, darker below. */
+  midtones: Vec3
+  /** Scales/tints the bright end (CDL slope). */
+  highlights: Vec3
+  /** Contrast about the 0.5 display pivot. 1 = neutral. */
+  contrast: number
+  /** 1 = neutral, 0 = grayscale, >1 = punchier. */
+  saturation: number
+}
+
+const NEUTRAL_GRADE_CHANNEL = 0.5
+export const DEFAULT_COLOR_GRADING: ColorGradingOptions = {
+  shadows: new Vec3(NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL),
+  midtones: new Vec3(NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL),
+  highlights: new Vec3(NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL),
+  contrast: 1,
+  saturation: 1,
+}
+
 export type GizmoDragKind = "rotate" | "translate"
 
 export interface GizmoDragEvent {
@@ -651,7 +679,7 @@ export class Engine {
   private compositeBindGroup!: GPUBindGroup
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
-  private readonly compositeUniformData = new Float32Array(28)
+  private readonly compositeUniformData = new Float32Array(40)
   /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
   private backgroundColor: Vec3 | null = null
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
@@ -861,6 +889,42 @@ export class Engine {
     return { exposure: v.exposure, gamma: v.gamma, look: v.look }
   }
 
+  private colorGrading: ColorGradingOptions = {
+    shadows: new Vec3(NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL),
+    midtones: new Vec3(NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL),
+    highlights: new Vec3(NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL, NEUTRAL_GRADE_CHANNEL),
+    contrast: DEFAULT_COLOR_GRADING.contrast,
+    saturation: DEFAULT_COLOR_GRADING.saturation,
+  }
+
+  /**
+   * Color-grade the tonemapped scene (ASC CDL slope/offset/power + saturation).
+   * The background layer is deliberately left ungraded — see the call site in
+   * composite.ts. Uniforms-only: no pipeline rebuild, safe to call per frame
+   * (e.g. from a slider drag).
+   */
+  setColorGrading(patch: Partial<ColorGradingOptions>): void {
+    const g = this.colorGrading
+    if (patch.shadows) g.shadows = new Vec3(patch.shadows.x, patch.shadows.y, patch.shadows.z)
+    if (patch.midtones) g.midtones = new Vec3(patch.midtones.x, patch.midtones.y, patch.midtones.z)
+    if (patch.highlights) g.highlights = new Vec3(patch.highlights.x, patch.highlights.y, patch.highlights.z)
+    if (patch.contrast !== undefined) g.contrast = patch.contrast
+    if (patch.saturation !== undefined) g.saturation = patch.saturation
+    if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
+  /** Current grade (for serialization into a scene descriptor). */
+  getColorGrading(): ColorGradingOptions {
+    const g = this.colorGrading
+    return {
+      shadows: new Vec3(g.shadows.x, g.shadows.y, g.shadows.z),
+      midtones: new Vec3(g.midtones.x, g.midtones.y, g.midtones.z),
+      highlights: new Vec3(g.highlights.x, g.highlights.y, g.highlights.z),
+      contrast: g.contrast,
+      saturation: g.saturation,
+    }
+  }
+
   setViewTransformOptions(patch: Partial<ViewTransformOptions>): void {
     const v = this.viewTransform
     if (patch.exposure !== undefined) v.exposure = patch.exposure
@@ -901,6 +965,32 @@ export class Engine {
     u[25] = this.backgroundEffect ? 1 : 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
+    // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
+    // on the CPU, so the shader only ever sees slope/offset/power. Mid-gray is
+    // neutral in all three; the signed distance from it is the amount.
+    const g = this.colorGrading
+    const off = (c: number) => (c - NEUTRAL_GRADE_CHANNEL) * 0.5 // ±0.25 lift
+    // power < 1 brightens, so midtones ABOVE neutral must lower the exponent.
+    const pow_ = (c: number) => Math.max(0.05, 1 - (c - NEUTRAL_GRADE_CHANNEL) * 1.5)
+    const slope = (c: number) => Math.max(0, 1 + (c - NEUTRAL_GRADE_CHANNEL) * 1.5)
+    u[28] = off(g.shadows.x)
+    u[29] = off(g.shadows.y)
+    u[30] = off(g.shadows.z)
+    u[31] = g.contrast
+    u[32] = pow_(g.midtones.x)
+    u[33] = pow_(g.midtones.y)
+    u[34] = pow_(g.midtones.z)
+    u[35] = g.saturation
+    u[36] = slope(g.highlights.x)
+    u[37] = slope(g.highlights.y)
+    u[38] = slope(g.highlights.z)
+    // Neutral grade → flag off, so the default pipeline pays nothing per pixel.
+    const neutral =
+      u[28] === 0 && u[29] === 0 && u[30] === 0 &&
+      u[32] === 1 && u[33] === 1 && u[34] === 1 &&
+      u[36] === 1 && u[37] === 1 && u[38] === 1 &&
+      g.contrast === 1 && g.saturation === 1
+    u[39] = neutral ? 0 : 1
     this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
   }
 
@@ -2005,10 +2095,11 @@ export class Engine {
     // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      // 7 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
+      // 10 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
       // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray ·
-      // (time, _, canvas width, canvas height) for user background effects.
-      size: 112,
+      // (time, _, canvas width, canvas height) for user background effects ·
+      // three grade vectors (CDL offset+contrast, power+saturation, slope+flag).
+      size: 160,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.bgParamsDummyBuffer = this.device.createBuffer({

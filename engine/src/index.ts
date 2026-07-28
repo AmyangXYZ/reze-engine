@@ -2,6 +2,8 @@ export {
   Engine,
   DEFAULT_BLOOM_OPTIONS,
   DEFAULT_VIEW_TRANSFORM,
+  DEFAULT_COLOR_GRADING,
+  type ColorGradingOptions,
   type EngineStats,
   type EngineOptions,
   type BloomOptions,

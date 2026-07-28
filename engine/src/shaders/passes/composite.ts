@@ -39,7 +39,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 7>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 10>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -62,6 +62,8 @@ override APPLY_GAMMA: bool = true;
 // viewU[3] = (camera right, tanHalfFov·aspect); viewU[4] = (camera up, tanHalfFov);
 // viewU[5] = (camera forward, _) — refreshed per frame while skybox/effect active.
 // viewU[6] = (time seconds, effect on/off, canvas width, canvas height).
+// viewU[7] = (grade offset.rgb, contrast);  viewU[8] = (grade power.rgb, saturation);
+// viewU[9] = (grade slope.rgb, grade on/off) — see grade() below.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 
@@ -81,6 +83,24 @@ fn filmic(x: f32) -> f32 {
 
 /** Canvas size in pixels — for user background effects (aspect correction). */
 fn bgResolution() -> vec2f { return viewU[6].zw; }
+
+/** Color grading, applied to the tonemapped SCENE (not the background — see the
+ *  call site). The core is ASC CDL, the film-industry interchange standard:
+ *
+ *      out = (in · slope + offset) ^ power        then saturation  (SOP → SAT)
+ *
+ *  Using the real standard rather than invented controls means a look authored
+ *  here maps onto any grading tool. slope/offset/power are derived on the CPU
+ *  from the UI's shadow/midtone/highlight colors (see setColorGrading), so the
+ *  per-pixel cost is one mul-add, one pow, one lerp. */
+fn grade(c: vec3f) -> vec3f {
+  var x = pow(max(c * viewU[9].xyz + viewU[7].xyz, vec3f(0.0)), viewU[8].xyz);
+  // Contrast pivots on 0.5 — display-referred midpoint, since we grade post-Filmic.
+  x = (x - vec3f(0.5)) * viewU[7].w + vec3f(0.5);
+  // Rec.709 luma, matching the ASC SAT node.
+  let luma = dot(x, vec3f(0.2126, 0.7152, 0.0722));
+  return max(mix(vec3f(luma), x, viewU[8].w), vec3f(0.0));
+}
 `
 
 const COMPOSITE_BODY = /* wgsl */ `
@@ -107,6 +127,13 @@ const COMPOSITE_BODY = /* wgsl */ `
   let exposed = combined * exp2(viewU[0].x);
   let tm = vec3f(filmic(exposed.r), filmic(exposed.g), filmic(exposed.b));
   var disp = max(tm, vec3f(0.0));
+  // Grade the SCENE only, before the display gamma. Deliberately not applied to
+  // the background: it keeps a picked background color exactly as picked, and —
+  // load-bearing — leaves green-screen mode's key color unshifted so chroma
+  // keying still works. Skipped entirely when the grade is neutral.
+  if (viewU[9].w > 0.5) {
+    disp = grade(disp);
+  }
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));
   }
