@@ -117,7 +117,7 @@ const COMPOSITE_BODY = /* wgsl */ `
   var bgA = select(0.0, 1.0, bg.w > 0.5);
   var bgPm = bg.rgb * bgA;  // premultiplied accumulator
   let fxOn = viewU[6].y > 0.5;
-  if (bg.w > 1.5 || fxOn) {
+  if ((bg.w > 1.5 || fxOn) COVERAGE_GATE) {
     // The equirect and any effect both need this pixel's world-space view ray,
     // rebuilt from the camera basis. The dome sits at infinity (no parallax) —
     // PhotoDome-style, display-only.
@@ -152,8 +152,28 @@ const EFFECT_CALL = /* wgsl */ `
     }
 `
 
+// Derivative builtins are illegal in non-uniform control flow (WGSL uniformity
+// analysis rejects the pipeline), so the coverage gate below can only wrap
+// effect code that doesn't use them. Checked textually at build time.
+const USES_DERIVATIVES = /\b(?:fwidth|dpdx|dpdy)(?:Fine|Coarse)?\s*\(/
+
+/** Skip the whole background block (equirect sample + effect) behind pixels the
+ *  model fully covers — the composite multiplies the result by (1 - alpha) = 0
+ *  there anyway, and on a full-screen effect that's a third or more of the frame
+ *  (the cost Safari feels most). The equirect uses explicit-LOD sampling, which
+ *  is always legal in non-uniform flow; only derivative-using effects must keep
+ *  uniform control flow and forgo the gate. */
+function coverageGate(effect?: CompositeEffectSource | null): string {
+  const gated = !effect || !USES_DERIVATIVES.test(effect.wgsl)
+  return gated ? "&& alpha < 0.999" : ""
+}
+
 export function buildCompositeShader(effect?: CompositeEffectSource | null): string {
-  if (!effect) return COMPOSITE_HEAD + COMPOSITE_BODY.replace("BG_EFFECT_CALL", NO_EFFECT_CALL)
+  if (!effect)
+    return (
+      COMPOSITE_HEAD +
+      COMPOSITE_BODY.replace("BG_EFFECT_CALL", NO_EFFECT_CALL).replace("COVERAGE_GATE", coverageGate(null))
+    )
   return (
     COMPOSITE_HEAD +
     "\n// ── user background effect (setBackgroundEffect) ──\n" +
@@ -161,7 +181,7 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
     "\n" +
     effect.wgsl +
     "\n" +
-    COMPOSITE_BODY.replace("BG_EFFECT_CALL", EFFECT_CALL.trim())
+    COMPOSITE_BODY.replace("BG_EFFECT_CALL", EFFECT_CALL.trim()).replace("COVERAGE_GATE", coverageGate(effect))
   )
 }
 

@@ -173,7 +173,7 @@ type GroupInstall = {
   renderClass: RenderClass
   alphaMode: AlphaMode
   pipeline: GPURenderPipeline
-  /** Depth-write-off twin, used when this group's material draws in the transparent bucket. */
+  /** Depth-write-off twin — dormant, kept for a future OIT path. */
   pipelineNoDepthWrite: GPURenderPipeline
   /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
@@ -359,6 +359,10 @@ interface DrawCall {
   baseBindGroupEntries?: GPUBindGroupEntry[]
   /** Material draws only: false = excluded from the shadow map (fully sheer). */
   castsShadow?: boolean
+  /** Edge-flagged materials: interleaved inverted-hull outline drawn right after
+   *  this material with the outline pipeline. Shares this call's index range;
+   *  own bind group (edge uniforms + diffuse texture for the alpha test). */
+  outline?: { bindGroup: GPUBindGroup }
 }
 
 interface PickDrawCall {
@@ -456,14 +460,10 @@ function buildAlphaSampler(
 /** Texture-alpha statistics over ≤400 of the material's triangle centroids:
  *  `avg` (0..1) and `translucentFrac` — the fraction of samples that are
  *  neither fully opaque nor fully cut out (alpha in ~0.03..0.97). Together
- *  they classify two distinct things:
- *    sheer   (avg low)            — a veil: mostly see-through everywhere
- *    partial (translucentFrac up) — mostly-opaque cloth with sheer REGIONS,
- *                                   e.g. a lace skirt panel
- *  Both route to the transparent bucket; only `sheer` is excluded from the
- *  shadow map and outline pass. */
+ *   Bucketing itself is binary (babylon-mmd parity): ANY translucent coverage
+ *  routes to the alpha-blend bucket. `avg` below this threshold additionally
+ *  marks a material as fully sheer (a veil), which vetoes shadow casting. */
 const SHEER_ALPHA_THRESHOLD = 0.7
-const PARTIAL_TRANSLUCENT_FRAC = 0.15
 function materialAlphaStats(
   verts: Float32Array,
   indices: Uint32Array,
@@ -917,7 +917,12 @@ export class Engine {
   }
 
   /** Debug/diagnostic: skip every inverted-hull outline draw. */
-  private outlineEnabled = true
+  // OFF by default — the product aesthetic. Modern high-detail models read
+  // better without hulls (babylon-mmd's own demos disable its outline renderer
+  // too), and no hull pass means no depth-tie edge cases against near-coplanar
+  // cloth. The full MMD-faithful machinery (interleaved per-material hulls,
+  // texture-alpha-modulated rims) stays in place behind setOutlineEnabled(true).
+  private outlineEnabled = false
   setOutlineEnabled(on: boolean): void {
     this.outlineEnabled = on
   }
@@ -1493,6 +1498,8 @@ export class Engine {
         attributes: [
           { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat },
           { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat },
+          // uv — the outline FS alpha-tests the diffuse texture (babylon-mmd parity)
+          { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat },
         ],
       },
       {
@@ -1758,6 +1765,7 @@ export class Engine {
       label: "outline per-frame bind group layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ],
     })
     // Outline per-instance reuses mainPerInstanceBindGroupLayout (same skinMats binding)
@@ -1765,6 +1773,7 @@ export class Engine {
       label: "outline per-material bind group layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
 
@@ -1780,7 +1789,10 @@ export class Engine {
     this.outlinePerFrameBindGroup = this.device.createBindGroup({
       label: "outline per-frame bind group",
       layout: this.outlinePerFrameBindGroupLayout,
-      entries: [{ binding: 0, resource: { buffer: this.cameraUniformBuffer } }],
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: this.materialSampler },
+      ],
     })
 
     const outlineShaderModule = this.device.createShaderModule({
@@ -1797,8 +1809,10 @@ export class Engine {
       cullMode: "back",
       depthStencil: {
         format: "depth24plus-stencil8",
-        // Don’t write outline into depth buffer — stops z-fighting / black cracks vs body (MMD-style; body depth stays authoritative)
-        depthWriteEnabled: false,
+        // babylon-mmd draws outlines WITH depth write (its _afterRenderingMesh
+        // forces setDepthWrite(true)); the constant bias below still makes
+        // hulls lose depth ties against their own near-coplanar geometry.
+        depthWriteEnabled: true,
         depthCompare: "less-equal",
         // CONFIRMED fix (bisected live via setOutlineEnabled): hull fragments
         // carry their surface's exact depth, so against this model's paired
@@ -3555,28 +3569,26 @@ export class Engine {
       }
 
       const materialAlpha = mat.diffuse[3]
-      // Transparent bucket when the MATERIAL says so — or when the TEXTURE does
-      // (sheer cloth almost always ships with diffuse alpha 1.0 and carries its
-      // translucency in texture alpha). Transparent-bucket draws happen after
-      // the opaque bucket (and after the late-drawn hair render-class), so a
-      // veil composites over the hair behind it instead of depth-rejecting it;
-      // they are also excluded from the shadow map, so sheer cloth stops
-      // casting the solid shadow of an opaque sheet.
       const diffusePath = texLogicalPath(mat.diffuseTextureIndex)
       const alphaSampler = diffusePath ? this.textureAlphaCache.get(diffusePath) : null
       const stats = materialAlphaStats(meshVertices, meshIndices, currentIndexOffset, indexCount, alphaSampler)
+      // babylon-mmd parity (its default DepthWriteAlphaBlendingWithEvaluation
+      // method): the bucket decision is BINARY. A material with ANY translucent
+      // texels on its geometry is alpha-blend — drawn in PMX author order with
+      // depth write ON (forceDepthWrite); everything else is opaque. The old
+      // avg/frac tier system left mostly-opaque lace (translucentFrac 0.09) in
+      // the opaque bucket while its sibling panels went transparent, breaking
+      // the author's compositing order — the gray fold patches. The 2% floor
+      // only guards against centroid-sampling noise on genuinely solid cloth.
       const sheer = stats.avg < SHEER_ALPHA_THRESHOLD
-      const partial = !sheer && stats.translucentFrac > PARTIAL_TRANSLUCENT_FRAC
-      // Transparent bucket: drawn after the opaque bucket (and hair) with depth
-      // WRITE OFF, so a lace panel folded in front of itself blends both layers
-      // consistently instead of a triangle-order patchwork of single/double
-      // coverage. Partial-sheer cloth still casts shadows and keeps its outline;
-      // fully sheer cloth (veil) does neither.
-      const isTransparent = materialAlpha < 1.0 - 0.001 || sheer || partial
+      const isTransparent = materialAlpha < 1.0 - 0.001 || sheer || stats.translucentFrac > 0.02
+      // Shadow casting: the PMX author's own flag (bit 0x04, cast self-shadow),
+      // still vetoed for fully sheer cloth — a veil must not cast a solid sheet.
+      const castsShadow = (mat.edgeFlag & 0x04) !== 0 && !sheer
       // Load-time classification log — one line per material, cheap and
-      // invaluable when a model renders wrong (bucket/outline/sheer disputes).
+      // invaluable when a model renders wrong (bucket/outline/shadow disputes).
       console.info(
-        `[reze] ${mat.name}: alpha=${materialAlpha.toFixed(2)} avg=${stats.avg.toFixed(2)} sheerFrac=${stats.translucentFrac.toFixed(2)} ${sheer ? "SHEER" : partial ? "PARTIAL" : "opaque"} bucket=${isTransparent ? "transparent" : "opaque"} edge=${(mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0 ? (sheer ? "skipped(sheer)" : "on") : "off"}`,
+        `[reze] ${mat.name}: alpha=${materialAlpha.toFixed(2)} avg=${stats.avg.toFixed(2)} translucentFrac=${stats.translucentFrac.toFixed(2)} bucket=${isTransparent ? "transparent" : "opaque"} castsShadow=${castsShadow} edge=${(mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0 ? "on" : "off"}`,
       )
 
       // Sphere map (sph=1 multiply / spa=2 add). Mode 3 (sub-texture UV) is
@@ -3615,24 +3627,13 @@ export class Engine {
         this.zeroStyleBuffer,
       )
 
-      const type: DrawCallType = isTransparent ? "transparent" : "opaque"
-      inst.drawCalls.push({
-        type,
-        count: indexCount,
-        firstIndex: currentIndexOffset,
-        bindGroup,
-        materialName: mat.name,
-        groupId: null,
-        baseBindGroupEntries,
-        castsShadow: !sheer,
-      })
-
-      // No inverted-hull outline for SHEER materials: the outline shader draws a
-      // solid edgeColor silhouette (it never samples texture alpha), so a
-      // see-through veil dragged a near-black hull over the cloth behind it —
-      // broken black shapes that waved with physics and flickered with camera
-      // angle. A solid rim on see-through fabric is wrong in principle.
-      if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0 && !sheer) {
+      // Inverted-hull outline for EVERY edge-flagged material (PMX bit 0x10) —
+      // the outline FS alpha-tests the diffuse texture, so sheer fabric masks
+      // its own hull where it is see-through instead of us skipping it here.
+      // Drawn interleaved right after this material's color draw (babylon-mmd's
+      // per-mesh afterRender outline stage) — see drawMaterials.
+      let outline: DrawCall["outline"]
+      if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
         const materialUniformData = new Float32Array([
           mat.edgeColor[0],
           mat.edgeColor[1],
@@ -3648,18 +3649,26 @@ export class Engine {
         const outlineBindGroup = this.device.createBindGroup({
           label: `${prefix}outline: ${mat.name}`,
           layout: this.outlinePerMaterialBindGroupLayout,
-          entries: [{ binding: 0, resource: { buffer: outlineUniformBuffer } }],
+          entries: [
+            { binding: 0, resource: { buffer: outlineUniformBuffer } },
+            { binding: 1, resource: textureView },
+          ],
         })
-        const outlineType: DrawCallType = isTransparent ? "transparent-outline" : "opaque-outline"
-        inst.drawCalls.push({
-          type: outlineType,
-          count: indexCount,
-          firstIndex: currentIndexOffset,
-          bindGroup: outlineBindGroup,
-          materialName: mat.name,
-          groupId: null,
-        })
+        outline = { bindGroup: outlineBindGroup }
       }
+
+      const type: DrawCallType = isTransparent ? "transparent" : "opaque"
+      inst.drawCalls.push({
+        type,
+        count: indexCount,
+        firstIndex: currentIndexOffset,
+        bindGroup,
+        materialName: mat.name,
+        groupId: null,
+        baseBindGroupEntries,
+        castsShadow,
+        outline,
+      })
 
       if (this.onRaycast) {
         const pickIdData = new Float32Array([modelId, materialId, 0, 0])
@@ -4509,11 +4518,22 @@ export class Engine {
     }
 
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
+    // Phase order: opaque models → ground → transparent fabric.
+    // The ground shader is the most expensive full-coverage draw in the frame
+    // (9-tap PCF on the 4096² shadow map per pixel), so it draws AFTER the
+    // opaque phase to get early-z rejected behind the body — drawing it first
+    // shaded every covered pixel and measurably dropped Safari fps. It still
+    // draws BEFORE the transparent phase so sheer fabric blends over the floor
+    // instead of over the background with the floor depth-rejected behind it.
     if (hasModels)
       this.forEachInstance((inst) => {
-        if (inst.model.visible) this.renderOneModel(pass, inst)
+        if (inst.model.visible) this.renderModelOpaquePhase(pass, inst)
       })
     if (this.hasGround) this.renderGround(pass)
+    if (hasModels)
+      this.forEachInstance((inst) => {
+        if (inst.model.visible) this.renderModelTransparentPhase(pass, inst)
+      })
     pass.end()
 
     // Bloom pyramid (EEVEE 3.6):
@@ -4805,8 +4825,7 @@ export class Engine {
     let overEyesPipeline: GPURenderPipeline | undefined
     try {
       pipeline = await this.createRenderClassPipeline(renderClass, module, false)
-      // Transparent-bucket draws don't write depth (self-overlap must blend, not
-      // patchwork) — same shading, different depth state.
+      // Dormant OIT twin — kept for a future order-independent-transparency path.
       pipelineNoDepthWrite = await this.createRenderClassPipeline(renderClass, module, false, false)
       if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true)
     } catch (e) {
@@ -4966,14 +4985,10 @@ export class Engine {
   }
 
   // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
-  // the neutral base (ungrouped materials render the default graph).
+  // the neutral base (ungrouped materials render the default graph). Transparent-bucket
+  // draws use the SAME depth-write-on pipeline — babylon-mmd's forceDepthWrite
+  // blending (see renderModelTransparentPhase for the trade-off record).
   private pipelineForDrawCall(inst: ModelInstance, dc: DrawCall): GPURenderPipeline {
-    // Transparent draws WRITE depth — MMD semantics: PMX triangle/material order
-    // is the author's compositing order, and a fold HIDES its far side rather
-    // than blending it (the far side shades dark — light-averted — so letting it
-    // show through read as gray fold-shaped stains; depth-write-off made every
-    // fold do that). The no-write twins stay available for a future true-OIT
-    // path but are deliberately unused.
     if (dc.groupId) {
       const install = inst.styleGroups.get(dc.groupId)
       if (install) return install.pipeline
@@ -4983,9 +4998,10 @@ export class Engine {
 
   /**
    * Draw every material of a given type (`opaque` or `transparent`) using the main
-   * pipeline(s). Binds the per-frame and per-instance groups once at the top of the
-   * batch, then issues one draw per material. Early-outs if nothing to draw so we
-   * don't waste bindings when a model has no transparents, etc.
+   * pipeline(s), and — babylon-mmd's per-mesh outline stage — each edge-flagged
+   * material's inverted hull IMMEDIATELY after its color draw. Interleaving is what
+   * makes outlines compose like MMD: every material drawn later in the author's
+   * order covers earlier hulls, and each hull sits over everything drawn before it.
    */
   private drawMaterials(pass: GPURenderPassEncoder, inst: ModelInstance, type: "opaque" | "transparent"): void {
     let currentPipeline: GPURenderPipeline | null = null
@@ -5004,61 +5020,58 @@ export class Engine {
       }
       pass.setBindGroup(2, draw.bindGroup)
       pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
-    }
-  }
-
-  /**
-   * Draw every outline of a given type (`opaque-outline` or `transparent-outline`).
-   * Uses its own pipeline layout (group 0 = camera-only, group 2 = edge uniforms), so
-   * every batch binds its own groups from scratch — the next drawMaterials call will
-   * rebind group 0/1 correctly if needed.
-   */
-  private drawOutlines(pass: GPURenderPassEncoder, inst: ModelInstance, type: DrawCallType): void {
-    if (!this.outlineEnabled) return
-    let bound = false
-    for (const draw of inst.drawCalls) {
-      if (draw.type !== type || !this.shouldRenderDrawCall(inst, draw)) continue
-      if (!bound) {
+      if (draw.outline && this.outlineEnabled) {
+        // Same index range; own pipeline + groups 0/2. Group 1 (skinMats) is
+        // layout-identical between the main and outline pipelines and stays
+        // bound. Restore group 0 afterwards and force a pipeline re-set.
         pass.setPipeline(this.outlinePipeline)
         pass.setBindGroup(0, this.outlinePerFrameBindGroup)
-        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
-        bound = true
+        pass.setBindGroup(2, draw.outline.bindGroup)
+        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+        pass.setBindGroup(0, this.perFrameBindGroup)
+        currentPipeline = null
       }
-      pass.setBindGroup(2, draw.bindGroup)
-      pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
     }
   }
 
   /**
-   * Main-pass render sequence for one model instance:
-   *   1) opaque bodies → 2) opaque outlines → 3) transparents → 4) transparent outlines.
-   * Each batch binds the groups it needs, so switching between main and outline
-   * pipelines is self-contained (no cross-batch dependencies).
+   * Main-pass render sequence for one model instance — babylon-mmd parity:
+   * opaque bucket, the hair-over-eyes stencil pass, then alpha-blend materials
+   * in PMX author order with depth write ON (forceDepthWrite). Outlines are not
+   * a separate phase: drawMaterials draws each edge-flagged material's hull
+   * right after the material itself, like MMD's per-mesh outline stage.
    */
-  private renderOneModel(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+  private setModelDrawState(pass: GPURenderPassEncoder, inst: ModelInstance): void {
     pass.setVertexBuffer(0, inst.vertexBuffer)
     pass.setVertexBuffer(1, inst.jointsBuffer)
     pass.setVertexBuffer(2, inst.weightsBuffer)
     pass.setIndexBuffer(inst.indexBuffer, "uint32")
-
     // Single stencil-reference set covers eye (write), hair (read not-equal),
     // and hairOverEyes (read equal). Non-stencil pipelines ignore the value.
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+  }
 
-    // Order matters (the black-hull saga): transparent color draws don't write
-    // depth (self-overlap must double-blend, not patchwork), so ALL outlines
-    // draw after the transparent depth PREPASS has recorded the fabric's depth
-    // — otherwise every hull behind a sheer skirt shows straight through it.
+  private renderModelOpaquePhase(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+    this.setModelDrawState(pass, inst)
     this.drawMaterials(pass, inst, "opaque")
     this.drawHairOverEyes(pass, inst)
+  }
+
+  private renderModelTransparentPhase(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+    this.setModelDrawState(pass, inst)
+    // Transparent: babylon-mmd's forceDepthWrite blending — PMX author order
+    // with depth write ON. The accepted trade-off after trying every variant:
+    //   · depth-write ON (this): a fold hides its far side; rare view-dependent
+    //     double-blend seams at some angles. MMD's own known behavior.
+    //   · nearest-surface prepass: view-independent, but punched see-through
+    //     holes to whatever sat far behind a fold.
+    //   · depth-write OFF layering: every overlap visible everywhere — MORE
+    //     gray patches and texture artifacts in practice.
     this.drawMaterials(pass, inst, "transparent")
-    this.drawOutlines(pass, inst, "opaque-outline")
-    this.drawOutlines(pass, inst, "transparent-outline")
   }
 
   /** Depth-only re-draw of transparent-bucket materials (see depth-prepass.ts).
-   *  Unused while transparent draws write depth themselves (MMD parity) — kept
-   *  for the dormant no-write/OIT path. */
+   *  Dormant — kept for a future order-independent-transparency path. */
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   protected drawTransparentDepthPrepass(pass: GPURenderPassEncoder, inst: ModelInstance): void {
     let bound = false
@@ -5119,6 +5132,10 @@ export class Engine {
     this.cameraMatrixData[32] = cameraPos.x
     this.cameraMatrixData[33] = cameraPos.y
     this.cameraMatrixData[34] = cameraPos.z
+    // Spare float after viewPos: render-target height in device px — the outline
+    // shader derives the full viewport (width via projection aspect) for its
+    // babylon-mmd constant-pixel edge extrusion.
+    this.cameraMatrixData[35] = this.canvas.height
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
     // 360 backdrop: the composite reconstructs each pixel's view ray from the
