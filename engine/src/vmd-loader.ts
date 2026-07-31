@@ -32,6 +32,14 @@ export interface CameraKeyframe {
   interpolation: Uint8Array // 24 bytes
 }
 
+/** A VMD "IK/display" record: one moment at which chains are switched. */
+export interface IkFrame {
+  frame: number
+  /** Model visibility rides in the same record. Parsed, unused by playback. */
+  visible: boolean
+  states: { boneName: string; enabled: boolean }[]
+}
+
 export class VMDLoader {
   private view: DataView
   private offset = 0
@@ -95,6 +103,48 @@ export class VMDLoader {
       const fov = this.getUint32()
       this.skip(1) // perspective flag (0 = perspective) — unused
       frames.push({ frame, distance, target, rotation, fov, interpolation })
+    }
+    frames.sort((a, b) => a.frame - b.frame)
+    return frames
+  }
+
+  static loadIkFromBuffer(buffer: ArrayBuffer): IkFrame[] {
+    return new VMDLoader(buffer).parseIk()
+  }
+
+  /**
+   * The IK/display block, at the very end of the file.
+   *
+   * MMD writes it after camera, light and self-shadow, and a motion-only VMD
+   * often stops before any of them — so every block is bounds-checked and a
+   * short file simply reports no IK data rather than throwing. Record sizes:
+   * bone 111 B, morph 23 B, camera 61 B, light 28 B, self-shadow 9 B.
+   */
+  private parseIk(): IkFrame[] {
+    this.offset = 0
+    const header = this.getString(30)
+    if (!header.startsWith("Vocaloid Motion Data")) throw new Error("Invalid VMD file header")
+    this.skip(20)
+    const end = this.view.buffer.byteLength
+    const seek = (size: number): boolean => {
+      if (this.offset + 4 > end) return false
+      this.skip(this.getUint32() * size)
+      return this.offset <= end
+    }
+    if (!seek(111) || !seek(23) || !seek(61) || !seek(28) || !seek(9)) return []
+    if (this.offset + 4 > end) return []
+
+    const count = this.getUint32()
+    const frames: IkFrame[] = []
+    for (let i = 0; i < count && this.offset + 9 <= end; i++) {
+      const frame = this.getUint32()
+      const visible = this.getUint8() !== 0
+      const ikCount = this.getUint32()
+      const states: { boneName: string; enabled: boolean }[] = []
+      for (let j = 0; j < ikCount && this.offset + 21 <= end; j++) {
+        states.push({ boneName: this.getShiftJisName(20), enabled: this.getUint8() !== 0 })
+      }
+      frames.push({ frame, visible, states })
     }
     frames.sort((a, b) => a.frame - b.frame)
     return frames
@@ -313,6 +363,20 @@ export class VMDLoader {
     const v = this.view.getFloat32(this.offset, true) // true = little endian
     this.offset += 4
     return v
+  }
+
+  /** A fixed-width, NUL-padded Shift-JIS name — the form every VMD name takes. */
+  private getShiftJisName(len: number): string {
+    const bytes = new Uint8Array(this.view.buffer, this.offset, len)
+    this.offset += len
+    let end = bytes.indexOf(0)
+    if (end < 0) end = len
+    const slice = bytes.slice(0, end)
+    try {
+      return this.decoder.decode(slice)
+    } catch {
+      return String.fromCharCode(...slice)
+    }
   }
 
   private getString(len: number): string {

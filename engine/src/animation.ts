@@ -26,9 +26,19 @@ export interface MorphKeyframe {
   weight: number
 }
 
+/** One IK chain switching on or off, keyed by its IK bone (左足ＩＫ and friends).
+ *  VMD stores these as steps — a state holds until the next keyframe changes it. */
+export interface IkKeyframe {
+  frame: number
+  enabled: boolean
+}
+
 export interface AnimationClip {
   boneTracks: Map<string, BoneKeyframe[]>
   morphTracks: Map<string, MorphKeyframe[]>
+  /** Per-chain IK state over time. Absent means "leave IK as the host set it" —
+   *  which is what every clip built before this existed will do. */
+  ikTracks?: Map<string, IkKeyframe[]>
   frameCount: number // last keyframe frame index
 }
 
@@ -70,9 +80,13 @@ export class AnimationState {
   private onEnd: ((animationName: string) => void) | null = null
 
   loadAnimation(name: string, clip: AnimationClip): void {
+    // Copied field by field rather than stored by reference, so the caller's
+    // object cannot mutate under playback. Every field has to be listed — an
+    // omission here is silent, and drops that part of the clip on the floor.
     this.animations.set(name, {
       boneTracks: clip.boneTracks,
       morphTracks: clip.morphTracks,
+      ikTracks: clip.ikTracks,
       frameCount: clip.frameCount,
     })
   }

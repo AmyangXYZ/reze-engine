@@ -3171,13 +3171,19 @@ export class Engine {
     return inst ? !inst.hiddenMaterials.has(materialName) : false
   }
 
-  setIKEnabled(enabled: boolean): void {
-    this.ikEnabled = enabled
-  }
-
   // Toggle the GPU vertex-morph path. Only affects models loaded afterwards.
   setGpuMorphsEnabled(enabled: boolean): void {
     this.useGpuMorphs = enabled
+  }
+
+  /**
+   * Engine-wide IK switch. Off suppresses every chain regardless of what any
+   * motion says — for hosts that pose the skeleton themselves and want their
+   * own rotations left alone. On (the default) hands the decision to the clip,
+   * which carries per-chain state from the VMD it came from.
+   */
+  setIKEnabled(enabled: boolean): void {
+    this.ikEnabled = enabled
   }
 
   getIKEnabled(): boolean {

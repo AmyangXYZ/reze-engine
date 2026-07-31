@@ -7,6 +7,8 @@ const BONE_NAME_SIZE = 15
 const MORPH_NAME_SIZE = 15
 const BONE_FRAME_SIZE = BONE_NAME_SIZE + 4 + 12 + 16 + 64 // 111 bytes
 const MORPH_FRAME_SIZE = MORPH_NAME_SIZE + 4 + 4 // 23 bytes
+/** IK bone names get 20 bytes in the IK block, not the 15 bones get elsewhere. */
+const IK_NAME_SIZE = 20
 
 // Build a Unicode-to-Shift-JIS lookup by inverting the TextDecoder mapping.
 let shiftJISTable: Map<string, number[]> | null = null
@@ -56,11 +58,30 @@ export class VMDWriter {
       totalMorphFrames += frames.length
     }
 
+    // IK state is stored per MOMENT, not per bone: one record lists every chain
+    // and its state at that frame. So the tracks are transposed back into the
+    // frames they were flattened from.
+    const ikByFrame = new Map<number, { boneName: string; enabled: boolean }[]>()
+    for (const [boneName, keys] of clip.ikTracks ?? []) {
+      for (const key of keys) {
+        const at = ikByFrame.get(key.frame)
+        if (at) at.push({ boneName, enabled: key.enabled })
+        else ikByFrame.set(key.frame, [{ boneName, enabled: key.enabled }])
+      }
+    }
+    const ikFrames = [...ikByFrame.entries()].sort((a, b) => a[0] - b[0])
+    let ikSize = 0
+    for (const [, states] of ikFrames) ikSize += 4 + 1 + 4 + states.length * (IK_NAME_SIZE + 1)
+
     const size =
       HEADER_SIZE +
       MODEL_NAME_SIZE +
       4 + totalBoneFrames * BONE_FRAME_SIZE +
-      4 + totalMorphFrames * MORPH_FRAME_SIZE
+      4 + totalMorphFrames * MORPH_FRAME_SIZE +
+      // Camera, light and self-shadow counts, then the IK block. Written only
+      // when there is IK state to carry: a plain motion stays byte-identical to
+      // what this writer produced before.
+      (ikFrames.length > 0 ? 4 * 4 + ikSize : 0)
 
     const buffer = new ArrayBuffer(size)
     const view = new DataView(buffer)
@@ -121,6 +142,27 @@ export class VMDWriter {
         // Weight (f32 LE)
         view.setFloat32(offset, kf.weight, true)
         offset += 4
+      }
+    }
+
+    if (ikFrames.length > 0) {
+      // Empty camera, light and self-shadow blocks — a reader walking the file
+      // in order has to pass through them to reach the IK block.
+      for (let i = 0; i < 3; i++, offset += 4) view.setUint32(offset, 0, true)
+      view.setUint32(offset, ikFrames.length, true)
+      offset += 4
+      for (const [frame, states] of ikFrames) {
+        view.setUint32(offset, frame, true)
+        offset += 4
+        view.setUint8(offset, 1) // model visible
+        offset += 1
+        view.setUint32(offset, states.length, true)
+        offset += 4
+        for (const state of states) {
+          offset = writeFixedShiftJIS(buffer, offset, state.boneName, IK_NAME_SIZE)
+          view.setUint8(offset, state.enabled ? 1 : 0)
+          offset += 1
+        }
       }
     }
 

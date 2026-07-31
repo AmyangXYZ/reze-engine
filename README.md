@@ -16,7 +16,7 @@ npm install reze-engine
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, ASC CDL colour grading, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
-- **VMD animation** — MMD IK, morphs on a GPU compute path, and VMD export
+- **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 - **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
@@ -108,7 +108,7 @@ engine.autoStyleGroups(name, overrides?)     // default style groups by material
 engine.applyStyleGroups(name, groups) / upsertStyleGroup / removeStyleGroup / getStyleGroups
 engine.setMaterialVisible(name, material, visible) / toggleMaterialVisible / isMaterialVisible
 
-engine.setIKEnabled(enabled)
+engine.setIKEnabled(enabled)                 // engine-wide OFF for hosts that pose bones themselves; ON hands per-chain state to the clip
 engine.setPhysicsEnabled(enabled)
 engine.resetPhysics()                        // re-pose bodies from animation + zero velocities (call if physics explodes)
 

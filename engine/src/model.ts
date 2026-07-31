@@ -12,6 +12,7 @@ import {
   AnimationState,
   BoneInterpolation,
   BoneKeyframe,
+  IkKeyframe,
   MorphKeyframe,
   interpolateControlPoints,
   rawInterpolationToBoneInterpolation,
@@ -1222,6 +1223,21 @@ export class Model {
     return loadBuffer().then((buf) => {
       const vmdKeyFrames = VMDLoader.loadFromBuffer(buf)
       const clip = this.buildClipFromVmdKeyFrames(vmdKeyFrames)
+      // The IK block lives past every other section, so it is read separately
+      // rather than threaded through the keyframe grouping.
+      const ikFrames = VMDLoader.loadIkFromBuffer(buf)
+      if (ikFrames.length > 0) {
+        const ikTracks = new Map<string, IkKeyframe[]>()
+        for (const record of ikFrames) {
+          for (const state of record.states) {
+            const track = ikTracks.get(state.boneName)
+            if (track) track.push({ frame: record.frame, enabled: state.enabled })
+            else ikTracks.set(state.boneName, [{ frame: record.frame, enabled: state.enabled }])
+          }
+        }
+        for (const track of ikTracks.values()) track.sort((a, b) => a.frame - b.frame)
+        clip.ikTracks = ikTracks
+      }
       this.animationState.loadAnimation(name, clip)
     })
   }
@@ -1359,8 +1375,35 @@ export class Model {
     return idx
   }
 
+  /**
+   * IK bones whose chains are switched OFF at the current frame.
+   *
+   * VMD carries this per chain and over time — a motion legitimately disables
+   * foot IK for a lift and restores it on landing — so it belongs to the clip,
+   * not to a global switch on the engine.
+   */
+  private ikDisabled = new Set<number>()
+
+  /** Step the IK state to `frame`. VMD IK keys are steps: a state holds until
+   *  the next one changes it, so this is a lookup, not an interpolation. */
+  private applyIkFromClip(clip: AnimationClip, frame: number): void {
+    if (!clip.ikTracks || clip.ikTracks.size === 0) {
+      if (this.ikDisabled.size > 0) this.ikDisabled.clear()
+      return
+    }
+    this.ikDisabled.clear()
+    for (const [boneName, keys] of clip.ikTracks) {
+      const index = this.runtimeSkeleton.nameIndex[boneName]
+      if (index === undefined || index < 0 || keys.length === 0) continue
+      let state = keys[0].frame <= frame ? keys[0].enabled : true
+      for (let i = 1; i < keys.length && keys[i].frame <= frame; i++) state = keys[i].enabled
+      if (!state) this.ikDisabled.add(index)
+    }
+  }
+
   private applyPoseFromClip(clip: AnimationClip | null, frame: number): void {
     if (!clip) return
+    this.applyIkFromClip(clip, frame)
     if (clip !== this.lastAppliedClip) {
       this.boneTrackIndices.clear()
       this.morphTrackIndices.clear()
@@ -1447,8 +1490,12 @@ export class Model {
     }
   }
 
-  // Returns true when morphs changed (vertex buffer may need upload). ikEnabled is driven by engine (same for all models).
-  update(deltaTime: number, ikEnabled: boolean): boolean {
+  // Returns true when morphs changed (vertex buffer may need upload). `ikEnabled`
+  // is the host's runtime switch (engine-wide); the clip decides which chains
+  // within that. A host driving bones directly — motion capture writing FK
+  // rotations every frame with no clip playing — turns it off wholesale, because
+  // there is no motion present to carry the per-chain answer.
+  update(deltaTime: number, ikEnabled = true): boolean {
     // Update tween time (in milliseconds)
     this.tweenTimeMs += deltaTime * 1000
 
@@ -1472,7 +1519,8 @@ export class Model {
     // Compute world matrices (needed for IK solving to read bone positions)
     this.computeWorldMatrices()
 
-    // Solve IK chains (modifies localRotations with final IK rotations)
+    // Solve IK chains (modifies localRotations with final IK rotations). Chains
+    // the clip switched off are skipped inside.
     if (ikEnabled) {
       this.solveIKChains()
       // Recompute world matrices with final IK rotations applied to localRotations
@@ -1492,6 +1540,9 @@ export class Model {
     // Solve each IK solver sequentially, ensuring consistent state between solvers
     let firstSolver = true
     for (const solver of ikSolvers) {
+      // Switched off by the motion for this frame — leave the chain on whatever
+      // the FK track put there.
+      if (this.ikDisabled.has(solver.ikBoneIndex)) continue
       // Each solver must see the effects of previous solvers on localRotations, so
       // recompute world matrices between solvers. The first solver is skipped: the
       // caller (update) already computed them and nothing has changed localRotations yet.
