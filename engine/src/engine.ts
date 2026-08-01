@@ -81,7 +81,7 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   // share the face material family. Bare 口 is omitted — it collides with 袖口 (cuff).
   [
     "face",
-    ["顔", "颜", "顏", "脸", "臉", "かお", "face", "舌", "tongue", "牙", "牙齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "歯茎", "gums"],
+    ["顔", "颜", "顏", "脸", "臉", "かお", "face", "舌", "tongue", "牙", "牙齿", "齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "唇", "歯茎", "gums"],
   ],
   ["hair", ["前髪", "後髪", "髪", "髮", "头发", "頭髪", "もみあげ", "アホ毛", "ヘア", "hair", "ahoge", "bang"]],
   ["body", ["肌", "皮肤", "skin"]],
@@ -3611,6 +3611,8 @@ export class Engine {
   }
 
   // Shadow is cast from the visible sun direction — same vector the shader lights with.
+  /** Whether the shadow map holds anything — see the shadow pass in `render`. */
+  private shadowMapPopulated = false
   private shadowLightVPDirty = true
   private updateShadowLightVP() {
     if (!this.shadowLightVPDirty) return
@@ -4597,7 +4599,12 @@ export class Engine {
     // them. WebGPU inserts the storage→vertex barrier between this pass and the render passes.
     if (hasModels) this.dispatchMorphCompute(encoder)
 
-    if (hasModels) {
+    // Runs one more time after the last model goes: this pass owns the shadow map's
+    // only `depthLoadOp: "clear"`, so skipping it outright leaves the texture holding
+    // the final frame's depth — and the ground, which draws on `hasGround` alone,
+    // keeps PCF-sampling a character that is no longer in the scene. One clearing
+    // pass on the transition to empty, then it stops.
+    if (hasModels || this.shadowMapPopulated) {
       const sp = encoder.beginRenderPass({
         colorAttachments: [],
         depthStencilAttachment: {
@@ -4612,6 +4619,7 @@ export class Engine {
         if (inst.model.visible) this.drawInstanceShadow(sp, inst)
       })
       sp.end()
+      this.shadowMapPopulated = hasModels
     }
 
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
