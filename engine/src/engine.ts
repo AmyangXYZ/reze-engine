@@ -3611,8 +3611,14 @@ export class Engine {
   }
 
   // Shadow is cast from the visible sun direction — same vector the shader lights with.
-  /** Whether the shadow map holds anything — see the shadow pass in `render`. */
-  private shadowMapPopulated = false
+  /** Whether the shadow map needs clearing — see the shadow pass in `render`.
+   *
+   *  Starts true so the very first frame runs the pass even with an empty scene. The
+   *  depth texture is created once and WebGPU zero-fills it, and depth 0.0 is the
+   *  nearest possible occluder: leave it uncleared and every ground pixel inside the
+   *  light frustum tests as shadowed, painting a hard-edged patch the shape of the
+   *  frustum onto an otherwise empty floor. */
+  private shadowMapPopulated = true
   private shadowLightVPDirty = true
   private updateShadowLightVP() {
     if (!this.shadowLightVPDirty) return
