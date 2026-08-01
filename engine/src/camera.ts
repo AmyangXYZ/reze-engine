@@ -96,22 +96,46 @@ export class Camera {
     this.fov = pose.fov // drives the projection
   }
 
+  // MMD camera: look at `target` from `distance` back, oriented by the euler rotation.
+  // forward = q·(0,0,1) (LH), up = q·(0,1,0) — read as columns 2 and 1 of the rot matrix.
+  // eye = target + forward·distance (distance is negative in VMD, so eye sits behind).
+  // Euler is NEGATED on all three axes: babylon-mmd builds the shot with
+  // RotationYawPitchRoll(-ry, -rx, -rz), and our fromEuler(rx,ry,rz) equals
+  // RotationYawPitchRoll(ry,rx,rz) — so the MMD-authentic rotation is fromEuler(-r).
+  //
+  // Leaves the rotation matrix in `_quatScratch`; getViewMatrix reads its up vector.
+  private vmdEye(): Vec3 {
+    const r = this._vmdRotation
+    const q = Quat.fromEuler(-r.x, -r.y, -r.z)
+    Mat4.fromQuatInto(q.x, q.y, q.z, q.w, this._quatScratch, 0)
+    const s = this._quatScratch
+    const t = this._vmdTarget
+    const d = this._vmdDistance
+    return new Vec3(t.x + s[8] * d, t.y + s[9] * d, t.z + s[10] * d)
+  }
+
+  /**
+   * Where the shot is actually taken from: the VMD eye while a camera VMD drives, the
+   * orbit position otherwise.
+   *
+   * `getPosition()` deliberately stays orbit-only — pan, zoom and framing reason in the
+   * spherical coordinates a camera VMD never touches. Anything asking "where is the
+   * viewer" wants THIS. Feeding the orbit position to the shader's `camera.viewPos`
+   * while rendering from the VMD camera left every view-dependent term — specular, rim,
+   * fresnel, sphere maps, the eye visibility gate — evaluated from a camera that was not
+   * the one taking the picture, with the error depending on wherever the orbit happened
+   * to be left.
+   */
+  getEyePosition(): Vec3 {
+    return this.vmdDriven ? this.vmdEye() : this.getPosition()
+  }
+
   getViewMatrix(): Mat4 {
     if (this.vmdDriven) {
-      // MMD camera: look at `target` from `distance` back, oriented by the euler rotation.
-      // forward = q·(0,0,1) (LH), up = q·(0,1,0) — read as columns 2 and 1 of the rot matrix.
-      // eye = target + forward·distance (distance is negative in VMD, so eye sits behind).
-      // Euler is NEGATED on all three axes: babylon-mmd builds the shot with
-      // RotationYawPitchRoll(-ry, -rx, -rz), and our fromEuler(rx,ry,rz) equals
-      // RotationYawPitchRoll(ry,rx,rz) — so the MMD-authentic rotation is fromEuler(-r).
-      const r = this._vmdRotation
-      const q = Quat.fromEuler(-r.x, -r.y, -r.z)
-      Mat4.fromQuatInto(q.x, q.y, q.z, q.w, this._quatScratch, 0)
+      const eye = this.vmdEye()
       const s = this._quatScratch
       const t = this._vmdTarget
-      const d = this._vmdDistance
-      const ex = t.x + s[8] * d, ey = t.y + s[9] * d, ez = t.z + s[10] * d
-      Mat4.lookAtInto(this._viewMat.values, ex, ey, ez, t.x, t.y, t.z, s[4], s[5], s[6])
+      Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, t.x, t.y, t.z, s[4], s[5], s[6])
       return this._viewMat
     }
     const eye = this.getPosition()

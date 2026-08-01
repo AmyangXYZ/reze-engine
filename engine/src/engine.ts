@@ -4305,7 +4305,7 @@ export class Engine {
     e.preventDefault()
 
     // Pick threshold stays pixel-based — clicking should feel the same at any zoom.
-    const camPos = this.camera.getPosition()
+    const camPos = this.camera.getEyePosition()
     const dist = Math.max(0.01, bonePos.subtract(camPos).length())
     const worldPerPixel = (dist * Math.tan(this.camera.fov * 0.5) * 2) / Math.max(1, this.canvas.clientHeight)
     const worldThreshold = Engine.GIZMO_PICK_THRESHOLD_PX * worldPerPixel
@@ -5237,7 +5237,7 @@ export class Engine {
   private updateCameraUniforms() {
     const viewMatrix = this.camera.getViewMatrix()
     const projectionMatrix = this.camera.getProjectionMatrix()
-    const cameraPos = this.camera.getPosition()
+    const cameraPos = this.camera.getEyePosition()
     this.cameraMatrixData.set(viewMatrix.values, 0)
     this.cameraMatrixData.set(projectionMatrix.values, 16)
     this.cameraMatrixData[32] = cameraPos.x
