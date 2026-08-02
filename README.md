@@ -16,6 +16,7 @@ npm install reze-engine
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, ASC CDL colour grading, 4× MSAA, Apple-TBDR-friendly targets
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
+- **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
@@ -63,7 +64,8 @@ engine/src/
   animation.ts       AnimationClip, VMD bezier interpolation, playback/priority
   ik-solver.ts       MMD-style CCD IK (angle limits, solve-axis specialization)
   camera.ts          Orbit camera (alpha/beta/radius), bone-follow, mouse/touch
-  math.ts            Vec3 / Quat / Mat4 (zero-alloc *Into variants for hot paths)
+  math.ts            Vec3 / Quat / Mat4 — euler orders, swing-twist, shortest-arc,
+                     look-rotation (zero-alloc *Into variants for hot paths)
   pmx-loader.ts      PMX parser: mesh, bones, morphs, rigid bodies, joints
   vmd-loader.ts      VMD motion parser  ·  vmd-writer.ts  VMD export (Shift-JIS)
   asset-reader.ts    URL + local-folder asset resolution  ·  folder-upload.ts
@@ -153,6 +155,21 @@ model.getBoneWorldPosition(name)
 ```
 
 `AnimationClip` holds keyframes only (bone/morph tracks keyed by `frame`, plus `frameCount`); time advances at fixed `FPS` (exported, default 30).
+
+### Math
+
+Every operation has an allocating form and a zero-alloc `*Into` form (out parameter last, returned).
+
+```javascript
+Quat.fromEulerOrder(x, y, z, order)   // intrinsic order string "YXZ" | "ZYX" | … ; toEulerOrder(q, order) inverts
+Quat.fromUnitVectors(from, to)        // shortest arc
+Quat.twistAroundAxis(q, axis)         // swing-twist split: q = swing · twist
+Quat.lookRotation(forward, up)        // +Z forward
+Quat.rotateVec(q, v) / rotateVecInv(q, v)
+Quat.fromBasis(x, y, z)               // rotation taking the standard basis onto x/y/z
+Quat.slerp(a, b, t) / nlerp / dot / angleTo / mirrorZ   // mirrorZ = RH ↔ LH (with Vec3.mirrorZ)
+bezierInterpolate(x1, x2, y1, y2, t) / interpolateControlPoints(cp, t)   // VMD 127-space curves
+```
 
 ### Local folder uploads (browser)
 
