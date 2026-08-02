@@ -12,7 +12,11 @@ export class Camera {
   target: Vec3
   fov: number
   aspect: number = 1
-  near: number = 0.05
+  /** Depth precision scales with the near plane: at 0.05 the 24-bit buffer wasted
+   *  nearly all of it within a hand's reach and coplanar cloth/body layers z-fought
+   *  (white crack flashes, worse the further the camera). 0.5 MMD units ≈ 4 cm —
+   *  closer than any real framing — and buys 10× precision at character range. */
+  near: number = 0.5
   far: number = FAR_CAP
 
   // Input state
