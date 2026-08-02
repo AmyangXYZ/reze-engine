@@ -1,15 +1,76 @@
 "use client"
 
 import Header from "@/components/header"
-import { Engine, EngineStats, LocomotionController, Vec3 } from "reze-engine"
+import { Engine, EngineStats, LocomotionController, Model, Vec3, type StrafeClipEntry } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
 
-const MODEL_ID = "thoth"
-const VMD_BASE = "/unity-fbx-locomotion/vmd"
+const VMD_ROOT = "/unity-fbx-locomotion"
+const VMD_BASE = `${VMD_ROOT}/vmd`
+
+// ai同屏连携: the player character plus two AI companions in follow formation.
+// Every character plays VMDs converted against ITS OWN measured skeleton, with the
+// pack's authored root speeds at that conversion's scale.
+const PLAYER = {
+  id: "thoth",
+  pmx: "/models/托特/托特.pmx",
+  vmdDir: VMD_BASE,
+  runSpeed: 62.7,
+  sprintSpeed: 86.3,
+}
+const COMPANIONS = [
+  {
+    id: "izanami",
+    pmx: "/models/深空之眼—伊邪那美「初雪千华」/伊邪那美誓约2.0.pmx",
+    vmdDir: `${VMD_ROOT}/vmd-izanami`,
+    runSpeed: 61.3,
+    sprintSpeed: 84.5,
+    // formation slot in player-local space: x = player's right, z = player's forward
+    slot: { x: -14, z: -11 },
+  },
+  {
+    id: "skuld",
+    pmx: "/models/深空之眼—诗蔻蒂/诗蔻蒂3.0.pmx",
+    vmdDir: `${VMD_ROOT}/vmd-skuld`,
+    runSpeed: 61.7,
+    sprintSpeed: 85.0,
+    slot: { x: 14, z: -11 },
+  },
+]
+// Companions hold position inside the deadband; approach speed ramps in over the
+// arrive radius beyond it (analog magnitude), so they settle instead of overshooting.
+const FOLLOW_DEADBAND = 3
+const FOLLOW_ARRIVE = 8
+const FOLLOW_SPRINT_AT = 30
+
+const deg = (d: number) => (d * Math.PI) / 180
+
+// The 8-direction strafe rings. Angles and speeds MEASURED from each clip's authored
+// root motion at this conversion's scale (FL/FR are the pure ±90° side clips;
+// BL/BR are slower side-step variants, unused).
+const STRAFE_RUN: StrafeClipEntry[] = [
+  { clip: "StrafeRun_F", angle: deg(0), speed: 65.4 },
+  { clip: "StrafeRun_R45", angle: deg(45), speed: 65.4 },
+  { clip: "StrafeRun_FR", angle: deg(90), speed: 60.6 },
+  { clip: "StrafeRun_R135", angle: deg(135), speed: 65.4 },
+  { clip: "StrafeRun_B", angle: deg(180), speed: 65.4 },
+  { clip: "StrafeRun_L135", angle: deg(-135), speed: 65.4 },
+  { clip: "StrafeRun_FL", angle: deg(-90), speed: 60.6 },
+  { clip: "StrafeRun_L45", angle: deg(-45), speed: 65.4 },
+]
+const STRAFE_SPRINT: StrafeClipEntry[] = [
+  { clip: "StrafeSprint_F", angle: deg(0), speed: 83.0 },
+  { clip: "StrafeSprint_R45", angle: deg(45), speed: 85.4 },
+  { clip: "StrafeSprint_FR", angle: deg(90), speed: 83.1 },
+  { clip: "StrafeSprint_R135", angle: deg(135), speed: 77.0 },
+  { clip: "StrafeSprint_B", angle: deg(180), speed: 65.3 },
+  { clip: "StrafeSprint_L135", angle: deg(-135), speed: 77.0 },
+  { clip: "StrafeSprint_FL", angle: deg(-90), speed: 83.0 },
+  { clip: "StrafeSprint_L45", angle: deg(-45), speed: 83.0 },
+]
 
 // Input keys the demo cares about — everything else never touches state.
-const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight"])
+const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight", "Space"])
 
 /** Stick travel radius in px; drag past SPRINT_AT of it to sprint. Travel close to
  *  the base radius (72) lets the knob overhang the rim at full deflection — the
@@ -77,7 +138,7 @@ function VirtualStick({
   return (
     <div
       ref={baseRef}
-      className="relative w-36 h-36 rounded-full border-2 border-white/35 bg-white/[0.03] backdrop-blur-[2px] touch-none select-none"
+      className="relative w-36 h-36 rounded-full border-2 border-white/70 bg-white/15 backdrop-blur-[2px] touch-none select-none"
       onPointerDown={(e) => {
         e.preventDefault()
         e.currentTarget.setPointerCapture(e.pointerId)
@@ -92,12 +153,12 @@ function VirtualStick({
       onContextMenu={(e) => e.preventDefault()}
     >
       {/* inner ring, like the classic wheel */}
-      <div className="absolute inset-0 m-auto w-16 h-16 rounded-full border border-white/30 pointer-events-none" />
+      <div className="absolute inset-0 m-auto w-16 h-16 rounded-full border border-white/50 pointer-events-none" />
       {/* Eased by default so keyboard pushes glide to their direction and releases
           spring back; dragging zeroes the duration inline for 1:1 tracking. */}
       <div
         ref={knobRef}
-        className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-white/25 border-2 border-white/60 shadow-[0_0_12px_rgba(255,255,255,0.25)] pointer-events-none transition-transform duration-150 ease-out"
+        className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-white/70 border-2 border-white shadow-[0_0_14px_rgba(255,255,255,0.45)] pointer-events-none transition-transform duration-150 ease-out"
       />
     </div>
   )
@@ -108,9 +169,44 @@ export default function Home() {
   const engineRef = useRef<Engine | null>(null)
   const keysRef = useRef<Set<string>>(new Set())
   const stickRef = useRef({ x: 0, y: 0, active: false })
+  const actorsRef = useRef<Model[]>([])
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const dancingRef = useRef(false)
+  const danceCancelRef = useRef(false)
+  const [dancing, setDancing] = useState(false)
+  const [spaceHeld, setSpaceHeld] = useState(false)
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
+
+  // ai同屏连携 showcase: one press (button or Space), all three play the dance together
+  // with the song — a synced one-shot per model. The dance can't re-trigger itself;
+  // only MOVEMENT interrupts it (WASD/wheel cancels, and you run out of the fade).
+  const startDance = useCallback(() => {
+    const actors = actorsRef.current
+    if (actors.length === 0 || dancingRef.current) return
+    if (!audioRef.current) {
+      audioRef.current = new Audio("/audios/One More Last Time.wav")
+      audioRef.current.preload = "auto"
+    }
+    const onEnd = () => {
+      // fired by the player's one-shot finishing (natural end or cancel fade done)
+      dancingRef.current = false
+      danceCancelRef.current = false
+      setDancing(false)
+      audioRef.current?.pause()
+    }
+    let ok = false
+    actors.forEach((m, i) => {
+      ok = m.playOneShot("dance", { fadeIn: 0.4, fadeOut: 0.6, onEnd: i === 0 ? onEnd : undefined }) || ok
+    })
+    if (!ok) return
+    audioRef.current.currentTime = 0
+    void audioRef.current.play().catch(() => {})
+    dancingRef.current = true
+    danceCancelRef.current = false
+    setDancing(true)
+  }, [])
 
   const stickDisplayRef = useRef<((x: number, y: number) => void) | null>(null)
   const [shiftHeld, setShiftHeld] = useState(false)
@@ -139,36 +235,77 @@ export default function Home() {
     try {
       const engine = new Engine(canvasRef.current, {
         camera: { distance: 45, target: new Vec3(0, 11.5, 0) },
-        bloom: { color: new Vec3(0.9, 0.3, 0.6) },
+        bloom: { color: new Vec3(0.75, 0.82, 1.0) },
         // reze-design's sun: azimuth 205°, elevation 21° (azElToDirection), strength 2.
         sun: { strength: 2.0, direction: new Vec3(0.3946, -0.3584, 0.8462) },
+        // tailwind blue-200, display-space sRGB
+        background: new Vec3(0.749, 0.859, 0.996),
       })
       engineRef.current = engine
       await engine.init()
 
-      const model = await engine.loadModel(MODEL_ID, "/models/托特/托特.pmx")
-      await engine.autoStyleGroups(MODEL_ID, { body: ["手"], metal: ["指甲"] })
+      const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
+      await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
       // Room to sprint: ~10s of full sprint in any direction before the edge.
-      engine.addGround({ diffuseColor: new Vec3(1, 0.3, 0.6), width: 2000, height: 2000, fadeStart: 600, fadeEnd: 950 })
+      // Pale blue-grey stage with a fine white grid, fading into the backdrop.
+      engine.addGround({
+        // tailwind blue-400 in linear light
+        diffuseColor: new Vec3(0.116, 0.384, 0.956),
+        gridLineColor: new Vec3(0.95, 0.96, 1.0),
+        gridLineOpacity: 0.5,
+        noiseStrength: 0.02,
+        opacity: 1,
+        // Kept modest: the far grid aliases into a shimmering band at horizon
+        // distances. The fade starts early and ramps long so the ground melts
+        // into the backdrop instead of meeting it at a visible horizon line.
+        width: 800,
+        height: 800,
+        fadeStart: 120,
+        fadeEnd: 300,
+      })
 
       await Promise.all([
-        model.loadVmd("idle", `${VMD_BASE}/Idle.vmd`),
-        model.loadVmd("run", `${VMD_BASE}/Run_Lfoot.vmd`),
-        model.loadVmd("sprint", `${VMD_BASE}/Sprint_Lfoot.vmd`),
+        model.loadVmd("idle", `${PLAYER.vmdDir}/Idle.vmd`),
+        model.loadVmd("run", `${PLAYER.vmdDir}/Run_Lfoot.vmd`),
+        model.loadVmd("sprint", `${PLAYER.vmdDir}/Sprint_Lfoot.vmd`),
+        model.loadVmd("dance", "/animations/One More Last Time.vmd"),
+        ...[...STRAFE_RUN, ...STRAFE_SPRINT].map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
       ])
 
-      // Speeds = the pack's measured root motion × this conversion's scale (0.1306
-      // from the measured 托特 skeleton), so strides match the ground covered.
       const controller = new LocomotionController(
         model,
-        { idle: "idle", run: "run", sprint: "sprint" },
-        { runSpeed: 62.7, sprintSpeed: 86.3 }
+        { idle: "idle", run: "run", sprint: "sprint", strafeRun: STRAFE_RUN, strafeSprint: STRAFE_SPRINT },
+        { runSpeed: PLAYER.runSpeed, sprintSpeed: PLAYER.sprintSpeed }
       )
       // Spawn facing the camera (rest facing, -Z); she turns around on the first input.
       controller.teleport(0, 0, 0, Math.PI)
       // Follow the root (全ての親): the gait clips don't animate it, so the camera
       // tracks the run without inheriting センター's bob and lean.
       engine.setCameraFollow(model, undefined, new Vec3(0, 11.5, 0))
+
+      // AI companions: own model, own per-skeleton VMDs, own controller — steered by
+      // a follow policy through the same setMove interface the player uses.
+      const companions = await Promise.all(
+        COMPANIONS.map(async (def) => {
+          const m = await engine.loadModel(def.id, def.pmx)
+          await engine.autoStyleGroups(def.id)
+          await Promise.all([
+            m.loadVmd("idle", `${def.vmdDir}/Idle.vmd`),
+            m.loadVmd("run", `${def.vmdDir}/Run_Lfoot.vmd`),
+            m.loadVmd("sprint", `${def.vmdDir}/Sprint_Lfoot.vmd`),
+            m.loadVmd("dance", "/animations/One More Last Time.vmd"),
+          ])
+          const c = new LocomotionController(
+            m,
+            { idle: "idle", run: "run", sprint: "sprint" },
+            { runSpeed: def.runSpeed, sprintSpeed: def.sprintSpeed }
+          )
+          // Spawn already in formation around the player (player faces -Z at rest).
+          c.teleport(-def.slot.x, 0, -def.slot.z, Math.PI)
+          return { def, controller: c, model: m }
+        })
+      )
+      actorsRef.current = [model, ...companions.map((c) => c.model)]
 
       let last = performance.now()
       engine.runRenderLoop(() => {
@@ -202,9 +339,39 @@ export default function Home() {
         const cosA = Math.cos(alpha)
         const x = rawX * -cosA + rawY * -sinA
         const y = rawX * sinA + rawY * -cosA
+        // Souls-style unlocked camera: input is camera-relative but the character
+        // turns toward the movement and runs — never glued to the camera's facing.
+        // (The strafe ring stays loaded for a future lock-on mode, where side-
+        // stepping is the right behavior: controller.setFacing(targetYaw).)
+        // Movement interrupts the dance: one cancel fade, and she runs out of it.
+        if (dancingRef.current && !danceCancelRef.current && (rawX !== 0 || rawY !== 0 || stick.active)) {
+          danceCancelRef.current = true
+          for (const m of actorsRef.current) m.cancelOneShot(0.25) // snappy: she's running almost immediately
+        }
         controller.setMove(x, y, sprint)
         const pose = controller.update(dt)
-        engine.setModelTransform(MODEL_ID, { position: pose.position, rotation: pose.rotation })
+        engine.setModelTransform(PLAYER.id, { position: pose.position, rotation: pose.rotation })
+
+        // Companion follow AI: chase a formation slot in the player's local frame;
+        // hold inside the deadband, run beyond it, sprint when left far behind.
+        const fx = Math.sin(pose.yaw)
+        const fz = Math.cos(pose.yaw)
+        for (const { def, controller: c } of companions) {
+          const tx = pose.position.x + Math.cos(pose.yaw) * def.slot.x + fx * def.slot.z
+          const tz = pose.position.z - Math.sin(pose.yaw) * def.slot.x + fz * def.slot.z
+          const p = c.getPosition()
+          const dx = tx - p.x
+          const dz = tz - p.z
+          const dist = Math.hypot(dx, dz)
+          if (!dancingRef.current && dist > FOLLOW_DEADBAND) {
+            const mag = Math.min(1, (dist - FOLLOW_DEADBAND) / FOLLOW_ARRIVE)
+            c.setMove((dx / dist) * mag, (dz / dist) * mag, dist > FOLLOW_SPRINT_AT)
+          } else {
+            c.setMove(0, 0)
+          }
+          const cp = c.update(dt)
+          engine.setModelTransform(def.id, { position: cp.position, rotation: cp.rotation })
+        }
 
         setStats(engine.getStats())
       })
@@ -234,10 +401,20 @@ export default function Home() {
     const down = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (!INPUT_CODES.has(e.code)) return
+      if (e.code === "Space") {
+        e.preventDefault() // page scroll
+        setSpaceHeld(true)
+        startDance()
+        return
+      }
       keysRef.current.add(e.code)
       if (e.code.startsWith("Shift")) setShiftHeld(true)
     }
     const up = (e: KeyboardEvent) => {
+      if (e.code === "Space") {
+        setSpaceHeld(false)
+        return
+      }
       keysRef.current.delete(e.code)
       if (e.code.startsWith("Shift") && !keysRef.current.has("ShiftLeft") && !keysRef.current.has("ShiftRight"))
         setShiftHeld(false)
@@ -245,6 +422,7 @@ export default function Home() {
     const blur = () => {
       keysRef.current.clear()
       setShiftHeld(false)
+      setSpaceHeld(false)
     }
     window.addEventListener("keydown", down)
     window.addEventListener("keyup", up)
@@ -270,13 +448,14 @@ export default function Home() {
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none pointer-events-auto z-1" />
 
       {!loading && !engineError && (
-        <div className="absolute bottom-24 left-48 z-[60] pointer-events-auto flex flex-col items-center gap-3">
+        // Mobile: thumb zone at the bottom-left corner, no SHIFT (rim drag sprints).
+        <div className="absolute bottom-10 left-6 sm:bottom-24 sm:left-48 z-[60] pointer-events-auto flex flex-col items-center gap-3">
           <VirtualStick onChange={onStick} display={stickDisplayRef} />
           <button
-            className={`w-36 h-10 flex items-center justify-center rounded-xl border font-mono font-semibold text-xs tracking-[0.2em] select-none touch-none transition-all duration-75 ${
+            className={`hidden sm:flex w-36 h-10 items-center justify-center rounded-xl border font-mono font-semibold text-xs tracking-[0.2em] select-none touch-none transition-all duration-75 ${
               shiftHeld
                 ? "bg-white/90 text-black border-white scale-95 shadow-[0_0_20px_rgba(255,255,255,0.45)]"
-                : "bg-white/5 text-white/75 border-white/15 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.15),0_2px_10px_rgba(0,0,0,0.35)]"
+                : "bg-white/20 text-white/90 border-white/50 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_10px_rgba(0,0,0,0.25)]"
             }`}
             onPointerDown={(e) => {
               e.preventDefault()
@@ -289,6 +468,28 @@ export default function Home() {
             aria-label="Sprint"
           >
             SHIFT
+          </button>
+        </div>
+      )}
+
+      {!loading && !engineError && (
+        // Skill zone, bottom-right — the button's center lines up with the wheel
+        // knob's center (wheel center = container bottom + SHIFT 40px + gap 12px +
+        // 72px on desktop; wheel only on mobile). Space triggers and highlights it;
+        // while dancing it can't re-trigger — only movement interrupts.
+        <div className="absolute bottom-[4.5rem] right-6 sm:bottom-[11.25rem] sm:right-48 z-[60] pointer-events-auto">
+          <button
+            className={`w-20 h-20 rounded-full border-2 font-mono font-semibold text-xs tracking-widest select-none touch-none transition-all duration-100 ${
+              dancing || spaceHeld
+                ? "bg-white/90 text-black border-white scale-95 shadow-[0_0_28px_rgba(255,255,255,0.5)]"
+                : "bg-white/25 text-white border-white/70 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_2px_12px_rgba(0,0,0,0.25)]"
+            }`}
+            onClick={startDance}
+            onContextMenu={(e) => e.preventDefault()}
+            aria-label="Dance together (Space)"
+          >
+            ♪
+            <div className="text-[9px] mt-0.5 tracking-[0.2em]">DANCE</div>
           </button>
         </div>
       )}
