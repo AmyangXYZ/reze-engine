@@ -11,16 +11,41 @@ const VMD_BASE = "/unity-fbx-locomotion/vmd"
 // Input keys the demo cares about — everything else never touches state.
 const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight"])
 
-/** Stick travel radius in px; drag past SPRINT_AT of it to sprint. */
-const STICK_RADIUS = 52
+/** Stick travel radius in px; drag past SPRINT_AT of it to sprint. Travel close to
+ *  the base radius (72) lets the knob overhang the rim at full deflection — the
+ *  familiar mobile-wheel "pushed past the edge" look. */
+const STICK_RADIUS = 66
 const SPRINT_AT = 0.92
 
 /** Mobile-game movement wheel. Reports {x, y (up = +forward), active} through a ref
- *  callback; the knob is moved via direct DOM transform so dragging never re-renders. */
-function VirtualStick({ onChange }: { onChange: (x: number, y: number, active: boolean) => void }) {
+ *  callback; the knob is moved via direct DOM transform so dragging never re-renders.
+ *  `display` receives a setter the host calls to mirror OTHER input (keyboard WASD)
+ *  on the knob — ignored while a drag owns it. */
+function VirtualStick({
+  onChange,
+  display,
+}: {
+  onChange: (x: number, y: number, active: boolean) => void
+  display: React.MutableRefObject<((x: number, y: number) => void) | null>
+}) {
   const baseRef = useRef<HTMLDivElement>(null)
   const knobRef = useRef<HTMLDivElement>(null)
   const pointerId = useRef<number | null>(null)
+
+  useEffect(() => {
+    display.current = (x, y) => {
+      if (pointerId.current !== null || !knobRef.current) return
+      const len = Math.hypot(x, y)
+      if (len > 1) {
+        x /= len
+        y /= len
+      }
+      knobRef.current.style.transform = `translate(${x * STICK_RADIUS}px, ${-y * STICK_RADIUS}px)`
+    }
+    return () => {
+      display.current = null
+    }
+  }, [display])
 
   const move = (clientX: number, clientY: number) => {
     const base = baseRef.current
@@ -34,13 +59,18 @@ function VirtualStick({ onChange }: { onChange: (x: number, y: number, active: b
       dx *= STICK_RADIUS / len
       dy *= STICK_RADIUS / len
     }
+    knob.style.transitionDuration = "0ms" // dragging tracks the finger 1:1
     knob.style.transform = `translate(${dx}px, ${dy}px)`
     onChange(dx / STICK_RADIUS, -dy / STICK_RADIUS, true)
   }
 
   const release = () => {
     pointerId.current = null
-    if (knobRef.current) knobRef.current.style.transform = "translate(0px, 0px)"
+    const knob = knobRef.current
+    if (knob) {
+      knob.style.transitionDuration = "" // class easing back on → animated spring-return
+      knob.style.transform = "translate(0px, 0px)"
+    }
     onChange(0, 0, false)
   }
 
@@ -63,9 +93,11 @@ function VirtualStick({ onChange }: { onChange: (x: number, y: number, active: b
     >
       {/* inner ring, like the classic wheel */}
       <div className="absolute inset-0 m-auto w-16 h-16 rounded-full border border-white/30 pointer-events-none" />
+      {/* Eased by default so keyboard pushes glide to their direction and releases
+          spring back; dragging zeroes the duration inline for 1:1 tracking. */}
       <div
         ref={knobRef}
-        className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-white/25 border-2 border-white/60 shadow-[0_0_12px_rgba(255,255,255,0.25)] pointer-events-none"
+        className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-white/25 border-2 border-white/60 shadow-[0_0_12px_rgba(255,255,255,0.25)] pointer-events-none transition-transform duration-150 ease-out"
       />
     </div>
   )
@@ -80,10 +112,23 @@ export default function Home() {
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
 
+  const stickDisplayRef = useRef<((x: number, y: number) => void) | null>(null)
+  const [shiftHeld, setShiftHeld] = useState(false)
+
   const onStick = useCallback((x: number, y: number, active: boolean) => {
     stickRef.current.x = x
     stickRef.current.y = y
     stickRef.current.active = active
+  }, [])
+
+  const setShift = useCallback((on: boolean) => {
+    const keys = keysRef.current
+    if (on) keys.add("ShiftLeft")
+    else {
+      keys.delete("ShiftLeft")
+      keys.delete("ShiftRight")
+    }
+    setShiftHeld(on)
   }, [])
 
   const initEngine = useCallback(async () => {
@@ -141,14 +186,16 @@ export default function Home() {
         let rawX: number
         let rawY: number
         let sprint: boolean
+        const shiftDown = keys.has("ShiftLeft") || keys.has("ShiftRight")
         if (stick.active) {
           rawX = stick.x
           rawY = stick.y
-          sprint = Math.hypot(stick.x, stick.y) > SPRINT_AT
+          sprint = shiftDown || Math.hypot(stick.x, stick.y) > SPRINT_AT
         } else {
           rawX = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0)
           rawY = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0)
-          sprint = keys.has("ShiftLeft") || keys.has("ShiftRight")
+          sprint = shiftDown
+          stickDisplayRef.current?.(rawX, rawY) // mirror keyboard on the knob
         }
         const alpha = engine.getCameraAlpha()
         const sinA = Math.sin(alpha)
@@ -186,13 +233,18 @@ export default function Home() {
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      if (INPUT_CODES.has(e.code)) keysRef.current.add(e.code)
+      if (!INPUT_CODES.has(e.code)) return
+      keysRef.current.add(e.code)
+      if (e.code.startsWith("Shift")) setShiftHeld(true)
     }
     const up = (e: KeyboardEvent) => {
       keysRef.current.delete(e.code)
+      if (e.code.startsWith("Shift") && !keysRef.current.has("ShiftLeft") && !keysRef.current.has("ShiftRight"))
+        setShiftHeld(false)
     }
     const blur = () => {
       keysRef.current.clear()
+      setShiftHeld(false)
     }
     window.addEventListener("keydown", down)
     window.addEventListener("keyup", up)
@@ -218,8 +270,26 @@ export default function Home() {
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none pointer-events-auto z-1" />
 
       {!loading && !engineError && (
-        <div className="absolute bottom-24 left-48 z-[60] pointer-events-auto">
-          <VirtualStick onChange={onStick} />
+        <div className="absolute bottom-24 left-48 z-[60] pointer-events-auto flex flex-col items-center gap-3">
+          <VirtualStick onChange={onStick} display={stickDisplayRef} />
+          <button
+            className={`w-36 h-10 flex items-center justify-center rounded-xl border font-mono font-semibold text-xs tracking-[0.2em] select-none touch-none transition-all duration-75 ${
+              shiftHeld
+                ? "bg-white/90 text-black border-white scale-95 shadow-[0_0_20px_rgba(255,255,255,0.45)]"
+                : "bg-white/5 text-white/75 border-white/15 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.15),0_2px_10px_rgba(0,0,0,0.35)]"
+            }`}
+            onPointerDown={(e) => {
+              e.preventDefault()
+              e.currentTarget.setPointerCapture(e.pointerId)
+              setShift(true)
+            }}
+            onPointerUp={() => setShift(false)}
+            onPointerCancel={() => setShift(false)}
+            onContextMenu={(e) => e.preventDefault()}
+            aria-label="Sprint"
+          >
+            SHIFT
+          </button>
         </div>
       )}
     </div>
