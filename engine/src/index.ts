@@ -70,6 +70,7 @@ export {
   type LocomotionClips,
   type LocomotionOptions,
   type LocomotionPose,
+  type StrafeClipEntry,
 } from "./locomotion"
 export {
   FPS,

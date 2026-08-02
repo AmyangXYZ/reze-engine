@@ -202,6 +202,98 @@ test("tank mode: backpedal moves backward at backpedalScale, never sprints", () 
   assert.equal(w.sprint, 0)
 })
 
+const DEG = Math.PI / 180
+const RING = (prefix) => [
+  { clip: `${prefix}F`, angle: 0, speed: 60 },
+  { clip: `${prefix}R45`, angle: 45 * DEG, speed: 60 },
+  { clip: `${prefix}R`, angle: 90 * DEG, speed: 50 },
+  { clip: `${prefix}R135`, angle: 135 * DEG, speed: 60 },
+  { clip: `${prefix}B`, angle: 180 * DEG, speed: 60 },
+  { clip: `${prefix}L135`, angle: -135 * DEG, speed: 60 },
+  { clip: `${prefix}L`, angle: -90 * DEG, speed: 50 },
+  { clip: `${prefix}L45`, angle: -45 * DEG, speed: 60 },
+]
+
+function makeStrafeStub() {
+  const clips = { idle: { frameCount: 90 } }
+  for (const e of [...RING("run_"), ...RING("sprint_")]) clips[e.clip] = { frameCount: e.clip.startsWith("run_") ? 30 : 24 }
+  return {
+    lastEntries: null,
+    getClip(name) {
+      return clips[name] ?? null
+    },
+    setBlendPose(entries) {
+      this.lastEntries = entries
+    },
+    clearBlendPose() {
+      this.lastEntries = null
+    },
+  }
+}
+
+function makeStrafeController(stub) {
+  return new LocomotionController(stub, {
+    idle: "idle",
+    run: "run_F",
+    strafeRun: RING("run_"),
+    strafeSprint: RING("sprint_"),
+  })
+}
+
+test("strafe mode: body holds the facing while moving sideways on the right clip", () => {
+  const stub = makeStrafeStub()
+  const c = makeStrafeController(stub)
+  c.setFacing(0) // face +Z
+  c.setMove(1, 0) // move +X = the character's right
+  const pose = STEPS(c, 240)
+  assert.ok(Math.abs(pose.yaw) < 1e-6, `yaw held, got ${pose.yaw}`)
+  const w = weightsByName(stub)
+  assert.ok(w["run_R"] > 0.999, `pure-right clip drives: ${JSON.stringify(w)}`)
+  assert.ok(c.getPosition().x > 0)
+  assert.equal(Math.round(c.getPosition().z * 1e6), 0)
+})
+
+test("strafe mode: a diagonal blends the adjacent ring pair, weights sum to 1", () => {
+  const stub = makeStrafeStub()
+  const c = makeStrafeController(stub)
+  c.setFacing(0)
+  c.setMove(Math.sin(22.5 * DEG), Math.cos(22.5 * DEG)) // halfway F..R45
+  STEPS(c, 240)
+  const w = weightsByName(stub)
+  assert.ok(Math.abs(w["run_F"] - 0.5) < 0.01 && Math.abs(w["run_R45"] - 0.5) < 0.01, JSON.stringify(w))
+  let sum = 0
+  for (const e of stub.lastEntries) sum += e.weight
+  assert.ok(Math.abs(sum - 1) < 1e-9)
+})
+
+test("strafe mode: sprint engages the sprint ring; root speed uses authored clip speed", () => {
+  const stub = makeStrafeStub()
+  const c = makeStrafeController(stub)
+  c.setFacing(0)
+  c.setMove(-1, 0, true) // sprint left
+  STEPS(c, 240)
+  const w = weightsByName(stub)
+  assert.ok(w["sprint_L"] > 0.999, JSON.stringify(w))
+  const x1 = c.getPosition().x
+  STEPS(c, 60) // 1s at authored 50 u/s for the pure-side clip
+  assert.ok(Math.abs(x1 - c.getPosition().x - 50) < 0.5, `dx=${x1 - c.getPosition().x}`)
+})
+
+test("strafe mode: releasing input settles into idle without drift", () => {
+  const stub = makeStrafeStub()
+  const c = makeStrafeController(stub)
+  c.setFacing(0)
+  c.setMove(0, -1) // backpedal
+  STEPS(c, 120)
+  c.setMove(0, 0)
+  STEPS(c, 120)
+  const w = weightsByName(stub)
+  assert.ok(w.idle > 0.999)
+  const z = c.getPosition().z
+  STEPS(c, 30)
+  assert.equal(c.getPosition().z, z)
+})
+
 test("huge dt is clamped (tab-switch guard)", () => {
   const stub = makeStub()
   const c = makeController(stub, { runSpeed: 6 })

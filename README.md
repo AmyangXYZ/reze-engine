@@ -18,6 +18,7 @@ npm install reze-engine
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
 - **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
+- **Clip blending & locomotion** — weighted multi-clip pose blending, crossfades, and a game-style character controller (idle/run/sprint speed blend, code-driven root motion) — the [demo](https://reze-engine.vercel.app) is WASD-playable
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 - **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
@@ -62,6 +63,8 @@ engine/src/
   model.ts           Model: skeleton, 4-bone skinning, morphs (CPU + GPU compute),
                      animation state, drives IK; per-frame update()
   animation.ts       AnimationClip, VMD bezier interpolation, playback/priority
+  locomotion.ts      LocomotionController — idle/run/sprint blended over setBlendPose,
+                     pivot-gated turns, root motion returned for setModelTransform
   ik-solver.ts       MMD-style CCD IK (angle limits, solve-axis specialization)
   camera.ts          Orbit camera (alpha/beta/radius), bone-follow, mouse/touch
   math.ts            Vec3 / Quat / Mat4 — euler orders, swing-twist, shortest-arc,
@@ -152,7 +155,23 @@ model.rotateBones({ 首: quat }, ms?) / moveBones({ センター: vec3 }, ms?)
 model.setMorphWeight(name, weight, ms?)
 model.resetAllBones() / resetAllMorphs()
 model.getBoneWorldPosition(name)
+
+model.setBlendPose(entries)                  // pose from N weighted clips {name, time, weight} — the caller owns every clock; rest pose fills a weight sum below 1
+model.crossfadeTo(name, seconds, { loop? })  // fade the current clip (or the rest pose) into a target that owns the progress clock
+model.setBoneRotationOffset(name, quat)      // constant local offset composed after every pose source (the classic heel correction); null clears
 ```
+
+### Locomotion
+
+```javascript
+const walk = new LocomotionController(model, { idle, run, sprint }, { runSpeed, sprintSpeed })
+walk.setMove(x, y, sprint?)                  // world-vector input: turns toward it (pivots in place past 45°), then runs
+walk.setDrive(forward, steer, sprint?)       // tank-style alternative: steer rotates the facing, forward runs along it
+const pose = walk.update(dt)                 // per frame: blends the pose, integrates root motion
+engine.setModelTransform(name, { position: pose.position, rotation: pose.rotation })
+```
+
+Clips are in-place; run and sprint share one gait phase so blends stay on the same feet. Match `runSpeed`/`sprintSpeed` to the clips' authored root motion or the feet slide.
 
 `AnimationClip` holds keyframes only (bone/morph tracks keyed by `frame`, plus `frameCount`); time advances at fixed `FPS` (exported, default 30).
 

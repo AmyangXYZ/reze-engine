@@ -8,11 +8,24 @@ import { Model } from "./model"
 import { FPS, type BlendEntry } from "./animation"
 import { Quat, Vec3 } from "./math"
 
+export interface StrafeClipEntry {
+  /** Clip name previously loaded on the model. */
+  clip: string
+  /** Movement direction relative to the facing, radians: 0 = forward, + = the character's right. */
+  angle: number
+  /** The clip's authored root speed in MMD units/s (post-conversion scale) — drives root motion. */
+  speed: number
+}
+
 export interface LocomotionClips {
   /** Clip names previously loaded on the model (loadVmd/loadClip). */
   idle: string
   run: string
   sprint?: string
+  /** Directional ring for strafe mode (setFacing): body holds a facing while movement
+   *  blends the two ring clips nearest the local move angle. */
+  strafeRun?: StrafeClipEntry[]
+  strafeSprint?: StrafeClipEntry[]
 }
 
 export interface LocomotionOptions {
@@ -93,6 +106,11 @@ export class LocomotionController {
 
   private readonly entries: BlendEntry[]
   private readonly pose: LocomotionPose
+  // Strafe mode: non-null = the world yaw the body holds (movement decoupled from facing).
+  private facingYaw: number | null = null
+  private readonly strafeRun: StrafeClipEntry[] | null
+  private readonly strafeSprint: StrafeClipEntry[] | null
+  private readonly strafeEntries: BlendEntry[]
 
   constructor(model: Model, clips: LocomotionClips, options?: LocomotionOptions) {
     this.model = model
@@ -110,6 +128,11 @@ export class LocomotionController {
       { name: clips.run, time: 0, weight: 0 },
       { name: clips.sprint ?? clips.run, time: 0, weight: 0 },
     ]
+    const byAngle = (a: StrafeClipEntry, b: StrafeClipEntry) => a.angle - b.angle
+    this.strafeRun = clips.strafeRun ? [...clips.strafeRun].sort(byAngle) : null
+    this.strafeSprint = clips.strafeSprint ? [...clips.strafeSprint].sort(byAngle) : null
+    // idle + adjacent pair per gear; unused slots keep weight 0 and are skipped.
+    this.strafeEntries = Array.from({ length: 5 }, () => ({ name: clips.idle, time: 0, weight: 0 }))
     this.pose = { position: this.position, yaw: 0, rotation: this.rotation, speedLevel: 0 }
   }
 
@@ -145,6 +168,13 @@ export class LocomotionController {
     this.yaw = yaw
   }
 
+  /** Strafe mode: hold the body at this world yaw (a camera forward, a lock-on target)
+   *  while setMove's vector drives the directional strafe ring — requires
+   *  clips.strafeRun. null returns to turn-toward-movement. */
+  setFacing(yaw: number | null): void {
+    this.facingYaw = this.strafeRun ? yaw : null
+  }
+
   getPosition(): Vec3 {
     return this.position
   }
@@ -163,6 +193,10 @@ export class LocomotionController {
    *  weighted pose to the model, and returns the root transform to apply. */
   update(dt: number): LocomotionPose {
     if (dt > 0.1) dt = 0.1 // tab-switch guard: never integrate a huge step
+
+    if (this.facingYaw !== null && this.strafeRun !== null && !this.tankMode) {
+      return this.updateStrafe(dt)
+    }
 
     const hasSprint = this.clips.sprint !== undefined
     let moving: boolean
@@ -198,9 +232,11 @@ export class LocomotionController {
     }
 
     // Speed level ramps linearly toward the target; the pose blend follows it.
-    // (No sprint while backpedaling.)
+    // Input magnitude scales the target (analog sticks and arrival steering slow
+    // down instead of overshooting). No sprint while backpedaling.
     const sprinting = this.inputSprint && hasSprint && !(this.tankMode && this.inputForward < 0)
-    const target = moving ? (sprinting ? 2 : 1) : 0
+    const magnitude = this.tankMode ? Math.abs(this.inputForward) : Math.min(1, Math.hypot(this.inputX, this.inputY))
+    const target = moving ? (sprinting ? 2 : 1) * magnitude : 0
     const maxStep = this.speedResponse * dt
     const d = target - this.speedLevel
     this.speedLevel += Math.abs(d) <= maxStep ? d : Math.sign(d) * maxStep
@@ -249,6 +285,114 @@ export class LocomotionController {
     this.rotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
     this.pose.yaw = this.yaw
     this.pose.speedLevel = this.speedLevel
+    return this.pose
+  }
+
+  /** The two ring clips straddling `local` (radians rel. facing), with the blend
+   *  fraction between them. The ring is sorted; the last→first gap wraps. */
+  private ringPair(ring: StrafeClipEntry[], local: number): { a: StrafeClipEntry; b: StrafeClipEntry; t: number } {
+    const n = ring.length
+    for (let i = 0; i < n; i++) {
+      const a = ring[i]
+      const b = ring[(i + 1) % n]
+      const gap = (((b.angle - a.angle) % TWO_PI) + TWO_PI) % TWO_PI || TWO_PI
+      const rel = (((local - a.angle) % TWO_PI) + TWO_PI) % TWO_PI
+      if (rel <= gap + 1e-9) return { a, b, t: rel / gap }
+    }
+    return { a: ring[0], b: ring[0], t: 0 }
+  }
+
+  /** Strafe-mode frame: the body holds facingYaw; movement blends the two ring clips
+   *  nearest the local move angle, per gear, all sharing one gait phase. Root motion
+   *  follows the input direction at the pair's authored (angle-lerped) speed. */
+  private updateStrafe(dt: number): LocomotionPose {
+    const runRing = this.strafeRun!
+    const sprintRing = this.strafeSprint
+
+    this.yaw = wrapAngle(this.yaw + wrapAngle(this.facingYaw! - this.yaw) * Math.min(1, this.turnResponse * dt))
+
+    const m = Math.hypot(this.inputX, this.inputY)
+    const moving = m > 0.05
+    const sprinting = this.inputSprint && sprintRing !== null
+    const target = moving ? (sprinting ? 2 : 1) * Math.min(1, m) : 0
+    const maxStep = this.speedResponse * dt
+    const d = target - this.speedLevel
+    this.speedLevel += Math.abs(d) <= maxStep ? d : Math.sign(d) * maxStep
+    const level = this.speedLevel
+
+    let runA = runRing[0]
+    let runB = runRing[0]
+    let runT = 0
+    let sprintA = sprintRing ? sprintRing[0] : runRing[0]
+    let sprintB = sprintA
+    let sprintT = 0
+    if (moving) {
+      const local = wrapAngle(Math.atan2(this.inputX, this.inputY) - this.yaw)
+      const rp = this.ringPair(runRing, local)
+      runA = rp.a
+      runB = rp.b
+      runT = rp.t
+      if (sprintRing) {
+        const sp = this.ringPair(sprintRing, local)
+        sprintA = sp.a
+        sprintB = sp.b
+        sprintT = sp.t
+      }
+      this.dirX = this.inputX / m
+      this.dirZ = this.inputY / m
+    }
+
+    // Root motion at the authored (angle-lerped, gear-lerped) clip speed.
+    const runSpeed = runA.speed + (runB.speed - runA.speed) * runT
+    const topSpeed = sprintRing ? sprintA.speed + (sprintB.speed - sprintA.speed) * sprintT : runSpeed
+    const speed = level <= 1 ? runSpeed * level : runSpeed + (topSpeed - runSpeed) * (level - 1)
+    this.position.x += this.dirX * speed * dt
+    this.position.z += this.dirZ * speed * dt
+
+    // Clocks: idle free-runs; the ring shares one phase (durations are uniform per gear).
+    const idleDur = this.clipDuration(this.clips.idle)
+    const runDur = this.clipDuration(runA.clip)
+    const sprintDur = sprintRing ? this.clipDuration(sprintA.clip) : runDur
+    this.idleTime = (this.idleTime + dt) % idleDur
+    const gaitDur = level <= 1 ? runDur : runDur + (sprintDur - runDur) * (level - 1)
+    this.gaitPhase = (this.gaitPhase + dt / gaitDur) % 1
+
+    let wIdle: number
+    let wRun: number
+    let wSprint: number
+    if (level <= 1) {
+      wIdle = 1 - level
+      wRun = level
+      wSprint = 0
+    } else {
+      wIdle = 0
+      wRun = 2 - level
+      wSprint = level - 1
+    }
+
+    const e = this.strafeEntries
+    e[0].name = this.clips.idle
+    e[0].time = this.idleTime
+    e[0].weight = wIdle
+    e[1].name = runA.clip
+    e[1].time = this.gaitPhase * runDur
+    e[1].weight = wRun * (1 - runT)
+    e[2].name = runB.clip
+    e[2].time = this.gaitPhase * runDur
+    e[2].weight = wRun * runT
+    e[3].name = sprintA.clip
+    e[3].time = this.gaitPhase * sprintDur
+    e[3].weight = wSprint * (1 - sprintT)
+    e[4].name = sprintB.clip
+    e[4].time = this.gaitPhase * sprintDur
+    e[4].weight = wSprint * sprintT
+    this.model.setBlendPose(e)
+
+    const ry = this.yaw + this.yawOffset
+    const half = ry * 0.5
+    this.rotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
+    this.pose.yaw = this.yaw
+    this.pose.speedLevel = level
     return this.pose
   }
 }

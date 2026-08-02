@@ -106,6 +106,13 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
       "尾",
       "套", // 外套 (coat), 手套 (gloves)
       "腿", // 腿环 (leg ring/garter) and other leg-wear accessories
+      "带", // straps and bands: 头带/发带/背带/腰带
+      "绳", // ropes: 背绳/腰绳
+      "纱", // gauze/veils: 头纱
+      "肩布", // shoulder cloth/drape
+      "背球", // back ornament sphere
+      "腰花", // waist flower
+      "花蕊", // flower pistil ornament
       "skirt",
       "dress",
       "ribbon",

@@ -313,6 +313,21 @@ export class Model {
   private morphTrackIndices: Map<string, number> = new Map()
   private lastAppliedClip: AnimationClip | null = null
 
+  // One-shot action layer: plays a clip ONCE over whatever else drives the pose
+  // (locomotion blend, a playing clip, a crossfade, or rest), with fade-in/out
+  // envelopes — the background keeps advancing and is what the fade-out returns to.
+  private oneShot: {
+    name: string
+    time: number
+    duration: number
+    fadeIn: number
+    fadeOut: number
+    cancelW: number
+    cancelling: boolean
+    onEnd: (() => void) | null
+  } | null = null
+  private readonly oneShotEntries: BlendEntry[] = []
+
   // Blended pose: declarative N-clip mix (setBlendPose) or a running crossfade.
   // Cursor caches are per clip so sampling several clips in one frame doesn't
   // thrash the single-clip caches above; WeakMap so removed clips can collect.
@@ -1329,6 +1344,7 @@ export class Model {
     }
     this.blendEntries = null
     this.crossfade = null
+    this.oneShot = null
     this.resetAllBones()
     this.resetAllMorphs()
     return this.animationState.play(name, options)
@@ -1337,6 +1353,7 @@ export class Model {
   show(name: string): void {
     this.blendEntries = null
     this.crossfade = null
+    this.oneShot = null
     this.resetAllBones()
     this.resetAllMorphs()
     this.animationState.show(name)
@@ -1357,6 +1374,37 @@ export class Model {
     this.blendEntries = null
   }
 
+  /** Play a clip ONCE over whatever currently drives the pose — the locomotion blend,
+   *  a playing clip, a crossfade, or rest. The background keeps advancing underneath;
+   *  fade-in ramps the one-shot over it and fade-out returns to whatever the
+   *  background is doing by then. Replaces any active one-shot immediately. */
+  playOneShot(name: string, options?: { fadeIn?: number; fadeOut?: number; onEnd?: () => void }): boolean {
+    const clip = this.animationState.getAnimationClip(name)
+    if (!clip || clip.frameCount <= 0 || !Number.isFinite(clip.frameCount)) return false
+    const duration = clip.frameCount / FPS
+    const fadeIn = Math.max(0, options?.fadeIn ?? 0.15)
+    const fadeOut = Math.max(0, Math.min(options?.fadeOut ?? 0.25, duration))
+    this.oneShot = { name, time: 0, duration, fadeIn, fadeOut, cancelW: 1, cancelling: false, onEnd: options?.onEnd ?? null }
+    this.clipApplySuspended = false
+    return true
+  }
+
+  /** Fade the active one-shot out early over `fadeOut` seconds (default 0.2). */
+  cancelOneShot(fadeOut = 0.2): void {
+    if (!this.oneShot) return
+    if (fadeOut <= 0) {
+      this.oneShot = null
+      return
+    }
+    this.oneShot.cancelling = true
+    this.oneShot.fadeOut = fadeOut
+  }
+
+  /** Name of the active one-shot, or null. */
+  getOneShot(): string | null {
+    return this.oneShot?.name ?? null
+  }
+
   /** Fade from the currently playing clip (or from the rest pose when nothing plays)
    *  into `name` over `seconds`. The target starts at frame 0 and becomes the current
    *  clip immediately — progress, looping and the camera clock report the target for
@@ -1364,6 +1412,7 @@ export class Model {
   crossfadeTo(name: string, seconds: number, options?: { loop?: boolean }): boolean {
     if (!this.animationState.hasAnimation(name)) return false
     this.blendEntries = null
+    this.oneShot = null
     this.clipApplySuspended = false
 
     const fromName = this.animationState.getCurrentAnimation()
@@ -1397,6 +1446,7 @@ export class Model {
   stop(): void {
     this.blendEntries = null
     this.crossfade = null
+    this.oneShot = null
     this.animationState.stop()
   }
 
@@ -1411,6 +1461,7 @@ export class Model {
   clearAnimation(): void {
     this.blendEntries = null
     this.crossfade = null
+    this.oneShot = null
     this.animationState.clear()
   }
 
@@ -1727,6 +1778,59 @@ export class Model {
     }
   }
 
+  /** One one-shot step: weight envelope from fade-in/out (easeInOut-shaped), the
+   *  background entries scaled by 1-w underneath, the one-shot clip at w on top. */
+  private applyOneShot(deltaTime: number): void {
+    const os = this.oneShot
+    if (os === null) return
+    os.time += deltaTime
+
+    // Envelope: min of the fade-in ramp and the fade-out ramp (or the cancel ramp).
+    const wIn = os.fadeIn > 0 ? Math.min(1, os.time / os.fadeIn) : 1
+    let wOut = 1
+    if (os.cancelling) {
+      os.cancelW -= deltaTime / os.fadeOut
+      wOut = Math.max(0, os.cancelW)
+    } else if (os.fadeOut > 0) {
+      wOut = Math.max(0, Math.min(1, (os.duration - os.time) / os.fadeOut))
+    }
+    const w = easeInOut(Math.min(wIn, wOut))
+
+    // Background entries at (1 - w): the still-advancing blend, the current clip, or
+    // nothing (rest fill). Copied into a pooled array — never scale caller-owned weights.
+    const pool = this.oneShotEntries
+    let n = 0
+    const put = (name: string, time: number, weight: number) => {
+      if (pool.length <= n) pool.push({ name: "", time: 0, weight: 0 })
+      const e = pool[n++]
+      e.name = name
+      e.time = time
+      e.weight = weight
+    }
+    const bg = 1 - w
+    if (bg > 1e-6) {
+      if (this.blendEntries !== null && this.blendEntries.length > 0) {
+        for (const e of this.blendEntries) put(e.name, e.time, e.weight * bg)
+      } else {
+        const clip = this.animationState.getCurrentClip()
+        const name = this.animationState.getCurrentAnimation()
+        if (clip !== null && name !== null && name !== os.name) {
+          put(name, this.animationState.getCurrentFrame() / FPS, bg)
+        }
+        // else: rest pose fills the remainder inside applyBlendedPose
+      }
+    }
+    put(os.name, Math.min(os.time, os.duration), w)
+    for (let i = n; i < pool.length; i++) pool[i].weight = 0
+    this.applyBlendedPose(pool)
+
+    if (os.time >= os.duration || (os.cancelling && os.cancelW <= 0)) {
+      const onEnd = os.onEnd
+      this.oneShot = null
+      onEnd?.()
+    }
+  }
+
   /** One crossfade step: advance the outgoing clock (the target's clock lives in
    *  animationState, already ticked by update), shape the weight with easeInOut,
    *  and hand both to the blend sampler. Holds in place while paused. */
@@ -1781,7 +1885,9 @@ export class Model {
 
     this.animationState.update(deltaTime)
     if (!this.clipApplySuspended) {
-      if (this.blendEntries !== null && this.blendEntries.length > 0) {
+      if (this.oneShot !== null) {
+        this.applyOneShot(deltaTime)
+      } else if (this.blendEntries !== null && this.blendEntries.length > 0) {
         this.applyBlendedPose(this.blendEntries)
       } else if (this.crossfade !== null) {
         this.applyCrossfade(deltaTime)
