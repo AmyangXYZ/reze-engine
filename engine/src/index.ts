@@ -53,7 +53,7 @@ export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 export { EYE_GRAPH } from "./graph/presets/eye"
 export { FACE_GRAPH } from "./graph/presets/face"
 export { Model } from "./model"
-export { Vec3, Quat, Mat4 } from "./math"
+export { Vec3, Quat, Mat4, easeInOut, type EulerOrder } from "./math"
 export type {
   AnimationClip,
   AnimationPlayOptions,
@@ -64,7 +64,12 @@ export type {
   BoneInterpolation,
   ControlPoint,
 } from "./animation"
-export { FPS } from "./animation"
+export {
+  FPS,
+  bezierInterpolate,
+  interpolateControlPoints,
+  rawInterpolationToBoneInterpolation,
+} from "./animation"
 export { VMDLoader, type CameraKeyframe, type IkFrame } from "./vmd-loader"
 export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"

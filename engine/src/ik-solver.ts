@@ -1,6 +1,6 @@
 // IK solver (MMD-style; see Saba MMDIkSolver.cpp)
 
-import { Mat4, Quat, Vec3 } from "./math"
+import { Mat4, Quat, Vec3, type EulerOrder } from "./math"
 import { Bone, IKLink, IKSolver, IKChainInfo } from "./model"
 
 // Callback type for updating world matrix (provided by model to handle append transformations)
@@ -79,7 +79,6 @@ const _ikVec: Vec3[] = [
   new Vec3(0, 0, 0), new Vec3(0, 0, 0), new Vec3(0, 0, 0), new Vec3(0, 0, 0),
 ]
 const _ikQuat: Quat[] = [
-  new Quat(0, 0, 0, 1), new Quat(0, 0, 0, 1), new Quat(0, 0, 0, 1),
   new Quat(0, 0, 0, 1), new Quat(0, 0, 0, 1), new Quat(0, 0, 0, 1),
 ]
 const _ikMat: Float32Array[] = [
@@ -215,7 +214,7 @@ export class IKSolverSystem {
     //   _ikVec[0]=chainPos, [1]=ikPos, [2]=targetPos, [3]=chainTargetVec, [4]=chainIkVec,
     //           [5]=rotAxis, [6]=finalAxis, [7]=eulerTmp, [8]=limitedEuler
     //   _ikMat[0]=parentRot, [1]=invParentRot, [2]=quatToMatTmp
-    //   _ikQuat[0]=ikRotation, [1]=combinedRot, [2]=localRotConj, [3..5]=axisAngleTmp
+    //   _ikQuat[0]=ikRotation, [1]=combinedRot, [2]=localRotConj
 
     const chainPos = Vec3.setFromMat4Translation(worldMatrices[chainBoneIndex].values, _ikVec[0])
     const ikPos = Vec3.setFromMat4Translation(worldMatrices[ikBoneIndex].values, _ikVec[1])
@@ -340,16 +339,8 @@ export class IKSolverSystem {
     return Math.sqrt(dx * dx + dy * dy + dz * dz)
   }
 
-  // Euler axis triples for each rotation order (indexed by order enum).
-  // Reused to avoid allocations in reconstructQuatFromEulerInto.
-  private static readonly EULER_AXES: readonly [number, number, number][][] = [
-    // YXZ: Y, X, Z
-    [[0, 1, 0], [1, 0, 0], [0, 0, 1]],
-    // ZYX: Z, Y, X
-    [[0, 0, 1], [0, 1, 0], [1, 0, 0]],
-    // XZY: X, Z, Y
-    [[1, 0, 0], [0, 0, 1], [0, 1, 0]],
-  ]
+  // Maps InternalEulerRotationOrder to the shared math-layer order names.
+  private static readonly EULER_ORDER_NAMES: readonly EulerOrder[] = ["YXZ", "ZYX", "XZY"]
 
   private static extractEulerAnglesInto(quat: Quat, order: InternalEulerRotationOrder, out: Vec3): void {
     Mat4.fromQuatInto(quat.x, quat.y, quat.z, quat.w, _ikMat[2], 0)
@@ -396,27 +387,7 @@ export class IKSolverSystem {
   }
 
   private static reconstructQuatFromEulerInto(euler: Vec3, order: InternalEulerRotationOrder, out: Quat): void {
-    const axes = this.EULER_AXES[order]
-    const a1 = axes[0], a2 = axes[1], a3 = axes[2]
-    const ang1 =
-      order === InternalEulerRotationOrder.YXZ ? euler.y
-      : order === InternalEulerRotationOrder.ZYX ? euler.z
-      : euler.x
-    const ang2 =
-      order === InternalEulerRotationOrder.YXZ ? euler.x
-      : order === InternalEulerRotationOrder.ZYX ? euler.y
-      : euler.z
-    const ang3 =
-      order === InternalEulerRotationOrder.YXZ ? euler.z
-      : order === InternalEulerRotationOrder.ZYX ? euler.x
-      : euler.y
-
-    // result = axisAngle(a1, ang1); then *= axisAngle(a2, ang2); then *= axisAngle(a3, ang3)
-    Quat.fromAxisAngleInto(a1[0], a1[1], a1[2], ang1, out)
-    Quat.fromAxisAngleInto(a2[0], a2[1], a2[2], ang2, _ikQuat[3])
-    Quat.multiplyInto(out, _ikQuat[3], out)
-    Quat.fromAxisAngleInto(a3[0], a3[1], a3[2], ang3, _ikQuat[3])
-    Quat.multiplyInto(out, _ikQuat[3], out)
+    Quat.fromEulerOrderInto(euler.x, euler.y, euler.z, this.EULER_ORDER_NAMES[order], out)
   }
 
   // Write parent's world rotation (translation stripped) into out Float32Array.

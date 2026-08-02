@@ -3,6 +3,10 @@ export function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2
 }
 
+// Euler rotation order, read as intrinsic axes left to right:
+// "YXZ" = rotate about Y, then local X, then local Z (equals extrinsic ZXY — the MMD/PMX convention).
+export type EulerOrder = "XYZ" | "XZY" | "YXZ" | "YZX" | "ZXY" | "ZYX"
+
 export class Vec3 {
   x: number
   y: number
@@ -111,6 +115,18 @@ export class Vec3 {
     out.y = m[1] * nx + m[5] * ny + m[9] * nz
     out.z = m[2] * nx + m[6] * ny + m[10] * nz
     return out
+  }
+
+  // out = (x, y, -z): right-handed Y-up ↔ left-handed Y-up (involutive). Safe when out === v.
+  static mirrorZInto(v: Vec3, out: Vec3): Vec3 {
+    out.x = v.x
+    out.y = v.y
+    out.z = -v.z
+    return out
+  }
+
+  static mirrorZ(v: Vec3): Vec3 {
+    return new Vec3(v.x, v.y, -v.z)
   }
 
   // In-place normalize returning length squared info via Vec3. Alias for normalize() but explicit.
@@ -332,6 +348,328 @@ export class Quat {
     const z = cy * cx * sz - sy * sx * cz
 
     return new Quat(x, y, z, w).normalize()
+  }
+
+  // 4D dot product. Negative means a and b are on opposite hemispheres (same rotation
+  // when |dot| ≈ 1 either way — quaternion double cover).
+  static dot(a: Quat, b: Quat): number {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+  }
+
+  // Rotation angle between a and b in radians, insensitive to double cover.
+  static angleTo(a: Quat, b: Quat): number {
+    const d = Math.abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+    return 2 * Math.acos(Math.min(1, d))
+  }
+
+  // out = conjugate of q (inverse for unit quaternions), without mutating q. Safe when out === q.
+  static conjugateInto(q: Quat, out: Quat): Quat {
+    out.x = -q.x
+    out.y = -q.y
+    out.z = -q.z
+    out.w = q.w
+    return out
+  }
+
+  // out = normalized lerp from a to b, taking the shorter path (negates b when dot < 0).
+  // Cheaper than slerp; non-constant angular velocity. Safe when out === a or out === b.
+  static nlerpInto(a: Quat, b: Quat, t: number, out: Quat): Quat {
+    const d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+    const s = d < 0 ? -1 : 1
+    const x = a.x + (b.x * s - a.x) * t
+    const y = a.y + (b.y * s - a.y) * t
+    const z = a.z + (b.z * s - a.z) * t
+    const w = a.w + (b.w * s - a.w) * t
+    const invLen = 1 / Math.hypot(x, y, z, w)
+    out.x = x * invLen
+    out.y = y * invLen
+    out.z = z * invLen
+    out.w = w * invLen
+    return out
+  }
+
+  static nlerp(a: Quat, b: Quat, t: number): Quat {
+    return Quat.nlerpInto(a, b, t, new Quat(0, 0, 0, 1))
+  }
+
+  // out = v rotated by unit quaternion q (no matrix, no allocation). Safe when out === v.
+  static rotateVecInto(q: Quat, v: Vec3, out: Vec3): Vec3 {
+    // v' = v + 2*qw*(qv × v) + 2*(qv × (qv × v))
+    const qx = q.x, qy = q.y, qz = q.z, qw = q.w
+    const vx = v.x, vy = v.y, vz = v.z
+    // t = 2 * (qv × v)
+    const tx = 2 * (qy * vz - qz * vy)
+    const ty = 2 * (qz * vx - qx * vz)
+    const tz = 2 * (qx * vy - qy * vx)
+    out.x = vx + qw * tx + qy * tz - qz * ty
+    out.y = vy + qw * ty + qz * tx - qx * tz
+    out.z = vz + qw * tz + qx * ty - qy * tx
+    return out
+  }
+
+  static rotateVec(q: Quat, v: Vec3): Vec3 {
+    return Quat.rotateVecInto(q, v, new Vec3(0, 0, 0))
+  }
+
+  // out = v rotated by the inverse (conjugate) of unit quaternion q. Safe when out === v.
+  static rotateVecInvInto(q: Quat, v: Vec3, out: Vec3): Vec3 {
+    const qx = -q.x, qy = -q.y, qz = -q.z, qw = q.w
+    const vx = v.x, vy = v.y, vz = v.z
+    const tx = 2 * (qy * vz - qz * vy)
+    const ty = 2 * (qz * vx - qx * vz)
+    const tz = 2 * (qx * vy - qy * vx)
+    out.x = vx + qw * tx + qy * tz - qz * ty
+    out.y = vy + qw * ty + qz * tx - qx * tz
+    out.z = vz + qw * tz + qx * ty - qy * tx
+    return out
+  }
+
+  static rotateVecInv(q: Quat, v: Vec3): Vec3 {
+    return Quat.rotateVecInvInto(q, v, new Vec3(0, 0, 0))
+  }
+
+  // out = shortest-arc rotation taking unit vector `from` to unit vector `to`.
+  // Matches Babylon's FromUnitVectorsToRef exactly, including the near-antiparallel
+  // branch (w = 1 + dot < 0.001 → 180° about a perpendicular picked the same way).
+  static fromUnitVectorsInto(from: Vec3, to: Vec3, out: Quat): Quat {
+    const r = from.x * to.x + from.y * to.y + from.z * to.z + 1
+    if (r < 0.001) {
+      if (Math.abs(from.x) > Math.abs(from.z)) {
+        out.setXYZW(-from.y, from.x, 0, 0)
+      } else {
+        out.setXYZW(0, -from.z, from.y, 0)
+      }
+    } else {
+      // q = (from × to, 1 + from·to)
+      out.setXYZW(
+        from.y * to.z - from.z * to.y,
+        from.z * to.x - from.x * to.z,
+        from.x * to.y - from.y * to.x,
+        r
+      )
+    }
+    const invLen = 1 / Math.sqrt(out.x * out.x + out.y * out.y + out.z * out.z + out.w * out.w)
+    out.setXYZW(out.x * invLen, out.y * invLen, out.z * invLen, out.w * invLen)
+    return out
+  }
+
+  static fromUnitVectors(from: Vec3, to: Vec3): Quat {
+    return Quat.fromUnitVectorsInto(from, to, new Quat(0, 0, 0, 1))
+  }
+
+  // out = rotation taking the standard basis onto the orthonormal axes x, y, z
+  // (the columns of the column-major rotation matrix): rotateVec(out, (1,0,0)) = x, etc.
+  static fromBasisInto(x: Vec3, y: Vec3, z: Vec3, out: Quat): Quat {
+    // Shepperd's method on the 3x3 with columns x, y, z.
+    const m00 = x.x, m01 = x.y, m02 = x.z
+    const m10 = y.x, m11 = y.y, m12 = y.z
+    const m20 = z.x, m21 = z.y, m22 = z.z
+    const trace = m00 + m11 + m22
+    if (trace > 0) {
+      const s = 0.5 / Math.sqrt(trace + 1)
+      out.setXYZW((m12 - m21) * s, (m20 - m02) * s, (m01 - m10) * s, 0.25 / s)
+    } else if (m00 > m11 && m00 > m22) {
+      const s = 2 * Math.sqrt(1 + m00 - m11 - m22)
+      out.setXYZW(0.25 * s, (m10 + m01) / s, (m20 + m02) / s, (m12 - m21) / s)
+    } else if (m11 > m22) {
+      const s = 2 * Math.sqrt(1 + m11 - m00 - m22)
+      out.setXYZW((m10 + m01) / s, 0.25 * s, (m21 + m12) / s, (m20 - m02) / s)
+    } else {
+      const s = 2 * Math.sqrt(1 + m22 - m00 - m11)
+      out.setXYZW((m20 + m02) / s, (m21 + m12) / s, 0.25 * s, (m01 - m10) / s)
+    }
+    return out
+  }
+
+  static fromBasis(x: Vec3, y: Vec3, z: Vec3): Quat {
+    return Quat.fromBasisInto(x, y, z, new Quat(0, 0, 0, 1))
+  }
+
+  // out = twist component of q around unit axis `a`, so that q = swing · twist
+  // (swing = Quat.multiply(q, conjugate(twist))). Singular when q is ~180° about an
+  // axis perpendicular to `a` — returns identity there.
+  static twistAroundAxisInto(q: Quat, a: Vec3, out: Quat): Quat {
+    const d = q.x * a.x + q.y * a.y + q.z * a.z
+    const px = a.x * d
+    const py = a.y * d
+    const pz = a.z * d
+    const len = Math.sqrt(px * px + py * py + pz * pz + q.w * q.w)
+    if (len < 1e-8) {
+      out.setIdentity()
+      return out
+    }
+    out.setXYZW(px / len, py / len, pz / len, q.w / len)
+    return out
+  }
+
+  static twistAroundAxis(q: Quat, a: Vec3): Quat {
+    return Quat.twistAroundAxisInto(q, a, new Quat(0, 0, 0, 1))
+  }
+
+  // out = orientation looking along `forward` (mapped to local +Z, the engine's LH forward)
+  // with local +Y toward `up`. Falls back to a reference up when forward ∥ up.
+  static lookRotationInto(forward: Vec3, up: Vec3, out: Quat): Quat {
+    let zx = forward.x, zy = forward.y, zz = forward.z
+    const zl = Math.sqrt(zx * zx + zy * zy + zz * zz)
+    if (zl === 0) return out.setIdentity()
+    const zi = 1 / zl
+    zx *= zi; zy *= zi; zz *= zi
+    // x = up × z
+    let xx = up.y * zz - up.z * zy
+    let xy = up.z * zx - up.x * zz
+    let xz = up.x * zy - up.y * zx
+    let xl = Math.sqrt(xx * xx + xy * xy + xz * xz)
+    if (xl < 1e-8) {
+      // forward ∥ up: substitute a reference up not parallel to forward
+      const uy = Math.abs(zy) < 0.99 ? 1 : 0
+      const ux = 1 - uy
+      xx = uy * zz
+      xy = -ux * zz
+      xz = ux * zy - uy * zx
+      xl = Math.sqrt(xx * xx + xy * xy + xz * xz)
+    }
+    const xi = 1 / xl
+    xx *= xi; xy *= xi; xz *= xi
+    // y = z × x (unit: z ⊥ x)
+    const yx = zy * xz - zz * xy
+    const yy = zz * xx - zx * xz
+    const yz = zx * xy - zy * xx
+    _lookX.setXYZ(xx, xy, xz)
+    _lookY.setXYZ(yx, yy, yz)
+    _lookZ.setXYZ(zx, zy, zz)
+    return Quat.fromBasisInto(_lookX, _lookY, _lookZ, out)
+  }
+
+  static lookRotation(forward: Vec3, up: Vec3): Quat {
+    return Quat.lookRotationInto(forward, up, new Quat(0, 0, 0, 1))
+  }
+
+  // out = q with the Z axis mirrored: right-handed Y-up ↔ left-handed Y-up
+  // (conjugation by the Z-mirror; involutive). Pairs with Vec3.mirrorZInto. Safe when out === q.
+  static mirrorZInto(q: Quat, out: Quat): Quat {
+    out.x = -q.x
+    out.y = -q.y
+    out.z = q.z
+    out.w = q.w
+    return out
+  }
+
+  static mirrorZ(q: Quat): Quat {
+    return new Quat(-q.x, -q.y, q.z, q.w)
+  }
+
+  // out = quaternion from euler angles (radians) applied in the given intrinsic order.
+  // fromEulerOrderInto(x, y, z, "YXZ", out) matches Quat.fromEuler (the MMD/PMX convention).
+  static fromEulerOrderInto(x: number, y: number, z: number, order: EulerOrder, out: Quat): Quat {
+    out.setIdentity()
+    for (let i = 0; i < 3; i++) {
+      const axis = order.charCodeAt(i) - 88 // "X" → 0, "Y" → 1, "Z" → 2
+      const angle = axis === 0 ? x : axis === 1 ? y : z
+      const half = angle * 0.5
+      const s = Math.sin(half)
+      const c = Math.cos(half)
+      const ax = out.x, ay = out.y, az = out.z, aw = out.w
+      if (axis === 0) {
+        out.x = aw * s + ax * c
+        out.y = ay * c + az * s
+        out.z = az * c - ay * s
+        out.w = aw * c - ax * s
+      } else if (axis === 1) {
+        out.x = ax * c - az * s
+        out.y = aw * s + ay * c
+        out.z = az * c + ax * s
+        out.w = aw * c - ay * s
+      } else {
+        out.x = ax * c + ay * s
+        out.y = ay * c - ax * s
+        out.z = aw * s + az * c
+        out.w = aw * c - az * s
+      }
+    }
+    return out
+  }
+
+  static fromEulerOrder(x: number, y: number, z: number, order: EulerOrder): Quat {
+    return Quat.fromEulerOrderInto(x, y, z, order, new Quat(0, 0, 0, 1))
+  }
+
+  // Extract euler angles (radians) in the given intrinsic order into out (out.x/y/z = rotation
+  // about X/Y/Z). At gimbal lock (middle angle ±90°) the split between first and third angle is
+  // ambiguous; the third is set to 0.
+  static toEulerOrderInto(q: Quat, order: EulerOrder, out: Vec3): Vec3 {
+    Mat4.fromQuatInto(q.x, q.y, q.z, q.w, _eulerMat, 0)
+    const m = _eulerMat
+    const m11 = m[0], m12 = m[4], m13 = m[8]
+    const m21 = m[1], m22 = m[5], m23 = m[9]
+    const m31 = m[2], m32 = m[6], m33 = m[10]
+    const clamp = (v: number) => (v < -1 ? -1 : v > 1 ? 1 : v)
+    switch (order) {
+      case "XYZ":
+        out.y = Math.asin(clamp(m13))
+        if (Math.abs(m13) < 0.9999999) {
+          out.x = Math.atan2(-m23, m33)
+          out.z = Math.atan2(-m12, m11)
+        } else {
+          out.x = Math.atan2(m32, m22)
+          out.z = 0
+        }
+        break
+      case "YXZ":
+        out.x = Math.asin(-clamp(m23))
+        if (Math.abs(m23) < 0.9999999) {
+          out.y = Math.atan2(m13, m33)
+          out.z = Math.atan2(m21, m22)
+        } else {
+          out.y = Math.atan2(-m31, m11)
+          out.z = 0
+        }
+        break
+      case "ZXY":
+        out.x = Math.asin(clamp(m32))
+        if (Math.abs(m32) < 0.9999999) {
+          out.y = Math.atan2(-m31, m33)
+          out.z = Math.atan2(-m12, m22)
+        } else {
+          out.y = 0
+          out.z = Math.atan2(m21, m11)
+        }
+        break
+      case "ZYX":
+        out.y = Math.asin(-clamp(m31))
+        if (Math.abs(m31) < 0.9999999) {
+          out.x = Math.atan2(m32, m33)
+          out.z = Math.atan2(m21, m11)
+        } else {
+          out.x = 0
+          out.z = Math.atan2(-m12, m22)
+        }
+        break
+      case "YZX":
+        out.z = Math.asin(clamp(m21))
+        if (Math.abs(m21) < 0.9999999) {
+          out.x = Math.atan2(-m23, m22)
+          out.y = Math.atan2(-m31, m11)
+        } else {
+          out.x = 0
+          out.y = Math.atan2(m13, m33)
+        }
+        break
+      case "XZY":
+        out.z = Math.asin(-clamp(m12))
+        if (Math.abs(m12) < 0.9999999) {
+          out.x = Math.atan2(m32, m22)
+          out.y = Math.atan2(m13, m11)
+        } else {
+          out.x = Math.atan2(-m23, m33)
+          out.y = 0
+        }
+        break
+    }
+    return out
+  }
+
+  static toEulerOrder(q: Quat, order: EulerOrder): Vec3 {
+    return Quat.toEulerOrderInto(q, order, new Vec3(0, 0, 0))
   }
 }
 
@@ -836,6 +1174,13 @@ export class Mat4 {
     return new Mat4(out)
   }
 }
+
+// Module-private scratch for Quat.toEulerOrderInto / lookRotationInto (never handed out,
+// so no cross-call stomping with the public pools below).
+const _eulerMat = new Float32Array(16)
+const _lookX = new Vec3(0, 0, 0)
+const _lookY = new Vec3(0, 0, 0)
+const _lookZ = new Vec3(0, 0, 0)
 
 // Preallocated scratch instances for hot paths. Each subsystem should use its own
 // slot to avoid cross-call stomping. Bump the count if more call sites need scratch.
