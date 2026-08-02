@@ -11,38 +11,63 @@ const VMD_BASE = "/unity-fbx-locomotion/vmd"
 // Input keys the demo cares about — everything else never touches state.
 const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight"])
 
-function KeyButton({
-  code,
-  label,
-  active,
-  wide,
-  onPress,
-}: {
-  code: string
-  label: string
-  active: boolean
-  wide?: boolean
-  onPress: (code: string, on: boolean) => void
-}) {
+/** Stick travel radius in px; drag past SPRINT_AT of it to sprint. */
+const STICK_RADIUS = 52
+const SPRINT_AT = 0.92
+
+/** Mobile-game movement wheel. Reports {x, y (up = +forward), active} through a ref
+ *  callback; the knob is moved via direct DOM transform so dragging never re-renders. */
+function VirtualStick({ onChange }: { onChange: (x: number, y: number, active: boolean) => void }) {
+  const baseRef = useRef<HTMLDivElement>(null)
+  const knobRef = useRef<HTMLDivElement>(null)
+  const pointerId = useRef<number | null>(null)
+
+  const move = (clientX: number, clientY: number) => {
+    const base = baseRef.current
+    const knob = knobRef.current
+    if (!base || !knob) return
+    const rect = base.getBoundingClientRect()
+    let dx = clientX - (rect.left + rect.width / 2)
+    let dy = clientY - (rect.top + rect.height / 2)
+    const len = Math.hypot(dx, dy)
+    if (len > STICK_RADIUS) {
+      dx *= STICK_RADIUS / len
+      dy *= STICK_RADIUS / len
+    }
+    knob.style.transform = `translate(${dx}px, ${dy}px)`
+    onChange(dx / STICK_RADIUS, -dy / STICK_RADIUS, true)
+  }
+
+  const release = () => {
+    pointerId.current = null
+    if (knobRef.current) knobRef.current.style.transform = "translate(0px, 0px)"
+    onChange(0, 0, false)
+  }
+
   return (
-    <button
-      className={`${wide ? "w-40 h-10 text-xs tracking-[0.2em]" : "w-12 h-12 text-sm"} flex items-center justify-center rounded-xl border font-mono font-semibold select-none touch-none transition-all duration-75 ${
-        active
-          ? "bg-white/90 text-black border-white scale-95 shadow-[0_0_20px_rgba(255,255,255,0.45)]"
-          : "bg-white/5 text-white/75 border-white/15 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.15),0_2px_10px_rgba(0,0,0,0.35)]"
-      }`}
+    <div
+      ref={baseRef}
+      className="relative w-36 h-36 rounded-full border-2 border-white/35 bg-white/[0.03] backdrop-blur-[2px] touch-none select-none"
       onPointerDown={(e) => {
         e.preventDefault()
         e.currentTarget.setPointerCapture(e.pointerId)
-        onPress(code, true)
+        pointerId.current = e.pointerId
+        move(e.clientX, e.clientY)
       }}
-      onPointerUp={() => onPress(code, false)}
-      onPointerCancel={() => onPress(code, false)}
+      onPointerMove={(e) => {
+        if (pointerId.current === e.pointerId) move(e.clientX, e.clientY)
+      }}
+      onPointerUp={release}
+      onPointerCancel={release}
       onContextMenu={(e) => e.preventDefault()}
-      aria-label={label}
     >
-      {label}
-    </button>
+      {/* inner ring, like the classic wheel */}
+      <div className="absolute inset-0 m-auto w-16 h-16 rounded-full border border-white/30 pointer-events-none" />
+      <div
+        ref={knobRef}
+        className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-white/25 border-2 border-white/60 shadow-[0_0_12px_rgba(255,255,255,0.25)] pointer-events-none"
+      />
+    </div>
   )
 }
 
@@ -50,19 +75,15 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<Engine | null>(null)
   const keysRef = useRef<Set<string>>(new Set())
+  const stickRef = useRef({ x: 0, y: 0, active: false })
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
-  const [pressed, setPressed] = useState<ReadonlySet<string>>(new Set())
 
-  // One entry point for keyboard and on-screen buttons: the render loop reads
-  // keysRef; `pressed` mirrors it for the button highlights.
-  const press = useCallback((code: string, on: boolean) => {
-    const keys = keysRef.current
-    if (on === keys.has(code)) return
-    if (on) keys.add(code)
-    else keys.delete(code)
-    setPressed(new Set(keys))
+  const onStick = useCallback((x: number, y: number, active: boolean) => {
+    stickRef.current.x = x
+    stickRef.current.y = y
+    stickRef.current.active = active
   }, [])
 
   const initEngine = useCallback(async () => {
@@ -111,18 +132,30 @@ export default function Home() {
         last = now
 
         // Camera-relative controls, FPS-style: the mouse orbits the view and thereby
-        // steers the run — W is always away from the camera, D is screen-right.
-        // Orbit eye sits at target + r·(sinα, ·, cosα), so screen-forward is
-        // (-sinα, -cosα) and screen-right is (-cosα, sinα).
+        // steers the run — up is always away from the camera, right is screen-right.
+        // The wheel gives analog direction/magnitude (rim = sprint); WASD + Shift
+        // feed the same vector. Orbit eye sits at target + r·(sinα, ·, cosα), so
+        // screen-forward is (-sinα, -cosα) and screen-right is (-cosα, sinα).
         const keys = keysRef.current
-        const rawX = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0)
-        const rawY = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0)
+        const stick = stickRef.current
+        let rawX: number
+        let rawY: number
+        let sprint: boolean
+        if (stick.active) {
+          rawX = stick.x
+          rawY = stick.y
+          sprint = Math.hypot(stick.x, stick.y) > SPRINT_AT
+        } else {
+          rawX = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0)
+          rawY = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0)
+          sprint = keys.has("ShiftLeft") || keys.has("ShiftRight")
+        }
         const alpha = engine.getCameraAlpha()
         const sinA = Math.sin(alpha)
         const cosA = Math.cos(alpha)
         const x = rawX * -cosA + rawY * -sinA
         const y = rawX * sinA + rawY * -cosA
-        controller.setMove(x, y, keys.has("ShiftLeft") || keys.has("ShiftRight"))
+        controller.setMove(x, y, sprint)
         const pose = controller.update(dt)
         engine.setModelTransform(MODEL_ID, { position: pose.position, rotation: pose.rotation })
 
@@ -153,14 +186,13 @@ export default function Home() {
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      if (INPUT_CODES.has(e.code)) press(e.code, true)
+      if (INPUT_CODES.has(e.code)) keysRef.current.add(e.code)
     }
     const up = (e: KeyboardEvent) => {
-      if (INPUT_CODES.has(e.code)) press(e.code, false)
+      keysRef.current.delete(e.code)
     }
     const blur = () => {
       keysRef.current.clear()
-      setPressed(new Set())
     }
     window.addEventListener("keydown", down)
     window.addEventListener("keyup", up)
@@ -170,7 +202,7 @@ export default function Home() {
       window.removeEventListener("keyup", up)
       window.removeEventListener("blur", blur)
     }
-  }, [press])
+  }, [])
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
@@ -186,21 +218,8 @@ export default function Home() {
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none pointer-events-auto z-1" />
 
       {!loading && !engineError && (
-        // Mobile-wheel position: 20% in from the left and bottom edges.
-        <div className="absolute bottom-24 left-48 z-[60] pointer-events-auto flex flex-col items-center gap-2">
-          <KeyButton code="KeyW" label="W" active={pressed.has("KeyW")} onPress={press} />
-          <div className="flex gap-2">
-            <KeyButton code="KeyA" label="A" active={pressed.has("KeyA")} onPress={press} />
-            <KeyButton code="KeyS" label="S" active={pressed.has("KeyS")} onPress={press} />
-            <KeyButton code="KeyD" label="D" active={pressed.has("KeyD")} onPress={press} />
-          </div>
-          <KeyButton
-            code="ShiftLeft"
-            label="SHIFT"
-            wide
-            active={pressed.has("ShiftLeft") || pressed.has("ShiftRight")}
-            onPress={press}
-          />
+        <div className="absolute bottom-24 left-48 z-[60] pointer-events-auto">
+          <VirtualStick onChange={onStick} />
         </div>
       )}
     </div>
