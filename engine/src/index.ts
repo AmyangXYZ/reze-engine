@@ -58,6 +58,7 @@ export type {
   AnimationClip,
   AnimationPlayOptions,
   AnimationProgress,
+  BlendEntry,
   BoneKeyframe,
   IkKeyframe,
   MorphKeyframe,
@@ -65,11 +66,19 @@ export type {
   ControlPoint,
 } from "./animation"
 export {
+  LocomotionController,
+  type LocomotionClips,
+  type LocomotionOptions,
+  type LocomotionPose,
+} from "./locomotion"
+export {
   FPS,
   bezierInterpolate,
   interpolateControlPoints,
   rawInterpolationToBoneInterpolation,
 } from "./animation"
 export { VMDLoader, type CameraKeyframe, type IkFrame } from "./vmd-loader"
+export { VMDWriter } from "./vmd-writer"
+export { PmxLoader } from "./pmx-loader"
 export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"

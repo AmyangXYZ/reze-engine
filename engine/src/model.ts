@@ -1,4 +1,4 @@
-import { Mat4, Quat, Vec3, scratchMat4Values, scratchQuat } from "./math"
+import { Mat4, Quat, Vec3, easeInOut, scratchMat4Values, scratchQuat } from "./math"
 import { Engine } from "./engine"
 import { joinAssetPath, type AssetReader } from "./asset-reader"
 import { Rigidbody, Joint } from "./physics"
@@ -10,8 +10,10 @@ import {
   AnimationPlayOptions,
   AnimationProgress,
   AnimationState,
+  BlendEntry,
   BoneInterpolation,
   BoneKeyframe,
+  FPS,
   IkKeyframe,
   MorphKeyframe,
   interpolateControlPoints,
@@ -27,6 +29,13 @@ const _animSlerp = new Quat(0, 0, 0, 1)
 const _animInterpT = new Vec3(0, 0, 0)
 const _convOut = new Vec3(0, 0, 0)
 const _convMat = new Float32Array(16)
+// Blend-path scratch: per-entry sample target and the crossfade's two fixed entries.
+const _blendQ = new Quat(0, 0, 0, 1)
+const _blendT = new Vec3(0, 0, 0)
+const _fadeEntries: BlendEntry[] = [
+  { name: "", time: 0, weight: 0 },
+  { name: "", time: 0, weight: 0 },
+]
 
 export interface Texture {
   path: string
@@ -303,6 +312,23 @@ export class Model {
   private boneTrackIndices: Map<string, number> = new Map()
   private morphTrackIndices: Map<string, number> = new Map()
   private lastAppliedClip: AnimationClip | null = null
+
+  // Blended pose: declarative N-clip mix (setBlendPose) or a running crossfade.
+  // Cursor caches are per clip so sampling several clips in one frame doesn't
+  // thrash the single-clip caches above; WeakMap so removed clips can collect.
+  private blendEntries: BlendEntry[] | null = null
+  private crossfade: { fromName: string | null; fromFrame: number; fromLoop: boolean; elapsed: number; duration: number } | null = null
+  private readonly blendBoneCursors = new WeakMap<AnimationClip, Map<string, number>>()
+  private readonly blendMorphCursors = new WeakMap<AnimationClip, Map<string, number>>()
+  // Per-bone accumulators (lazy — sized to the skeleton on first blend). Generation
+  // marks avoid a clear pass: a slot is live this frame only when gen matches.
+  private blendRotAcc: Quat[] | null = null
+  private blendTransAcc: Vec3[] | null = null
+  private blendWeightAcc: Float32Array | null = null
+  private blendBoneGen: Int32Array | null = null
+  private blendMorphAcc: Float32Array | null = null
+  private blendMorphGen: Int32Array | null = null
+  private blendGenCounter = 0
 
   private assetReader: AssetReader | null = null
   private assetBasePath = ""
@@ -672,6 +698,21 @@ export class Model {
   // Non-fatal PMX parse problems (truncated sections, suspicious counts…).
   getLoadWarnings(): readonly string[] {
     return this.loadWarnings
+  }
+
+  /** Post-pose local rotation offsets by bone index (see setBoneRotationOffset). */
+  private readonly boneRotationOffsets = new Map<number, Quat>()
+
+  /** Compose a constant local rotation onto a bone AFTER every pose source (clip,
+   *  blend, tween) each frame — the classic MMD "heel correction": pitch the 足首
+   *  bones so a motion authored for flat shoes grounds a heeled model. Persists
+   *  across play()/show(); pass null to clear. */
+  setBoneRotationOffset(boneName: string, rotation: Quat | null): boolean {
+    const idx = this.runtimeSkeleton.nameIndex[boneName]
+    if (idx === undefined || idx < 0) return false
+    if (rotation === null) this.boneRotationOffsets.delete(idx)
+    else this.boneRotationOffsets.set(idx, rotation.clone())
+    return true
   }
 
   getRigidbodies(): Rigidbody[] {
@@ -1282,18 +1323,61 @@ export class Model {
   play(name?: string, options?: AnimationPlayOptions): void | boolean {
     this.clipApplySuspended = false
     if (name === undefined) {
+      // Resume: a paused crossfade continues from where it held.
       this.animationState.play()
       return
     }
+    this.blendEntries = null
+    this.crossfade = null
     this.resetAllBones()
     this.resetAllMorphs()
     return this.animationState.play(name, options)
   }
 
   show(name: string): void {
+    this.blendEntries = null
+    this.crossfade = null
     this.resetAllBones()
     this.resetAllMorphs()
     this.animationState.show(name)
+  }
+
+  /** Drive the pose from N weighted clips; the caller owns every clock (see BlendEntry).
+   *  The entries array is held by reference and read each update, so a per-frame driver
+   *  can mutate it in place without re-calling. Cleared by play(name)/show()/stop()/
+   *  clearAnimation()/crossfadeTo(). The single-clip player keeps ticking underneath
+   *  but stops writing the pose while a blend is set. */
+  setBlendPose(entries: BlendEntry[]): void {
+    this.blendEntries = entries
+    this.crossfade = null
+    this.clipApplySuspended = false
+  }
+
+  clearBlendPose(): void {
+    this.blendEntries = null
+  }
+
+  /** Fade from the currently playing clip (or from the rest pose when nothing plays)
+   *  into `name` over `seconds`. The target starts at frame 0 and becomes the current
+   *  clip immediately — progress, looping and the camera clock report the target for
+   *  the whole fade. Bones only the outgoing clip animates ease back to rest. */
+  crossfadeTo(name: string, seconds: number, options?: { loop?: boolean }): boolean {
+    if (!this.animationState.hasAnimation(name)) return false
+    this.blendEntries = null
+    this.clipApplySuspended = false
+
+    const fromName = this.animationState.getCurrentAnimation()
+    const fromFrame = this.animationState.getCurrentFrame()
+    const fromLoop = this.animationState.getProgress().looping
+    this.animationState.forcePlay(name, options?.loop ?? false)
+
+    // Fading a clip into itself has no second pose to hold — just restart.
+    if (seconds <= 0 || fromName === name) {
+      this.crossfade = null
+      return true
+    }
+    this.crossfade = { fromName, fromFrame, fromLoop, elapsed: 0, duration: seconds }
+    return true
   }
 
   // @deprecated Use model.play()
@@ -1311,6 +1395,8 @@ export class Model {
   }
 
   stop(): void {
+    this.blendEntries = null
+    this.crossfade = null
     this.animationState.stop()
   }
 
@@ -1323,12 +1409,15 @@ export class Model {
    *  pose is no longer re-applied each frame afterwards — follow with
    *  resetAllBones()/resetAllMorphs() to return to the bind pose. */
   clearAnimation(): void {
+    this.blendEntries = null
+    this.crossfade = null
     this.animationState.clear()
   }
 
   // Seek by absolute timeline seconds, not frame index.
   seek(seconds: number): void {
     this.clipApplySuspended = false
+    this.crossfade = null // a timeline jump mid-fade snaps to the target clip
     this.animationState.seek(seconds)
   }
 
@@ -1401,6 +1490,73 @@ export class Model {
     }
   }
 
+  /** Sample one bone track at `frame` into outRot + outVmdTrans. The translation is
+   *  VMD-space (bind-relative), NOT yet converted to bone-local — callers convert with
+   *  convertVMDTranslationToLocal once they know the final rotation. The cursor cache
+   *  belongs to the caller (single-clip path vs per-clip blend caches). Returns false
+   *  for an empty track. */
+  private sampleBoneTrackInto(
+    boneName: string,
+    keyFrames: BoneKeyframe[],
+    frame: number,
+    cursors: Map<string, number>,
+    outRot: Quat,
+    outVmdTrans: Vec3
+  ): boolean {
+    if (keyFrames.length === 0) return false
+
+    const cachedIdx = cursors.get(boneName) ?? -1
+    const clampedFrame = Math.max(keyFrames[0].frame, Math.min(keyFrames[keyFrames.length - 1].frame, frame))
+    const idx = this.findKeyframeIndex(clampedFrame, keyFrames, cachedIdx)
+    if (idx < 0) return false
+    cursors.set(boneName, idx)
+
+    const frameA = keyFrames[idx]
+    const frameB = keyFrames[idx + 1]
+
+    if (!frameB) {
+      outRot.set(frameA.rotation)
+      outVmdTrans.set(frameA.translation)
+    } else {
+      const frameDelta = frameB.frame - frameA.frame
+      const gradient = frameDelta > 0 ? (clampedFrame - frameA.frame) / frameDelta : 0
+      const interp = frameB.interpolation
+
+      const rotT = interpolateControlPoints(interp.rotation, gradient)
+      Quat.slerpInto(frameA.rotation, frameB.rotation, rotT, outRot)
+
+      const txWeight = interpolateControlPoints(interp.translationX, gradient)
+      const tyWeight = interpolateControlPoints(interp.translationY, gradient)
+      const tzWeight = interpolateControlPoints(interp.translationZ, gradient)
+
+      outVmdTrans.setXYZ(
+        frameA.translation.x + (frameB.translation.x - frameA.translation.x) * txWeight,
+        frameA.translation.y + (frameB.translation.y - frameA.translation.y) * tyWeight,
+        frameA.translation.z + (frameB.translation.z - frameA.translation.z) * tzWeight
+      )
+    }
+    return true
+  }
+
+  /** Sample one morph track at `frame` (linear weight lerp). Returns NaN for an empty track. */
+  private sampleMorphTrack(morphName: string, keyFrames: MorphKeyframe[], frame: number, cursors: Map<string, number>): number {
+    if (keyFrames.length === 0) return NaN
+
+    const cachedIdx = cursors.get(morphName) ?? -1
+    const clampedFrame = Math.max(keyFrames[0].frame, Math.min(keyFrames[keyFrames.length - 1].frame, frame))
+    const idx = this.findKeyframeIndex(clampedFrame, keyFrames, cachedIdx)
+    if (idx < 0) return NaN
+    cursors.set(morphName, idx)
+
+    const frameA = keyFrames[idx]
+    const frameB = keyFrames[idx + 1]
+    return frameB
+      ? frameA.weight +
+      (frameB.weight - frameA.weight) *
+      (frameB.frame > frameA.frame ? (clampedFrame - frameA.frame) / (frameB.frame - frameA.frame) : 0)
+      : frameA.weight
+  }
+
   private applyPoseFromClip(clip: AnimationClip | null, frame: number): void {
     if (!clip) return
     this.applyIkFromClip(clip, frame)
@@ -1411,83 +1567,204 @@ export class Model {
     }
 
     for (const [boneName, keyFrames] of clip.boneTracks.entries()) {
-      if (keyFrames.length === 0) continue
-
-      const cachedIdx = this.boneTrackIndices.get(boneName) ?? -1
-      const clampedFrame = Math.max(keyFrames[0].frame, Math.min(keyFrames[keyFrames.length - 1].frame, frame))
-      const idx = this.findKeyframeIndex(clampedFrame, keyFrames, cachedIdx)
-
-      if (idx < 0) continue
-
-      this.boneTrackIndices.set(boneName, idx)
-
-      const frameA = keyFrames[idx]
-      const frameB = keyFrames[idx + 1]
+      if (!this.sampleBoneTrackInto(boneName, keyFrames, frame, this.boneTrackIndices, _animSlerp, _animInterpT)) continue
 
       const boneIdx = this.runtimeSkeleton.nameIndex[boneName]
       if (boneIdx === undefined) continue
 
-      const localRot = this.runtimeSkeleton.localRotations[boneIdx]
-      const localTrans = this.runtimeSkeleton.localTranslations[boneIdx]
-
-      if (!frameB) {
-        const frameRotation = frameA.rotation
-        localRot.set(frameRotation)
-        const localTranslation = this.convertVMDTranslationToLocal(boneIdx, frameA.translation, frameRotation)
-        localTrans.set(localTranslation)
-      } else {
-        const frameDelta = frameB.frame - frameA.frame
-        const gradient = frameDelta > 0 ? (clampedFrame - frameA.frame) / frameDelta : 0
-        const interp = frameB.interpolation
-
-        const rotT = interpolateControlPoints(interp.rotation, gradient)
-        const rotation = Quat.slerpInto(frameA.rotation, frameB.rotation, rotT, _animSlerp)
-
-        const txWeight = interpolateControlPoints(interp.translationX, gradient)
-        const tyWeight = interpolateControlPoints(interp.translationY, gradient)
-        const tzWeight = interpolateControlPoints(interp.translationZ, gradient)
-
-        const interpolatedVMDTranslation = _animInterpT.setXYZ(
-          frameA.translation.x + (frameB.translation.x - frameA.translation.x) * txWeight,
-          frameA.translation.y + (frameB.translation.y - frameA.translation.y) * tyWeight,
-          frameA.translation.z + (frameB.translation.z - frameA.translation.z) * tzWeight
-        )
-
-        const localTranslation = this.convertVMDTranslationToLocal(boneIdx, interpolatedVMDTranslation, rotation)
-
-        localRot.set(rotation)
-        localTrans.set(localTranslation)
-      }
+      const localTranslation = this.convertVMDTranslationToLocal(boneIdx, _animInterpT, _animSlerp)
+      this.runtimeSkeleton.localRotations[boneIdx].set(_animSlerp)
+      this.runtimeSkeleton.localTranslations[boneIdx].set(localTranslation)
     }
 
     for (const [morphName, keyFrames] of clip.morphTracks.entries()) {
-      if (keyFrames.length === 0) continue
-
-      const cachedIdx = this.morphTrackIndices.get(morphName) ?? -1
-      const clampedFrame = Math.max(keyFrames[0].frame, Math.min(keyFrames[keyFrames.length - 1].frame, frame))
-      const idx = this.findKeyframeIndex(clampedFrame, keyFrames, cachedIdx)
-
-      if (idx < 0) continue
-
-      this.morphTrackIndices.set(morphName, idx)
-
-      const frameA = keyFrames[idx]
-      const frameB = keyFrames[idx + 1]
+      const weight = this.sampleMorphTrack(morphName, keyFrames, frame, this.morphTrackIndices)
+      if (Number.isNaN(weight)) continue
 
       const morphIdx = this.runtimeMorph.nameIndex[morphName]
       if (morphIdx === undefined) continue
 
-      const weight = frameB
-        ? frameA.weight +
-        (frameB.weight - frameA.weight) *
-        (keyFrames[idx + 1].frame > keyFrames[idx].frame
-          ? (clampedFrame - keyFrames[idx].frame) / (keyFrames[idx + 1].frame - keyFrames[idx].frame)
-          : 0)
-        : frameA.weight
-
       this.runtimeMorph.weights[morphIdx] = weight
       this.morphsDirty = true // Mark as dirty when animation sets morph weights
     }
+  }
+
+  /** Weighted N-clip pose blend. Rotations accumulate by hemisphere-aligned weighted
+   *  sum then normalize (nlerp generalized to N inputs); VMD-space translations lerp.
+   *  A bone missing from a clip contributes that clip's share of the REST pose, so a
+   *  weight sum below 1 fades toward rest — that is also how crossfading from "no
+   *  clip" works. IK on/off state follows the highest-weight entry. */
+  private applyBlendedPose(entries: BlendEntry[]): void {
+    // Resolve entries; find the total weight and the dominant entry (drives IK state).
+    let total = 0
+    let live = 0
+    let domClip: AnimationClip | null = null
+    let domFrame = 0
+    let domWeight = 0
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]
+      if (!(e.weight > 1e-6)) continue
+      const clip = this.animationState.getAnimationClip(e.name)
+      if (!clip) continue
+      total += e.weight
+      live++
+      if (e.weight > domWeight) {
+        domWeight = e.weight
+        domClip = clip
+        domFrame = e.time * FPS
+      }
+    }
+    if (live === 0 || domClip === null) return
+    // A sum above 1 normalizes; below 1 stays — the remainder is the rest pose's share.
+    const norm = total > 1 ? 1 / total : 1
+
+    this.applyIkFromClip(domClip, domFrame)
+
+    if (this.blendRotAcc === null) {
+      const boneCount = this.runtimeSkeleton.localRotations.length
+      this.blendRotAcc = Array.from({ length: boneCount }, () => new Quat(0, 0, 0, 0))
+      this.blendTransAcc = Array.from({ length: boneCount }, () => new Vec3(0, 0, 0))
+      this.blendWeightAcc = new Float32Array(boneCount)
+      this.blendBoneGen = new Int32Array(boneCount).fill(-1)
+      this.blendMorphAcc = new Float32Array(this.runtimeMorph.weights.length)
+      this.blendMorphGen = new Int32Array(this.runtimeMorph.weights.length).fill(-1)
+    }
+    const rotAcc = this.blendRotAcc
+    const transAcc = this.blendTransAcc!
+    const weightAcc = this.blendWeightAcc!
+    const boneGen = this.blendBoneGen!
+    const morphAcc = this.blendMorphAcc!
+    const morphGen = this.blendMorphGen!
+    const gen = ++this.blendGenCounter
+
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]
+      if (!(e.weight > 1e-6)) continue
+      const clip = this.animationState.getAnimationClip(e.name)
+      if (!clip) continue
+      const w = e.weight * norm
+      const frame = e.time * FPS
+
+      let cursors = this.blendBoneCursors.get(clip)
+      if (!cursors) {
+        cursors = new Map()
+        this.blendBoneCursors.set(clip, cursors)
+      }
+      for (const [boneName, keyFrames] of clip.boneTracks.entries()) {
+        if (!this.sampleBoneTrackInto(boneName, keyFrames, frame, cursors, _blendQ, _blendT)) continue
+        const boneIdx = this.runtimeSkeleton.nameIndex[boneName]
+        if (boneIdx === undefined) continue
+
+        const r = rotAcc[boneIdx]
+        const t = transAcc[boneIdx]
+        if (boneGen[boneIdx] !== gen) {
+          boneGen[boneIdx] = gen
+          r.setXYZW(_blendQ.x * w, _blendQ.y * w, _blendQ.z * w, _blendQ.w * w)
+          t.setXYZ(_blendT.x * w, _blendT.y * w, _blendT.z * w)
+          weightAcc[boneIdx] = w
+        } else {
+          // Hemisphere-align this sample against the accumulated sum before adding.
+          const d = r.x * _blendQ.x + r.y * _blendQ.y + r.z * _blendQ.z + r.w * _blendQ.w
+          const s = d < 0 ? -w : w
+          r.x += _blendQ.x * s
+          r.y += _blendQ.y * s
+          r.z += _blendQ.z * s
+          r.w += _blendQ.w * s
+          t.x += _blendT.x * w
+          t.y += _blendT.y * w
+          t.z += _blendT.z * w
+          weightAcc[boneIdx] += w
+        }
+      }
+
+      let morphCursors = this.blendMorphCursors.get(clip)
+      if (!morphCursors) {
+        morphCursors = new Map()
+        this.blendMorphCursors.set(clip, morphCursors)
+      }
+      for (const [morphName, keyFrames] of clip.morphTracks.entries()) {
+        const weight = this.sampleMorphTrack(morphName, keyFrames, frame, morphCursors)
+        if (Number.isNaN(weight)) continue
+        const morphIdx = this.runtimeMorph.nameIndex[morphName]
+        if (morphIdx === undefined) continue
+        if (morphGen[morphIdx] !== gen) {
+          morphGen[morphIdx] = gen
+          morphAcc[morphIdx] = weight * w
+        } else {
+          morphAcc[morphIdx] += weight * w
+        }
+      }
+    }
+
+    // Finalize touched bones: fold the rest-pose remainder in, normalize, convert.
+    const boneCount = rotAcc.length
+    for (let i = 0; i < boneCount; i++) {
+      if (boneGen[i] !== gen) continue
+      const r = rotAcc[i]
+      const wSum = weightAcc[i]
+      if (wSum < 1) {
+        // Rest local rotation is identity (0,0,0,1); translation contribution is zero.
+        const rest = 1 - wSum
+        r.w += r.w < 0 ? -rest : rest
+      }
+      const len = Math.sqrt(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w)
+      if (len > 1e-8) {
+        const inv = 1 / len
+        _blendQ.setXYZW(r.x * inv, r.y * inv, r.z * inv, r.w * inv)
+      } else {
+        _blendQ.setIdentity()
+      }
+      const localTranslation = this.convertVMDTranslationToLocal(i, transAcc[i], _blendQ)
+      this.runtimeSkeleton.localRotations[i].set(_blendQ)
+      this.runtimeSkeleton.localTranslations[i].set(localTranslation)
+    }
+
+    const morphCount = morphAcc.length
+    for (let i = 0; i < morphCount; i++) {
+      if (morphGen[i] !== gen) continue
+      this.runtimeMorph.weights[i] = morphAcc[i]
+      this.morphsDirty = true
+    }
+  }
+
+  /** One crossfade step: advance the outgoing clock (the target's clock lives in
+   *  animationState, already ticked by update), shape the weight with easeInOut,
+   *  and hand both to the blend sampler. Holds in place while paused. */
+  private applyCrossfade(deltaTime: number): void {
+    const fade = this.crossfade
+    if (fade === null) return
+    const playing = this.animationState.getProgress().playing
+
+    if (playing) {
+      fade.elapsed += deltaTime
+      if (fade.fromName !== null) {
+        const fromClip = this.animationState.getAnimationClip(fade.fromName)
+        if (fromClip && fromClip.frameCount > 0 && Number.isFinite(fromClip.frameCount)) {
+          fade.fromFrame += deltaTime * FPS
+          if (fade.fromLoop) {
+            while (fade.fromFrame >= fromClip.frameCount) fade.fromFrame -= fromClip.frameCount
+          } else if (fade.fromFrame > fromClip.frameCount) {
+            fade.fromFrame = fromClip.frameCount
+          }
+        } else {
+          fade.fromName = null // outgoing clip was removed mid-fade: fade from rest
+        }
+      }
+    }
+
+    const t = fade.duration > 0 ? Math.min(1, fade.elapsed / fade.duration) : 1
+    const w = easeInOut(t)
+    const toName = this.animationState.getCurrentAnimation()
+
+    _fadeEntries[0].name = toName ?? ""
+    _fadeEntries[0].time = this.animationState.getCurrentFrame() / FPS
+    _fadeEntries[0].weight = toName !== null ? w : 0
+    _fadeEntries[1].name = fade.fromName ?? ""
+    _fadeEntries[1].time = fade.fromFrame / FPS
+    _fadeEntries[1].weight = fade.fromName !== null ? 1 - w : 0
+    this.applyBlendedPose(_fadeEntries)
+
+    if (t >= 1) this.crossfade = null
   }
 
   // Returns true when morphs changed (vertex buffer may need upload). `ikEnabled`
@@ -1503,10 +1780,22 @@ export class Model {
     const tweensChangedMorphs = this.updateTweens()
 
     this.animationState.update(deltaTime)
-    const clip = this.animationState.getCurrentClip()
-    const frame = this.animationState.getCurrentFrame()
-    if (clip !== null && !this.clipApplySuspended) {
-      this.applyPoseFromClip(clip, frame)
+    if (!this.clipApplySuspended) {
+      if (this.blendEntries !== null && this.blendEntries.length > 0) {
+        this.applyBlendedPose(this.blendEntries)
+      } else if (this.crossfade !== null) {
+        this.applyCrossfade(deltaTime)
+      } else {
+        const clip = this.animationState.getCurrentClip()
+        if (clip !== null) this.applyPoseFromClip(clip, this.animationState.getCurrentFrame())
+      }
+    }
+
+    // Constant per-bone offsets compose after every pose source, before the
+    // world/IK passes (ankle offsets survive IK — the solver moves thigh/knee).
+    for (const [idx, offset] of this.boneRotationOffsets) {
+      const r = this.runtimeSkeleton.localRotations[idx]
+      Quat.multiplyInto(r, offset, r)
     }
 
     // Apply morphs if tweens changed morphs or animation changed morphs

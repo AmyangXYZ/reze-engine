@@ -3628,14 +3628,40 @@ export class Engine {
    *  frustum onto an otherwise empty floor. */
   private shadowMapPopulated = true
   private shadowLightVPDirty = true
+  // Last shadow-volume center, to skip recomputes while nothing moves.
+  private readonly shadowCenter = new Vec3(0, 11, 0)
+
   private updateShadowLightVP() {
-    if (!this.shadowLightVPDirty) return
+    // The 64×64-unit volume follows the camera target so a character carried far
+    // from the origin by code-driven root motion stays inside the lit frustum.
+    const t = this.camera.target
+    const moved =
+      Math.abs(t.x - this.shadowCenter.x) > 1e-3 ||
+      Math.abs(t.y - this.shadowCenter.y) > 1e-3 ||
+      Math.abs(t.z - this.shadowCenter.z) > 1e-3
+    if (!this.shadowLightVPDirty && !moved) return
     this.shadowLightVPDirty = false
+    this.shadowCenter.setXYZ(t.x, t.y, t.z)
+
     const dir = new Vec3(this.sun.direction.x, this.sun.direction.y, this.sun.direction.z)
     dir.normalize()
-    const target = new Vec3(0, 11, 0)
-    const eye = new Vec3(target.x - dir.x * 72, target.y - dir.y * 72, target.z - dir.z * 72)
     const up = Math.abs(dir.y) > 0.99 ? new Vec3(0, 0, -1) : new Vec3(0, 1, 0)
+
+    // Snap the center to shadow-map texels in the light's right/up plane so the
+    // moving volume doesn't shimmer the shadow edges while running.
+    const right = Vec3.crossInto(up, dir, new Vec3(0, 0, 0)).normalize()
+    const upv = Vec3.crossInto(dir, right, new Vec3(0, 0, 0))
+    const texel = 64 / Engine.SHADOW_MAP_SIZE
+    const tr = Math.round(t.dot(right) / texel) * texel
+    const tu = Math.round(t.dot(upv) / texel) * texel
+    const td = t.dot(dir)
+    const target = new Vec3(
+      right.x * tr + upv.x * tu + dir.x * td,
+      right.y * tr + upv.y * tu + dir.y * td,
+      right.z * tr + upv.z * tu + dir.z * td
+    )
+
+    const eye = new Vec3(target.x - dir.x * 72, target.y - dir.y * 72, target.z - dir.z * 72)
     const view = Mat4.lookAt(eye, target, up)
     const proj = Mat4.orthographicLh(-32, 32, -32, 32, 1, 140)
     const vp = proj.multiply(view)
@@ -4589,12 +4615,24 @@ export class Engine {
     if (hasModels) {
       this.updateInstances(deltaTime)
       this.updateSkinMatrices()
-      // Update camera target from bound model (bone not found → 0,0,0 + offset)
+      // Update camera target from bound model. Bone world matrices are model-space,
+      // so compose the scene placement (setModelTransform) — otherwise the camera
+      // ignores a moved/rotated model (code-driven root motion). Bone not found →
+      // follow the model root itself.
       if (this.cameraTargetModel) {
-        const pos = this.cameraTargetModel.getBoneWorldPosition(this.cameraTargetBoneName)
-        const px = pos?.x ?? 0
-        const py = pos?.y ?? 0
-        const pz = pos?.z ?? 0
+        const m = this.cameraTargetModel
+        const pos = m.getBoneWorldPosition(this.cameraTargetBoneName)
+        let px = m.position.x
+        let py = m.position.y
+        let pz = m.position.z
+        if (pos) {
+          const s = m.scale
+          pos.setXYZ(pos.x * s, pos.y * s, pos.z * s)
+          Quat.rotateVecInto(m.rotation, pos, pos)
+          px += pos.x
+          py += pos.y
+          pz += pos.z
+        }
         this.camera.target.x = px + this.cameraTargetOffset.x
         this.camera.target.y = py + this.cameraTargetOffset.y
         this.camera.target.z = pz + this.cameraTargetOffset.z

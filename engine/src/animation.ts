@@ -61,6 +61,17 @@ export interface AnimationProgress {
 
 export const FPS = 30
 
+/** One weighted contribution to a blended pose (see Model.setBlendPose). */
+export interface BlendEntry {
+  /** Name of a clip previously loaded with loadVmd/loadClip. */
+  name: string
+  /** Clip-local time in seconds. The caller owns the clock — wrap or clamp before passing. */
+  time: number
+  /** Relative weight >= 0. Entries are normalized over their sum; a sum below 1 is
+   *  NOT renormalized — the remainder blends toward the rest pose. */
+  weight: number
+}
+
 interface QueuedAnimationRequest {
   name: string
   priority: number
@@ -145,6 +156,21 @@ export class AnimationState {
     this.currentAnimationName = name
     this.currentFrame = 0
     this.currentPriority = priority
+    this.currentLoop = loop
+    this.isPlaying = true
+    this.isPaused = false
+    this.nextAnimation = null
+    return true
+  }
+
+  /** Make `name` current at frame 0 and play it, bypassing priority arbitration.
+   *  Used by crossfadeTo, which owns the transition and must not be queued behind
+   *  the clip it is fading away from. */
+  forcePlay(name: string, loop: boolean): boolean {
+    if (!this.animations.has(name)) return false
+    this.currentAnimationName = name
+    this.currentFrame = 0
+    this.currentPriority = 0
     this.currentLoop = loop
     this.isPlaying = true
     this.isPaused = false
