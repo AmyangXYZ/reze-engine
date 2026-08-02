@@ -21,3 +21,6 @@ graph_traces.txt
 trace_graphs.py
 scripts/dump_material_graphs.py
 scripts/dump_scene_world.py
+# Commercial Unity animation pack — raw FBX sources are never committed/redistributed.
+# The converted VMDs (vmd/) ship with the demo; regenerate via reze-rig's fbx2vmd.
+web/public/unity-fbx-locomotion/Animations/
