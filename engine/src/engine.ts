@@ -385,7 +385,8 @@ interface DrawCall {
   // Present only for material draw calls (opaque/transparent) — the grouping walk skips
   // any draw call without it.
   baseBindGroupEntries?: GPUBindGroupEntry[]
-  /** Material draws only: false = excluded from the shadow map (fully sheer). */
+  /** Material draws only: false = excluded from the shadow map (PMX cast-shadow
+   *  flag off). Sheer texels are cut per fragment by the shadow pass's alpha test. */
   castsShadow?: boolean
   /** Edge-flagged materials: interleaved inverted-hull outline drawn right after
    *  this material with the outline pipeline. Shares this call's index range;
@@ -490,7 +491,7 @@ function buildAlphaSampler(
  *  neither fully opaque nor fully cut out (alpha in ~0.03..0.97). Together
  *   Bucketing itself is binary (babylon-mmd parity): ANY translucent coverage
  *  routes to the alpha-blend bucket. `avg` below this threshold additionally
- *  marks a material as fully sheer (a veil), which vetoes shadow casting. */
+ *  marks a material as fully sheer (a veil). */
 const SHEER_ALPHA_THRESHOLD = 0.7
 function materialAlphaStats(
   verts: Float32Array,
@@ -1770,6 +1771,7 @@ export class Engine {
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
       ],
     })
     const shadowShader = this.device.createShaderModule({
@@ -1778,8 +1780,13 @@ export class Engine {
     })
     this.shadowDepthPipeline = this.device.createRenderPipeline({
       label: "shadow depth pipeline",
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [shadowBindGroupLayout] }),
+      // Group 1 is the main pass's per-material layout so each shadow draw can
+      // rebind the draw call's existing material bind group for the alpha test.
+      layout: this.device.createPipelineLayout({
+        bindGroupLayouts: [shadowBindGroupLayout, this.mainPerMaterialBindGroupLayout],
+      }),
       vertex: { module: shadowShader, entryPoint: "vs", buffers: fullVertexBuffers as GPUVertexBufferLayout[] },
+      fragment: { module: shadowShader, entryPoint: "fs", targets: [] },
       primitive: { cullMode: "none" },
       depthStencil: {
         format: "depth32float",
@@ -3357,6 +3364,7 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 1, resource: { buffer: skinMatrixBuffer } },
+        { binding: 2, resource: this.materialSampler },
       ],
     })
 
@@ -3687,9 +3695,12 @@ export class Engine {
       // only guards against centroid-sampling noise on genuinely solid cloth.
       const sheer = stats.avg < SHEER_ALPHA_THRESHOLD
       const isTransparent = materialAlpha < 1.0 - 0.001 || sheer || stats.translucentFrac > 0.02
-      // Shadow casting: the PMX author's own flag (bit 0x04, cast self-shadow),
-      // still vetoed for fully sheer cloth — a veil must not cast a solid sheet.
-      const castsShadow = (mat.edgeFlag & 0x04) !== 0 && !sheer
+      // Shadow casting: the PMX author's own flag (bit 0x04, cast self-shadow) —
+      // exactly what MMD honors. Sheerness is handled per texel by the shadow
+      // pass's alpha test, not by a per-material veto: a threshold on avg alpha
+      // misclassified fully-worn opaque dresses (avg 0.69) as veils and stripped
+      // their shadows, while any lower cliff would strand the next model.
+      const castsShadow = (mat.edgeFlag & 0x04) !== 0
       // Load-time classification log — one line per material, cheap and
       // invaluable when a model renders wrong (bucket/outline/shadow disputes).
       console.info(
@@ -4726,7 +4737,9 @@ export class Engine {
     sp.setVertexBuffer(2, inst.weightsBuffer)
     sp.setIndexBuffer(inst.indexBuffer, "uint32")
     for (const draw of inst.shadowDrawCalls) {
-      if (this.shouldRenderDrawCall(inst, draw)) sp.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      if (!this.shouldRenderDrawCall(inst, draw)) continue
+      sp.setBindGroup(1, draw.bindGroup)
+      sp.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
     }
   }
 
