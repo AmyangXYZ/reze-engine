@@ -33,64 +33,33 @@ export interface SixDofSpringConstraint {
   // positions and full-rate corrections chatter (see LOOP_ERP_SCALE).
   isLoop: boolean
 
-  // Per-substep cache. Filled by solver's setup pass once before SI iters,
+  // Per-substep solver cache lives in solver.ts' SolverCache (flat SoA typed
+  // arrays indexed by constraint slot) — see F_STRIDE layout there.
   // read by the velocity-only iter loop. None of these depend on lv/av — only
   // on pos/ori/inertia which are constant during solve.
-  cacheSkip: boolean              // both bodies static — skip entirely
-  cacheLeverA: Float32Array       // 3: rA = anchor − posA (world-space)
-  cacheLeverB: Float32Array       // 3
-  cacheLinAxes: Float32Array      // 9: 3 linear axes × xyz, world-space
-  cacheLinCrossA: Float32Array    // 9: I⁻¹A·(rA × ax) per axis
-  cacheLinCrossB: Float32Array    // 9: I⁻¹B·(rB × ax) per axis
-  cacheLinJacInv: Float32Array    // 3: 1/(im+im+cA²·ii+cB²·ii) per axis
   // Limit rows are unilateral (Bullet-style): the per-substep accumulated
   // impulse is clamped to the corrective sign, so a limit can push a body
   // back into range but never pull it deeper / brake its natural recovery —
   // bilateral limit rows act as motors and pump energy into swinging cloth.
-  cacheLinTargetVel: Float32Array // 3: limit ERP target, signed
-  cacheLinActive: Uint8Array      // 3
-  cacheLinLimitImp: Float32Array  // 3: accumulated limit impulse (per substep)
   // Spring rows are velocity-target drives; setup clamps k to the deadbeat
   // stability bound so they cannot pump energy. maxImp bounds the per-substep
   // accumulated impulse by the real spring force (k·|err|·dt) for rows that
   // must stay force-limited (loop-edge welds); Infinity for authored springs.
-  cacheLinSpringTarget: Float32Array // 3
-  cacheLinSpringMaxImp: Float32Array // 3
-  cacheLinSpringImp: Float32Array    // 3
-  cacheLinSpringActive: Uint8Array   // 3
-  cacheAngAxes: Float32Array      // 9 (spring rows)
-  cacheAngTargetVel: Float32Array // 3 (spring rows)
-  cacheAngActive: Uint8Array      // 3 (spring rows)
   // Per-axis angular Jacobians and tensor-multiplied axes: with full inertia
   // tensors the effective mass differs per axis, and impulse application
   // needs I⁻¹·axis per body.
-  cacheAngJacInv: Float32Array    // 3: 1/(axᵀ(I⁻¹A+I⁻¹B)ax) per axis
   // Angular spring force clamp (|k·err|·dt) + per-substep accumulator —
   // unclamped spring velocity-drives pump energy slowly (the restoring
   // magnitude on derived euler axes is orientation-dependent by up to ~25%,
   // and a mis-scaled oscillator restoring force injects per cycle).
-  cacheAngSpringMaxImp: Float32Array // 3
-  cacheAngSpringImp: Float32Array    // 3
-  cacheAngWA: Float32Array        // 9: I⁻¹A·axis per axis
-  cacheAngWB: Float32Array        // 9
   // Single geodesic limit row: shortest rotation from the current relative
   // orientation to the euler-clamped target. Per-axis euler limit rows are
   // geometrically inconsistent for large violations (asin singularity) and
   // pump energy instead of converging. Unilateral like the linear limits.
-  cacheAngLimAxis: Float32Array   // 3, world-space unit axis
-  cacheAngLimWA: Float32Array     // 3: I⁻¹A·axis
-  cacheAngLimWB: Float32Array     // 3
-  cacheAngLimJacInv: number
-  cacheAngLimTarget: number       // target relative angular velocity along axis
-  cacheAngLimActive: number
-  cacheAngLimImp: number          // accumulated impulse (per substep)
   // Per-axis angular limit rows for the small-violation regime. act:
   // 1 = bilateral (locked axis), 2 = unilateral stop (ranged axis) — a
   // bilateral row on a ranged axis brakes natural recovery and pumps
   // energy into swinging cloth.
-  cacheAngPATarget: Float32Array // 3
-  cacheAngPAActive: Uint8Array   // 3
-  cacheAngPAImp: Float32Array    // 3
 }
 
 // Stop-limit ERP. PMX rigs are tuned against MMD's stiff limit response;
@@ -173,38 +142,6 @@ export function buildConstraints(
       springStiffness,
       equilibriumPoint: new Float32Array(6),
       isLoop: false,
-      cacheSkip: false,
-      cacheLeverA: new Float32Array(3),
-      cacheLeverB: new Float32Array(3),
-      cacheLinAxes: new Float32Array(9),
-      cacheLinCrossA: new Float32Array(9),
-      cacheLinCrossB: new Float32Array(9),
-      cacheLinJacInv: new Float32Array(3),
-      cacheLinTargetVel: new Float32Array(3),
-      cacheLinActive: new Uint8Array(3),
-      cacheLinLimitImp: new Float32Array(3),
-      cacheLinSpringTarget: new Float32Array(3),
-      cacheLinSpringMaxImp: new Float32Array(3),
-      cacheLinSpringImp: new Float32Array(3),
-      cacheLinSpringActive: new Uint8Array(3),
-      cacheAngAxes: new Float32Array(9),
-      cacheAngTargetVel: new Float32Array(3),
-      cacheAngActive: new Uint8Array(3),
-      cacheAngJacInv: new Float32Array(3),
-      cacheAngSpringMaxImp: new Float32Array(3),
-      cacheAngSpringImp: new Float32Array(3),
-      cacheAngWA: new Float32Array(9),
-      cacheAngWB: new Float32Array(9),
-      cacheAngLimAxis: new Float32Array(3),
-      cacheAngLimWA: new Float32Array(3),
-      cacheAngLimWB: new Float32Array(3),
-      cacheAngLimJacInv: 0,
-      cacheAngLimTarget: 0,
-      cacheAngLimActive: 0,
-      cacheAngLimImp: 0,
-      cacheAngPATarget: new Float32Array(3),
-      cacheAngPAActive: new Uint8Array(3),
-      cacheAngPAImp: new Float32Array(3),
     })
   }
 

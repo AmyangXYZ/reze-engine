@@ -4,6 +4,7 @@ import { RigidbodyType, RigidbodyShape } from "./types"
 import { RigidBodyStore } from "./body"
 import { World } from "./world"
 import { buildConstraints, type SixDofSpringConstraint } from "./constraint"
+import { SolverCache } from "./solver"
 import { ContactPool } from "./contact"
 
 const _bodyMat = new Float32Array(16)
@@ -19,6 +20,7 @@ export class RezePhysics {
   private store: RigidBodyStore
   private world: World
   private constraints: SixDofSpringConstraint[]
+  private solverCache: SolverCache
   private contacts: ContactPool
   private firstFrame = true
   private timeAccum = 0
@@ -100,6 +102,7 @@ export class RezePhysics {
     this.store.groundIndex = gi
     this.world = new World(new Vec3(0, -98, 0))
     this.constraints = buildConstraints(rigidbodies, joints)
+    this.solverCache = new SolverCache(this.constraints)
     this.contacts = new ContactPool()
     this.prevPositions = new Float32Array(this.store.count * 3)
     this.prevOrientations = new Float32Array(this.store.count * 4)
@@ -256,7 +259,7 @@ export class RezePhysics {
       this.savePrevState()
       this.advanceKinematicToTargets(1 / (nSub - k))
       const tStep = performance.now()
-      this.world.step(this.store, this.constraints, this.contacts, this.fixedTimeStep)
+      this.world.step(this.store, this.constraints, this.solverCache, this.contacts, this.fixedTimeStep)
       this.stepCostEmaMs += (performance.now() - tStep - this.stepCostEmaMs) * 0.2
       this.restoreNonFiniteBodies()
       this.timeAccum -= this.fixedTimeStep

@@ -2,7 +2,7 @@ import { Vec3 } from "../math"
 import type { RigidBodyStore } from "./body"
 import { RigidbodyType } from "./types"
 import type { SixDofSpringConstraint } from "./constraint"
-import { solveConstraints } from "./solver"
+import { solveConstraints, type SolverCache } from "./solver"
 import { findContacts, type ContactPool } from "./contact"
 
 // World step: predict velocities → collide → solve → position correction →
@@ -30,7 +30,13 @@ export class World {
     this.gravity.z = g.z
   }
 
-  step(store: RigidBodyStore, constraints: SixDofSpringConstraint[], contacts: ContactPool, dt: number): void {
+  step(
+    store: RigidBodyStore,
+    constraints: SixDofSpringConstraint[],
+    cache: SolverCache,
+    contacts: ContactPool,
+    dt: number,
+  ): void {
     if (dt <= 0) return
 
     const N = store.count
@@ -79,7 +85,7 @@ export class World {
 
     // 3. Solve joint + contact constraints (velocity-only).
     if (constraints.length > 0 || contacts.count > 0) {
-      solveConstraints(store, constraints, contacts, dt, this.solverIterations)
+      solveConstraints(store, constraints, cache, contacts, dt, this.solverIterations)
     }
 
     // 4. Position correction (split impulse). Direct translation along the

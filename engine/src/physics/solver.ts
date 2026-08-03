@@ -73,6 +73,7 @@ const _quatScratchB = new Float32Array(4)
 export function solveConstraints(
   store: RigidBodyStore,
   constraints: SixDofSpringConstraint[],
+  cache: SolverCache,
   contacts: ContactPool,
   dt: number,
   iterations: number,
@@ -90,7 +91,7 @@ export function solveConstraints(
   const W = store.invInertiaWorld
 
   for (let c = 0; c < constraints.length; c++) {
-    setupConstraint(constraints[c], store, dt, invDt)
+    setupConstraint(constraints[c], c, cache, store, dt, invDt)
   }
   for (let ci = 0; ci < contacts.count; ci++) {
     setupContactRow(contacts.get(ci), lv, av, invMass, W)
@@ -98,10 +99,67 @@ export function solveConstraints(
 
   for (let iter = 0; iter < iterations; iter++) {
     for (let c = 0; c < constraints.length; c++) {
-      iterateConstraint(constraints[c], lv, av, invMass)
+      iterateConstraint(c, cache, lv, av, invMass)
     }
     for (let ci = 0; ci < contacts.count; ci++) {
       iterateContactRow(contacts.get(ci), lv, av, invMass)
+    }
+  }
+}
+
+// ── Flat solver cache (SoA) ──────────────────────────────────────────────────
+// One typed-array block instead of a dozen small Float32Arrays per constraint:
+// the 10-iteration hot loop walks memory linearly off a single base pointer
+// instead of pointer-chasing ~1000 scattered objects. Layout below mirrors the
+// old cache fields one-to-one; the math is untouched and bit-identical.
+const F_STRIDE = 108
+const LEVER_A = 0 // 3
+const LEVER_B = 3 // 3
+const LIN_AXES = 6 // 9
+const LIN_CA = 15 // 9
+const LIN_CB = 24 // 9
+const LIN_JAC = 33 // 3
+const LIN_TGT = 36 // 3
+const LIN_LIMIT_IMP = 39 // 3
+const LIN_SPR_TGT = 42 // 3
+const LIN_SPR_MAX = 45 // 3
+const LIN_SPR_IMP = 48 // 3
+const ANG_AXES = 51 // 9
+const ANG_TGT = 60 // 3
+const ANG_JAC = 63 // 3
+const ANG_SPR_MAX = 66 // 3
+const ANG_SPR_IMP = 69 // 3
+const ANG_WA = 72 // 9
+const ANG_WB = 81 // 9
+const ANG_LIM_AXIS = 90 // 3
+const ANG_LIM_WA = 93 // 3
+const ANG_LIM_WB = 96 // 3
+const ANG_PA_TGT = 99 // 3
+const ANG_PA_IMP = 102 // 3
+const I_STRIDE = 16
+const I_BODY_A = 0
+const I_BODY_B = 1
+const I_SKIP = 2
+const I_LIN_ACT = 3 // 3
+const I_LIN_SPR_ACT = 6 // 3
+const I_ANG_ACT = 9 // 3
+const I_ANG_PA_ACT = 12 // 3
+const I_ANG_LIM_ACT = 15
+
+export class SolverCache {
+  readonly F: Float32Array
+  readonly I: Int32Array
+  /** f64 lane for the geodesic row's scalars — they were plain number fields,
+   *  and demoting them to f32 would break bit-identical results. */
+  readonly D: Float64Array
+  constructor(constraints: SixDofSpringConstraint[]) {
+    const n = constraints.length
+    this.F = new Float32Array(n * F_STRIDE)
+    this.I = new Int32Array(n * I_STRIDE)
+    this.D = new Float64Array(n * 3)
+    for (let i = 0; i < n; i++) {
+      this.I[i * I_STRIDE + I_BODY_A] = constraints[i].bodyA
+      this.I[i * I_STRIDE + I_BODY_B] = constraints[i].bodyB
     }
   }
 }
@@ -110,10 +168,18 @@ export function solveConstraints(
 // guarantees pos/ori don't change between this and the iter loop.
 function setupConstraint(
   con: SixDofSpringConstraint,
+  ci: number,
+  cache: SolverCache,
   store: RigidBodyStore,
   dt: number,
   invDt: number,
 ): void {
+  const F = cache.F
+  const I = cache.I
+  const D = cache.D
+  const base = ci * F_STRIDE
+  const ib = ci * I_STRIDE
+  const db = ci * 3
   const a = con.bodyA
   const b = con.bodyB
   const imA = store.invMass[a]
@@ -122,8 +188,9 @@ function setupConstraint(
   const a9 = a * 9
   const b9 = b * 9
 
-  con.cacheSkip = imA === 0 && imB === 0
-  if (con.cacheSkip) return
+  const skip = imA === 0 && imB === 0
+  I[ib + I_SKIP] = skip ? 1 : 0
+  if (skip) return
 
   const erpScale = con.isLoop ? LOOP_ERP_SCALE : 1.0
 
@@ -149,10 +216,10 @@ function setupConstraint(
   const rBx = _TB[12] - pos[bi + 0]
   const rBy = _TB[13] - pos[bi + 1]
   const rBz = _TB[14] - pos[bi + 2]
-  const lA = con.cacheLeverA
-  const lB = con.cacheLeverB
-  lA[0] = rAx; lA[1] = rAy; lA[2] = rAz
-  lB[0] = rBx; lB[1] = rBy; lB[2] = rBz
+  const lA = base + LEVER_A
+  const lB = base + LEVER_B
+  F[lA + 0] = rAx; F[lA + 1] = rAy; F[lA + 2] = rAz
+  F[lB + 0] = rBx; F[lB + 1] = rBy; F[lB + 2] = rBz
 
   // linearDiff = TA.basis^T · (TB.origin − TA.origin); axes = TA columns 0/1/2.
   const dxw = _TB[12] - _TA[12]
@@ -162,21 +229,21 @@ function setupConstraint(
   const linDiff1 = _TA[4] * dxw + _TA[5] * dyw + _TA[6] * dzw
   const linDiff2 = _TA[8] * dxw + _TA[9] * dyw + _TA[10] * dzw
 
-  const axes = con.cacheLinAxes
-  const cA = con.cacheLinCrossA
-  const cB = con.cacheLinCrossB
-  const jac = con.cacheLinJacInv
-  const tgt = con.cacheLinTargetVel
-  const act = con.cacheLinActive
+  const axes = base + LIN_AXES
+  const cA = base + LIN_CA
+  const cB = base + LIN_CB
+  const jac = base + LIN_JAC
+  const tgt = base + LIN_TGT
+  const act = ib + I_LIN_ACT
 
   for (let i = 0; i < 3; i++) {
     const o = i * 3
     const axx = i === 0 ? _TA[0] : i === 1 ? _TA[4] : _TA[8]
     const axy = i === 0 ? _TA[1] : i === 1 ? _TA[5] : _TA[9]
     const axz = i === 0 ? _TA[2] : i === 1 ? _TA[6] : _TA[10]
-    axes[o + 0] = axx
-    axes[o + 1] = axy
-    axes[o + 2] = axz
+    F[axes + o + 0] = axx
+    F[axes + o + 1] = axy
+    F[axes + o + 2] = axz
 
     const cAx = rAy * axz - rAz * axy
     const cAy = rAz * axx - rAx * axz
@@ -192,13 +259,13 @@ function setupConstraint(
     const wBx = W[b9 + 0] * cBx + W[b9 + 1] * cBy + W[b9 + 2] * cBz
     const wBy = W[b9 + 3] * cBx + W[b9 + 4] * cBy + W[b9 + 5] * cBz
     const wBz = W[b9 + 6] * cBx + W[b9 + 7] * cBy + W[b9 + 8] * cBz
-    cA[o + 0] = wAx; cA[o + 1] = wAy; cA[o + 2] = wAz
-    cB[o + 0] = wBx; cB[o + 1] = wBy; cB[o + 2] = wBz
+    F[cA + o + 0] = wAx; F[cA + o + 1] = wAy; F[cA + o + 2] = wAz
+    F[cB + o + 0] = wBx; F[cB + o + 1] = wBy; F[cB + o + 2] = wBz
 
     const denom = imA + imB +
       (cAx * wAx + cAy * wAy + cAz * wAz) +
       (cBx * wBx + cBy * wBy + cBz * wBz)
-    jac[i] = denom > 0 ? 1 / denom : 0
+    F[jac + i] = denom > 0 ? 1 / denom : 0
 
     const lo = con.linearMin[i]
     const hi = con.linearMax[i]
@@ -219,9 +286,9 @@ function setupConstraint(
         else if (target < -MAX_LINEAR_CORRECTION_VEL) target = -MAX_LINEAR_CORRECTION_VEL
       }
     }
-    tgt[i] = target
-    act[i] = denom > 0 ? active : 0
-    con.cacheLinLimitImp[i] = 0
+    F[tgt + i] = target
+    I[act + i] = denom > 0 ? active : 0
+    F[base + LIN_LIMIT_IMP + i] = 0
     // A spring on a locked axis is redundant — the bilateral limit row
     // already welds the DOF, and driving it twice overshoots every
     // iteration (PMX rigs routinely put k=100000 springs on locked axes,
@@ -235,12 +302,12 @@ function setupConstraint(
       const meff = 1 / denom
       const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * meff)
       const gamma = c + dt * k
-      con.cacheLinSpringTarget[i] = -(k / gamma) * serr
-      con.cacheLinSpringMaxImp[i] = 1 / (dt * gamma)
-      con.cacheLinSpringImp[i] = 0
-      con.cacheLinSpringActive[i] = 1
+      F[base + LIN_SPR_TGT + i] = -(k / gamma) * serr
+      F[base + LIN_SPR_MAX + i] = 1 / (dt * gamma)
+      F[base + LIN_SPR_IMP + i] = 0
+      I[ib + I_LIN_SPR_ACT + i] = 1
     } else if (!(lo === hi && con.isLoop)) {
-      con.cacheLinSpringActive[i] = 0
+      I[ib + I_LIN_SPR_ACT + i] = 0
     }
   }
 
@@ -272,56 +339,56 @@ function setupConstraint(
   l = Math.hypot(zx, zy, zz)
   if (l > 1e-8) { const inv = 1/l; zx*=inv; zy*=inv; zz*=inv }
 
-  const angAxes = con.cacheAngAxes
-  angAxes[0] = xx; angAxes[1] = xy; angAxes[2] = xz
-  angAxes[3] = yx; angAxes[4] = yy; angAxes[5] = yz
-  angAxes[6] = zx; angAxes[7] = zy; angAxes[8] = zz
+  const angAxes = base + ANG_AXES
+  F[angAxes + 0] = xx; F[angAxes + 1] = xy; F[angAxes + 2] = xz
+  F[angAxes + 3] = yx; F[angAxes + 4] = yy; F[angAxes + 5] = yz
+  F[angAxes + 6] = zx; F[angAxes + 7] = zy; F[angAxes + 8] = zz
 
   // Per-axis angular Jacobians with the full tensors: cache I⁻¹·axis per
   // body plus 1/(axᵀ(I⁻¹A+I⁻¹B)ax) per axis.
-  const angJac = con.cacheAngJacInv
-  const angWAs = con.cacheAngWA
-  const angWBs = con.cacheAngWB
+  const angJac = base + ANG_JAC
+  const angWAs = base + ANG_WA
+  const angWBs = base + ANG_WB
   for (let i = 0; i < 3; i++) {
     const o = i * 3
-    const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
+    const axx = F[angAxes + o + 0], axy = F[angAxes + o + 1], axz = F[angAxes + o + 2]
     const wAx = W[a9 + 0] * axx + W[a9 + 1] * axy + W[a9 + 2] * axz
     const wAy = W[a9 + 3] * axx + W[a9 + 4] * axy + W[a9 + 5] * axz
     const wAz = W[a9 + 6] * axx + W[a9 + 7] * axy + W[a9 + 8] * axz
     const wBx = W[b9 + 0] * axx + W[b9 + 1] * axy + W[b9 + 2] * axz
     const wBy = W[b9 + 3] * axx + W[b9 + 4] * axy + W[b9 + 5] * axz
     const wBz = W[b9 + 6] * axx + W[b9 + 7] * axy + W[b9 + 8] * axz
-    angWAs[o + 0] = wAx; angWAs[o + 1] = wAy; angWAs[o + 2] = wAz
-    angWBs[o + 0] = wBx; angWBs[o + 1] = wBy; angWBs[o + 2] = wBz
+    F[angWAs + o + 0] = wAx; F[angWAs + o + 1] = wAy; F[angWAs + o + 2] = wAz
+    F[angWBs + o + 0] = wBx; F[angWBs + o + 1] = wBy; F[angWBs + o + 2] = wBz
     const denom = axx * (wAx + wBx) + axy * (wAy + wBy) + axz * (wAz + wBz)
-    angJac[i] = denom > 0 ? 1 / denom : 0
+    F[angJac + i] = denom > 0 ? 1 / denom : 0
   }
 
   // Per-axis rows carry only the springs. Sign flip vs linear:
   // d(angDiff)/dt = −(ω_B − ω_A)·ax.
-  const angTgt = con.cacheAngTargetVel
-  const angAct = con.cacheAngActive
+  const angTgt = base + ANG_TGT
+  const angAct = ib + I_ANG_ACT
   for (let i = 0; i < 3; i++) {
     const idx = i + 3
     // Springs on locked axes are skipped — the limit row welds those, and
     // double-driving a DOF overshoots every iteration (see the linear loop).
-    if (con.springEnabled[idx] && angJac[i] > 0 && con.angularMin[i] !== con.angularMax[i]) {
-      // Implicit spring-damper, angular flavor. angJac[i] = 1/denom IS the
+    if (con.springEnabled[idx] && F[angJac + i] > 0 && con.angularMin[i] !== con.angularMax[i]) {
+      // Implicit spring-damper, angular flavor. F[angJac + i] = 1/denom IS the
       // row's effective inertia. Sign flip vs linear: d(err)/dt = −relAv, so
       // the bias is positive for positive error. cacheAngSpringMaxImp holds
       // the CFM softness s (not a clamp).
       const k = con.springStiffness[idx]
       const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
-      const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * angJac[i])
+      const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * F[angJac + i])
       const gamma = c + dt * k
-      angTgt[i] = (k / gamma) * serr
-      con.cacheAngSpringMaxImp[i] = 1 / (dt * gamma)
-      angAct[i] = 1
+      F[angTgt + i] = (k / gamma) * serr
+      F[base + ANG_SPR_MAX + i] = 1 / (dt * gamma)
+      I[angAct + i] = 1
     } else {
-      angTgt[i] = 0
-      angAct[i] = 0
+      F[angTgt + i] = 0
+      I[angAct + i] = 0
     }
-    con.cacheAngSpringImp[i] = 0
+    F[base + ANG_SPR_IMP + i] = 0
   }
 
   // Angular limit handling is hybrid. Small violations (the resting-cloth
@@ -331,10 +398,10 @@ function setupConstraint(
   // this port used) become geometrically inconsistent for large errors — near
   // the asin singularity they chase phantom errors and pump angular velocity
   // into the chain instead of converging.
-  con.cacheAngLimActive = 0
-  con.cacheAngPAActive[0] = 0
-  con.cacheAngPAActive[1] = 0
-  con.cacheAngPAActive[2] = 0
+  I[ib + I_ANG_LIM_ACT] = 0
+  I[ib + I_ANG_PA_ACT + 0] = 0
+  I[ib + I_ANG_PA_ACT + 1] = 0
+  I[ib + I_ANG_PA_ACT + 2] = 0
   if (imA > 0 || imB > 0) {
     const ex = _angDiffScratch[0], ey = _angDiffScratch[1], ez = _angDiffScratch[2]
     // Free axes (min > max) follow the current angle, i.e. no correction.
@@ -352,16 +419,16 @@ function setupConstraint(
       // convergence (more iterations enforce the brake harder).
       for (let i = 0; i < 3; i++) {
         const err = i === 0 ? errX : i === 1 ? errY : errZ
-        con.cacheAngPAImp[i] = 0
+        F[base + ANG_PA_IMP + i] = 0
         if (err === 0) {
-          con.cacheAngPAActive[i] = 0
+          I[ib + I_ANG_PA_ACT + i] = 0
           continue
         }
         let target = err * STOP_ERP * erpScale * invDt
         if (target > MAX_ANGULAR_CORRECTION_VEL) target = MAX_ANGULAR_CORRECTION_VEL
         else if (target < -MAX_ANGULAR_CORRECTION_VEL) target = -MAX_ANGULAR_CORRECTION_VEL
-        con.cacheAngPATarget[i] = target
-        con.cacheAngPAActive[i] = con.angularMin[i] === con.angularMax[i] ? 1 : 2
+        F[base + ANG_PA_TGT + i] = target
+        I[ib + I_ANG_PA_ACT + i] = con.angularMin[i] === con.angularMax[i] ? 1 : 2
       }
     } else if (maxErr > 0) {
       // Bilateral (equality) if any violated axis is locked — a locked axis
@@ -389,56 +456,63 @@ function setupConstraint(
         const invS = 1 / sinHalf
         const axx = qex * invS, axy = qey * invS, axz = qez * invS
         // Axis lives in TA's frame; TA's basis columns map it to world.
-        const lim = con.cacheAngLimAxis
-        lim[0] = _TA[0] * axx + _TA[4] * axy + _TA[8] * axz
-        lim[1] = _TA[1] * axx + _TA[5] * axy + _TA[9] * axz
-        lim[2] = _TA[2] * axx + _TA[6] * axy + _TA[10] * axz
-        const gWA = con.cacheAngLimWA
-        const gWB = con.cacheAngLimWB
-        gWA[0] = W[a9 + 0] * lim[0] + W[a9 + 1] * lim[1] + W[a9 + 2] * lim[2]
-        gWA[1] = W[a9 + 3] * lim[0] + W[a9 + 4] * lim[1] + W[a9 + 5] * lim[2]
-        gWA[2] = W[a9 + 6] * lim[0] + W[a9 + 7] * lim[1] + W[a9 + 8] * lim[2]
-        gWB[0] = W[b9 + 0] * lim[0] + W[b9 + 1] * lim[1] + W[b9 + 2] * lim[2]
-        gWB[1] = W[b9 + 3] * lim[0] + W[b9 + 4] * lim[1] + W[b9 + 5] * lim[2]
-        gWB[2] = W[b9 + 6] * lim[0] + W[b9 + 7] * lim[1] + W[b9 + 8] * lim[2]
-        const gDenom = lim[0] * (gWA[0] + gWB[0]) + lim[1] * (gWA[1] + gWB[1]) + lim[2] * (gWA[2] + gWB[2])
-        con.cacheAngLimJacInv = gDenom > 0 ? 1 / gDenom : 0
+        const lim = base + ANG_LIM_AXIS
+        F[lim + 0] = _TA[0] * axx + _TA[4] * axy + _TA[8] * axz
+        F[lim + 1] = _TA[1] * axx + _TA[5] * axy + _TA[9] * axz
+        F[lim + 2] = _TA[2] * axx + _TA[6] * axy + _TA[10] * axz
+        const gWA = base + ANG_LIM_WA
+        const gWB = base + ANG_LIM_WB
+        F[gWA + 0] = W[a9 + 0] * F[lim + 0] + W[a9 + 1] * F[lim + 1] + W[a9 + 2] * F[lim + 2]
+        F[gWA + 1] = W[a9 + 3] * F[lim + 0] + W[a9 + 4] * F[lim + 1] + W[a9 + 5] * F[lim + 2]
+        F[gWA + 2] = W[a9 + 6] * F[lim + 0] + W[a9 + 7] * F[lim + 1] + W[a9 + 8] * F[lim + 2]
+        F[gWB + 0] = W[b9 + 0] * F[lim + 0] + W[b9 + 1] * F[lim + 1] + W[b9 + 2] * F[lim + 2]
+        F[gWB + 1] = W[b9 + 3] * F[lim + 0] + W[b9 + 4] * F[lim + 1] + W[b9 + 5] * F[lim + 2]
+        F[gWB + 2] = W[b9 + 6] * F[lim + 0] + W[b9 + 7] * F[lim + 1] + W[b9 + 8] * F[lim + 2]
+        const gDenom = F[lim + 0] * (F[gWA + 0] + F[gWB + 0]) + F[lim + 1] * (F[gWA + 1] + F[gWB + 1]) + F[lim + 2] * (F[gWA + 2] + F[gWB + 2])
+        D[db + 0] = gDenom > 0 ? 1 / gDenom : 0
         let target = angle * STOP_ERP * erpScale * invDt
         if (target > MAX_ANGULAR_CORRECTION_VEL) target = MAX_ANGULAR_CORRECTION_VEL
-        con.cacheAngLimTarget = target
-        con.cacheAngLimActive = bilateral ? 1 : 2
+        D[db + 1] = target
+        I[ib + I_ANG_LIM_ACT] = bilateral ? 1 : 2
       }
     }
   }
-  con.cacheAngLimImp = 0
+  D[db + 2] = 0
 }
 
 // ITER: read cache, compute relVel from current lv/av, apply impulse.
 function iterateConstraint(
-  con: SixDofSpringConstraint,
+  ci: number,
+  cache: SolverCache,
   lv: Float32Array,
   av: Float32Array,
   invMass: Float32Array,
 ): void {
-  if (con.cacheSkip) return
-  const a = con.bodyA
-  const b = con.bodyB
+  const F = cache.F
+  const I = cache.I
+  const D = cache.D
+  const base = ci * F_STRIDE
+  const ib = ci * I_STRIDE
+  const db = ci * 3
+  if (I[ib + I_SKIP] === 1) return
+  const a = I[ib + I_BODY_A]
+  const b = I[ib + I_BODY_B]
   const ai = a * 3
   const bi = b * 3
   const imA = invMass[a]
   const imB = invMass[b]
 
   // Linear axes — relVel at the offset point: v_pivot = v_CG + ω × r.
-  const lA = con.cacheLeverA
-  const lB = con.cacheLeverB
-  const rAx = lA[0], rAy = lA[1], rAz = lA[2]
-  const rBx = lB[0], rBy = lB[1], rBz = lB[2]
-  const axes = con.cacheLinAxes
-  const cA = con.cacheLinCrossA
-  const cB = con.cacheLinCrossB
-  const jac = con.cacheLinJacInv
-  const tgt = con.cacheLinTargetVel
-  const act = con.cacheLinActive
+  const lA = base + LEVER_A
+  const lB = base + LEVER_B
+  const rAx = F[lA + 0], rAy = F[lA + 1], rAz = F[lA + 2]
+  const rBx = F[lB + 0], rBy = F[lB + 1], rBz = F[lB + 2]
+  const axes = base + LIN_AXES
+  const cA = base + LIN_CA
+  const cB = base + LIN_CB
+  const jac = base + LIN_JAC
+  const tgt = base + LIN_TGT
+  const act = ib + I_LIN_ACT
 
   const vAx = lv[ai + 0] + av[ai + 1] * rAz - av[ai + 2] * rAy
   const vAy = lv[ai + 1] + av[ai + 2] * rAx - av[ai + 0] * rAz
@@ -450,15 +524,15 @@ function iterateConstraint(
   const dvy = vBy - vAy
   const dvz = vBz - vAz
 
-  const sprAct = con.cacheLinSpringActive
-  const sprTgt = con.cacheLinSpringTarget
-  const sprMax = con.cacheLinSpringMaxImp
-  const sprImp = con.cacheLinSpringImp
-  const limImp = con.cacheLinLimitImp
+  const sprAct = ib + I_LIN_SPR_ACT
+  const sprTgt = base + LIN_SPR_TGT
+  const sprMax = base + LIN_SPR_MAX
+  const sprImp = base + LIN_SPR_IMP
+  const limImp = base + LIN_LIMIT_IMP
   for (let i = 0; i < 3; i++) {
-    if (!act[i] && !sprAct[i]) continue
+    if (!I[act + i] && !I[sprAct + i]) continue
     const o = i * 3
-    const axx = axes[o + 0], axy = axes[o + 1], axz = axes[o + 2]
+    const axx = F[axes + o + 0], axy = F[axes + o + 1], axz = F[axes + o + 2]
     const relVel = dvx * axx + dvy * axy + dvz * axz
     let j = 0
 
@@ -467,15 +541,15 @@ function iterateConstraint(
     // clamped to the corrective sign, so the stop pushes back into range but
     // never pulls deeper or brakes natural recovery (a bilateral stop acts
     // as a motor and pumps energy into swinging cloth).
-    if (act[i]) {
-      const target = tgt[i]
-      let dImp = LIMIT_SOFTNESS_LINEAR * (target - relVel) * jac[i]
-      if (act[i] === 2) {
-        const old = limImp[i]
+    if (I[act + i]) {
+      const target = F[tgt + i]
+      let dImp = LIMIT_SOFTNESS_LINEAR * (target - relVel) * F[jac + i]
+      if (I[act + i] === 2) {
+        const old = F[limImp + i]
         let next = old + dImp
         if (target > 0 ? next < 0 : next > 0) next = 0
         dImp = next - old
-        limImp[i] = next
+        F[limImp + i] = next
       }
       j += dImp
     }
@@ -484,11 +558,11 @@ function iterateConstraint(
     // with accumulated λ, dissipative by construction. relVel is refreshed
     // with the limit impulse applied just above (j·denom = j / jac) — driving
     // the spring off the stale value double-corrects the DOF.
-    if (sprAct[i]) {
-      const relVelNow = j !== 0 ? relVel + j / jac[i] : relVel
-      const s = sprMax[i] // CFM softness
-      const dImp = (sprTgt[i] - relVelNow - s * sprImp[i]) / (1 / jac[i] + s)
-      sprImp[i] += dImp
+    if (I[sprAct + i]) {
+      const relVelNow = j !== 0 ? relVel + j / F[jac + i] : relVel
+      const s = F[sprMax + i] // CFM softness
+      const dImp = (F[sprTgt + i] - relVelNow - s * F[sprImp + i]) / (1 / F[jac + i] + s)
+      F[sprImp + i] += dImp
       j += dImp
     }
 
@@ -497,91 +571,91 @@ function iterateConstraint(
       lv[ai + 0] -= j * imA * axx
       lv[ai + 1] -= j * imA * axy
       lv[ai + 2] -= j * imA * axz
-      av[ai + 0] -= j * cA[o + 0]
-      av[ai + 1] -= j * cA[o + 1]
-      av[ai + 2] -= j * cA[o + 2]
+      av[ai + 0] -= j * F[cA + o + 0]
+      av[ai + 1] -= j * F[cA + o + 1]
+      av[ai + 2] -= j * F[cA + o + 2]
     }
     if (imB > 0) {
       lv[bi + 0] += j * imB * axx
       lv[bi + 1] += j * imB * axy
       lv[bi + 2] += j * imB * axz
-      av[bi + 0] += j * cB[o + 0]
-      av[bi + 1] += j * cB[o + 1]
-      av[bi + 2] += j * cB[o + 2]
+      av[bi + 0] += j * F[cB + o + 0]
+      av[bi + 1] += j * F[cB + o + 1]
+      av[bi + 2] += j * F[cB + o + 2]
     }
   }
 
   // Angular axes — relAv = ω_B − ω_A.
-  const angAxes = con.cacheAngAxes
-  const angJac = con.cacheAngJacInv
-  const angWAs = con.cacheAngWA
-  const angWBs = con.cacheAngWB
-  const angTgt = con.cacheAngTargetVel
-  const angAct = con.cacheAngActive
+  const angAxes = base + ANG_AXES
+  const angJac = base + ANG_JAC
+  const angWAs = base + ANG_WA
+  const angWBs = base + ANG_WB
+  const angTgt = base + ANG_TGT
+  const angAct = ib + I_ANG_ACT
   const dax = av[bi + 0] - av[ai + 0]
   const day = av[bi + 1] - av[ai + 1]
   const daz = av[bi + 2] - av[ai + 2]
-  const angSprMax = con.cacheAngSpringMaxImp
-  const angSprImp = con.cacheAngSpringImp
+  const angSprMax = base + ANG_SPR_MAX
+  const angSprImp = base + ANG_SPR_IMP
   for (let i = 0; i < 3; i++) {
-    if (!angAct[i]) continue
+    if (!I[angAct + i]) continue
     const o = i * 3
-    const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
+    const axx = F[angAxes + o + 0], axy = F[angAxes + o + 1], axz = F[angAxes + o + 2]
     const relAv = dax * axx + day * axy + daz * axz
     // Implicit spring-damper row (soft constraint, see setup).
-    const s = angSprMax[i] // CFM softness
-    const j = (angTgt[i] - relAv - s * angSprImp[i]) / (1 / angJac[i] + s)
-    angSprImp[i] += j
+    const s = F[angSprMax + i] // CFM softness
+    const j = (F[angTgt + i] - relAv - s * F[angSprImp + i]) / (1 / F[angJac + i] + s)
+    F[angSprImp + i] += j
     if (j === 0) continue
     if (imA > 0) {
-      av[ai + 0] -= j * angWAs[o + 0]
-      av[ai + 1] -= j * angWAs[o + 1]
-      av[ai + 2] -= j * angWAs[o + 2]
+      av[ai + 0] -= j * F[angWAs + o + 0]
+      av[ai + 1] -= j * F[angWAs + o + 1]
+      av[ai + 2] -= j * F[angWAs + o + 2]
     }
     if (imB > 0) {
-      av[bi + 0] += j * angWBs[o + 0]
-      av[bi + 1] += j * angWBs[o + 1]
-      av[bi + 2] += j * angWBs[o + 2]
+      av[bi + 0] += j * F[angWBs + o + 0]
+      av[bi + 1] += j * F[angWBs + o + 1]
+      av[bi + 2] += j * F[angWBs + o + 2]
     }
   }
 
   // Per-axis angular limit rows (small-violation regime), on the derived
   // euler axes. Sign convention matches the springs: positive target reduces
   // positive error via d(angDiff)/dt = −(ω_B − ω_A)·ax.
-  const paAct = con.cacheAngPAActive
-  if (paAct[0] || paAct[1] || paAct[2]) {
-    const paTgt = con.cacheAngPATarget
-    const paImp = con.cacheAngPAImp
+  const paAct = ib + I_ANG_PA_ACT
+  if (I[paAct + 0] || I[paAct + 1] || I[paAct + 2]) {
+    const paTgt = base + ANG_PA_TGT
+    const paImp = base + ANG_PA_IMP
     for (let i = 0; i < 3; i++) {
-      if (!paAct[i]) continue
+      if (!I[paAct + i]) continue
       const o = i * 3
-      const axx = angAxes[o + 0], axy = angAxes[o + 1], axz = angAxes[o + 2]
+      const axx = F[angAxes + o + 0], axy = F[angAxes + o + 1], axz = F[angAxes + o + 2]
       const relAv =
         (av[bi + 0] - av[ai + 0]) * axx +
         (av[bi + 1] - av[ai + 1]) * axy +
         (av[bi + 2] - av[ai + 2]) * axz
-      const target = paTgt[i]
+      const target = F[paTgt + i]
       // Locked axes (act 1) are welds — full gain, like the 0.16.3 fold;
       // softness only tempers the unilateral stops.
-      const soft = paAct[i] === 2 ? LIMIT_SOFTNESS_ANGULAR : 1.0
-      let j = soft * (target - relAv) * angJac[i]
-      if (paAct[i] === 2) {
-        const old = paImp[i]
+      const soft = I[paAct + i] === 2 ? LIMIT_SOFTNESS_ANGULAR : 1.0
+      let j = soft * (target - relAv) * F[angJac + i]
+      if (I[paAct + i] === 2) {
+        const old = F[paImp + i]
         let next = old + j
         if (target > 0 ? next < 0 : next > 0) next = 0
         j = next - old
-        paImp[i] = next
+        F[paImp + i] = next
       }
       if (j === 0) continue
       if (imA > 0) {
-        av[ai + 0] -= j * angWAs[o + 0]
-        av[ai + 1] -= j * angWAs[o + 1]
-        av[ai + 2] -= j * angWAs[o + 2]
+        av[ai + 0] -= j * F[angWAs + o + 0]
+        av[ai + 1] -= j * F[angWAs + o + 1]
+        av[ai + 2] -= j * F[angWAs + o + 2]
       }
       if (imB > 0) {
-        av[bi + 0] += j * angWBs[o + 0]
-        av[bi + 1] += j * angWBs[o + 1]
-        av[bi + 2] += j * angWBs[o + 2]
+        av[bi + 0] += j * F[angWBs + o + 0]
+        av[bi + 1] += j * F[angWBs + o + 1]
+        av[bi + 2] += j * F[angWBs + o + 2]
       }
     }
   }
@@ -589,34 +663,34 @@ function iterateConstraint(
   // Geodesic limit row: drive (ω_B − ω_A)·axis toward the correction target.
   // Unilateral — the accumulated impulse can only push toward the legal
   // region (target is always ≥ 0 along the corrective axis).
-  if (con.cacheAngLimActive) {
-    const lim = con.cacheAngLimAxis
-    const nx = lim[0], ny = lim[1], nz = lim[2]
+  if (I[ib + I_ANG_LIM_ACT] !== 0) {
+    const lim = base + ANG_LIM_AXIS
+    const nx = F[lim + 0], ny = F[lim + 1], nz = F[lim + 2]
     // Re-read relAv — the spring rows above may have changed av.
     const relAv =
       (av[bi + 0] - av[ai + 0]) * nx +
       (av[bi + 1] - av[ai + 1]) * ny +
       (av[bi + 2] - av[ai + 2]) * nz
-    let j = LIMIT_SOFTNESS_ANGULAR * (con.cacheAngLimTarget - relAv) * con.cacheAngLimJacInv
-    if (con.cacheAngLimActive === 2) {
-      const old = con.cacheAngLimImp
+    let j = LIMIT_SOFTNESS_ANGULAR * (D[db + 1] - relAv) * D[db + 0]
+    if (I[ib + I_ANG_LIM_ACT] === 2) {
+      const old = D[db + 2]
       let next = old + j
       if (next < 0) next = 0
       j = next - old
-      con.cacheAngLimImp = next
+      D[db + 2] = next
     }
     if (j !== 0) {
-      const gWA = con.cacheAngLimWA
-      const gWB = con.cacheAngLimWB
+      const gWA = base + ANG_LIM_WA
+      const gWB = base + ANG_LIM_WB
       if (imA > 0) {
-        av[ai + 0] -= j * gWA[0]
-        av[ai + 1] -= j * gWA[1]
-        av[ai + 2] -= j * gWA[2]
+        av[ai + 0] -= j * F[gWA + 0]
+        av[ai + 1] -= j * F[gWA + 1]
+        av[ai + 2] -= j * F[gWA + 2]
       }
       if (imB > 0) {
-        av[bi + 0] += j * gWB[0]
-        av[bi + 1] += j * gWB[1]
-        av[bi + 2] += j * gWB[2]
+        av[bi + 0] += j * F[gWB + 0]
+        av[bi + 1] += j * F[gWB + 1]
+        av[bi + 2] += j * F[gWB + 2]
       }
     }
   }
