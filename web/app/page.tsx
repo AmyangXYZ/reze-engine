@@ -45,6 +45,15 @@ const FOLLOW_SPRINT_AT = 30
 
 const deg = (d: number) => (d * Math.PI) / 180
 
+// Authored stops: skid profiles measured from each clip's root motion at this
+// conversion's scale (exit at the plateau). Release at speed plays the matched
+// stop; ANY key press interrupts it instantly — anims for committed outcomes,
+// immediate response for new intent.
+const STOP_CLIPS = [
+  { clip: "Sprint_Stop_Lfoot", exitTime: 2.08, forward: [0, 13.9, 24.1, 34.2, 42.2, 47.3, 51.1, 53.5, 53.7, 52.7], gear: "sprint" as const, foot: "L" as const },
+  { clip: "Sprint_Stop_Rfoot", exitTime: 2.22, forward: [0, 13.9, 24.1, 34.2, 41, 46.7, 50.5, 53.6, 56.1, 58.5, 58.7], gear: "sprint" as const, foot: "R" as const },
+]
+
 // The 8-direction strafe rings. Angles and speeds MEASURED from each clip's authored
 // root motion at this conversion's scale (FL/FR are the pure ±90° side clips;
 // BL/BR are slower side-step variants, unused).
@@ -84,7 +93,11 @@ const SPRINT_AT = 0.92
 const KB_RUN_AT = 0.75 // deflection of a full run
 const KB_TO_RUN = 0.35 // s from standstill to full run
 const KB_TO_SPRINT = 1.6 // s of continued holding from run into the rim — sprint is earned
-const KB_DECEL_TIME = 0.25
+const KB_DECEL_TIME = 0 // instant: the stop must begin at full velocity or the seam lurches
+// Action-game two-speed rule: any real movement intent means at least a full run —
+// the idle⊕run blend band is a ramp to pass through, never a place to dwell
+// (the mid-band "slow run" reads as interpolation, not locomotion).
+const MIN_MOVE = 0.8
 const KB_TURN_PAUSE = 0.35 // s: a direction change pauses the charge until the new keys are held steadily
 
 /** Mobile-game movement wheel. Reports {x, y (up = +forward), active} through a ref
@@ -274,11 +287,12 @@ export default function Home() {
         model.loadVmd("sprint", `${PLAYER.vmdDir}/Sprint_Lfoot.vmd`),
         model.loadVmd("dance", "/animations/One More Last Time.vmd"),
         ...[...STRAFE_RUN, ...STRAFE_SPRINT].map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
+        ...STOP_CLIPS.map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
       ])
 
       const controller = new LocomotionController(
         model,
-        { idle: "idle", run: "run", sprint: "sprint", strafeRun: STRAFE_RUN, strafeSprint: STRAFE_SPRINT },
+        { idle: "idle", run: "run", sprint: "sprint", strafeRun: STRAFE_RUN, strafeSprint: STRAFE_SPRINT, stop: STOP_CLIPS },
         { runSpeed: PLAYER.runSpeed, sprintSpeed: PLAYER.sprintSpeed }
       )
       // Spawn facing the camera (rest facing, -Z); she turns around on the first input.
@@ -368,8 +382,14 @@ export default function Home() {
         const alpha = engine.getCameraAlpha()
         const sinA = Math.sin(alpha)
         const cosA = Math.cos(alpha)
-        const x = rawX * -cosA + rawY * -sinA
-        const y = rawX * sinA + rawY * -cosA
+        let x = rawX * -cosA + rawY * -sinA
+        let y = rawX * sinA + rawY * -cosA
+        const mag = Math.hypot(x, y)
+        if (mag > 0.05 && mag < MIN_MOVE) {
+          const k = MIN_MOVE / mag
+          x *= k
+          y *= k
+        }
         // Souls-style unlocked camera: input is camera-relative but the character
         // turns toward the movement and runs — never glued to the camera's facing.
         // (The strafe ring stays loaded for a future lock-on mode, where side-
