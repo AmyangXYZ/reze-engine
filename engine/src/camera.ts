@@ -84,11 +84,42 @@ export class Camera {
   }
 
   /** Enter/leave VMD-camera drive. Backs up the orbit fov on enter, restores it on leave
-   *  (the VMD camera animates fov, so orbit's value would otherwise be clobbered). */
+   *  (the VMD camera animates fov, so orbit's value would otherwise be clobbered).
+   *  Leaving ADOPTS the current shot: the orbit re-seeds its spherical coords from the
+   *  VMD pose so the switch holds the frame instead of snapping to the stale orbit. */
   setVmdDriven(enabled: boolean): void {
     if (enabled === this.vmdDriven) return
     if (enabled) this._savedFov = this.fov
-    else this.fov = this._savedFov
+    else {
+      this.fov = this._savedFov
+      const eye = this.vmdEye() // also refreshes _quatScratch with the shot's basis
+      const s = this._quatScratch
+      // The VMD target is the natural orbit pivot. Position-baked tracks carry
+      // distance 0 (eye == target), so synthesize one a comfortable orbit
+      // radius ahead along the shot's forward (rotation column 2, LH).
+      let tx = this._vmdTarget.x
+      let ty = this._vmdTarget.y
+      let tz = this._vmdTarget.z
+      if (Math.abs(this._vmdDistance) < 1e-3) {
+        tx = eye.x + s[8] * 30
+        ty = eye.y + s[9] * 30
+        tz = eye.z + s[10] * 30
+      }
+      const dx = eye.x - tx
+      const dy = eye.y - ty
+      const dz = eye.z - tz
+      const r = Math.hypot(dx, dy, dz)
+      if (r > 1e-4) {
+        this.target.x = tx
+        this.target.y = ty
+        this.target.z = tz
+        this.radius = r
+        this.beta = Math.acos(Math.min(1, Math.max(-1, dy / r)))
+        // Degenerate top-down shots keep a sliver of beta so orbit controls work.
+        this.beta = Math.min(Math.PI - 0.01, Math.max(0.01, this.beta))
+        this.alpha = Math.atan2(dx, dz)
+      }
+    }
     this.vmdDriven = enabled
   }
 
@@ -138,8 +169,19 @@ export class Camera {
     if (this.vmdDriven) {
       const eye = this.vmdEye()
       const s = this._quatScratch
-      const t = this._vmdTarget
-      Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, t.x, t.y, t.z, s[4], s[5], s[6])
+      // View = Rᵀ · T(−eye), built straight from the quaternion basis instead of
+      // lookAt(eye, target): same matrix for a normal d<0 shot, but position-baked
+      // tracks store distance = 0 on every frame (eye == target), which degenerates
+      // lookAt's normalize to an all-zero basis. The orientation never depended on
+      // the eye→target line anyway — it IS the euler rotation.
+      const o = this._viewMat.values
+      o[0] = s[0]; o[1] = s[4]; o[2] = s[8]; o[3] = 0
+      o[4] = s[1]; o[5] = s[5]; o[6] = s[9]; o[7] = 0
+      o[8] = s[2]; o[9] = s[6]; o[10] = s[10]; o[11] = 0
+      o[12] = -(s[0] * eye.x + s[1] * eye.y + s[2] * eye.z)
+      o[13] = -(s[4] * eye.x + s[5] * eye.y + s[6] * eye.z)
+      o[14] = -(s[8] * eye.x + s[9] * eye.y + s[10] * eye.z)
+      o[15] = 1
       return this._viewMat
     }
     const eye = this.getPosition()

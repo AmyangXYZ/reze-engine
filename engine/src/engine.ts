@@ -809,6 +809,9 @@ export class Engine {
   // Camera target binding (Babylon/Three style: camera follows model)
   private cameraTargetModel: Model | null = null
   private cameraTargetBoneName = "全ての親"
+  private cameraFollowSmoothing = 0
+  private cameraFollowSeeded = false
+  private readonly cameraFollowPos = new Vec3(0, 0, 0)
   private cameraTargetOffset: Vec3 = new Vec3(0, 0, 0)
 
   private lastFrameTime = performance.now()
@@ -2318,6 +2321,9 @@ export class Engine {
     if (!this.multisampleTexture || this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width
       this.canvas.height = height
+      // bgResolution() reads the canvas size from the composite uniforms —
+      // refresh on resize or effects aspect-correct against the stale size.
+      if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
 
       this.multisampleTexture = this.device.createTexture({
         label: "multisample HDR render target",
@@ -2758,7 +2764,7 @@ export class Engine {
   }
 
   /** Souls-style follow cam: orbit center tracks a model bone each frame. Shorthand for setCameraTarget(model, boneName, offset). */
-  setCameraFollow(model: Model | null, boneName?: string, offset?: Vec3): void {
+  setCameraFollow(model: Model | null, boneName?: string, offset?: Vec3, smoothing?: number): void {
     if (model === null) {
       this.cameraTargetModel = null
       return
@@ -2768,6 +2774,10 @@ export class Engine {
     this.cameraTargetOffset.x = offset?.x ?? 0
     this.cameraTargetOffset.y = offset?.y ?? 0
     this.cameraTargetOffset.z = offset?.z ?? 0
+    // Handheld feel: seconds for the camera to close ~63% of the gap to the
+    // bone (exponential, frame-rate independent). 0 = rigid instant follow.
+    this.cameraFollowSmoothing = Math.max(0, smoothing ?? 0)
+    this.cameraFollowSeeded = false
   }
 
   // ── VMD camera track ──
@@ -4682,9 +4692,28 @@ export class Engine {
           py += pos.y
           pz += pos.z
         }
-        this.camera.target.x = px + this.cameraTargetOffset.x
-        this.camera.target.y = py + this.cameraTargetOffset.y
-        this.camera.target.z = pz + this.cameraTargetOffset.z
+        px += this.cameraTargetOffset.x
+        py += this.cameraTargetOffset.y
+        pz += this.cameraTargetOffset.z
+        const tau = this.cameraFollowSmoothing
+        if (tau > 0 && this.cameraFollowSeeded) {
+          // Exponential lag toward the bone: the handheld-camera feel. The
+          // orbit pivot trails the target and eases in, never snapping.
+          const k = 1 - Math.exp(-deltaTime / tau)
+          const f = this.cameraFollowPos
+          f.x += (px - f.x) * k
+          f.y += (py - f.y) * k
+          f.z += (pz - f.z) * k
+          this.camera.target.x = f.x
+          this.camera.target.y = f.y
+          this.camera.target.z = f.z
+        } else {
+          this.cameraFollowPos.setXYZ(px, py, pz)
+          this.cameraFollowSeeded = true
+          this.camera.target.x = px
+          this.camera.target.y = py
+          this.camera.target.z = pz
+        }
       }
     }
 
