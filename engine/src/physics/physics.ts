@@ -24,6 +24,10 @@ export class RezePhysics {
   private timeAccum = 0
   private readonly fixedTimeStep = 1 / 60
   private readonly maxSubSteps = 6
+  /** EMA of one world.step's CPU cost; drives catch-up load shedding. */
+  private stepCostEmaMs = 0.5
+  /** Max ms a single frame may spend catching up physics before shedding. */
+  private readonly stepBudgetMs = 8
 
   // Fixed-timestep render interpolation ("Fix Your Timestep"): the dynamic body pose is
   // rendered as lerp(prev, curr, alpha) between the last two completed substeps, where
@@ -210,10 +214,20 @@ export class RezePhysics {
     this.timeAccum += dt
     let nSub = Math.floor(this.timeAccum / this.fixedTimeStep)
     if (nSub > this.maxSubSteps) nSub = this.maxSubSteps
+    // Load shedding: the maxSubSteps cap alone still allows a stable DEGRADED state
+    // on weak/throttled devices — one long frame schedules catch-up substeps, which
+    // lengthen the next frame, which schedules more, and the cap becomes the steady
+    // state (6× step cost every frame; iOS "starts smooth, then stays slow").
+    // Catching up must never cost more than a frame-budget slice: shed the backlog
+    // instead (physics runs fractionally slow-motion for a beat; framerate holds).
+    const affordable = Math.max(1, Math.floor(this.stepBudgetMs / Math.max(0.05, this.stepCostEmaMs)))
+    if (nSub > affordable) nSub = affordable
     for (let k = 0; k < nSub; k++) {
       this.savePrevState()
       this.advanceKinematicToTargets(1 / (nSub - k))
+      const tStep = performance.now()
       this.world.step(this.store, this.constraints, this.contacts, this.fixedTimeStep)
+      this.stepCostEmaMs += (performance.now() - tStep - this.stepCostEmaMs) * 0.2
       this.restoreNonFiniteBodies()
       this.timeAccum -= this.fixedTimeStep
     }
