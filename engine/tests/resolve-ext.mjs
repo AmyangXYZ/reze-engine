@@ -3,7 +3,11 @@ export async function resolve(specifier, context, next) {
     try {
       return await next(specifier + ".js", context)
     } catch {
-      // fall through to the default resolution for a real error message
+      try {
+        return await next(specifier + "/index.js", context)
+      } catch {
+        // fall through to the default resolution for a real error message
+      }
     }
   }
   return next(specifier, context)
