@@ -2833,6 +2833,11 @@ export class Engine {
     return first ?? 0
   }
 
+  /** Current orbit eye position (spherical coords resolved to a point). */
+  getCameraPosition(): Vec3 {
+    return this.camera.getPosition()
+  }
+
   getCameraDistance(): number {
     return this.camera.radius
   }
