@@ -3734,11 +3734,6 @@ export class Engine {
       // misclassified fully-worn opaque dresses (avg 0.69) as veils and stripped
       // their shadows, while any lower cliff would strand the next model.
       const castsShadow = (mat.edgeFlag & 0x04) !== 0
-      // Load-time classification log — one line per material, cheap and
-      // invaluable when a model renders wrong (bucket/outline/shadow disputes).
-      console.info(
-        `[reze] ${mat.name}: alpha=${materialAlpha.toFixed(2)} avg=${stats.avg.toFixed(2)} translucentFrac=${stats.translucentFrac.toFixed(2)} bucket=${isTransparent ? "transparent" : "opaque"} castsShadow=${castsShadow} edge=${(mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0 ? "on" : "off"}`,
-      )
 
       // Sphere map (sph=1 multiply / spa=2 add). Mode 3 (sub-texture UV) is
       // rare and not implemented — treated as none, like a failed load.
