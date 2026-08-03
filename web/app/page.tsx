@@ -293,63 +293,14 @@ export default function Home() {
         fadeStart: 120,
         fadeEnd: 300,
       })
-      let gameReady = false
+      // The cast assembles progressively: the loop ticks whoever exists, so the
+      // player is running around while companions are still downloading.
+      let controller: LocomotionController | null = null
+      const companions: { def: (typeof COMPANIONS)[number]; controller: LocomotionController; model: Model }[] = []
       let last = performance.now()
-      engine.runRenderLoop(() => {
-        if (!gameReady) return
-        gameTick()
-      })
-
-      const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
-      engine.setModelTransform(PLAYER.id, { visible: false })
-      await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
-      engine.setModelTransform(PLAYER.id, { visible: true })
-
-      await Promise.all([
-        model.loadVmd("idle", `${PLAYER.vmdDir}/Idle.vmd`),
-        model.loadVmd("run", `${PLAYER.vmdDir}/Run_Lfoot.vmd`),
-        model.loadVmd("sprint", `${PLAYER.vmdDir}/Sprint_Lfoot.vmd`),
-        model.loadVmd("dance", "/animations/One More Last Time.vmd"),
-        ...[...STRAFE_RUN, ...STRAFE_SPRINT].map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
-        ...STOP_CLIPS.map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
-      ])
-
-      const controller = new LocomotionController(
-        model,
-        { idle: "idle", run: "run", sprint: "sprint", strafeRun: STRAFE_RUN, strafeSprint: STRAFE_SPRINT, stop: STOP_CLIPS },
-        { runSpeed: PLAYER.runSpeed, sprintSpeed: PLAYER.sprintSpeed }
-      )
-      // Spawn facing the camera (rest facing, -Z); she turns around on the first input.
-      controller.teleport(0, 0, 0, Math.PI)
-      // Follow the root (全ての親): the gait clips don't animate it, so the camera
-      // tracks the run without inheriting センター's bob and lean.
-      engine.setCameraFollow(model, undefined, new Vec3(0, 11.5, 0))
-
-      // AI companions: own model, own per-skeleton VMDs, own controller — steered by
-      // a follow policy through the same setMove interface the player uses.
-      const companions = await Promise.all(
-        COMPANIONS.map(async (def) => {
-          const m = await engine.loadModel(def.id, def.pmx)
-          await engine.autoStyleGroups(def.id)
-          await Promise.all([
-            m.loadVmd("idle", `${def.vmdDir}/Idle.vmd`),
-            m.loadVmd("run", `${def.vmdDir}/Run_Lfoot.vmd`),
-            m.loadVmd("sprint", `${def.vmdDir}/Sprint_Lfoot.vmd`),
-            m.loadVmd("dance", "/animations/One More Last Time.vmd"),
-          ])
-          const c = new LocomotionController(
-            m,
-            { idle: "idle", run: "run", sprint: "sprint" },
-            { runSpeed: def.runSpeed, sprintSpeed: def.sprintSpeed }
-          )
-          // Spawn already in formation around the player (player faces -Z at rest).
-          c.teleport(-def.slot.x, 0, -def.slot.z, Math.PI)
-          return { def, controller: c, model: m }
-        })
-      )
-      actorsRef.current = [model, ...companions.map((c) => c.model)]
-
       const gameTick = () => {
+        const ctl = controller
+        if (!ctl) return
         const now = performance.now()
         const dt = (now - last) / 1000
         last = now
@@ -416,15 +367,15 @@ export default function Home() {
         // Souls-style unlocked camera: input is camera-relative but the character
         // turns toward the movement and runs — never glued to the camera's facing.
         // (The strafe ring stays loaded for a future lock-on mode, where side-
-        // stepping is the right behavior: controller.setFacing(targetYaw).)
+        // stepping is the right behavior: ctl.setFacing(targetYaw).)
         // Movement interrupts the dance: one cancel fade, and she runs out of it.
         if (dancingRef.current && !danceCancelRef.current && (rawX !== 0 || rawY !== 0 || stick.active)) {
           danceCancelRef.current = true
           audioRef.current?.pause() // music stops WITH the dance, not after the fade
           for (const m of actorsRef.current) m.cancelOneShot(0.25) // snappy: she's running almost immediately
         }
-        controller.setMove(x, y, sprint)
-        const pose = controller.update(dt)
+        ctl.setMove(x, y, sprint)
+        const pose = ctl.update(dt)
         engine.setModelTransform(PLAYER.id, { position: pose.position, rotation: pose.rotation })
 
         // Companion follow AI: chase a formation slot in the player's local frame;
@@ -450,7 +401,67 @@ export default function Home() {
 
         setStats(engine.getStats())
       }
-      gameReady = true
+      engine.runRenderLoop(gameTick)
+
+      const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
+      engine.setModelTransform(PLAYER.id, { visible: false })
+      await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
+
+      await Promise.all([
+        model.loadVmd("idle", `${PLAYER.vmdDir}/Idle.vmd`),
+        model.loadVmd("run", `${PLAYER.vmdDir}/Run_Lfoot.vmd`),
+        model.loadVmd("sprint", `${PLAYER.vmdDir}/Sprint_Lfoot.vmd`),
+        model.loadVmd("dance", "/animations/One More Last Time.vmd"),
+        ...[...STRAFE_RUN, ...STRAFE_SPRINT].map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
+        ...STOP_CLIPS.map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
+      ])
+
+      const playerCtl = new LocomotionController(
+        model,
+        { idle: "idle", run: "run", sprint: "sprint", strafeRun: STRAFE_RUN, strafeSprint: STRAFE_SPRINT, stop: STOP_CLIPS },
+        { runSpeed: PLAYER.runSpeed, sprintSpeed: PLAYER.sprintSpeed }
+      )
+      // Spawn facing the camera (rest facing, -Z); she turns around on the first input.
+      playerCtl.teleport(0, 0, 0, Math.PI)
+      // Follow the root (全ての親): the gait clips don't animate it, so the camera
+      // tracks the run without inheriting センター's bob and lean.
+      engine.setCameraFollow(model, undefined, new Vec3(0, 11.5, 0))
+      // Pose and place BEFORE the reveal: her first visible frame is the idle
+      // in position — no bind-pose flash, no beat standing at the origin.
+      const pose0 = playerCtl.update(1 / 60)
+      engine.setModelTransform(PLAYER.id, { position: pose0.position, rotation: pose0.rotation, visible: true })
+      actorsRef.current = [model]
+      controller = playerCtl
+
+      // AI companions: own model, own per-skeleton VMDs, own controller — steered by
+      // a follow policy through the same setMove interface the player uses.
+      await Promise.all(
+        COMPANIONS.map(async (def) => {
+          const m = await engine.loadModel(def.id, def.pmx)
+          engine.setModelTransform(def.id, { visible: false })
+          await engine.autoStyleGroups(def.id)
+          await Promise.all([
+            m.loadVmd("idle", `${def.vmdDir}/Idle.vmd`),
+            m.loadVmd("run", `${def.vmdDir}/Run_Lfoot.vmd`),
+            m.loadVmd("sprint", `${def.vmdDir}/Sprint_Lfoot.vmd`),
+            m.loadVmd("dance", "/animations/One More Last Time.vmd"),
+          ])
+          const c = new LocomotionController(
+            m,
+            { idle: "idle", run: "run", sprint: "sprint" },
+            { runSpeed: def.runSpeed, sprintSpeed: def.sprintSpeed }
+          )
+          // Spawn already in formation around the player (player faces -Z at rest),
+          // posed and placed before the reveal — she joins mid-idle, not at center.
+          c.teleport(-def.slot.x, 0, -def.slot.z, Math.PI)
+          const p0 = c.update(1 / 60)
+          engine.setModelTransform(def.id, { position: p0.position, rotation: p0.rotation, visible: true })
+          companions.push({ def, controller: c, model: m })
+          actorsRef.current = [model, ...companions.map((x) => x.model)]
+        })
+      )
+
+
 
       // One settled frame (bind pose → blended idle is a jump), then park the physics on it.
       await new Promise((resolve) => requestAnimationFrame(resolve))
