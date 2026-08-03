@@ -53,6 +53,10 @@ export class RigidBodyStore {
   // Built lazily on first access.
   private collisionPairs: Uint16Array | null = null
 
+  /** Index of the built-in floor body (see RezePhysics constructor), -1 if none.
+   *  Excluded from the pair list; findContacts gives it a dedicated plane pass. */
+  groundIndex = -1
+
   constructor(rigidbodies: Rigidbody[]) {
     const N = rigidbodies.length
     this.count = N

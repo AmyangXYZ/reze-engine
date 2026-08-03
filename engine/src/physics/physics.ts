@@ -1,6 +1,6 @@
 import { Vec3, Quat, Mat4 } from "../math"
 import type { Rigidbody, Joint } from "./types"
-import { RigidbodyType } from "./types"
+import { RigidbodyType, RigidbodyShape } from "./types"
 import { RigidBodyStore } from "./body"
 import { World } from "./world"
 import { buildConstraints, type SixDofSpringConstraint } from "./constraint"
@@ -67,7 +67,37 @@ export class RezePhysics {
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
     this.joints = joints
-    this.store = new RigidBodyStore(rigidbodies)
+    // The floor is part of every world: a huge static box whose top face is
+    // model-space y = 0, so hair and hems rest on the ground instead of
+    // clipping through when a pose reaches it. Boneless (every bone-sync loop
+    // skips boneIndex < 0); collides with EVERY dynamic body regardless of
+    // group masks via findContacts' dedicated plane pass (spheres, capsules
+    // and boxes — box hems included).
+    const ground: Rigidbody = {
+      name: "__ground__",
+      englishName: "__ground__",
+      boneIndex: -1,
+      group: 0,
+      collisionMask: 0xffff,
+      shape: RigidbodyShape.Box,
+      size: new Vec3(500, 1, 500),
+      shapePosition: new Vec3(0, -1, 0),
+      shapeRotation: new Vec3(0, 0, 0),
+      mass: 0,
+      linearDamping: 0,
+      angularDamping: 0,
+      restitution: 0,
+      friction: 0.6,
+      type: RigidbodyType.Static,
+      bodyOffsetMatrixInverse: Mat4.identity(),
+    }
+    this.store = new RigidBodyStore([...rigidbodies, ground])
+    const gi = this.store.count - 1
+    // Mask 0 keeps the floor OUT of the generic pair list — findContacts runs a
+    // dedicated plane pass against every dynamic body (all shapes, boxes too).
+    this.store.collisionGroup[gi] = 0
+    this.store.willCollideMask[gi] = 0
+    this.store.groundIndex = gi
     this.world = new World(new Vec3(0, -98, 0))
     this.constraints = buildConstraints(rigidbodies, joints)
     this.contacts = new ContactPool()

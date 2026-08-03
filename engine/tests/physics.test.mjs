@@ -89,7 +89,7 @@ test("kinematic bodies track their bones through a translation", { skip: !hasAss
   for (let i = 0; i < 120; i++) sim.step()
   const store = sim.store
   const kin = []
-  for (let i = 0; i < store.count; i++) if (store.type[i] !== 1) kin.push(i)
+  for (let i = 0; i < store.count; i++) if (store.type[i] !== 1 && store.boneIndex[i] >= 0) kin.push(i)
   assert.ok(kin.length > 0, "model has kinematic anchors")
   const before = kin.map((i) => store.positions[i * 3])
   // Persistent +8 X shift applied to every bone world matrix before each step,
@@ -120,6 +120,31 @@ test("teleport (large jump) recovers without exploding", { skip: !hasAssets }, (
   assert.ok((sim.physics.teleportCount ?? 0) > jumps, "teleport path taken")
   assert.ok(allFinite(sim.store.positions), "positions finite")
   assert.ok(maxSpeed(sim.store) < 50, `no runaway velocities: ${maxSpeed(sim.store).toFixed(2)}`)
+})
+
+test("the built-in floor keeps sunken cloth above y=0", { skip: !hasAssets }, () => {
+  const sim = makeSim()
+  for (let i = 0; i < 120; i++) sim.step()
+  // Sink the skeleton 6 units — a sitting-height pose: the skirt and hair
+  // would hang well below y=0 without the floor; the ground box catches them.
+  // (Sinking further drags KINEMATIC anchors under the floor and jointed
+  // cloth legitimately follows them — that's not a floor failure.)
+  for (let f = 0; f < 300; f++) {
+    sim.model.update(DT)
+    const mats = sim.model.getWorldMatrices()
+    for (const m of mats) m.values[13] -= 6
+    sim.physics.step(DT, mats, sim.model.getBoneInverseBindMatrices())
+  }
+  assert.ok(allFinite(sim.store.positions), "positions finite")
+  let minY = Infinity
+  for (let i = 0; i < sim.store.count; i++) {
+    if (sim.store.type[i] !== 1) continue
+    const y = sim.store.positions[i * 3 + 1]
+    if (y < minY) minY = y
+  }
+  // Sphere/capsule centers sit a radius above the face; small transient
+  // penetration is fine — sinking metres below is not.
+  assert.ok(minY > -1.0, `dynamic bodies rest near the floor: minY=${minY.toFixed(2)}`)
 })
 
 test("broadphase pairs match the brute-force filtered sweep", { skip: !hasAssets }, () => {

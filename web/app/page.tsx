@@ -207,7 +207,20 @@ export default function Home() {
   // only MOVEMENT interrupts it (WASD/wheel cancels, and you run out of the fade).
   const startDance = useCallback(() => {
     const actors = actorsRef.current
-    if (actors.length === 0 || dancingRef.current) return
+    if (actors.length === 0) return
+    // Pressing again while dancing STOPS the show: cancel the one-shots, kill
+    // the music and rewind it, so the next press starts clean from the top.
+    if (dancingRef.current) {
+      if (!danceCancelRef.current) {
+        danceCancelRef.current = true
+        for (const m of actors) m.cancelOneShot(0.25)
+      }
+      if (audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current.currentTime = 0
+      }
+      return
+    }
     if (!audioRef.current) {
       audioRef.current = new Audio("/audios/One More Last Time.wav")
       audioRef.current.preload = "auto"
@@ -397,6 +410,7 @@ export default function Home() {
         // Movement interrupts the dance: one cancel fade, and she runs out of it.
         if (dancingRef.current && !danceCancelRef.current && (rawX !== 0 || rawY !== 0 || stick.active)) {
           danceCancelRef.current = true
+          audioRef.current?.pause() // music stops WITH the dance, not after the fade
           for (const m of actorsRef.current) m.cancelOneShot(0.25) // snappy: she's running almost immediately
         }
         controller.setMove(x, y, sprint)

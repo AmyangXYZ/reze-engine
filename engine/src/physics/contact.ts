@@ -993,4 +993,84 @@ export function findContacts(store: RigidBodyStore, pool: ContactPool): void {
     if (!aabbOverlap(store, i, j)) continue
     generateContacts(store, i, j, pool)
   }
+  // Built-in floor: a plane pass against every dynamic body. Cheaper and more
+  // complete than routing the huge ground box through the pair machinery —
+  // one y-test per body, and box hems collide too (there is no generic
+  // box-box narrowphase to lean on).
+  const g = store.groundIndex
+  if (g >= 0) {
+    const minA = store.aabbMin
+    for (let i = 0; i < store.count; i++) {
+      if (store.invMass[i] <= 0) continue
+      if (minA[i * 3 + 1] > CONTACT_MARGIN) continue
+      detectFloor(store, i, g, pool)
+    }
+  }
+}
+
+// The floor's top face is the model-space plane y = 0; its body (`g`) exists so
+// contact rows have a static B side. Normal convention matches the detectors:
+// A→B, so pointing DOWN into the floor; depth > 0 = penetrating.
+function detectFloor(store: RigidBodyStore, a: number, g: number, pool: ContactPool): void {
+  const ai = a * 3
+  const pos = store.positions
+  const gx = pos[g * 3 + 0]
+  const gy = pos[g * 3 + 1]
+  const gz = pos[g * 3 + 2]
+  const emit = (px: number, py: number, pz: number, depth: number) => {
+    const c = pool.acquire()
+    c.bodyA = a
+    c.bodyB = g
+    c.nx = 0
+    c.ny = -1
+    c.nz = 0
+    c.depth = depth
+    c.rAx = px - pos[ai + 0]
+    c.rAy = py - pos[ai + 1]
+    c.rAz = pz - pos[ai + 2]
+    c.rBx = px - gx
+    c.rBy = py - gy
+    c.rBz = pz - gz
+    combineMaterials(store, a, g, c)
+  }
+  const cx = pos[ai + 0]
+  const cy = pos[ai + 1]
+  const cz = pos[ai + 2]
+  switch (store.shape[a]) {
+    case RigidbodyShape.Sphere: {
+      const r = store.size[ai + 0]
+      const low = cy - r
+      if (low <= CONTACT_MARGIN) emit(cx, low, cz, -low)
+      break
+    }
+    case RigidbodyShape.Capsule: {
+      const r = store.size[ai + 0]
+      const h = store.size[ai + 1] * 0.5
+      const ax = _capPoint
+      capsuleAxis(store, a, ax)
+      for (const sgn of [-1, 1]) {
+        const ex = cx + ax[0] * h * sgn
+        const ey = cy + ax[1] * h * sgn
+        const ez = cz + ax[2] * h * sgn
+        const low = ey - r
+        if (low <= CONTACT_MARGIN) emit(ex, low, ez, -low)
+      }
+      break
+    }
+    case RigidbodyShape.Box: {
+      const hx = store.size[ai + 0]
+      const hy = store.size[ai + 1]
+      const hz = store.size[ai + 2]
+      const out = _capPointB
+      for (let k = 0; k < 8; k++) {
+        const lx = k & 1 ? hx : -hx
+        const ly = k & 2 ? hy : -hy
+        const lz = k & 4 ? hz : -hz
+        bodyLocalToWorldDir(store, a, lx, ly, lz, out)
+        const wy = cy + out[1]
+        if (wy <= CONTACT_MARGIN) emit(cx + out[0], wy, cz + out[2], -wy)
+      }
+      break
+    }
+  }
 }
