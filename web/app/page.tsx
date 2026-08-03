@@ -274,8 +274,8 @@ export default function Home() {
       // engine.setPhysicsEnabled(false) isolates physics.
       ;(window as unknown as { engine?: Engine }).engine = engine
 
-      const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
-      await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
+      // Stage first: ground up and the render loop painting before any model or
+      // VMD bytes arrive — she pops in styled once ready, companions after.
       // Room to sprint: ~10s of full sprint in any direction before the edge.
       // Pale blue-grey stage with a fine white grid, fading into the backdrop.
       engine.addGround({
@@ -293,6 +293,17 @@ export default function Home() {
         fadeStart: 120,
         fadeEnd: 300,
       })
+      let gameReady = false
+      let last = performance.now()
+      engine.runRenderLoop(() => {
+        if (!gameReady) return
+        gameTick()
+      })
+
+      const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
+      engine.setModelTransform(PLAYER.id, { visible: false })
+      await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
+      engine.setModelTransform(PLAYER.id, { visible: true })
 
       await Promise.all([
         model.loadVmd("idle", `${PLAYER.vmdDir}/Idle.vmd`),
@@ -338,8 +349,7 @@ export default function Home() {
       )
       actorsRef.current = [model, ...companions.map((c) => c.model)]
 
-      let last = performance.now()
-      engine.runRenderLoop(() => {
+      const gameTick = () => {
         const now = performance.now()
         const dt = (now - last) / 1000
         last = now
@@ -439,7 +449,8 @@ export default function Home() {
         }
 
         setStats(engine.getStats())
-      })
+      }
+      gameReady = true
 
       // One settled frame (bind pose → blended idle is a jump), then park the physics on it.
       await new Promise((resolve) => requestAnimationFrame(resolve))
