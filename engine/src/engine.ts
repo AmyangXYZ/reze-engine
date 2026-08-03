@@ -374,6 +374,9 @@ export interface EngineStats {
   frameTimeMax: number // ms — worst frame interval in the window (hitch / stutter indicator)
   fps1PercentLow: number // "1% low" fps = 1000 / 99th-percentile frame interval
   jitter: number // ms — stddev of frame intervals (pacing evenness; high = janky at any mean fps)
+  cpuAnimMs: number // ms/frame (EMA) — model updates: blending, IK, world matrices
+  cpuPhysicsMs: number // ms/frame (EMA) — physics stepping across all instances
+  cpuRenderMs: number // ms/frame (EMA) — the rest of the render thread: uniforms, encoding, submit
 }
 
 type DrawCallType = "opaque" | "transparent" | "ground" | "opaque-outline" | "transparent-outline"
@@ -822,6 +825,9 @@ export class Engine {
     frameTime: 0,
     frameTimeMax: 0,
     fps1PercentLow: 0,
+    cpuAnimMs: 0,
+    cpuPhysicsMs: 0,
+    cpuRenderMs: 0,
     jitter: 0,
   }
   private animationFrameId: number | null = null
@@ -2956,17 +2962,35 @@ export class Engine {
     return { ...this.stats }
   }
 
+  /** Frame-rate cap for the render loop, or null for display-rate. On high-refresh
+   *  displays (144/240Hz) rAF runs the WHOLE pipeline — physics, IK, blending,
+   *  passes — that many times per second for no visible gain over ~120 (VMD content
+   *  is 30fps; blending interpolates). Capping restores the per-second budget. */
+  private maxFPS: number | null = null
+  private lastLoopTime = 0
+
+  setMaxFPS(fps: number | null): void {
+    this.maxFPS = fps !== null && fps > 0 ? fps : null
+  }
+
   runRenderLoop(callback?: () => void) {
     this.renderLoopCallback = callback || null
 
-    const loop = () => {
+    const loop = (now: number) => {
+      this.animationFrameId = requestAnimationFrame(loop)
+
+      if (this.maxFPS !== null) {
+        // Tolerate rAF jitter: accept frames within ~half a display tick early.
+        const minInterval = 1000 / this.maxFPS - 2
+        if (now - this.lastLoopTime < minInterval) return
+        this.lastLoopTime = now
+      }
+
       this.render()
 
       if (this.renderLoopCallback) {
         this.renderLoopCallback()
       }
-
-      this.animationFrameId = requestAnimationFrame(loop)
     }
 
     this.animationFrameId = requestAnimationFrame(loop)
@@ -3227,9 +3251,22 @@ export class Engine {
     for (const inst of this.modelInstances.values()) fn(inst)
   }
 
+  // CPU frame-time breakdown (EMA-smoothed into getStats): where a frame's
+  // milliseconds actually go — animation/IK/blending vs physics vs everything
+  // else on the render thread. The first question of any perf report.
+  private cpuAnimMs = 0
+  private cpuPhysicsMs = 0
+  private cpuRenderMs = 0
+  private frameAnimMsRaw = 0
+  private framePhysicsMsRaw = 0
+
   private updateInstances(deltaTime: number): void {
+    let animMs = 0
+    let physicsMs = 0
     this.forEachInstance((inst) => {
+      const tAnim = performance.now()
       const verticesChanged = inst.model.update(deltaTime, this.ikEnabled)
+      animMs += performance.now() - tAnim
       if (inst.gpuMorph) {
         // GPU path: on a weight change, upload effective weights (thresholding tiny values
         // to 0 to match the CPU skip) and flag the compute dispatch for this frame.
@@ -3248,10 +3285,17 @@ export class Engine {
         inst.vertexBufferNeedsUpdate = true
       }
       if (inst.physics && this.physicsEnabled) {
+        const tPhys = performance.now()
         inst.physics.step(deltaTime, inst.model.getWorldMatrices(), inst.model.getBoneInverseBindMatrices())
+        physicsMs += performance.now() - tPhys
       }
       if (inst.vertexBufferNeedsUpdate) this.updateVertexBuffer(inst)
     })
+    this.frameAnimMsRaw = animMs
+    this.framePhysicsMsRaw = physicsMs
+    const EMA = 0.1
+    this.cpuAnimMs += (animMs - this.cpuAnimMs) * EMA
+    this.cpuPhysicsMs += (physicsMs - this.cpuPhysicsMs) * EMA
   }
 
   private updateVertexBuffer(inst: ModelInstance): void {
@@ -4608,6 +4652,9 @@ export class Engine {
   }
 
   private renderWithDelta(deltaTime: number) {
+    const tFrame = performance.now()
+    this.frameAnimMsRaw = 0
+    this.framePhysicsMsRaw = 0
     if (this.resizePending) {
       this.resizePending = false
       this.handleResize()
@@ -4758,6 +4805,10 @@ export class Engine {
     if (pick && hasModels) this.renderPickPass(encoder)
 
     this.device.queue.submit([encoder.finish()])
+
+    // Everything this frame that wasn't animation or physics: uniforms, encoding, submit.
+    const renderOnly = performance.now() - tFrame - this.frameAnimMsRaw - this.framePhysicsMsRaw
+    this.cpuRenderMs += (renderOnly - this.cpuRenderMs) * 0.1
 
     if (pick) {
       this.pendingPick = null
@@ -5389,5 +5440,8 @@ export class Engine {
     this.stats.frameTimeMax = Math.round(max * 100) / 100
     this.stats.fps1PercentLow = p99 > 0 ? Math.round(1000 / p99) : 0
     this.stats.jitter = Math.round(stddev * 100) / 100
+    this.stats.cpuAnimMs = Math.round(this.cpuAnimMs * 100) / 100
+    this.stats.cpuPhysicsMs = Math.round(this.cpuPhysicsMs * 100) / 100
+    this.stats.cpuRenderMs = Math.round(this.cpuRenderMs * 100) / 100
   }
 }
