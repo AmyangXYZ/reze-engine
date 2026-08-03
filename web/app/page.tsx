@@ -70,13 +70,21 @@ const STRAFE_SPRINT: StrafeClipEntry[] = [
 ]
 
 // Input keys the demo cares about — everything else never touches state.
-const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "ShiftLeft", "ShiftRight", "Space"])
+const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "Space"])
 
 /** Stick travel radius in px; drag past SPRINT_AT of it to sprint. Travel close to
  *  the base radius (72) lets the knob overhang the rim at full deflection — the
  *  familiar mobile-wheel "pushed past the edge" look. */
 const STICK_RADIUS = 66
 const SPRINT_AT = 0.92
+// Keyboard throttle, race-game style: holding WASD ramps the input magnitude toward
+// the rim (sprint) and release decays it — one rule for both inputs: deflection =
+// speed, rim = sprint. Two-phase charge: snap to run fast, then a deliberate slower
+// push into the rim, so movement is responsive but sprint is intentional.
+const KB_RUN_AT = 0.75 // deflection of a full run
+const KB_TO_RUN = 0.35 // s from standstill to full run
+const KB_TO_SPRINT = 0.9 // s of continued holding from run into the rim
+const KB_DECEL_TIME = 0.25
 
 /** Mobile-game movement wheel. Reports {x, y (up = +forward), active} through a ref
  *  callback; the knob is moved via direct DOM transform so dragging never re-renders.
@@ -175,6 +183,7 @@ export default function Home() {
   const danceCancelRef = useRef(false)
   const [dancing, setDancing] = useState(false)
   const [spaceHeld, setSpaceHeld] = useState(false)
+  const kbThrottle = useRef({ mag: 0, dirX: 0, dirY: 1 })
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
@@ -209,22 +218,11 @@ export default function Home() {
   }, [])
 
   const stickDisplayRef = useRef<((x: number, y: number) => void) | null>(null)
-  const [shiftHeld, setShiftHeld] = useState(false)
 
   const onStick = useCallback((x: number, y: number, active: boolean) => {
     stickRef.current.x = x
     stickRef.current.y = y
     stickRef.current.active = active
-  }, [])
-
-  const setShift = useCallback((on: boolean) => {
-    const keys = keysRef.current
-    if (on) keys.add("ShiftLeft")
-    else {
-      keys.delete("ShiftLeft")
-      keys.delete("ShiftRight")
-    }
-    setShiftHeld(on)
   }, [])
 
   const initEngine = useCallback(async () => {
@@ -243,6 +241,11 @@ export default function Home() {
       })
       engineRef.current = engine
       await engine.init()
+      // Uncapped: chase native refresh. engine.setMaxFPS(n) is available for
+      // hosts that prefer to spend less CPU on high-refresh displays.
+      // Console access for perf work: engine.getStats() has the CPU breakdown,
+      // engine.setPhysicsEnabled(false) isolates physics.
+      ;(window as unknown as { engine?: Engine }).engine = engine
 
       const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
       await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
@@ -323,16 +326,31 @@ export default function Home() {
         let rawX: number
         let rawY: number
         let sprint: boolean
-        const shiftDown = keys.has("ShiftLeft") || keys.has("ShiftRight")
         if (stick.active) {
           rawX = stick.x
           rawY = stick.y
-          sprint = shiftDown || Math.hypot(stick.x, stick.y) > SPRINT_AT
+          sprint = Math.hypot(stick.x, stick.y) > SPRINT_AT
         } else {
-          rawX = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0)
-          rawY = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0)
-          sprint = shiftDown
-          stickDisplayRef.current?.(rawX, rawY) // mirror keyboard on the knob
+          // Keyboard throttle: held keys steer while the magnitude ramps toward the
+          // rim; release keeps the last direction and decays, so she glides down
+          // through run to a stop and the knob plays the whole story.
+          const kx = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0)
+          const ky = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0)
+          const t = kbThrottle.current
+          const held = kx !== 0 || ky !== 0
+          if (held) {
+            const len = Math.hypot(kx, ky)
+            t.dirX = kx / len
+            t.dirY = ky / len
+            const rate = t.mag < KB_RUN_AT ? KB_RUN_AT / KB_TO_RUN : (1 - KB_RUN_AT) / KB_TO_SPRINT
+            t.mag = Math.min(1, t.mag + rate * dt)
+          } else {
+            t.mag = Math.max(0, t.mag - dt / KB_DECEL_TIME)
+          }
+          rawX = t.dirX * t.mag
+          rawY = t.dirY * t.mag
+          sprint = t.mag > SPRINT_AT
+          stickDisplayRef.current?.(rawX, rawY)
         }
         const alpha = engine.getCameraAlpha()
         const sinA = Math.sin(alpha)
@@ -408,7 +426,6 @@ export default function Home() {
         return
       }
       keysRef.current.add(e.code)
-      if (e.code.startsWith("Shift")) setShiftHeld(true)
     }
     const up = (e: KeyboardEvent) => {
       if (e.code === "Space") {
@@ -416,12 +433,9 @@ export default function Home() {
         return
       }
       keysRef.current.delete(e.code)
-      if (e.code.startsWith("Shift") && !keysRef.current.has("ShiftLeft") && !keysRef.current.has("ShiftRight"))
-        setShiftHeld(false)
     }
     const blur = () => {
       keysRef.current.clear()
-      setShiftHeld(false)
       setSpaceHeld(false)
     }
     window.addEventListener("keydown", down)
@@ -448,36 +462,17 @@ export default function Home() {
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none pointer-events-auto z-1" />
 
       {!loading && !engineError && (
-        // Mobile: thumb zone at the bottom-left corner, no SHIFT (rim drag sprints).
-        <div className="absolute bottom-10 left-6 sm:bottom-24 sm:left-48 z-[60] pointer-events-auto flex flex-col items-center gap-3">
+        // Mobile-wheel thumb zone; hold WASD or drag — the rim is the sprint zone.
+        <div className="absolute bottom-10 left-6 sm:bottom-24 sm:left-48 z-[60] pointer-events-auto">
           <VirtualStick onChange={onStick} display={stickDisplayRef} />
-          <button
-            className={`hidden sm:flex w-36 h-10 items-center justify-center rounded-xl border font-mono font-semibold text-xs tracking-[0.2em] select-none touch-none transition-all duration-75 ${
-              shiftHeld
-                ? "bg-white/90 text-black border-white scale-95 shadow-[0_0_20px_rgba(255,255,255,0.45)]"
-                : "bg-white/20 text-white/90 border-white/50 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_10px_rgba(0,0,0,0.25)]"
-            }`}
-            onPointerDown={(e) => {
-              e.preventDefault()
-              e.currentTarget.setPointerCapture(e.pointerId)
-              setShift(true)
-            }}
-            onPointerUp={() => setShift(false)}
-            onPointerCancel={() => setShift(false)}
-            onContextMenu={(e) => e.preventDefault()}
-            aria-label="Sprint"
-          >
-            SHIFT
-          </button>
         </div>
       )}
 
       {!loading && !engineError && (
         // Skill zone, bottom-right — the button's center lines up with the wheel
-        // knob's center (wheel center = container bottom + SHIFT 40px + gap 12px +
-        // 72px on desktop; wheel only on mobile). Space triggers and highlights it;
-        // while dancing it can't re-trigger — only movement interrupts.
-        <div className="absolute bottom-[4.5rem] right-6 sm:bottom-[11.25rem] sm:right-48 z-[60] pointer-events-auto">
+        // knob's center (wheel center = container bottom + 72px). Space triggers and
+        // highlights it; while dancing it can't re-trigger — only movement interrupts.
+        <div className="absolute bottom-[4.5rem] right-6 sm:bottom-32 sm:right-48 z-[60] pointer-events-auto">
           <button
             className={`w-20 h-20 rounded-full border-2 font-mono font-semibold text-xs tracking-widest select-none touch-none transition-all duration-100 ${
               dancing || spaceHeld
