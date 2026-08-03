@@ -18,7 +18,8 @@ npm install reze-engine
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
 - **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
-- **Clip blending & locomotion** — weighted multi-clip pose blending, crossfades, and a game-style character controller (idle/run/sprint speed blend, code-driven root motion) — the [demo](https://reze.one) is WASD-playable
+- **Clip blending & locomotion** — weighted multi-clip pose blending, crossfades, and a game-style character controller (idle/run/sprint speed blend, authored stop skids, code-driven root motion) — the [demo](https://reze.one) is WASD-playable
+- **State machine & clip events** — declarative animation states (clips or delegates like the LocomotionController) with guarded crossfade transitions; time-triggered clip callbacks on any playback path
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 - **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
@@ -65,6 +66,8 @@ engine/src/
   animation.ts       AnimationClip, VMD bezier interpolation, playback/priority
   locomotion.ts      LocomotionController — idle/run/sprint blended over setBlendPose,
                      pivot-gated turns, root motion returned for setModelTransform
+  state-machine.ts   AnimationStateMachine — clip/delegate states, guarded crossfade
+                     transitions, exit-time returns
   ik-solver.ts       MMD-style CCD IK (angle limits, solve-axis specialization)
   camera.ts          Orbit camera (alpha/beta/radius), bone-follow, mouse/touch
   math.ts            Vec3 / Quat / Mat4 — euler orders, swing-twist, shortest-arc,
@@ -174,6 +177,22 @@ engine.setModelTransform(name, { position: pose.position, rotation: pose.rotatio
 Clips are in-place; run and sprint share one gait phase so blends stay on the same feet. Match `runSpeed`/`sprintSpeed` to the clips' authored root motion or the feet slide.
 
 `AnimationClip` holds keyframes only (bone/morph tracks keyed by `frame`, plus `frameCount`); time advances at fixed `FPS` (exported, default 30).
+
+### State machine & clip events
+
+```javascript
+const loco = new LocomotionController(model, clips, { autoApply: false }) // computes but does not apply
+const sm = new AnimationStateMachine(model, {
+  loco:  { entries: (dt) => { loco.update(dt); return loco.getBlendEntries() } },
+  skill: { clip: "Skill_A", loop: false },
+}, [
+  { from: "loco",  to: "skill", when: () => wantSkill },
+  { from: "skill", to: "loco" },                 // unconditional: fires as the clip ends
+], { initial: "loco" })
+sm.update(dt)                                    // per frame; crossfades keep the outgoing state advancing
+
+model.addClipEvent("Skill_A", 0.42, (e) => sfx()) // fires when playback crosses 0.42s on any path; returns unsubscribe
+```
 
 ### Math
 

@@ -17,6 +17,41 @@ export interface StrafeClipEntry {
   speed: number
 }
 
+export interface TurnClipEntry {
+  /** Clip name previously loaded on the model. */
+  clip: string
+  /** Signed yaw the clip turns through, radians (+ = the character's right). */
+  angle: number
+  /** Clip-local seconds at which the yaw is complete (the settle tail is skipped). */
+  exitTime: number
+}
+
+export interface RunTurnClipEntry {
+  /** Clip name previously loaded on the model. */
+  clip: string
+  /** Signed total yaw, radians (+ = the character's right; reversals are ±PI). */
+  angle: number
+  /** Clip-local seconds at which the yaw is complete (settle tail skipped). */
+  exitTime: number
+  /** Uniform samples over [0, exitTime] of the clip's authored forward displacement
+   *  (MMD units along the heading at trigger) — the overrun-plant-return curve. */
+  forward: number[]
+  gear: "run" | "sprint"
+  foot: "L" | "R"
+}
+
+export interface StopClipEntry {
+  /** Clip name previously loaded on the model. */
+  clip: string
+  /** Clip-local seconds at which the deceleration settles (idle tail skipped). */
+  exitTime: number
+  /** Uniform samples over [0, exitTime] of the authored forward displacement
+   *  (MMD units along the heading at release) — the skid-to-plant curve. */
+  forward: number[]
+  gear: "run" | "sprint"
+  foot: "L" | "R"
+}
+
 export interface LocomotionClips {
   /** Clip names previously loaded on the model (loadVmd/loadClip). */
   idle: string
@@ -26,9 +61,26 @@ export interface LocomotionClips {
    *  blends the two ring clips nearest the local move angle. */
   strafeRun?: StrafeClipEntry[]
   strafeSprint?: StrafeClipEntry[]
+  /** Authored turn-in-place clips: reversal-class direction changes from near-
+   *  standstill play the nearest clip (yaw baked in the bones, root held) and
+   *  transfer its angle to the root at exitTime — instead of the eased pivot. */
+  turnInPlace?: TurnClipEntry[]
+  /** Authored RUNNING reversals (plant-and-turn): while moving fast with a
+   *  reversal-class heading error, the matching clip plays with the root driven
+   *  along its measured forward profile; yaw transfers at exitTime and she runs
+   *  out along the new heading. */
+  runTurn?: RunTurnClipEntry[]
+  /** Authored stops: releasing input at speed plays the gear/foot-matched stop with
+   *  the root driven along its measured skid profile, instead of a blend to idle.
+   *  Re-pressing input interrupts the stop and resumes locomotion. */
+  stop?: StopClipEntry[]
 }
 
 export interface LocomotionOptions {
+  /** When false, update() computes the pose but does NOT call setBlendPose —
+   *  read it with getBlendEntries(). For embedding in an AnimationStateMachine
+   *  delegate state, which owns the final blend. Default true. */
+  autoApply?: boolean
   /** Ground speed in MMD units/second at full run (default 67 — measured from the Unity
    *  locomotion pack's root motion before the in-place strip; ≈5.4 m/s at MMD scale).
    *  Match this to the clips or the feet slide. */
@@ -42,6 +94,14 @@ export interface LocomotionOptions {
   /** Heading error (radians) beyond which the character pivots strictly in place —
    *  no translation until the body is back within this cone (default PI/4). */
   turnInPlaceThreshold?: number
+  /** Minimum heading error (radians) for an authored turn clip to fire (default
+   *  ~100°: reversals only — smaller corrections keep the instant pivot). */
+  turnClipMinAngle?: number
+  /** Playback rate for turn clips (default 1.4 — the authored turns are deliberate;
+   *  game pacing wants them brisker). */
+  turnTimeScale?: number
+  /** Playback rate for stop clips (default 1.25) — same reasoning. */
+  stopTimeScale?: number
   /** Tank-mode steering rate, radians/second (default 2.5 ≈ 143°/s). */
   steerRate?: number
   /** Backpedal speed as a fraction of run speed in tank mode (default 0.5). */
@@ -74,12 +134,47 @@ function wrapAngle(a: number): number {
 
 export class LocomotionController {
   private readonly model: Model
+  private readonly autoApply: boolean
+  private lastEntries: BlendEntry[] | null = null
   private readonly clips: LocomotionClips
   private readonly runSpeed: number
   private readonly sprintSpeed: number
   private readonly speedResponse: number
   private readonly turnResponse: number
   private readonly cosTurnThreshold: number
+  private readonly turnClipMinAngle: number
+  private readonly turnTimeScale: number
+  private readonly stopTimeScale: number
+  private turning: { entry: TurnClipEntry; time: number } | null = null
+  private runTurning: {
+    entry: RunTurnClipEntry
+    time: number
+    startX: number
+    startZ: number
+    dirX: number
+    dirZ: number
+  } | null = null
+  /** An interrupted authored clip fading out OVER resumed locomotion, so breaking
+   *  out of a stop is instantly responsive without a pose pop. */
+  private exitGhost: { clip: string; clipTime: number; elapsed: number } | null = null
+  private stopping: {
+    entry: StopClipEntry
+    time: number
+    startX: number
+    startZ: number
+    dirX: number
+    dirZ: number
+    startLevel: number
+    /** Idle's share of the blend at release (level < 1 shows part idle) — the
+     *  crossfade source keeps this exact mix or the first stop frame snaps. */
+    fromIdleW: number
+    /** The gear clip that was visibly playing at release — the crossfade source
+     *  (fading over `run` after a SPRINT release would snap the pose). It keeps
+     *  advancing through the fade so the motion never freezes. */
+    fromClip: string
+    fromTime: number
+  } | null = null
+  private readonly turnEntries: BlendEntry[]
   private readonly yawOffset: number
 
   private inputX = 0
@@ -93,6 +188,10 @@ export class LocomotionController {
   private readonly backpedalScale: number
 
   private speedLevel = 0
+  /** Peak-hold of speedLevel (decays ~1.5/s): reversal triggers read this, because
+   *  keyboard direction flips pass through a dead moment (W+S cancel, key gap) that
+   *  dips the instantaneous level right when the reversal input lands. */
+  private recentSpeed = 0
   private yaw = 0
   // Movement direction = the INPUT heading, not the body yaw. The body turns
   // cosmetically toward it; translating along the (sweeping) body yaw instead
@@ -118,8 +217,17 @@ export class LocomotionController {
     this.runSpeed = options?.runSpeed ?? 67
     this.sprintSpeed = options?.sprintSpeed ?? 92
     this.speedResponse = options?.speedResponse ?? 5
+    this.autoApply = options?.autoApply ?? true
     this.turnResponse = options?.turnResponse ?? 10
     this.cosTurnThreshold = Math.cos(options?.turnInPlaceThreshold ?? Math.PI / 4)
+    this.turnClipMinAngle = options?.turnClipMinAngle ?? (100 * Math.PI) / 180
+    this.turnTimeScale = options?.turnTimeScale ?? 1.4
+    this.stopTimeScale = options?.stopTimeScale ?? 1.25
+    this.turnEntries = [
+      { name: clips.idle, time: 0, weight: 0 },
+      { name: clips.idle, time: 0, weight: 1 },
+      { name: clips.idle, time: 0, weight: 0 },
+    ]
     this.steerRate = options?.steerRate ?? 2.5
     this.backpedalScale = options?.backpedalScale ?? 0.5
     this.yawOffset = options?.yawOffset ?? Math.PI
@@ -127,6 +235,7 @@ export class LocomotionController {
       { name: clips.idle, time: 0, weight: 1 },
       { name: clips.run, time: 0, weight: 0 },
       { name: clips.sprint ?? clips.run, time: 0, weight: 0 },
+      { name: clips.idle, time: 0, weight: 0 }, // fading ghost of an interrupted clip
     ]
     const byAngle = (a: StrafeClipEntry, b: StrafeClipEntry) => a.angle - b.angle
     this.strafeRun = clips.strafeRun ? [...clips.strafeRun].sort(byAngle) : null
@@ -181,7 +290,19 @@ export class LocomotionController {
 
   /** Stop driving the model's pose (the blend is cleared; the single-clip player resumes). */
   detach(): void {
-    this.model.clearBlendPose()
+    this.lastEntries = null
+    if (this.autoApply) this.model.clearBlendPose()
+  }
+
+  /** The most recent update()'s blend entries (null before the first update or
+   *  after detach). The array is reused between frames — read, don't hold. */
+  getBlendEntries(): BlendEntry[] | null {
+    return this.lastEntries
+  }
+
+  private emit(entries: BlendEntry[]): void {
+    this.lastEntries = entries
+    if (this.autoApply) this.model.setBlendPose(entries)
   }
 
   private clipDuration(name: string): number {
@@ -196,6 +317,16 @@ export class LocomotionController {
 
     if (this.facingYaw !== null && this.strafeRun !== null && !this.tankMode) {
       return this.updateStrafe(dt)
+    }
+
+    if (this.turning !== null) {
+      return this.updateTurnClip(dt)
+    }
+    if (this.runTurning !== null) {
+      return this.updateRunTurn(dt)
+    }
+    if (this.stopping !== null) {
+      return this.updateStop(dt)
     }
 
     const hasSprint = this.clips.sprint !== undefined
@@ -218,12 +349,97 @@ export class LocomotionController {
     } else {
       const m = Math.hypot(this.inputX, this.inputY)
       moving = m > 0.05
+      this.recentSpeed = Math.max(this.speedLevel, this.recentSpeed - dt * 1.5)
+      // Release at speed: play the authored stop instead of blending to idle.
+      const stops = this.clips.stop
+      // Gate on the peak-hold speed: the release decay (throttle/analog) drains the
+      // instantaneous level below any threshold before `moving` goes false. The
+      // small floor on the actual level keeps standstill taps from faking a skid.
+      if (!moving && stops && stops.length > 0 && this.recentSpeed >= 0.7 && this.speedLevel >= 0.35) {
+        const gear = this.recentSpeed > 1.4 ? "sprint" : "run"
+        const foot = this.gaitPhase < 0.5 ? "L" : "R"
+        // Gear must match exactly: supplying stops for only one gear means the
+        // other gear keeps the default quick blend-to-idle.
+        let best: StopClipEntry | null = null
+        let bestScore = -1
+        for (const e of stops) {
+          if (e.gear !== gear) continue
+          const score = e.foot === foot ? 1 : 0
+          if (score > bestScore) {
+            best = e
+            bestScore = score
+          }
+        }
+        if (best) {
+          const fromClip = gear === "sprint" && this.clips.sprint ? this.clips.sprint : this.clips.run
+          this.stopping = {
+            entry: best,
+            time: 0,
+            startX: this.position.x,
+            startZ: this.position.z,
+            dirX: this.dirX,
+            dirZ: this.dirZ,
+            startLevel: Math.min(this.recentSpeed, 2),
+            fromIdleW: Math.max(0, 1 - this.speedLevel),
+            fromClip,
+            fromTime: this.gaitPhase * this.clipDuration(fromClip),
+          }
+          return this.updateStop(dt)
+        }
+      }
       // Yaw eases toward the input heading only while there is one. Turns are strictly
       // in place: zero translation outside the threshold cone, ramping smoothly to full
       // speed as the body aligns — so direction reversals (L-R-L) cannot drift.
       if (moving) {
         const desired = Math.atan2(this.inputX, this.inputY)
         const err = wrapAngle(desired - this.yaw)
+        // Running reversal: while moving fast with a reversal-class error, play the
+        // authored plant-and-turn for the current gear and gait foot.
+        const runTurns = this.clips.runTurn
+        if (runTurns && runTurns.length > 0 && this.recentSpeed >= 0.6 && Math.abs(err) >= (130 * Math.PI) / 180) {
+          const gear = this.recentSpeed > 1.4 ? "sprint" : "run"
+          const foot = this.gaitPhase < 0.5 ? "L" : "R"
+          const side = err < 0 ? -1 : 1
+          let best: RunTurnClipEntry | null = null
+          let bestScore = -1
+          for (const e of runTurns) {
+            if (Math.sign(e.angle) !== side) continue
+            const score = (e.gear === gear ? 2 : 0) + (e.foot === foot ? 1 : 0)
+            if (score > bestScore) {
+              best = e
+              bestScore = score
+            }
+          }
+          if (best) {
+            // Restore the pre-dip speed so she runs OUT of the turn at pace.
+            this.speedLevel = Math.max(this.speedLevel, Math.min(this.recentSpeed, 2))
+            this.runTurning = {
+              entry: best,
+              time: 0,
+              startX: this.position.x,
+              startZ: this.position.z,
+              dirX: Math.sin(this.yaw),
+              dirZ: Math.cos(this.yaw),
+            }
+            return this.updateRunTurn(dt)
+          }
+        }
+        // Reversal-class turn from near-standstill: play the authored turn clip
+        // whose angle is nearest the error instead of the eased pivot.
+        const turnClips = this.clips.turnInPlace
+        if (turnClips && turnClips.length > 0 && this.speedLevel < 0.3 && Math.abs(err) >= this.turnClipMinAngle) {
+          let best = turnClips[0]
+          let bestD = Math.abs(wrapAngle(err - best.angle))
+          for (const e of turnClips) {
+            const d = Math.abs(wrapAngle(err - e.angle))
+            if (d < bestD) {
+              best = e
+              bestD = d
+            }
+          }
+          this.turning = { entry: best, time: 0 }
+          return this.updateTurnClip(dt)
+        }
         this.yaw = wrapAngle(this.yaw + err * Math.min(1, this.turnResponse * dt))
         align = Math.max(0, (Math.cos(err) - this.cosTurnThreshold) / (1 - this.cosTurnThreshold))
         this.dirX = this.inputX / m
@@ -278,7 +494,26 @@ export class LocomotionController {
     this.entries[1].weight = wRun
     this.entries[2].time = this.gaitPhase * sprintDur
     this.entries[2].weight = wSprint
-    this.model.setBlendPose(this.entries)
+    const GHOST_FADE = 0.25
+    if (this.exitGhost) {
+      const g = this.exitGhost
+      g.elapsed += dt
+      const wGhost = Math.max(0, 1 - g.elapsed / GHOST_FADE)
+      if (wGhost <= 0) {
+        this.exitGhost = null
+        this.entries[3].weight = 0
+      } else {
+        this.entries[0].weight *= 1 - wGhost
+        this.entries[1].weight *= 1 - wGhost
+        this.entries[2].weight *= 1 - wGhost
+        this.entries[3].name = g.clip
+        this.entries[3].time = g.clipTime + g.elapsed // the clip's real tail keeps playing
+        this.entries[3].weight = wGhost
+      }
+    } else {
+      this.entries[3].weight = 0
+    }
+    this.emit(this.entries)
 
     const ry = this.yaw + this.yawOffset
     const half = ry * 0.5
@@ -386,13 +621,205 @@ export class LocomotionController {
     e[4].name = sprintB.clip
     e[4].time = this.gaitPhase * sprintDur
     e[4].weight = wSprint * sprintT
-    this.model.setBlendPose(e)
+    this.emit(e)
 
     const ry = this.yaw + this.yawOffset
     const half = ry * 0.5
     this.rotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
     this.pose.yaw = this.yaw
     this.pose.speedLevel = level
+    return this.pose
+  }
+
+  /** Authored turn-in-place frame: the clip rotates the body through its bones while
+   *  the root yaw stays frozen; at exitTime the measured angle transfers to the root
+   *  in the same instant the pose hands back to idle — the same orientation expressed
+   *  two ways, so the cut is seamless. No translation during the turn. */
+  private updateTurnClip(dt: number): LocomotionPose {
+    const t = this.turning!
+    t.time += dt * this.turnTimeScale
+
+    // Speed level settles toward 0 while turning (we were near-standstill already).
+    const maxStep = this.speedResponse * dt
+    this.speedLevel += Math.abs(-this.speedLevel) <= maxStep ? -this.speedLevel : -Math.sign(this.speedLevel) * maxStep
+
+    const idleDur = this.clipDuration(this.clips.idle)
+    this.idleTime = (this.idleTime + dt) % idleDur
+
+    if (t.time >= t.entry.exitTime) {
+      // Transfer the angle to the root and hand the pose to idle IN THE SAME frame —
+      // leaving the previous blend up would double the rotation for one frame.
+      this.yaw = wrapAngle(this.yaw + t.entry.angle)
+      this.turning = null
+      const e = this.turnEntries
+      e[0].weight = 0
+      e[1].name = this.clips.idle
+      e[1].time = this.idleTime
+      e[1].weight = 1
+      e[2].weight = 0
+      this.emit(e)
+    } else {
+      // Fade the turn clip over idle at the edges so entry doesn't pop.
+      const w = Math.min(1, t.time / 0.12)
+      const e = this.turnEntries
+      e[0].name = t.entry.clip
+      e[0].time = Math.min(t.time, t.entry.exitTime)
+      e[0].weight = w
+      e[1].name = this.clips.idle
+      e[1].time = this.idleTime
+      e[1].weight = 1 - w
+      e[2].weight = 0
+      this.emit(e)
+    }
+
+    const ry = this.yaw + this.yawOffset
+    const half = ry * 0.5
+    this.rotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
+    this.pose.yaw = this.yaw
+    this.pose.speedLevel = this.speedLevel
+    return this.pose
+  }
+
+  /** Authored-stop frame: root follows the clip's measured skid profile along the
+   *  release heading; input returning interrupts and resumes locomotion at a level
+   *  proportional to how much of the stop remains. */
+  private updateStop(dt: number): LocomotionPose {
+    const t = this.stopping!
+    const entry = t.entry
+
+    // Interrupt: input came back — locomotion resumes instantly from a LOW level
+    // (a stop is committed; breaking out is a fresh walk-up, never a drift), while
+    // the stop pose fades out as a ghost instead of hard-cutting.
+    if (Math.hypot(this.inputX, this.inputY) > 0.05) {
+      this.speedLevel = Math.min(t.startLevel * (1 - Math.min(1, t.time / entry.exitTime)), 0.3)
+      this.recentSpeed = this.speedLevel
+      this.exitGhost = { clip: entry.clip, clipTime: Math.min(t.time, entry.exitTime), elapsed: 0 }
+      this.stopping = null
+      return this.update(dt)
+    }
+
+    t.time += dt * this.stopTimeScale
+    const clipT = Math.min(t.time, entry.exitTime)
+    const fwd = LocomotionController.profileAt(entry.forward, clipT / entry.exitTime)
+    this.position.x = t.startX + t.dirX * fwd
+    this.position.z = t.startZ + t.dirZ * fwd
+
+    this.speedLevel = t.startLevel * Math.max(0, 1 - t.time / entry.exitTime)
+
+    const idleDur = this.clipDuration(this.clips.idle)
+    this.idleTime = (this.idleTime + dt) % idleDur
+
+    const FADE_OUT = 0.35
+    if (t.time >= entry.exitTime + FADE_OUT) {
+      this.stopping = null
+      this.speedLevel = 0
+      this.gaitPhase = 0
+      const e = this.turnEntries
+      e[0].weight = 0
+      e[1].name = this.clips.idle
+      e[1].time = this.idleTime
+      e[1].weight = 1
+      e[2].weight = 0
+      this.emit(e)
+    } else if (t.time >= entry.exitTime) {
+      // Settle tail: the root is already still, so keep playing the clip's own
+      // recovery (it exists past exitTime) while fading to idle — no hard cut.
+      const wOut = (t.time - entry.exitTime) / FADE_OUT
+      const e = this.turnEntries
+      e[0].name = entry.clip
+      e[0].time = t.time // real tail frames beyond exitTime
+      e[0].weight = 1 - wOut
+      e[1].name = this.clips.idle
+      e[1].time = this.idleTime
+      e[1].weight = wOut
+      e[2].weight = 0
+      this.emit(e)
+    } else {
+      const fromDur = this.clipDuration(t.fromClip)
+      t.fromTime = (t.fromTime + dt) % fromDur
+      const w = Math.min(1, t.time / 0.25)
+      const e = this.turnEntries
+      e[0].name = entry.clip
+      e[0].time = clipT
+      e[0].weight = w
+      e[1].name = t.fromClip
+      e[1].time = t.fromTime
+      e[1].weight = (1 - w) * (1 - t.fromIdleW)
+      e[2].name = this.clips.idle
+      e[2].time = this.idleTime
+      e[2].weight = (1 - w) * t.fromIdleW
+      this.emit(e)
+    }
+
+    const ry = this.yaw + this.yawOffset
+    const half = ry * 0.5
+    this.rotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
+    this.pose.yaw = this.yaw
+    this.pose.speedLevel = this.speedLevel
+    return this.pose
+  }
+
+  /** Linear interpolation over a uniformly sampled profile at t in [0, 1]. */
+  private static profileAt(samples: number[], t: number): number {
+    const n = samples.length - 1
+    if (n <= 0) return 0
+    const x = Math.min(Math.max(t, 0), 1) * n
+    const i = Math.min(n - 1, Math.floor(x))
+    return samples[i] + (samples[i + 1] - samples[i]) * (x - i)
+  }
+
+  /** Running-reversal frame: bones carry the turn while the root travels the clip's
+   *  AUTHORED forward profile along the trigger heading (overrun, plant, return) —
+   *  no fabricated motion, so the feet stay glued. At exitTime the yaw transfers
+   *  and the normal path runs her out along the new heading. */
+  private updateRunTurn(dt: number): LocomotionPose {
+    const t = this.runTurning!
+    t.time += dt
+    const entry = t.entry
+    const clipT = Math.min(t.time, entry.exitTime)
+
+    const fwd = LocomotionController.profileAt(entry.forward, clipT / entry.exitTime)
+    this.position.x = t.startX + t.dirX * fwd
+    this.position.z = t.startZ + t.dirZ * fwd
+
+    const idleDur = this.clipDuration(this.clips.idle)
+    this.idleTime = (this.idleTime + dt) % idleDur
+
+    if (t.time >= entry.exitTime) {
+      this.yaw = wrapAngle(this.yaw + entry.angle)
+      this.runTurning = null
+      // She exits mid-stride: keep the speed level, restart the gait cleanly, and
+      // point the travel direction along the new heading so the next frame runs out.
+      this.gaitPhase = 0
+      this.dirX = Math.sin(this.yaw)
+      this.dirZ = Math.cos(this.yaw)
+      const e = this.turnEntries
+      e[0].name = this.clips.run
+      e[0].time = 0
+      e[0].weight = Math.min(1, this.speedLevel)
+      e[1].name = this.clips.idle
+      e[1].time = this.idleTime
+      e[1].weight = 1 - Math.min(1, this.speedLevel)
+      e[2].weight = 0
+      this.emit(e)
+    } else {
+      const w = Math.min(1, t.time / 0.1)
+      const e = this.turnEntries
+      e[0].name = entry.clip
+      e[0].time = clipT
+      e[0].weight = w
+      e[1].name = this.clips.run
+      e[1].time = this.gaitPhase * this.clipDuration(this.clips.run)
+      e[1].weight = 1 - w
+      e[2].weight = 0
+      this.emit(e)
+    }
+
+    const ry = this.yaw + this.yawOffset
+    const half = ry * 0.5
+    this.rotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
+    this.pose.yaw = this.yaw
+    this.pose.speedLevel = this.speedLevel
     return this.pose
   }
 }

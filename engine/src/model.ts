@@ -32,6 +32,14 @@ const _convMat = new Float32Array(16)
 // Blend-path scratch: per-entry sample target and the crossfade's two fixed entries.
 const _blendQ = new Quat(0, 0, 0, 1)
 const _blendT = new Vec3(0, 0, 0)
+export interface ClipEventInfo {
+  clip: string
+  /** The registered event time, seconds. */
+  time: number
+  /** The clip's blend weight at the moment of firing. */
+  weight: number
+}
+
 const _fadeEntries: BlendEntry[] = [
   { name: "", time: 0, weight: 0 },
   { name: "", time: 0, weight: 0 },
@@ -327,6 +335,10 @@ export class Model {
     onEnd: (() => void) | null
   } | null = null
   private readonly oneShotEntries: BlendEntry[] = []
+  /** Time-triggered clip callbacks (footsteps, skill timing). Fired by every
+   *  playback path when a clip's cursor crosses the event time with weight. */
+  private readonly clipEvents = new Map<string, { time: number; minWeight: number; callback: (e: ClipEventInfo) => void }[]>()
+  private readonly entryEventPrev = new WeakMap<BlendEntry, { name: string; time: number }>()
 
   // Blended pose: declarative N-clip mix (setBlendPose) or a running crossfade.
   // Cursor caches are per clip so sampling several clips in one frame doesn't
@@ -1405,6 +1417,50 @@ export class Model {
     return this.oneShot?.name ?? null
   }
 
+  /** Fire `callback` whenever `clip`'s playback crosses `time` (seconds) with at
+   *  least `minWeight` influence (default 0.1) — on any path: blend entries,
+   *  one-shots, crossfades, or plain play. Loop wraps fire correctly; hard cursor
+   *  jumps may occasionally fire or skip (events are for sfx-grade timing, not
+   *  logic). Returns an unsubscribe function. */
+  addClipEvent(clip: string, time: number, callback: (e: ClipEventInfo) => void, options?: { minWeight?: number }): () => void {
+    let list = this.clipEvents.get(clip)
+    if (!list) {
+      list = []
+      this.clipEvents.set(clip, list)
+    }
+    const def = { time, minWeight: options?.minWeight ?? 0.1, callback }
+    list.push(def)
+    return () => {
+      const i = list.indexOf(def)
+      if (i >= 0) list.splice(i, 1)
+    }
+  }
+
+  private fireClipEvents(name: string, prev: number, now: number, weight: number): void {
+    const evs = this.clipEvents.get(name)
+    if (!evs || evs.length === 0) return
+    const wrapped = now < prev
+    for (let i = 0; i < evs.length; i++) {
+      const ev = evs[i]
+      if (weight < ev.minWeight) continue
+      const hit = wrapped ? ev.time > prev || ev.time <= now : ev.time > prev && ev.time <= now
+      if (hit) ev.callback({ clip: name, time: ev.time, weight })
+    }
+  }
+
+  /** Per-entry cursor memory for event crossing detection; keyed on entry object
+   *  identity (controllers reuse their arrays, so this stays warm). */
+  private trackEntryEvents(e: BlendEntry): void {
+    const prev = this.entryEventPrev.get(e)
+    if (prev === undefined) {
+      this.entryEventPrev.set(e, { name: e.name, time: e.time })
+      return
+    }
+    if (prev.name === e.name && prev.time !== e.time) this.fireClipEvents(e.name, prev.time, e.time, e.weight)
+    prev.name = e.name
+    prev.time = e.time
+  }
+
   /** Fade from the currently playing clip (or from the rest pose when nothing plays)
    *  into `name` over `seconds`. The target starts at frame 0 and becomes the current
    *  clip immediately — progress, looping and the camera clock report the target for
@@ -1695,6 +1751,7 @@ export class Model {
       if (!clip) continue
       const w = e.weight * norm
       const frame = e.time * FPS
+      if (this.clipEvents.size > 0) this.trackEntryEvents(e)
 
       let cursors = this.blendBoneCursors.get(clip)
       if (!cursors) {
@@ -1883,6 +1940,8 @@ export class Model {
     // Update all active tweens (rotations, translations, morphs)
     const tweensChangedMorphs = this.updateTweens()
 
+    const evWatch = this.clipEvents.size > 0 ? this.animationState.getCurrentAnimation() : null
+    const evPrevFrame = evWatch !== null ? this.animationState.getCurrentFrame() : 0
     this.animationState.update(deltaTime)
     if (!this.clipApplySuspended) {
       if (this.oneShot !== null) {
@@ -1893,7 +1952,12 @@ export class Model {
         this.applyCrossfade(deltaTime)
       } else {
         const clip = this.animationState.getCurrentClip()
-        if (clip !== null) this.applyPoseFromClip(clip, this.animationState.getCurrentFrame())
+        if (clip !== null) {
+          this.applyPoseFromClip(clip, this.animationState.getCurrentFrame())
+          if (evWatch !== null && evWatch === this.animationState.getCurrentAnimation()) {
+            this.fireClipEvents(evWatch, evPrevFrame / FPS, this.animationState.getCurrentFrame() / FPS, 1)
+          }
+        }
       }
     }
 

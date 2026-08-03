@@ -52,7 +52,7 @@ export { BODY_GRAPH } from "./graph/presets/body"
 export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 export { EYE_GRAPH } from "./graph/presets/eye"
 export { FACE_GRAPH } from "./graph/presets/face"
-export { Model } from "./model"
+export { Model, type ClipEventInfo } from "./model"
 export { Vec3, Quat, Mat4, easeInOut, type EulerOrder } from "./math"
 export type {
   AnimationClip,
@@ -71,7 +71,11 @@ export {
   type LocomotionOptions,
   type LocomotionPose,
   type StrafeClipEntry,
+  type TurnClipEntry,
+  type RunTurnClipEntry,
+  type StopClipEntry,
 } from "./locomotion"
+export { AnimationStateMachine, type AnimStateDef, type AnimTransitionDef, type StateMachineOptions } from "./state-machine"
 export {
   FPS,
   bezierInterpolate,

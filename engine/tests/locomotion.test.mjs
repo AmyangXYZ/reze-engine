@@ -294,6 +294,170 @@ test("strafe mode: releasing input settles into idle without drift", () => {
   assert.equal(c.getPosition().z, z)
 })
 
+const TURN_CLIPS = [
+  { clip: "turn_L90", angle: (-90 * Math.PI) / 180, exitTime: 1.2 },
+  { clip: "turn_R90", angle: (90 * Math.PI) / 180, exitTime: 1.2 },
+  { clip: "turn_L180", angle: -Math.PI, exitTime: 1.6 },
+]
+
+function makeTurnStub() {
+  const clips = { idle: { frameCount: 90 }, run: { frameCount: 30 } }
+  for (const t of TURN_CLIPS) clips[t.clip] = { frameCount: 68 }
+  return {
+    lastEntries: null,
+    getClip(name) {
+      return clips[name] ?? null
+    },
+    setBlendPose(entries) {
+      this.lastEntries = entries
+    },
+    clearBlendPose() {
+      this.lastEntries = null
+    },
+  }
+}
+
+test("turn clips: a reversal from standstill plays the nearest clip and transfers its yaw", () => {
+  const stub = makeTurnStub()
+  const c = new LocomotionController(stub, { idle: "idle", run: "run", turnInPlace: TURN_CLIPS }, { turnTimeScale: 1 })
+  c.setMove(0, 1)
+  STEPS(c, 120) // face +Z, then release and settle
+  c.setMove(0, 0)
+  STEPS(c, 120)
+  const p0 = { x: c.getPosition().x, z: c.getPosition().z }
+  c.setMove(0, -1) // 180° reversal from idle
+  c.update(1 / 60)
+  const w = weightsByName(stub)
+  assert.ok(w["turn_L180"] !== undefined, `turn clip active: ${JSON.stringify(w)}`)
+  // during the turn: no translation, yaw frozen
+  const yawBefore = STEPS(c, 30).yaw
+  assert.ok(Math.abs(yawBefore) < 1e-6, `root yaw frozen during turn, got ${yawBefore}`)
+  assert.equal(c.getPosition().x, p0.x)
+  assert.equal(c.getPosition().z, p0.z)
+  // run past exitTime: angle transfers, then she runs off toward -Z
+  const pose = STEPS(c, 120)
+  assert.ok(Math.abs(Math.abs(pose.yaw) - Math.PI) < 0.2, `yaw transferred, got ${pose.yaw}`)
+  assert.ok(c.getPosition().z < p0.z - 1, "moving -Z after the turn")
+})
+
+test("turn clips: small corrections keep the instant pivot (no clip)", () => {
+  const stub = makeTurnStub()
+  const c = new LocomotionController(stub, { idle: "idle", run: "run", turnInPlace: TURN_CLIPS })
+  c.setMove(0, 1)
+  STEPS(c, 120)
+  c.setMove(1, 1) // 45° — under the ~100° threshold
+  STEPS(c, 10)
+  const w = weightsByName(stub)
+  assert.ok(!("turn_L90" in w) && !("turn_R90" in w) && !("turn_L180" in w), JSON.stringify(w))
+})
+
+test("turn clips: weights sum to 1 throughout the turn", () => {
+  const stub = makeTurnStub()
+  const c = new LocomotionController(stub, { idle: "idle", run: "run", turnInPlace: TURN_CLIPS }, { turnTimeScale: 1 })
+  c.setMove(0, -1)
+  for (let i = 0; i < 90; i++) {
+    c.update(1 / 60)
+    let sum = 0
+    for (const e of stub.lastEntries) sum += e.weight
+    assert.ok(Math.abs(sum - 1) < 1e-9, `sum=${sum} at step ${i}`)
+  }
+})
+
+test("run-turn: a moving reversal plays the plant-and-turn along its authored profile", () => {
+  const clips = {
+    idle: { frameCount: 90 },
+    run: { frameCount: 30 },
+    rt: { frameCount: 41 },
+  }
+  const stub = {
+    lastEntries: null,
+    getClip(n) { return clips[n] ?? null },
+    setBlendPose(e) { this.lastEntries = e },
+    clearBlendPose() { this.lastEntries = null },
+  }
+  const c = new LocomotionController(stub, {
+    idle: "idle",
+    run: "run",
+    runTurn: [
+      { clip: "rt", angle: Math.PI, exitTime: 1.2, forward: [0, 8, 14, 16, 12, 6, -2], gear: "run", foot: "L" },
+      { clip: "rt", angle: -Math.PI, exitTime: 1.2, forward: [0, 8, 14, 16, 12, 6, -2], gear: "run", foot: "L" },
+    ],
+  })
+  c.setMove(0, 1)
+  STEPS(c, 120) // full run toward +Z
+  const z0 = c.getPosition().z
+  c.setMove(0, -1) // reversal while running
+  c.update(1 / 60)
+  const w = weightsByName(stub)
+  assert.ok(w["rt"] !== undefined, `run-turn active: ${JSON.stringify(w)}`)
+  // mid-turn: root has overrun forward along the OLD heading (profile positive)
+  STEPS(c, 30) // 0.5s in
+  assert.ok(c.getPosition().z > z0 + 5, `overran forward, dz=${c.getPosition().z - z0}`)
+  // after exit: yaw reversed, profile returned, and she runs out toward -Z
+  const pose = STEPS(c, 120)
+  assert.ok(Math.abs(Math.abs(pose.yaw) - Math.PI) < 0.2, `yaw=${pose.yaw}`)
+  assert.ok(c.getPosition().z < z0, `ran back past the plant, dz=${c.getPosition().z - z0}`)
+})
+
+test("stop clips: releasing at speed plays the skid along its profile, then idle", () => {
+  const clips = { idle: { frameCount: 90 }, run: { frameCount: 30 }, st: { frameCount: 45 } }
+  const stub = {
+    lastEntries: null,
+    getClip(n) { return clips[n] ?? null },
+    setBlendPose(e) { this.lastEntries = e },
+    clearBlendPose() {},
+  }
+  const c = new LocomotionController(stub, {
+    idle: "idle",
+    run: "run",
+    stop: [{ clip: "st", exitTime: 1.5, forward: [0, 10, 20, 28, 33, 35, 35], gear: "run", foot: "L" }],
+  })
+  c.setMove(0, 1)
+  STEPS(c, 120)
+  const z0 = c.getPosition().z
+  c.setMove(0, 0)
+  c.update(1 / 60)
+  const w = weightsByName(stub)
+  assert.ok(w["st"] !== undefined, `stop clip active: ${JSON.stringify(w)}`)
+  const pose = STEPS(c, 120) // 2s > exitTime
+  assert.ok(Math.abs(pose.position.z - z0 - 35) < 0.5, `skid distance dz=${pose.position.z - z0}`)
+  const w2 = weightsByName(stub)
+  assert.ok(w2.idle > 0.999, `settled to idle: ${JSON.stringify(w2)}`)
+  assert.equal(pose.speedLevel, 0)
+})
+
+test("stop clips: re-pressing input interrupts the stop and resumes", () => {
+  const clips = { idle: { frameCount: 90 }, run: { frameCount: 30 }, st: { frameCount: 45 } }
+  const stub = {
+    lastEntries: null,
+    getClip(n) { return clips[n] ?? null },
+    setBlendPose(e) { this.lastEntries = e },
+    clearBlendPose() {},
+  }
+  const c = new LocomotionController(stub, {
+    idle: "idle",
+    run: "run",
+    stop: [{ clip: "st", exitTime: 1.5, forward: [0, 10, 20, 28, 33, 35, 35], gear: "run", foot: "L" }],
+  })
+  c.setMove(0, 1)
+  STEPS(c, 120)
+  c.setMove(0, 0)
+  STEPS(c, 20) // ~0.33s into the stop
+  c.setMove(0, 1) // resume!
+  const p1 = STEPS(c, 1)
+  // The stop pose lingers only as a fading ghost over live locomotion,
+  // and the breakout restarts from a low level (fresh walk-up, no drift)
+  const w = weightsByName(stub)
+  assert.ok(w["st"] > 0 && w["st"] < 1, `ghost fading: ${JSON.stringify(w)}`)
+  assert.ok(p1.speedLevel <= 0.4, `breakout restarts low: ${p1.speedLevel}`)
+  STEPS(c, 24) // past the 0.25s fade
+  const w2 = weightsByName(stub)
+  assert.ok(!("st" in w2) || w2["st"] === 0, `ghost gone: ${JSON.stringify(w2)}`)
+  const z1 = c.getPosition().z
+  STEPS(c, 60)
+  assert.ok(c.getPosition().z > z1 + 1, "running again")
+})
+
 test("huge dt is clamped (tab-switch guard)", () => {
   const stub = makeStub()
   const c = makeController(stub, { runSpeed: 6 })
