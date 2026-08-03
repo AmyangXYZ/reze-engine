@@ -83,8 +83,9 @@ const SPRINT_AT = 0.92
 // push into the rim, so movement is responsive but sprint is intentional.
 const KB_RUN_AT = 0.75 // deflection of a full run
 const KB_TO_RUN = 0.35 // s from standstill to full run
-const KB_TO_SPRINT = 0.9 // s of continued holding from run into the rim
+const KB_TO_SPRINT = 1.6 // s of continued holding from run into the rim — sprint is earned
 const KB_DECEL_TIME = 0.25
+const KB_TURN_PAUSE = 0.35 // s: a direction change pauses the charge until the new keys are held steadily
 
 /** Mobile-game movement wheel. Reports {x, y (up = +forward), active} through a ref
  *  callback; the knob is moved via direct DOM transform so dragging never re-renders.
@@ -183,7 +184,7 @@ export default function Home() {
   const danceCancelRef = useRef(false)
   const [dancing, setDancing] = useState(false)
   const [spaceHeld, setSpaceHeld] = useState(false)
-  const kbThrottle = useRef({ mag: 0, dirX: 0, dirY: 1 })
+  const kbThrottle = useRef({ mag: 0, dirX: 0, dirY: 1, lastKx: 0, lastKy: 0, cool: 0 })
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
@@ -342,11 +343,23 @@ export default function Home() {
             const len = Math.hypot(kx, ky)
             t.dirX = kx / len
             t.dirY = ky / len
-            const rate = t.mag < KB_RUN_AT ? KB_RUN_AT / KB_TO_RUN : (1 - KB_RUN_AT) / KB_TO_SPRINT
-            t.mag = Math.min(1, t.mag + rate * dt)
+            // A different key combo interrupts the commitment: hold the charge
+            // until the new direction has been held steadily for a moment. (The
+            // first press from standstill is not a change — starts stay snappy.)
+            const changed = kx !== t.lastKx || ky !== t.lastKy
+            if (changed && (t.lastKx !== 0 || t.lastKy !== 0)) t.cool = KB_TURN_PAUSE
+            if (t.cool > 0) {
+              t.cool -= dt
+            } else {
+              const rate = t.mag < KB_RUN_AT ? KB_RUN_AT / KB_TO_RUN : (1 - KB_RUN_AT) / KB_TO_SPRINT
+              t.mag = Math.min(1, t.mag + rate * dt)
+            }
           } else {
             t.mag = Math.max(0, t.mag - dt / KB_DECEL_TIME)
+            t.cool = 0
           }
+          t.lastKx = kx
+          t.lastKy = ky
           rawX = t.dirX * t.mag
           rawY = t.dirY * t.mag
           sprint = t.mag > SPRINT_AT
