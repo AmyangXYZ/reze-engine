@@ -2802,6 +2802,16 @@ export class Engine {
   /** Turn the loaded camera VMD on/off (falls back to orbit when off). No-op if none loaded. */
   setCameraVmdEnabled(enabled: boolean): void {
     this.camera.setVmdDriven(enabled && this.cameraAnimation !== null)
+    if (!enabled && this.cameraTargetModel) {
+      // Follow resumes with a clean snap to bone + configured offset — one
+      // predictable cut to the scene's framing, no easing from the shot.
+      this.cameraFollowSeeded = false
+    }
+  }
+
+  /** True while the orbit target is riding a model bone (setCameraFollow). */
+  isCameraFollowing(): boolean {
+    return this.cameraTargetModel !== null
   }
 
   /** True while the loaded camera VMD is actively driving the shot. */

@@ -84,42 +84,11 @@ export class Camera {
   }
 
   /** Enter/leave VMD-camera drive. Backs up the orbit fov on enter, restores it on leave
-   *  (the VMD camera animates fov, so orbit's value would otherwise be clobbered).
-   *  Leaving ADOPTS the current shot: the orbit re-seeds its spherical coords from the
-   *  VMD pose so the switch holds the frame instead of snapping to the stale orbit. */
+   *  (the VMD camera animates fov, so orbit's value would otherwise be clobbered). */
   setVmdDriven(enabled: boolean): void {
     if (enabled === this.vmdDriven) return
     if (enabled) this._savedFov = this.fov
-    else {
-      this.fov = this._savedFov
-      const eye = this.vmdEye() // also refreshes _quatScratch with the shot's basis
-      const s = this._quatScratch
-      // The VMD target is the natural orbit pivot. Position-baked tracks carry
-      // distance 0 (eye == target), so synthesize one a comfortable orbit
-      // radius ahead along the shot's forward (rotation column 2, LH).
-      let tx = this._vmdTarget.x
-      let ty = this._vmdTarget.y
-      let tz = this._vmdTarget.z
-      if (Math.abs(this._vmdDistance) < 1e-3) {
-        tx = eye.x + s[8] * 30
-        ty = eye.y + s[9] * 30
-        tz = eye.z + s[10] * 30
-      }
-      const dx = eye.x - tx
-      const dy = eye.y - ty
-      const dz = eye.z - tz
-      const r = Math.hypot(dx, dy, dz)
-      if (r > 1e-4) {
-        this.target.x = tx
-        this.target.y = ty
-        this.target.z = tz
-        this.radius = r
-        this.beta = Math.acos(Math.min(1, Math.max(-1, dy / r)))
-        // Degenerate top-down shots keep a sliver of beta so orbit controls work.
-        this.beta = Math.min(Math.PI - 0.01, Math.max(0.01, this.beta))
-        this.alpha = Math.atan2(dx, dz)
-      }
-    }
+    else this.fov = this._savedFov
     this.vmdDriven = enabled
   }
 
