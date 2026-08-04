@@ -2,7 +2,7 @@ import { Vec3, Quat, Mat4 } from "../math"
 import type { Rigidbody, Joint } from "./types"
 import { RigidbodyType, RigidbodyShape } from "./types"
 import { RigidBodyStore } from "./body"
-import { World } from "./world"
+import { World, type WindOptions } from "./world"
 import { buildConstraints, type SixDofSpringConstraint } from "./constraint"
 import { SolverCache } from "./solver"
 import { ContactPool } from "./contact"
@@ -165,6 +165,13 @@ export class RezePhysics {
   }
   getGravity(): Vec3 {
     return this.world.gravity
+  }
+  /** World-wide air movement. See {@link WindOptions}; null is still air. */
+  setWind(wind: WindOptions | null): void {
+    this.world.setWind(wind)
+  }
+  getWind(): WindOptions | null {
+    return this.world.getWind()
   }
   getRigidbodies(): Rigidbody[] {
     return this.rigidbodies

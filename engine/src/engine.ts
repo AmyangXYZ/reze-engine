@@ -7,6 +7,7 @@ import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
+import type { WindOptions } from "./physics/world"
 import {
   createFetchAssetReader,
   createFileMapAssetReader,
@@ -799,6 +800,10 @@ export class Engine {
   // IK and physics enabled at engine level (same for all models)
   private ikEnabled = true
   private physicsEnabled = true
+  // World-wide, not per-model: MMD treats gravity and wind as properties of the
+  // scene, and a model loaded later must arrive into the same air as the rest.
+  private gravity = new Vec3(0, -98, 0)
+  private wind: WindOptions | null = null
   // GPU vertex-morph path. Set false BEFORE loadModel to fall back to the CPU path (A/B).
   private useGpuMorphs = true
 
@@ -3249,6 +3254,39 @@ export class Engine {
     return this.physicsEnabled
   }
 
+  /**
+   * Scene gravity, applied to every model's cloth and hair. The default is
+   * (0, -98, 0) — MMD's own scale, where a character stands about 20 units
+   * tall. Lower magnitudes float; tilting it sideways hangs everything on a
+   * slant, which is the cheap way to fake a strong draught.
+   */
+  setGravity(gravity: Vec3): void {
+    this.gravity = new Vec3(gravity.x, gravity.y, gravity.z)
+    this.forEachInstance((inst) => inst.physics?.setGravity(this.gravity))
+  }
+
+  getGravity(): Vec3 {
+    return new Vec3(this.gravity.x, this.gravity.y, this.gravity.z)
+  }
+
+  /**
+   * Air movement across the scene — null is still air.
+   *
+   * Applied as an acceleration alongside gravity, so `strength` is in the same
+   * units: against the default gravity of 98, a strength of 10-30 reads as a
+   * breeze through hair and a skirt without lifting them off the body. Gusting
+   * is driven by simulated time rather than wall time, so an exported take
+   * gusts exactly as the preview did.
+   */
+  setWind(wind: WindOptions | null): void {
+    this.wind = wind ? { ...wind, direction: new Vec3(wind.direction.x, wind.direction.y, wind.direction.z) } : null
+    this.forEachInstance((inst) => inst.physics?.setWind(this.wind))
+  }
+
+  getWind(): WindOptions | null {
+    return this.wind ? { ...this.wind, direction: new Vec3(this.wind.direction.x, this.wind.direction.y, this.wind.direction.z) } : null
+  }
+
   resetPhysics(): void {
     this.forEachInstance((inst) => {
       if (!inst.physics) return
@@ -3421,6 +3459,12 @@ export class Engine {
 
     const rbs = model.getRigidbodies()
     const physics = rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
+    // Adopt the scene's air, or a model added mid-session would fall under
+    // different gravity from the ones already on stage.
+    if (physics) {
+      physics.setGravity(this.gravity)
+      if (this.wind) physics.setWind(this.wind)
+    }
 
     const shadowBindGroup = this.device.createBindGroup({
       label: `${name}: shadow bind`,

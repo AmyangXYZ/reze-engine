@@ -15,7 +15,7 @@ npm install reze-engine
 - **Anime-style rendering** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, ASC CDL colour grading, 4× MSAA, Apple-TBDR-friendly targets
-- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies; structure-of-arrays solver, a world floor so hair and hems rest on the ground instead of clipping through it, and per-frame load shedding that holds framerate on weak devices
+- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies; structure-of-arrays solver, scene gravity and wind, a world floor so hair and hems rest on the ground instead of clipping through it, and per-frame load shedding that holds framerate on weak devices
 - **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
 - **Clip blending & locomotion** — weighted multi-clip pose blending, crossfades, and a game-style character controller (idle/run/sprint speed blend, authored stop skids, code-driven root motion) — the [demo](https://reze.one) is WASD-playable
@@ -90,7 +90,7 @@ engine/src/
     physics.ts         RezePhysics: bone↔body sync, fixed-step accumulator + interpolation
     solver.ts          sequential-impulse PGS (joint + contact rows)
     contact.ts         narrowphase (analytical sphere/box/capsule pairs) + contact pool
-    constraint.ts      6DOF spring joints   ·   world.ts  broadphase + step
+    constraint.ts      6DOF spring joints   ·   world.ts  step, gravity + wind
     body.ts            SoA rigid-body store  ·  types.ts
 
   shaders/
@@ -119,6 +119,8 @@ engine.setMaterialVisible(name, material, visible) / toggleMaterialVisible / isM
 engine.setIKEnabled(enabled)                 // engine-wide OFF for hosts that pose bones themselves; ON hands per-chain state to the clip
 engine.setPhysicsEnabled(enabled)
 engine.resetPhysics()                        // re-pose bodies from animation + zero velocities (call if physics explodes)
+engine.setGravity(vec3) / getGravity()       // scene-wide; default (0, -98, 0) — MMD scale, where a character is ~18 units tall
+engine.setWind({ direction, strength, turbulence?, frequency? } | null) / getWind()   // scene-wide air; strength is in gravity's units, so 10-30 reads as a breeze through hair and skirt
 
 engine.setCameraFollow(model, bone?, offset?) / setCameraFollow(null)
 engine.setCameraTarget(vec3) / setCameraDistance(d) / setCameraAlpha(a) / setCameraBeta(b)
@@ -337,7 +339,9 @@ In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsu
 - **Discontinuity guards** — a bone-pose jump beyond continuous motion (timeline scrub, long stall) rigidly carries each dynamic body along with its kinematic root's transform delta and zeroes momentum instead of dragging cloth across the gap; correction velocities are clamped (120 u/s linear, 30 rad/s angular), per-step travel is capped, and any body that still goes non-finite is restored to its previous substep pose.
 - Sleeping is off (cloth must always react); resting bodies bleed micro-velocity via per-PMX damping.
 
-Engine surface is just `setPhysicsEnabled` / `resetPhysics` — all tuning (mass, damping, friction, restitution, joint stiffness/limits, collision groups) lives on the PMX rig.
+- **Gravity and wind** are scene-wide and summed once per substep, so wind costs the per-body loop nothing. Wind is an acceleration rather than a drag model: PMX authors already tune per-body damping to get the hang they want, and a second hidden drag term would fight it. Gusting rides a pair of incommensurate sines — one alone is a metronome — and advances on *simulated* time, so an exported take gusts frame-for-frame as its preview did.
+
+Engine surface is `setPhysicsEnabled` / `resetPhysics` / `setGravity` / `setWind` — everything else (mass, damping, friction, restitution, joint stiffness/limits, collision groups) lives on the PMX rig.
 
 ## Rendering
 
