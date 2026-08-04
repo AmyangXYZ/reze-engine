@@ -2987,32 +2987,20 @@ export class Engine {
     return { ...this.stats }
   }
 
-  /** Frame-rate cap for the render loop, or null for display-rate. On high-refresh
-   *  displays (144/240Hz) rAF runs the WHOLE pipeline — physics, IK, blending,
-   *  passes — that many times per second for no visible gain over ~120 (VMD content
-   *  is 30fps; blending interpolates). Capping restores the per-second budget. */
-  private maxFPS: number | null = null
-  private lastLoopTime = 0
-
-  setMaxFPS(fps: number | null): void {
-    this.maxFPS = fps !== null && fps > 0 ? fps : null
-  }
-
+  // The render loop runs at display rate, always. A frame-rate cap used to be
+  // offered here for high-refresh displays, on the reasoning that VMD content
+  // is 30fps and running the whole pipeline at 240 buys nothing. Nothing ever
+  // called it — every product in the family chases native refresh, because
+  // dropping frames a display can show is the one thing that reads as cheap.
+  // Physics already decouples: it steps at a fixed 60Hz behind an accumulator
+  // and the drawn pose is interpolated between substeps, so a 240Hz display
+  // costs four interpolations per simulation step, not four simulations.
   runRenderLoop(callback?: () => void) {
     this.renderLoopCallback = callback || null
 
-    const loop = (now: number) => {
+    const loop = () => {
       this.animationFrameId = requestAnimationFrame(loop)
-
-      if (this.maxFPS !== null) {
-        // Tolerate rAF jitter: accept frames within ~half a display tick early.
-        const minInterval = 1000 / this.maxFPS - 2
-        if (now - this.lastLoopTime < minInterval) return
-        this.lastLoopTime = now
-      }
-
       this.render()
-
       if (this.renderLoopCallback) {
         this.renderLoopCallback()
       }
@@ -3693,6 +3681,7 @@ export class Engine {
       ],
     })
   }
+
 
   // Shadow is cast from the visible sun direction — same vector the shader lights with.
   /** Whether the shadow map needs clearing — see the shadow pass in `render`.

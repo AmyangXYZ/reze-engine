@@ -288,8 +288,6 @@ export default function Home() {
       })
       engineRef.current = engine
       await engine.init()
-      // Uncapped: chase native refresh. engine.setMaxFPS(n) is available for
-      // hosts that prefer to spend less CPU on high-refresh displays.
       // Perf readout lives in the header's FPS pill (click it). Dev builds keep
       // a console handle for live probing; production exposes nothing.
       if (process.env.NODE_ENV === "development") (window as unknown as { engine?: Engine }).engine = engine

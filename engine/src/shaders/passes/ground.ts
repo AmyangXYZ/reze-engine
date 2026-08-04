@@ -50,40 +50,74 @@ struct VO { @builtin(position) position: vec4f, @location(0) worldPos: vec3f, @l
 }
 struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
 @fragment fn fs(i: VO) -> FSOut {
+  // Derivatives first, unconditionally: WGSL requires fwidth in uniform control
+  // flow and everything below branches on world position.
+  let gp = i.worldPos.xz / material.gridSpacing;
+  let gridDeriv = fwidth(gp);
+
+  var out: FSOut;
   let n = normalize(i.normal);
   let centerDist = length(i.worldPos.xz);
   let edgeFade = 1.0 - smoothstep(0.0, 1.0, clamp((centerDist - material.fadeStart) / max(material.fadeEnd - material.fadeStart, 0.001), 0.0, 1.0));
 
+  // Past the radial fade every term below is multiplied by edgeFade and the
+  // pixel is fully transparent. Shading it anyway produces nothing.
+  if (edgeFade <= 0.0) {
+    out.color = vec4f(0.0);
+    out.mask = vec4f(0.0, 1.0, 0.0, 0.0);
+    return out;
+  }
+
   let lclip = lightVP.viewProj * vec4f(i.worldPos, 1.0);
   let ndc = lclip.xyz / max(lclip.w, 1e-6);
-  let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-  let suv_c = clamp(suv, vec2f(0.02), vec2f(0.98));
-  let st = material.pcfTexel;
-  let compareZ = ndc.z - 0.0035;
-  var vis = 0.0;
-  for (var y = -2; y <= 2; y++) {
-    for (var x = -2; x <= 2; x++) {
-      vis += textureSampleCompare(shadowMap, shadowSampler, suv_c + vec2f(f32(x), f32(y)) * st, compareZ);
-    }
-  }
-  vis *= 0.04;
   // Outside the light's frustum there IS no shadow information — the clamped
-  // border samples above compare against unrelated depths and read "shadowed",
+  // border samples compare against unrelated depths and read "shadowed",
   // darkening the whole far plane with a visible band at the frustum edge
   // (masked by the opaque surface normally, glaring in green-screen mode where
   // only the shadow-catcher term renders). Fade to fully lit near the border.
   let inZ = select(0.0, 1.0, ndc.z > 0.0 && ndc.z < 1.0);
   let frustum = (1.0 - smoothstep(0.88, 0.96, abs(ndc.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc.y))) * inZ;
-  vis = mix(1.0, vis, frustum);
 
-  // Frosted/matte micro-texture
-  let noiseVal = fbmNoise(i.worldPos.xz * 3.0);
-  let noiseTint = 1.0 + (noiseVal - 0.5) * material.noiseStrength;
+  // THE cost of this shader, measured: a full-screen ground ran 25 shadow
+  // comparisons per pixel, and each one is hardware-bilinear, so ~100 depth
+  // samples per pixel. Gutting the rest of the shader changed nothing; cutting
+  // this is what makes looking down cheap.
+  //
+  // 3x3 at two-texel spacing covers the same +/-2 texel penumbra the 5x5 at
+  // one-texel spacing did — that kernel was oversampled, its taps overlapping
+  // almost entirely once the comparison sampler's own 2x2 filter is counted.
+  // Nine taps instead of twenty-five for the same blur radius.
+  //
+  // Skipped altogether outside the light frustum, where the mix below discards
+  // the result anyway: the shadow map covers a small area around the character
+  // and the ground is vastly larger than it.
+  var vis = 1.0;
+  if (frustum > 0.0) {
+    let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let suv_c = clamp(suv, vec2f(0.02), vec2f(0.98));
+    let st = material.pcfTexel * 2.0;
+    let compareZ = ndc.z - 0.0035;
+    var acc = 0.0;
+    for (var y = -1; y <= 1; y++) {
+      for (var x = -1; x <= 1; x++) {
+        // ...Level, not the implicit-derivative form: identical on a single-mip
+        // shadow map, and legal inside this branch.
+        acc += textureSampleCompareLevel(shadowMap, shadowSampler, suv_c + vec2f(f32(x), f32(y)) * st, compareZ);
+      }
+    }
+    vis = mix(1.0, acc * (1.0 / 9.0), frustum);
+  }
+
+  // Frosted/matte micro-texture. Scenes leaving it at zero were still paying
+  // sixteen hash rounds a pixel for a tint of exactly 1.
+  var noiseTint = 1.0;
+  if (material.noiseStrength != 0.0) {
+    let noiseVal = fbmNoise(i.worldPos.xz * 3.0);
+    noiseTint = 1.0 + (noiseVal - 0.5) * material.noiseStrength;
+  }
 
   // Grid lines — anti-aliased via screen-space derivatives
-  let gp = i.worldPos.xz / material.gridSpacing;
   let gridFrac = abs(fract(gp - 0.5) - 0.5);
-  let gridDeriv = fwidth(gp);
   let halfLine = material.gridLineWidth * 0.5;
   let gridLine = 1.0 - min(
     smoothstep(halfLine - gridDeriv.x, halfLine + gridDeriv.x, gridFrac.x),
@@ -101,7 +135,6 @@ struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
   let surfA = edgeFade * material.opacity;
   let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity);
   let outA = surfA + catchA;
-  var out: FSOut;
   out.color = vec4f(finalColor * surfA, outA);
   // mask.r = 0: ground never contributes to bloom. mask.g = 1.0 with src.a =
   // outA turns the aux blend into alpha-over, so the drawable alpha goes
