@@ -15,7 +15,7 @@ npm install reze-engine
 - **Anime-style rendering** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, ASC CDL colour grading, 4× MSAA, Apple-TBDR-friendly targets
-- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies
+- **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies; each model simulates on its own Web Worker (plain transferables — no SharedArrayBuffer, no special headers), so physics costs the main thread ~0.1 ms and a multi-model scene pays for its slowest world, not the sum
 - **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
 - **Clip blending & locomotion** — weighted multi-clip pose blending, crossfades, and a game-style character controller (idle/run/sprint speed blend, authored stop skids, code-driven root motion) — the [demo](https://reze.one) is WASD-playable
@@ -88,6 +88,8 @@ engine/src/
 
   physics/           in-house rigid-body solver (~2.5k lines)
     physics.ts         RezePhysics: bone↔body sync, fixed-step accumulator + interpolation
+    physics.worker.ts  worker entry — one model's world per worker, pipelined one
+    worker-physics.ts  frame deep over transferable buffers (main-thread facade)
     solver.ts          sequential-impulse PGS (joint + contact rows)
     contact.ts         narrowphase (analytical sphere/box/capsule pairs) + contact pool
     constraint.ts      6DOF spring joints   ·   world.ts  broadphase + step
