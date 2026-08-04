@@ -102,6 +102,10 @@ export interface LocomotionOptions {
   turnTimeScale?: number
   /** Playback rate for stop clips (default 1.25) — same reasoning. */
   stopTimeScale?: number
+  /** Seconds a heading must be held before a release earns an authored stop
+   *  (default 0.5). Below it, weaving direction changes blend to idle instead
+   *  of skidding metres along the last-held heading. */
+  stopCommitTime?: number
   /** Tank-mode steering rate, radians/second (default 2.5 ≈ 143°/s). */
   steerRate?: number
   /** Backpedal speed as a fraction of run speed in tank mode (default 0.5). */
@@ -148,6 +152,7 @@ export class LocomotionController {
   private readonly turnClipMinAngle: number
   private readonly turnTimeScale: number
   private readonly stopTimeScale: number
+  private readonly stopCommitTime: number
   private turning: { entry: TurnClipEntry; time: number } | null = null
   private runTurning: {
     entry: RunTurnClipEntry
@@ -160,6 +165,9 @@ export class LocomotionController {
   /** An interrupted authored clip fading out OVER resumed locomotion, so breaking
    *  out of a stop is instantly responsive without a pose pop. */
   private exitGhost: { clip: string; clipTime: number; elapsed: number } | null = null
+  private headingHold = 0
+  private headingDirX = 0
+  private headingDirY = 0
   private stopping: {
     entry: StopClipEntry
     time: number
@@ -168,6 +176,8 @@ export class LocomotionController {
     dirX: number
     dirZ: number
     startLevel: number
+    /** Fraction of the authored deceleration distance this stop travels. */
+    scale: number
     /** Idle's share of the blend at release (level < 1 shows part idle) — the
      *  crossfade source keeps this exact mix or the first stop frame snaps. */
     fromIdleW: number
@@ -226,6 +236,7 @@ export class LocomotionController {
     this.turnClipMinAngle = options?.turnClipMinAngle ?? (100 * Math.PI) / 180
     this.turnTimeScale = options?.turnTimeScale ?? 1.4
     this.stopTimeScale = options?.stopTimeScale ?? 1.25
+    this.stopCommitTime = options?.stopCommitTime ?? 0.5
     this.turnEntries = [
       { name: clips.idle, time: 0, weight: 0 },
       { name: clips.idle, time: 0, weight: 1 },
@@ -353,12 +364,32 @@ export class LocomotionController {
       const m = Math.hypot(this.inputX, this.inputY)
       moving = m > 0.05
       this.recentSpeed = Math.max(this.speedLevel, this.recentSpeed - dt * 1.5)
+      // How long the CURRENT heading has been held. An authored skid is the
+      // ending of a committed run; weaving through directions (D, then S+D,
+      // then S) rebuilds throttle in each new heading but earns no such
+      // ending — playing one there slides her metres along whichever way she
+      // happened to face last, which reads as drift.
+      if (moving) {
+        const dx = this.inputX / m
+        const dy = this.inputY / m
+        this.headingHold =
+          this.headingDirX * dx + this.headingDirY * dy > 0.94 ? this.headingHold + dt : 0
+        this.headingDirX = dx
+        this.headingDirY = dy
+      }
       // Release at speed: play the authored stop instead of blending to idle.
       const stops = this.clips.stop
       // Gate on the peak-hold speed: the release decay (throttle/analog) drains the
       // instantaneous level below any threshold before `moving` goes false. The
       // small floor on the actual level keeps standstill taps from faking a skid.
-      if (!moving && stops && stops.length > 0 && this.recentSpeed >= 0.7 && this.speedLevel >= 0.35) {
+      if (
+        !moving &&
+        stops &&
+        stops.length > 0 &&
+        this.recentSpeed >= 0.7 &&
+        this.speedLevel >= 0.35 &&
+        this.headingHold >= this.stopCommitTime
+      ) {
         const gear = this.recentSpeed > 1.4 ? "sprint" : "run"
         const foot = this.gaitPhase < 0.5 ? "L" : "R"
         // Gear must match exactly: supplying stops for only one gear means the
@@ -383,6 +414,13 @@ export class LocomotionController {
             dirX: this.dirX,
             dirZ: this.dirZ,
             startLevel: Math.min(this.recentSpeed, 2),
+            // How much of the authored skid this stop has earned. Each profile
+            // was captured at ITS gear's full speed (run = level 1, sprint =
+            // level 2), so compare like with like. Entering slower — or moments
+            // after a direction change, when the peak-hold still remembers the
+            // PREVIOUS heading's sprint — must not replay the full slide.
+            // Floored so a stop always still reads as a stop.
+            scale: Math.max(0.3, Math.min(1, this.speedLevel / (best.gear === "sprint" ? 2 : 1))),
             fromIdleW: Math.max(0, 1 - this.speedLevel),
             fromClip,
             fromTime: this.gaitPhase * this.clipDuration(fromClip),
@@ -707,7 +745,7 @@ export class LocomotionController {
 
     t.time += dt * this.stopTimeScale
     const clipT = Math.min(t.time, entry.exitTime)
-    const fwd = LocomotionController.profileAt(entry.forward, clipT / entry.exitTime)
+    const fwd = LocomotionController.profileAt(entry.forward, clipT / entry.exitTime) * t.scale
     this.position.x = t.startX + t.dirX * fwd
     this.position.z = t.startZ + t.dirZ * fwd
 
