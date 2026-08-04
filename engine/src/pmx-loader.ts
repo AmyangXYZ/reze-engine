@@ -84,10 +84,19 @@ export class PmxLoader {
   }
 
   private parseHeader() {
-    if (this.getString(3) !== "PMX") throw new Error("Not a PMX file")
-
-    // PMX: 1-byte alignment after signature
-    this.getUint8()
+    // The signature is four bytes. PMX 2.x writes "PMX ", but exporters in the
+    // wild also write "Pmx " — and a strict uppercase compare rejected those
+    // models outright. Compare case-insensitively and name what was actually
+    // found when it is something else, so a PMD (the older format, signature
+    // "Pmd") says so instead of "not a PMX file".
+    const signature = this.getString(4)
+    if (signature.slice(0, 3).toUpperCase() !== "PMX") {
+      const head = signature.slice(0, 3).toUpperCase()
+      if (head === "PMD") {
+        throw new Error("This is a PMD file (MMD's older format). Convert it to PMX in PMXEditor first.")
+      }
+      throw new Error(`Not a PMX file (signature "${signature.replace(/[^\x20-\x7e]/g, "?")}")`)
+    }
 
     // PMX: version (float32)
     const version = this.getFloat32()
@@ -1128,7 +1137,9 @@ export class PmxLoader {
   }
 
   private getString(len: number) {
-    const bytes = new Uint8Array(this.view.buffer, this.offset, len)
+    // byteOffset matters: a DataView built over a slice of a larger buffer has
+    // its own origin, and reading the raw buffer without it lands elsewhere.
+    const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + this.offset, len)
     this.offset += len
     return String.fromCharCode(...bytes)
   }
@@ -1137,18 +1148,23 @@ export class PmxLoader {
     const len = this.getInt32()
     if (len <= 0) return ""
 
-    // Debug: log problematic string lengths
-    if (len > 1000 || len < -1000) {
-      throw new RangeError(`Suspicious string length: ${len} at offset ${this.offset - 4}`)
-    }
-
+    // No arbitrary length ceiling. A model's comment field carries credits and
+    // terms of use and routinely runs past a thousand bytes — roughly five
+    // hundred characters in UTF-16 — so a "this looks too long" heuristic
+    // rejected perfectly ordinary models from several distributors. The bounds
+    // check below is the real guard: a length that would read past the end of
+    // the file is corrupt, and any length that fits is the author's business.
     // Ensure we don't read beyond buffer bounds
-    if (this.offset + len > this.view.buffer.byteLength) {
+    if (this.offset + len > this.view.byteLength) {
       throw new RangeError(`String length ${len} exceeds buffer bounds at offset ${this.offset - 4}`)
     }
 
-    const bytes = new Uint8Array(this.view.buffer, this.offset, len)
+    let bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + this.offset, len)
     this.offset += len
+    // UTF-16 needs whole code units. A stray odd length (seen from a few
+    // exporters) made TextDecoder emit a replacement char and, worse, shifted
+    // nothing — better to drop the orphan byte than to carry it into the name.
+    if (this.encoding === 0 && len % 2 === 1) bytes = bytes.subarray(0, len - 1)
     return this.decoder.decode(bytes)
   }
 

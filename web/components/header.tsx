@@ -16,8 +16,7 @@ const STAT_ROWS: { key: keyof EngineStats; label: string; unit?: string }[] = [
   { key: "frameTimeMax", label: "frame max", unit: "ms" },
   { key: "jitter", label: "jitter", unit: "ms" },
   { key: "cpuAnimMs", label: "anim", unit: "ms" },
-  { key: "cpuPhysicsMs", label: "physics (main)", unit: "ms" },
-  { key: "cpuPhysicsWorkerMs", label: "physics (worker)", unit: "ms" },
+  { key: "cpuPhysicsMs", label: "physics", unit: "ms" },
   { key: "cpuRenderMs", label: "render prep", unit: "ms" },
 ]
 
