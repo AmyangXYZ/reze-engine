@@ -126,6 +126,9 @@ export interface LocomotionPose {
 
 const TWO_PI = Math.PI * 2
 
+/** Seconds an interrupted stop's ghost pose takes to dissolve over resumed locomotion. */
+const GHOST_FADE = 0.25
+
 function wrapAngle(a: number): number {
   while (a > Math.PI) a -= TWO_PI
   while (a < -Math.PI) a += TWO_PI
@@ -457,13 +460,25 @@ export class LocomotionController {
     const d = target - this.speedLevel
     this.speedLevel += Math.abs(d) <= maxStep ? d : Math.sign(d) * maxStep
 
+    // Breakout throttle: while an interrupted skid's ghost still owns part of
+    // the pose (planted feet), root motion and the gait clock scale by what's
+    // LEFT of it — she accelerates exactly as the skid dissolves, so the feet
+    // never slide (滑步) through the handoff.
+    let ghostW = 0
+    if (this.exitGhost) {
+      this.exitGhost.elapsed += dt
+      ghostW = Math.max(0, 1 - this.exitGhost.elapsed / GHOST_FADE)
+      if (ghostW <= 0) this.exitGhost = null
+    }
+
     // Root motion along the travel direction. In-place clips carry no horizontal root.
     const speed =
       (this.speedLevel <= 1
         ? this.runSpeed * this.speedLevel
         : this.runSpeed + (this.sprintSpeed - this.runSpeed) * (this.speedLevel - 1)) *
       align *
-      speedScale
+      speedScale *
+      (1 - ghostW)
     this.position.x += this.dirX * speed * dt
     this.position.z += this.dirZ * speed * dt
 
@@ -474,7 +489,7 @@ export class LocomotionController {
     const sprintDur = hasSprint ? this.clipDuration(this.clips.sprint!) : runDur
     this.idleTime = (this.idleTime + dt) % idleDur
     const gaitDur = this.speedLevel <= 1 ? runDur : runDur + (sprintDur - runDur) * (this.speedLevel - 1)
-    this.gaitPhase = (this.gaitPhase + dt / gaitDur) % 1
+    this.gaitPhase = (this.gaitPhase + (dt * (1 - ghostW)) / gaitDur) % 1
 
     // Weights along the 1D speed axis.
     let wIdle: number, wRun: number, wSprint: number
@@ -494,22 +509,14 @@ export class LocomotionController {
     this.entries[1].weight = wRun
     this.entries[2].time = this.gaitPhase * sprintDur
     this.entries[2].weight = wSprint
-    const GHOST_FADE = 0.25
-    if (this.exitGhost) {
+    if (this.exitGhost !== null && ghostW > 0) {
       const g = this.exitGhost
-      g.elapsed += dt
-      const wGhost = Math.max(0, 1 - g.elapsed / GHOST_FADE)
-      if (wGhost <= 0) {
-        this.exitGhost = null
-        this.entries[3].weight = 0
-      } else {
-        this.entries[0].weight *= 1 - wGhost
-        this.entries[1].weight *= 1 - wGhost
-        this.entries[2].weight *= 1 - wGhost
-        this.entries[3].name = g.clip
-        this.entries[3].time = g.clipTime + g.elapsed // the clip's real tail keeps playing
-        this.entries[3].weight = wGhost
-      }
+      this.entries[0].weight *= 1 - ghostW
+      this.entries[1].weight *= 1 - ghostW
+      this.entries[2].weight *= 1 - ghostW
+      this.entries[3].name = g.clip
+      this.entries[3].time = g.clipTime + g.elapsed // the clip's real tail keeps playing
+      this.entries[3].weight = ghostW
     } else {
       this.entries[3].weight = 0
     }
