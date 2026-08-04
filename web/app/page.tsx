@@ -193,6 +193,29 @@ export default function Home() {
   const stickRef = useRef({ x: 0, y: 0, active: false })
   const actorsRef = useRef<Model[]>([])
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  // The song is fetched and decoded BEFORE the first dance press: the element
+  // exists from boot, and the first gesture anywhere (Safari gates media
+  // loading on one) triggers the actual buffering — so pressing dance starts
+  // sound with the motion instead of paying a 3MB fetch mid-dance.
+  const danceAudio = () => {
+    const a = new Audio("/audios/One More Last Time.m4a") // AAC: a third of the WAV, same song
+    a.preload = "auto"
+    return a
+  }
+  useEffect(() => {
+    if (!audioRef.current) audioRef.current = danceAudio()
+    const audio = audioRef.current
+    const warm = () => {
+      if (audio.paused && audio.readyState < 3) audio.load()
+    }
+    window.addEventListener("pointerdown", warm, { once: true })
+    window.addEventListener("keydown", warm, { once: true })
+    return () => {
+      window.removeEventListener("pointerdown", warm)
+      window.removeEventListener("keydown", warm)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const dancingRef = useRef(false)
   const danceCancelRef = useRef(false)
   const [dancing, setDancing] = useState(false)
@@ -221,10 +244,7 @@ export default function Home() {
       }
       return
     }
-    if (!audioRef.current) {
-      audioRef.current = new Audio("/audios/One More Last Time.wav")
-      audioRef.current.preload = "auto"
-    }
+    if (!audioRef.current) audioRef.current = danceAudio()
     const onEnd = () => {
       // fired by the player's one-shot finishing (natural end or cancel fade done)
       dancingRef.current = false
@@ -270,7 +290,9 @@ export default function Home() {
       await engine.init()
       // Uncapped: chase native refresh. engine.setMaxFPS(n) is available for
       // hosts that prefer to spend less CPU on high-refresh displays.
-      // Perf readout lives in the header's FPS pill (click it) — no console handle.
+      // Perf readout lives in the header's FPS pill (click it). Dev builds keep
+      // a console handle for live probing; production exposes nothing.
+      if (process.env.NODE_ENV === "development") (window as unknown as { engine?: Engine }).engine = engine
 
       // Stage first: ground up and the render loop painting before any model or
       // VMD bytes arrive — she pops in styled once ready, companions after.
@@ -333,7 +355,17 @@ export default function Home() {
             // until the new direction has been held steadily for a moment. (The
             // first press from standstill is not a change — starts stay snappy.)
             const changed = kx !== t.lastKx || ky !== t.lastKy
-            if (changed && (t.lastKx !== 0 || t.lastKy !== 0)) t.cool = KB_TURN_PAUSE
+            if (changed && (t.lastKx !== 0 || t.lastKy !== 0)) {
+              t.cool = KB_TURN_PAUSE
+              // Reversing costs momentum. Holding full throttle through a hard
+              // direction change let her sprint backwards the instant the keys
+              // said so — and the authored stop then honestly skidded four
+              // metres that way, which reads as drift. Sharper turn, bigger
+              // bite: ~none at 45°, half at 90°, most of it at 180°.
+              const prevLen = Math.hypot(t.lastKx, t.lastKy)
+              const dot = prevLen > 0 ? (kx * t.lastKx + ky * t.lastKy) / (len * prevLen) : 1
+              t.mag *= Math.max(0.25, Math.min(1, 0.5 * (1 + dot)))
+            }
             if (t.cool > 0) {
               t.cool -= dt
             } else {
@@ -387,10 +419,20 @@ export default function Home() {
           const dx = tx - p.x
           const dz = tz - p.z
           const dist = Math.hypot(dx, dz)
-          if (!dancingRef.current && dist > FOLLOW_DEADBAND) {
-            const mag = Math.min(1, (dist - FOLLOW_DEADBAND) / FOLLOW_ARRIVE)
+          // Hysteresis + a decisiveness floor: a companion either WALKS or
+          // STANDS. Hovering at the deadband edge used to emit near-zero move
+          // pulses — root creep under an idle pose, i.e. feet sliding while
+          // she breathes. Now she starts only well outside the band, keeps
+          // going until she's properly inside it, and never below half throttle.
+          const live = c as LocomotionController & { __following?: boolean }
+          const start = FOLLOW_DEADBAND + 2
+          const stop = FOLLOW_DEADBAND
+          if (!dancingRef.current && (live.__following ? dist > stop : dist > start)) {
+            live.__following = true
+            const mag = Math.max(0.5, Math.min(1, (dist - stop) / FOLLOW_ARRIVE))
             c.setMove((dx / dist) * mag, (dz / dist) * mag, dist > FOLLOW_SPRINT_AT)
           } else {
+            live.__following = false
             c.setMove(0, 0)
           }
           const cp = c.update(dt)
