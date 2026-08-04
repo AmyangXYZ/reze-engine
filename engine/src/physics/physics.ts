@@ -266,10 +266,12 @@ export class RezePhysics {
     }
     if (this.timeAccum >= this.fixedTimeStep) {
       // Substep budget exhausted mid-catchup: drop the remaining time and
-      // snap kinematic bodies the rest of the way (zero velocity) so they
-      // don't start next frame lagging behind their bones.
+      // snap kinematic bodies the rest of the way so they don't start next
+      // frame lagging behind their bones. They keep the velocity their
+      // trajectory implies — the character did move, and cloth in contact
+      // needs to know that or it stops being dragged and starts juddering.
       this.timeAccum = 0
-      this.snapKinematicToTargets(false)
+      this.snapKinematicToTargets(false, true)
     }
 
     // MMD mode-2 bone alignment for pinned (depth-1) bodies: position
@@ -470,7 +472,27 @@ export class RezePhysics {
   // Snap kinematic bodies straight to the frame target with zero velocity.
   // Used on teleports (onlyFlagged) and when the substep budget runs out
   // mid-catchup (all).
-  private snapKinematicToTargets(onlyFlagged: boolean): void {
+  /**
+   * Put kinematic bodies exactly on their targets.
+   *
+   * `keepTrajectoryVelocity` decides what the cloth is then told about how
+   * those bodies got there, and the two callers want opposite answers.
+   *
+   * After a teleport the honest answer is "nothing" — a scrub is not motion
+   * and handing the solver the implied velocity is what used to fling cloth
+   * across the discontinuity.
+   *
+   * After the substep budget is exhausted it is the opposite. The body really
+   * did travel along its animated trajectory this frame; the simulation just
+   * could not afford to walk it there in steps. Zeroing there tells every
+   * dynamic body in contact that the character stopped dead, so cloth loses
+   * its drag and is teleported by the body instead of dragged by it — it stops
+   * flowing and starts juddering. That branch only fires on a device already
+   * running under its refresh rate, which is precisely where the simulation
+   * can least afford to also look broken. The trajectory velocity is already
+   * computed every frame in kinTargetVel; it just needs to survive.
+   */
+  private snapKinematicToTargets(onlyFlagged: boolean, keepTrajectoryVelocity = false): void {
     const N = this.store.count
     const positions = this.store.positions
     const orientations = this.store.orientations
@@ -480,6 +502,8 @@ export class RezePhysics {
     const boneIdx = this.store.boneIndex
     const tp = this.kinTargetPos
     const to = this.kinTargetOri
+    const tv = this.kinTargetVel
+    const tav = this.kinTargetAngVel
     const flags = this.teleportFlags
 
     for (let i = 0; i < N; i++) {
@@ -496,8 +520,13 @@ export class RezePhysics {
       orientations[i4 + 1] = to[i4 + 1]
       orientations[i4 + 2] = to[i4 + 2]
       orientations[i4 + 3] = to[i4 + 3]
-      lv[i3 + 0] = 0; lv[i3 + 1] = 0; lv[i3 + 2] = 0
-      av[i3 + 0] = 0; av[i3 + 1] = 0; av[i3 + 2] = 0
+      if (keepTrajectoryVelocity) {
+        lv[i3 + 0] = tv[i3 + 0]; lv[i3 + 1] = tv[i3 + 1]; lv[i3 + 2] = tv[i3 + 2]
+        av[i3 + 0] = tav[i3 + 0]; av[i3 + 1] = tav[i3 + 1]; av[i3 + 2] = tav[i3 + 2]
+      } else {
+        lv[i3 + 0] = 0; lv[i3 + 1] = 0; lv[i3 + 2] = 0
+        av[i3 + 0] = 0; av[i3 + 1] = 0; av[i3 + 2] = 0
+      }
     }
   }
 

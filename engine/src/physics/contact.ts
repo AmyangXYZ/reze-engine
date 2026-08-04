@@ -929,8 +929,13 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
     return
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Sphere) {
+    // Only flip a contact this call actually produced. The detector returns
+    // without emitting whenever the shapes are out of range, and flipping then
+    // reverses the normal of whatever unrelated contact happens to sit at the
+    // end of the pool — pushing those two bodies together instead of apart.
+    const before = pool.count
     detectSphereCapsule(store, b, a, pool)
-    flipLastNormal(pool)
+    if (pool.count > before) flipLastNormal(pool)
     return
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Capsule) {
@@ -942,8 +947,9 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
     return
   }
   if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Sphere) {
+    const before = pool.count
     detectSphereBox(store, b, a, pool)
-    flipLastNormal(pool)
+    if (pool.count > before) flipLastNormal(pool)
     return
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Box) {
@@ -951,8 +957,9 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
     return
   }
   if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Capsule) {
+    const before = pool.count
     detectCapsuleBox(store, b, a, pool)
-    flipLastNormal(pool)
+    if (pool.count > before) flipLastNormal(pool)
     return
   }
   // Box-box left unimplemented.
