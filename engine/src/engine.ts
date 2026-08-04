@@ -7,6 +7,7 @@ import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
+import { WorkerPhysics } from "./physics/worker-physics"
 import {
   createFetchAssetReader,
   createFileMapAssetReader,
@@ -346,6 +347,11 @@ export interface GizmoDragEvent {
 export type GizmoDragCallback = (event: GizmoDragEvent) => void
 
 export type EngineOptions = {
+  /** Run each model's physics on a dedicated Web Worker (default true where
+   *  Workers exist). Pipelined one frame deep: main-thread physics cost drops
+   *  to two small copies and multi-model scenes pay for the SLOWEST model
+   *  instead of the sum. false = classic main-thread stepping. */
+  physicsWorkers?: boolean
   world?: WorldOptions
   sun?: SunOptions
   camera?: CameraOptions
@@ -376,6 +382,7 @@ export interface EngineStats {
   jitter: number // ms — stddev of frame intervals (pacing evenness; high = janky at any mean fps)
   cpuAnimMs: number // ms/frame (EMA) — model updates: blending, IK, world matrices
   cpuPhysicsMs: number // ms/frame (EMA) — physics stepping across all instances
+  cpuPhysicsWorkerMs: number // ms/frame (EMA) — the SLOWEST worker's step cost. Background-thread time (often an efficiency core), parallel to the frame: it only matters if it exceeds the frame budget.
   cpuRenderMs: number // ms/frame (EMA) — the rest of the render thread: uniforms, encoding, submit
 }
 
@@ -429,7 +436,7 @@ interface ModelInstance {
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
   hiddenMaterials: Set<string>
-  physics: RezePhysics | null
+  physics: RezePhysics | WorkerPhysics | null
   vertexBufferNeedsUpdate: boolean
   gpuMorph: GpuMorph | null
   // Style groups applied to this model: group id → compiled install.
@@ -830,6 +837,7 @@ export class Engine {
     fps1PercentLow: 0,
     cpuAnimMs: 0,
     cpuPhysicsMs: 0,
+    cpuPhysicsWorkerMs: 0,
     cpuRenderMs: 0,
     jitter: 0,
   }
@@ -839,6 +847,7 @@ export class Engine {
   private viewTransform!: ViewTransformOptions
 
   constructor(canvas: HTMLCanvasElement, options?: EngineOptions) {
+    this.physicsWorkersEnabled = options?.physicsWorkers ?? true
     this.canvas = canvas
     const d = DEFAULT_ENGINE_OPTIONS
     this.world = {
@@ -3031,7 +3040,10 @@ export class Engine {
 
   dispose() {
     this.stopRenderLoop()
-    this.forEachInstance((inst) => inst.model.stopAnimation())
+    this.forEachInstance((inst) => {
+      inst.model.stopAnimation()
+      if (inst.physics instanceof WorkerPhysics) inst.physics.dispose()
+    })
     if (Engine.instance === this) Engine.instance = null
     if (this.camera) this.camera.detachControl()
 
@@ -3108,6 +3120,7 @@ export class Engine {
     const inst = this.modelInstances.get(name)
     if (!inst) return
     inst.model.stopAnimation()
+    if (inst.physics instanceof WorkerPhysics) inst.physics.dispose()
     for (const path of inst.textureCacheKeys) {
       const tex = this.textureCache.get(path)
       if (!tex) continue
@@ -3281,6 +3294,9 @@ export class Engine {
   // else on the render thread. The first question of any perf report.
   private cpuAnimMs = 0
   private cpuPhysicsMs = 0
+  /** EMA of worker-side step cost (all instances) — the off-thread physics bill. */
+  private cpuPhysicsWorkerMs = 0
+  private physicsWorkersEnabled = true
   private cpuRenderMs = 0
   private frameAnimMsRaw = 0
   private framePhysicsMsRaw = 0
@@ -3288,6 +3304,7 @@ export class Engine {
   private updateInstances(deltaTime: number): void {
     let animMs = 0
     let physicsMs = 0
+    let workerMs = 0
     this.forEachInstance((inst) => {
       const tAnim = performance.now()
       const verticesChanged = inst.model.update(deltaTime, this.ikEnabled)
@@ -3313,6 +3330,7 @@ export class Engine {
         const tPhys = performance.now()
         inst.physics.step(deltaTime, inst.model.getWorldMatrices(), inst.model.getBoneInverseBindMatrices())
         physicsMs += performance.now() - tPhys
+        if (inst.physics instanceof WorkerPhysics) workerMs = Math.max(workerMs, inst.physics.stepMs)
       }
       if (inst.vertexBufferNeedsUpdate) this.updateVertexBuffer(inst)
     })
@@ -3321,6 +3339,7 @@ export class Engine {
     const EMA = 0.1
     this.cpuAnimMs += (animMs - this.cpuAnimMs) * EMA
     this.cpuPhysicsMs += (physicsMs - this.cpuPhysicsMs) * EMA
+    this.cpuPhysicsWorkerMs += (workerMs - this.cpuPhysicsWorkerMs) * EMA
   }
 
   private updateVertexBuffer(inst: ModelInstance): void {
@@ -3432,7 +3451,17 @@ export class Engine {
     this.device.queue.writeBuffer(indexBuffer, 0, indices)
 
     const rbs = model.getRigidbodies()
-    const physics = rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
+    let physics: RezePhysics | WorkerPhysics | null = null
+    if (rbs.length > 0) {
+      if (this.physicsWorkersEnabled && WorkerPhysics.supported()) {
+        try {
+          physics = await WorkerPhysics.create(rbs, model.getJoints(), model.getBoneInverseBindMatrices())
+        } catch (e) {
+          console.warn("[reze] physics worker unavailable — falling back to main-thread physics:", e)
+        }
+      }
+      if (!physics) physics = new RezePhysics(rbs, model.getJoints())
+    }
 
     const shadowBindGroup = this.device.createBindGroup({
       label: `${name}: shadow bind`,
@@ -5486,6 +5515,7 @@ export class Engine {
     this.stats.jitter = Math.round(stddev * 100) / 100
     this.stats.cpuAnimMs = Math.round(this.cpuAnimMs * 100) / 100
     this.stats.cpuPhysicsMs = Math.round(this.cpuPhysicsMs * 100) / 100
+    this.stats.cpuPhysicsWorkerMs = Math.round(this.cpuPhysicsWorkerMs * 100) / 100
     this.stats.cpuRenderMs = Math.round(this.cpuRenderMs * 100) / 100
   }
 }

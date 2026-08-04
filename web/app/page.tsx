@@ -270,9 +270,7 @@ export default function Home() {
       await engine.init()
       // Uncapped: chase native refresh. engine.setMaxFPS(n) is available for
       // hosts that prefer to spend less CPU on high-refresh displays.
-      // Console access for perf work: engine.getStats() has the CPU breakdown,
-      // engine.setPhysicsEnabled(false) isolates physics.
-      ;(window as unknown as { engine?: Engine }).engine = engine
+      // Perf readout lives in the header's FPS pill (click it) — no console handle.
 
       // Stage first: ground up and the render loop painting before any model or
       // VMD bytes arrive — she pops in styled once ready, companions after.
