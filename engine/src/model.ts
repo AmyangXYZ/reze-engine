@@ -1485,17 +1485,7 @@ export class Model {
     return true
   }
 
-  // @deprecated Use model.play()
-  playAnimation(): void {
-    this.animationState.play()
-  }
-
   pause(): void {
-    this.animationState.pause()
-  }
-
-  // @deprecated Use model.pause()
-  pauseAnimation(): void {
     this.animationState.pause()
   }
 
@@ -1503,11 +1493,6 @@ export class Model {
     this.blendEntries = null
     this.crossfade = null
     this.oneShot = null
-    this.animationState.stop()
-  }
-
-  // @deprecated Use model.stop()
-  stopAnimation(): void {
     this.animationState.stop()
   }
 
@@ -1525,11 +1510,6 @@ export class Model {
   seek(seconds: number): void {
     this.clipApplySuspended = false
     this.crossfade = null // a timeline jump mid-fade snaps to the target clip
-    this.animationState.seek(seconds)
-  }
-
-  // @deprecated Use model.seek()
-  seekAnimation(seconds: number): void {
     this.animationState.seek(seconds)
   }
 

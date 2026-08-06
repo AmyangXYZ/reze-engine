@@ -3024,7 +3024,7 @@ export class Engine {
 
   dispose() {
     this.stopRenderLoop()
-    this.forEachInstance((inst) => inst.model.stopAnimation())
+    this.forEachInstance((inst) => inst.model.stop())
     if (Engine.instance === this) Engine.instance = null
     if (this.camera) this.camera.detachControl()
 
@@ -3100,7 +3100,7 @@ export class Engine {
   removeModel(name: string): void {
     const inst = this.modelInstances.get(name)
     if (!inst) return
-    inst.model.stopAnimation()
+    inst.model.stop()
     for (const path of inst.textureCacheKeys) {
       const tex = this.textureCache.get(path)
       if (!tex) continue
