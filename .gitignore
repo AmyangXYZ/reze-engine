@@ -1,5 +1,8 @@
 blender-3.6.9
 bullet_src
+# Bullet 2.75 reference source — read when porting solver behaviour (MMD runs
+# this version). Kept locally, not vendored: it is upstream's tree, not ours.
+bullet-2.75-rc3
 # Local Claude Code settings
 .claude/
 

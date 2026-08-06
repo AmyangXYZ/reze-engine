@@ -2,7 +2,8 @@ import { Vec3 } from "../math"
 import type { RigidBodyStore } from "./body"
 import { RigidbodyType } from "./types"
 import type { SixDofSpringConstraint } from "./constraint"
-import { solveConstraints, type SolverCache } from "./solver"
+import { solveConstraints, saveContactImpulses, applySplitImpulsePush, type SolverCache } from "./solver"
+import { ManifoldCache } from "./manifold"
 import { findContacts, type ContactPool } from "./contact"
 
 // World step: predict velocities → collide → solve → position correction →
@@ -37,6 +38,9 @@ export interface WindOptions {
 export class World {
   readonly gravity: Vec3
   solverIterations = 10
+
+  /** Per-pair contact impulse history behind warm starting. */
+  private manifolds = new ManifoldCache()
 
   // Per-body damping factors pow(1−damping, dt), cached because damping and
   // the fixed dt never change — two Math.pow per body per substep otherwise.
@@ -166,50 +170,20 @@ export class World {
 
     // 3. Solve joint + contact constraints (velocity-only).
     if (constraints.length > 0 || contacts.count > 0) {
-      solveConstraints(store, constraints, cache, contacts, dt, this.solverIterations)
+      solveConstraints(store, constraints, cache, contacts, dt, this.solverIterations, this.manifolds)
+      applySplitImpulsePush(store, dt)
+      saveContactImpulses(store, contacts, this.manifolds)
+    } else {
+      this.manifolds.clear()
     }
 
-    // 4. Position correction (split impulse). Direct translation along the
-    //    contact normal — joint constraints in the same SI loop can't undo
-    //    it because it doesn't go through the velocity channel. Inverse-mass
-    //    weighted so a kinematic body stays put and only the dynamic one
-    //    translates.
-    // Softer and later than a rigid-body engine would use, deliberately. MMD
-    // cloth is a dense chain of small bodies resting on the character, and
-    // aggressive penetration recovery feeds those contacts energy that the
-    // joint springs hand straight back — the tips never settle. Measured on a
-    // 688-body model: resting peak velocity 1.79 → 1.10, and 12.9 → 6.6 under
-    // an idle animation, for a slop of two hundredths of a unit (under 2 mm at
-    // MMD scale) that no eye finds.
-    const POS_CORRECTION_FACTOR = 0.15
-    const POS_SLOP = 0.02
-    for (let ci = 0; ci < contacts.count; ci++) {
-      const c = contacts.get(ci)
-      if (c.depth <= POS_SLOP) continue
-      const imA = invMass[c.bodyA]
-      const imB = invMass[c.bodyB]
-      const total = imA + imB
-      if (total <= 0) continue
-      const correction = (c.depth - POS_SLOP) * POS_CORRECTION_FACTOR
-      const dx = correction * c.nx
-      const dy = correction * c.ny
-      const dz = correction * c.nz
-      const ai = c.bodyA * 3
-      const bi = c.bodyB * 3
-      if (imA > 0) {
-        const fA = imA / total
-        pos[ai + 0] -= dx * fA
-        pos[ai + 1] -= dy * fA
-        pos[ai + 2] -= dz * fA
-      }
-      if (imB > 0) {
-        const fB = imB / total
-        pos[bi + 0] += dx * fB
-        pos[bi + 1] += dy * fB
-        pos[bi + 2] += dz * fB
-      }
-    }
-
+    // 4. Penetration recovery happens in the contact velocity row (Baumgarte,
+    //    CONTACT_ERP), not here. Bullet 2.75 — the build MMD's physics runs —
+    //    defaults m_splitImpulse to false and folds positionalError straight
+    //    into m_rhs, so a separate position-translation pass is a divergence
+    //    from what PMX rigs are authored against. It also could not be made to
+    //    behave: every contact translated the body by its own full share, so a
+    //    panel carrying dozens of rows was shoved out dozens of times.
     // 5. Integrate. Cap angular velocity at π/2 per step — a high-impulse
     //    contact spike on a low-inertia body would otherwise spin past π
     //    in one step and trash the quaternion integration. Linear velocity

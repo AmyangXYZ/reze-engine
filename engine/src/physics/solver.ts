@@ -16,33 +16,72 @@ import type { RigidBodyStore } from "./body"
 import type { SixDofSpringConstraint } from "./constraint"
 import { STOP_ERP } from "./constraint"
 import type { Contact, ContactPool } from "./contact"
+import type { ManifoldCache } from "./manifold"
 
 const BOUNCE_THRESHOLD = 2.0
 
-// Successive over-relaxation factor on CONTACT rows only (joints untouched).
-// Each contact row independently drives the relative velocity at its own point
-// to zero; when a dress panel carries up to 43 of them at once, they all
-// correct the same motion and the body is over-braked, differently every
-// substep. Scaling each row's step damps that without changing the fixed
-// point — the accumulated impulse still converges to the same answer, just
-// approached rather than overshot.
+// Contact error-reduction parameter — btContactSolverInfo::m_erp in Bullet
+// 2.75, the build MMD's own physics runs, at its stock 0.2. PMX rigs are
+// authored against exactly this response.
 //
-// The gain is PER CONTACT, scaled by how contended its two bodies are, not a
-// flat constant. A flat factor was measured first and is wrong: it also slows
-// the well-conditioned rows, and a body resting on a SINGLE contact can then
-// no longer cancel its approach velocity within the iteration budget, so it
-// creeps forever instead of settling (托特 peak speed at 15 s: 0.11 at gain
-// 1.0, 0.46 at 0.5, 0.72 at 0.3 — a permanent limit cycle on a one-contact
-// body). Over-constraint is a local property, so the remedy has to be local.
+// Bullet folds penetration recovery into the CONTACT VELOCITY ROW rather than
+// translating positions (m_splitImpulse defaults to false in 2.75):
 //
-// gain = 1 / max(rows on A, rows on B), floored. One contact → 1.0, exact and
-// settling preserved; a dress panel sharing 20 rows → 0.05, damped. This is
-// the standard mass-splitting blend toward Jacobi in the contended cluster.
-const CONTACT_SOR_MIN = 0.12
+//   penetration     = cp.getDistance() + m_linearSlop      // < 0 when overlapping
+//   positionalError = -penetration * m_erp / m_timeStep
+//   velocityError   = restitution - rel_vel
+//   m_rhs           = (positionalError + velocityError) * m_jacDiagABInv
+//
+// Our `depth` is the negation of Bullet's distance, so positionalError is just
+// depth·ERP/dt — one expression covering both cases. Penetrating (depth > 0) it
+// pushes apart; separated (depth < 0, a speculative row) it ALLOWS approach at
+// the rate that closes the gap, which is what keeps those rows inert until the
+// body would really arrive.
+const CONTACT_ERP = 0.2
 
-// Per-body contact-row counts for the gain above; grown on demand, refilled
-// each substep. Module-level so the solve allocates nothing.
-let _rowCount = new Int32Array(0)
+// btContactSolverInfo's SOLVER_RANDMIZE_ORDER. Gauss-Seidel is order-biased —
+// rows solved first win — which on a cross-linked lattice shows up as a lean or
+// a period-2 chatter. Bullet ships the flag off; it is here to be measured.
+const RANDOMIZE_ORDER = true
+// btSequentialImpulseConstraintSolver::btRand2, so the shuffle is reproducible
+// and a take replays identically.
+let _seed = 0
+function rand2(): number {
+  _seed = (1664525 * _seed + 1013904223) & 0xffffffff
+  return _seed >>> 0
+}
+let _order = new Int32Array(0)
+
+// btContactSolverInfo::m_warmstartingFactor. Seeded impulses are scaled by
+// this so a stale cache decays instead of compounding.
+const WARMSTARTING_FACTOR = 0.85
+// btContactSolverInfo::m_restingContactRestitutionThreshold — past this many
+// substeps a contact is "resting" and stops bouncing.
+const RESTING_CONTACT_AGE = 2
+
+// btContactSolverInfo::m_linearSlop is 0 in 2.75 — no allowance, the row aims
+// at exactly touching. Kept named so the divergence is visible if it ever moves.
+const LINEAR_SLOP = 0
+
+// btContactSolverInfo::m_splitImpulse. False in 2.75 (only the demos turn it
+// on), but TRUE by default from Bullet 2.8x onward — which is what babylon-mmd
+// runs today. MMD is closed-source so its own setting cannot be read, but it is
+// widely reported to enable the flag, and our own measurements agree
+// independently: turning it on lowered the velocity-reversal rate on every rig
+// tested (伊邪那美 0.118 → 0.098, 诗蔻蒂 0.098 → 0.074, 托特 0.054 → 0.028).
+// With it on, the penetration term is moved out of the real
+// velocity row into a pseudo-velocity ("push") channel that is solved
+// separately and integrated straight into the transform, so recovering overlap
+// never adds momentum the joint springs can hand back.
+const SPLIT_IMPULSE = true
+// btContactSolverInfo::m_splitImpulsePenetrationThreshold. Bullet's sign: only
+// contacts DEEPER than this go to the split channel; shallower ones keep the
+// bias in the real row. Our depth is the negation, hence the flipped compare.
+const SPLIT_PENETRATION_THRESHOLD = 0.02
+
+// Pseudo-velocity accumulators for the split channel, zeroed each substep.
+let _pushLin = new Float32Array(0)
+let _pushAng = new Float32Array(0)
 
 // Ceilings on limit-correction velocity. In normal operation limit errors are
 // tiny; a large error only appears after a discontinuity (teleport, stall,
@@ -67,7 +106,41 @@ const LIMIT_SOFTNESS_ANGULAR = 0.5
 // error), so resting chains rang forever — the "static dress slowly boils"
 // bug. c is derived per row from a fixed damping ratio against the row's
 // effective mass: c = 2ζ√(k·m_eff).
-const SPRING_DAMPING_ZETA = 0.7
+// btGeneric6DofSpringConstraint drives a spring as a MOTOR, not as a
+// spring-damper: stiffness becomes a velocity target with a force cap.
+//
+//   velFactor      = fps · damping / numIterations
+//   targetVelocity = velFactor · force          (force = err · k)
+//   maxMotorForce  = |force| / fps
+//
+// m_springDamping defaults to 1.0 and PMX carries no damping field, so every
+// MMD spring runs at exactly that — which is what these rigs were authored
+// against. This replaces an implicit spring-damper with an invented damping
+// ratio (ζ = 0.7); ported in isolation the motor form measured 0.0015 mean
+// reversal at jerk 0.5, the calmest joint-side result recorded.
+const SPRING_DAMPING = 1.0
+// btConstraintInfo2::erp, from infoGlobal.m_erp — used only by getMotorFactor.
+const INFO_ERP = 0.2
+
+// btTypedConstraint::getMotorFactor. Scales a motor down as it approaches the
+// limit it is driving toward, so a stiff spring cannot drive straight through
+// its own stop and then be fought by the limit row. That fight is a candidate
+// explanation for the period-2 joint chatter seen on bodies carrying NO
+// contacts at all (qh_15_5: accumulated joint impulse alternating 8.4 / 14.7).
+function getMotorFactor(pos: number, lowLim: number, uppLim: number, vel: number, timeFact: number): number {
+  if (lowLim > uppLim) return 1
+  if (lowLim === uppLim) return 0
+  const deltaMax = vel / timeFact
+  if (deltaMax < 0) {
+    if (pos >= lowLim && pos < lowLim - deltaMax) return (lowLim - pos) / deltaMax
+    return pos < lowLim ? 0 : 1
+  }
+  if (deltaMax > 0) {
+    if (pos <= uppLim && pos > uppLim - deltaMax) return (uppLim - pos) / deltaMax
+    return pos > uppLim ? 0 : 1
+  }
+  return 0
+}
 
 // ERP scale for loop-closing constraints (see buildConstraints: joints that
 // close a cycle in the joint graph, e.g. the horizontal ring welds of
@@ -77,11 +150,6 @@ const SPRING_DAMPING_ZETA = 0.7
 // chatter. Loop edges keep shape at a fraction of the correction rate while
 // the spanning-tree chains stay stiff.
 const LOOP_ERP_SCALE = 1.0
-// Loop-edge LOCKED axes are converted to force-clamped springs instead of
-// weld rows: an equality row on a cycle fights the other cycle edges at any
-// ERP (the velocity system is over-determined too). A spring bounded by its
-// real force k·|err|·dt holds the ring's shape elastically without fighting.
-const LOOP_SPRING_K = 900
 // Angular limit violations below this switch to per-axis euler rows; above
 // it, the single geodesic row takes over (see setupConstraint).
 const GEODESIC_THRESHOLD = 0.5 // rad
@@ -102,6 +170,7 @@ export function solveConstraints(
   contacts: ContactPool,
   dt: number,
   iterations: number,
+  manifolds: ManifoldCache | null = null,
 ): void {
   if (dt <= 0) return
   if (constraints.length === 0 && contacts.count === 0) return
@@ -116,33 +185,165 @@ export function solveConstraints(
   const W = store.invInertiaWorld
 
   for (let c = 0; c < constraints.length; c++) {
-    setupConstraint(constraints[c], c, cache, store, dt, invDt)
-  }
-  // How many contact rows each body carries this substep — the per-contact
-  // relaxation gain below is a function of the more contended of its two
-  // bodies. Counting is O(contacts), done once, before any setup.
-  if (_rowCount.length < store.count) _rowCount = new Int32Array(store.count)
-  else _rowCount.fill(0, 0, store.count)
-  // Only DYNAMIC bodies are counted. A static body — above all the ground —
-  // collects a row from every body resting on it, and letting that inflate the
-  // count crushes the gain of each of those contacts to the floor, so nothing
-  // resting on the ground can build enough impulse and it creeps instead of
-  // settling. A body with invMass 0 cannot be over-braked in the first place.
-  for (let ci = 0; ci < contacts.count; ci++) {
-    const c = contacts.get(ci)
-    if (invMass[c.bodyA] > 0) _rowCount[c.bodyA]++
-    if (invMass[c.bodyB] > 0) _rowCount[c.bodyB]++
+    setupConstraint(constraints[c], c, cache, store, dt, invDt, iterations)
   }
   for (let ci = 0; ci < contacts.count; ci++) {
     setupContactRow(contacts.get(ci), lv, av, invMass, W, invDt)
   }
+  // Warm start: seed each row from what the same point converged to last
+  // substep and APPLY it before iterating, exactly as Bullet does at setup.
+  if (manifolds !== null) {
+    for (let ci = 0; ci < contacts.count; ci++) {
+      warmStartContact(contacts.get(ci), store, manifolds, lv, av, invMass)
+    }
+  }
 
+  // Bullet 2.75 solves each iteration in three separate passes, in this order:
+  // all joint rows, then all contact normal rows, then all friction rows. The
+  // friction bound is read from the contact's accumulated impulse AS IT STANDS
+  // after the normal pass, so friction tightens as the normal converges. Doing
+  // friction inline per contact (our previous shape) bounds it against a normal
+  // impulse that half the manifold has not contributed to yet.
+  if (RANDOMIZE_ORDER) {
+    // Reset per substep. Bullet keeps the seed on the solver instance; ours is
+    // module-level, so without this two worlds in one process share a stream
+    // and the same scene stops replaying identically — which the determinism
+    // test catches. Re-seeding costs nothing: the point is breaking the order
+    // bias BETWEEN iterations, not being unpredictable across frames.
+    _seed = 0
+    if (_order.length < contacts.count) _order = new Int32Array(contacts.count)
+    for (let i = 0; i < contacts.count; i++) _order[i] = i
+  }
   for (let iter = 0; iter < iterations; iter++) {
+    if (RANDOMIZE_ORDER) {
+      // Bullet reshuffles between iterations, not once per substep.
+      for (let i = 1; i < contacts.count; i++) {
+        const j = rand2() % (i + 1)
+        const tmp = _order[i]; _order[i] = _order[j]; _order[j] = tmp
+      }
+    }
     for (let c = 0; c < constraints.length; c++) {
       iterateConstraint(c, cache, lv, av, invMass)
     }
     for (let ci = 0; ci < contacts.count; ci++) {
-      iterateContactRow(contacts.get(ci), lv, av, invMass)
+      iterateContactNormal(contacts.get(RANDOMIZE_ORDER ? _order[ci] : ci), lv, av, invMass)
+    }
+    for (let ci = 0; ci < contacts.count; ci++) {
+      iterateContactFriction(contacts.get(ci), lv, av, invMass)
+    }
+  }
+
+  // Split-impulse pass: its OWN full set of iterations over the penetration
+  // channel only, exactly as Bullet runs it after the main loop.
+  if (SPLIT_IMPULSE) {
+    const n3 = store.count * 3
+    if (_pushLin.length < n3) { _pushLin = new Float32Array(n3); _pushAng = new Float32Array(n3) }
+    else { _pushLin.fill(0, 0, n3); _pushAng.fill(0, 0, n3) }
+    let any = false
+    for (let ci = 0; ci < contacts.count; ci++) if (contacts.get(ci).rhsPenetration !== 0) { any = true; break }
+    if (any) {
+      if (RANDOMIZE_ORDER) {
+    // Reset per substep. Bullet keeps the seed on the solver instance; ours is
+    // module-level, so without this two worlds in one process share a stream
+    // and the same scene stops replaying identically — which the determinism
+    // test catches. Re-seeding costs nothing: the point is breaking the order
+    // bias BETWEEN iterations, not being unpredictable across frames.
+    _seed = 0
+    if (_order.length < contacts.count) _order = new Int32Array(contacts.count)
+    for (let i = 0; i < contacts.count; i++) _order[i] = i
+  }
+  for (let iter = 0; iter < iterations; iter++) {
+    if (RANDOMIZE_ORDER) {
+      // Bullet reshuffles between iterations, not once per substep.
+      for (let i = 1; i < contacts.count; i++) {
+        const j = rand2() % (i + 1)
+        const tmp = _order[i]; _order[i] = _order[j]; _order[j] = tmp
+      }
+    }
+        for (let ci = 0; ci < contacts.count; ci++) {
+          resolveSplitPenetration(contacts.get(ci), invMass)
+        }
+      }
+    }
+  }
+}
+
+// Bullet's resolveSplitPenetrationImpulse: same Jacobian, but reading and
+// writing the pseudo-velocity channel, with its own push-only accumulator.
+function resolveSplitPenetration(c: Contact, invMass: Float32Array): void {
+  if (c.rhsPenetration === 0) return
+  const jacInvN = c.jacInvN
+  if (jacInvN <= 0) return
+  const imA = invMass[c.bodyA]
+  const imB = invMass[c.bodyB]
+  if (imA === 0 && imB === 0) return
+  const ai = c.bodyA * 3, bi = c.bodyB * 3
+  const nx = c.nx, ny = c.ny, nz = c.nz
+  const rAx = c.rAx, rAy = c.rAy, rAz = c.rAz
+  const rBx = c.rBx, rBy = c.rBy, rBz = c.rBz
+
+  const vAx = _pushLin[ai + 0] + _pushAng[ai + 1] * rAz - _pushAng[ai + 2] * rAy
+  const vAy = _pushLin[ai + 1] + _pushAng[ai + 2] * rAx - _pushAng[ai + 0] * rAz
+  const vAz = _pushLin[ai + 2] + _pushAng[ai + 0] * rAy - _pushAng[ai + 1] * rAx
+  const vBx = _pushLin[bi + 0] + _pushAng[bi + 1] * rBz - _pushAng[bi + 2] * rBy
+  const vBy = _pushLin[bi + 1] + _pushAng[bi + 2] * rBx - _pushAng[bi + 0] * rBz
+  const vBz = _pushLin[bi + 2] + _pushAng[bi + 0] * rBy - _pushAng[bi + 1] * rBx
+  const relVel = (vBx - vAx) * nx + (vBy - vAy) * ny + (vBz - vAz) * nz
+
+  let d = (c.rhsPenetration - relVel) * jacInvN
+  const old = c.appliedPushImpulse
+  let sum = old + d
+  if (sum < 0) { sum = 0; d = -old }
+  c.appliedPushImpulse = sum
+  if (d === 0) return
+  if (imA > 0) {
+    _pushLin[ai + 0] -= d * imA * nx
+    _pushLin[ai + 1] -= d * imA * ny
+    _pushLin[ai + 2] -= d * imA * nz
+    _pushAng[ai + 0] -= d * c.cAxN
+    _pushAng[ai + 1] -= d * c.cAyN
+    _pushAng[ai + 2] -= d * c.cAzN
+  }
+  if (imB > 0) {
+    _pushLin[bi + 0] += d * imB * nx
+    _pushLin[bi + 1] += d * imB * ny
+    _pushLin[bi + 2] += d * imB * nz
+    _pushAng[bi + 0] += d * c.cBxN
+    _pushAng[bi + 1] += d * c.cByN
+    _pushAng[bi + 2] += d * c.cBzN
+  }
+}
+
+/** Integrate the accumulated push/turn velocity straight into the transform —
+ *  btSolverBody::writebackVelocity(timeStep). Never touches real momentum. */
+export function applySplitImpulsePush(store: RigidBodyStore, dt: number): void {
+  if (!SPLIT_IMPULSE || _pushLin.length === 0) return
+  const pos = store.positions
+  const ori = store.orientations
+  const invMass = store.invMass
+  for (let i = 0; i < store.count; i++) {
+    if (invMass[i] <= 0) continue
+    const i3 = i * 3, i4 = i * 4
+    const px = _pushLin[i3 + 0], py = _pushLin[i3 + 1], pz = _pushLin[i3 + 2]
+    const wx = _pushAng[i3 + 0], wy = _pushAng[i3 + 1], wz = _pushAng[i3 + 2]
+    if (px === 0 && py === 0 && pz === 0 && wx === 0 && wy === 0 && wz === 0) continue
+    pos[i3 + 0] += px * dt
+    pos[i3 + 1] += py * dt
+    pos[i3 + 2] += pz * dt
+    if (wx !== 0 || wy !== 0 || wz !== 0) {
+      const qx = ori[i4 + 0], qy = ori[i4 + 1], qz = ori[i4 + 2], qw = ori[i4 + 3]
+      const dx = qw * wx + wy * qz - wz * qy
+      const dy = qw * wy + wz * qx - wx * qz
+      const dz = qw * wz + wx * qy - wy * qx
+      const dw = -(wx * qx + wy * qy + wz * qz)
+      const h = 0.5 * dt
+      let nx2 = qx + dx * h, ny2 = qy + dy * h, nz2 = qz + dz * h, nw2 = qw + dw * h
+      const l2 = nx2 * nx2 + ny2 * ny2 + nz2 * nz2 + nw2 * nw2
+      if (l2 > 0) {
+        const inv = 1 / Math.sqrt(l2)
+        ori[i4 + 0] = nx2 * inv; ori[i4 + 1] = ny2 * inv
+        ori[i4 + 2] = nz2 * inv; ori[i4 + 3] = nw2 * inv
+      }
     }
   }
 }
@@ -213,6 +414,7 @@ function setupConstraint(
   store: RigidBodyStore,
   dt: number,
   invDt: number,
+  iterations: number,
 ): void {
   const F = cache.F
   const I = cache.I
@@ -334,16 +536,20 @@ function setupConstraint(
     // iteration (PMX rigs routinely put k=100000 springs on locked axes,
     // which turned welded weight-bodies into energy pumps).
     if (con.springEnabled[i] && denom > 0 && lo !== hi) {
-      // Implicit spring-damper (see SPRING_DAMPING_ZETA). Stored per axis:
-      // cacheLinSpringTarget = −(k/γ)·err (the bias, in velocity units) and
-      // cacheLinSpringMaxImp = s (the CFM softness — NOT a clamp anymore).
+      // Bullet motor form. Our relVel is (vB − vA)·axis where Bullet's is the
+      // negation, so the target carries the opposite sign to Bullet's — which
+      // is the same sign the old spring-damper produced, so behaviour keeps its
+      // direction and only its magnitude law changes.
       const k = con.springStiffness[i]
       const serr = curr - con.equilibriumPoint[i]
-      const meff = 1 / denom
-      const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * meff)
-      const gamma = c + dt * k
-      F[base + LIN_SPR_TGT + i] = -(k / gamma) * serr
-      F[base + LIN_SPR_MAX + i] = 1 / (dt * gamma)
+      const force = serr * k
+      const velFactor = (invDt * SPRING_DAMPING) / iterations
+      const target = -velFactor * force
+      // getMotorFactor's `vel` is Bullet's tag_vel: −targetVelocity for a
+      // linear axis, which in our sign convention is the target itself.
+      const motFact = getMotorFactor(curr, lo, hi, target, invDt * INFO_ERP)
+      F[base + LIN_SPR_TGT + i] = motFact * target
+      F[base + LIN_SPR_MAX + i] = Math.abs(force) * dt
       F[base + LIN_SPR_IMP + i] = 0
       I[ib + I_LIN_SPR_ACT + i] = 1
     } else if (!(lo === hi && con.isLoop)) {
@@ -413,16 +619,18 @@ function setupConstraint(
     // Springs on locked axes are skipped — the limit row welds those, and
     // double-driving a DOF overshoots every iteration (see the linear loop).
     if (con.springEnabled[idx] && F[angJac + i] > 0 && con.angularMin[i] !== con.angularMax[i]) {
-      // Implicit spring-damper, angular flavor. F[angJac + i] = 1/denom IS the
-      // row's effective inertia. Sign flip vs linear: d(err)/dt = −relAv, so
-      // the bias is positive for positive error. cacheAngSpringMaxImp holds
-      // the CFM softness s (not a clamp).
+      // Bullet motor form, angular flavour. Bullet's angular force is −err·k
+      // and its rel_vel is the negation of our relAv, so the two flips cancel
+      // and our target stays positive for positive error, as before.
       const k = con.springStiffness[idx]
       const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
-      const c = 2 * SPRING_DAMPING_ZETA * Math.sqrt(k * F[angJac + i])
-      const gamma = c + dt * k
-      F[angTgt + i] = (k / gamma) * serr
-      F[base + ANG_SPR_MAX + i] = 1 / (dt * gamma)
+      const force = -serr * k
+      const velFactor = (invDt * SPRING_DAMPING) / iterations
+      const target = -velFactor * force
+      // tag_vel for a rotational axis is Bullet's targetVelocity, i.e. −ours.
+      const motFact = getMotorFactor(_angDiffScratch[i], con.angularMin[i], con.angularMax[i], -target, invDt * INFO_ERP)
+      F[angTgt + i] = motFact * target
+      F[base + ANG_SPR_MAX + i] = Math.abs(force) * dt
       I[angAct + i] = 1
     } else {
       F[angTgt + i] = 0
@@ -600,9 +808,16 @@ function iterateConstraint(
     // the spring off the stale value double-corrects the DOF.
     if (I[sprAct + i]) {
       const relVelNow = j !== 0 ? relVel + j / F[jac + i] : relVel
-      const s = F[sprMax + i] // CFM softness
-      const dImp = (F[sprTgt + i] - relVelNow - s * F[sprImp + i]) / (1 / F[jac + i] + s)
-      F[sprImp + i] += dImp
+      // Motor row: drive toward the target, accumulated impulse clamped to the
+      // spring's real force over the step (Bullet's m_lowerLimit/m_upperLimit).
+      let dImp = (F[sprTgt + i] - relVelNow) * F[jac + i]
+      const maxF = F[sprMax + i]
+      const oldS = F[sprImp + i]
+      let nextS = oldS + dImp
+      if (nextS < -maxF) nextS = -maxF
+      else if (nextS > maxF) nextS = maxF
+      dImp = nextS - oldS
+      F[sprImp + i] = nextS
       j += dImp
     }
 
@@ -643,9 +858,14 @@ function iterateConstraint(
     const axx = F[angAxes + o + 0], axy = F[angAxes + o + 1], axz = F[angAxes + o + 2]
     const relAv = dax * axx + day * axy + daz * axz
     // Implicit spring-damper row (soft constraint, see setup).
-    const s = F[angSprMax + i] // CFM softness
-    const j = (F[angTgt + i] - relAv - s * F[angSprImp + i]) / (1 / F[angJac + i] + s)
-    F[angSprImp + i] += j
+    let j = (F[angTgt + i] - relAv) * F[angJac + i]
+    const maxF = F[angSprMax + i]
+    const oldS = F[angSprImp + i]
+    let nextS = oldS + j
+    if (nextS < -maxF) nextS = -maxF
+    else if (nextS > maxF) nextS = maxF
+    j = nextS - oldS
+    F[angSprImp + i] = nextS
     if (j === 0) continue
     if (imA > 0) {
       av[ai + 0] -= j * F[angWAs + o + 0]
@@ -784,8 +1004,14 @@ function setupContactRow(
   const vBx = lv[bi + 0] + av[bi + 1] * rBz - av[bi + 2] * rBy
   const vBy = lv[bi + 1] + av[bi + 2] * rBx - av[bi + 0] * rBz
   const vBz = lv[bi + 2] + av[bi + 0] * rBy - av[bi + 1] * rBx
-  const relVelN0 = (vBx - vAx) * nx + (vBy - vAy) * ny + (vBz - vAz) * nz
-  c.bounceVel = c.restitution > 0 && relVelN0 < -BOUNCE_THRESHOLD
+  const dvx = vBx - vAx
+  const dvy = vBy - vAy
+  const dvz = vBz - vAz
+  const relVelN0 = dvx * nx + dvy * ny + dvz * nz
+  // Restitution is switched off once a point has been in contact for more than
+  // a couple of substeps (m_restingContactRestitutionThreshold), or resting
+  // cloth keeps being handed a little bounce forever.
+  c.bounceVel = c.restitution > 0 && relVelN0 < -BOUNCE_THRESHOLD && c.age <= RESTING_CONTACT_AGE
     ? -c.restitution * relVelN0
     : 0
 
@@ -801,29 +1027,54 @@ function setupContactRow(
   // (pulling) impulse, not a large positive one on a body in mid-air. On a
   // dress rig half of all contact rows are speculative and 88% of them fire,
   // which is the field of invisible brakes the cloth was shaking against.
-  c.allowedApproachVel = c.depth < 0 ? -c.depth * invDt : 0
-
-  // Relaxation gain, from the more contended of the two bodies (see
-  // CONTACT_SOR_MIN). A lone contact keeps gain 1.0 and stays exact.
-  const contended = _rowCount[c.bodyA] > _rowCount[c.bodyB] ? _rowCount[c.bodyA] : _rowCount[c.bodyB]
-  const gain = contended > 1 ? 1 / contended : 1
-  c.sorGain = gain < CONTACT_SOR_MIN ? CONTACT_SOR_MIN : gain
-
-  // Friction tangent basis. Pick the axis least aligned with n.
-  let t1x: number, t1y: number, t1z: number
-  if (Math.abs(nx) < 0.7071) { t1x = 0; t1y = -nz; t1z = ny }
-  else { t1x = nz; t1y = 0; t1z = -nx }
-  const tl = Math.hypot(t1x, t1y, t1z)
-  if (tl > 1e-8) {
-    const tInv = 1 / tl
-    t1x *= tInv; t1y *= tInv; t1z *= tInv
+  const positionalError = (c.depth - LINEAR_SLOP) * CONTACT_ERP * invDt
+  if (SPLIT_IMPULSE && c.depth > SPLIT_PENETRATION_THRESHOLD) {
+    c.biasVel = 0
+    c.rhsPenetration = positionalError
   } else {
-    c.jacInvT1 = 0; c.jacInvT2 = 0
-    return
+    c.biasVel = positionalError
+    c.rhsPenetration = 0
   }
-  const t2x = ny * t1z - nz * t1y
-  const t2y = nz * t1x - nx * t1z
-  const t2z = nx * t1y - ny * t1x
+
+  // Friction direction, Bullet 2.75 style. The stock solverMode is
+  // SOLVER_USE_WARMSTARTING | SOLVER_SIMD — SOLVER_USE_2_FRICTION_DIRECTIONS is
+  // NOT set, so there is exactly ONE friction row, aligned with the direction
+  // the contact is actually sliding:
+  //
+  //   m_lateralFrictionDir1 = vel - normalWorldOnB * rel_vel
+  //
+  // with vel = vA − vB. Our dv is vB − vA, so that direction is the negation of
+  // dv's tangential part; sign is irrelevant to a row with symmetric ±μN bounds.
+  // Below SIMD_EPSILON of sliding Bullet falls back to btPlaneSpace1, ported
+  // exactly. Direction is recomputed every substep — friction-direction caching
+  // is off in the stock mode.
+  let t1x = dvx - nx * relVelN0
+  let t1y = dvy - ny * relVelN0
+  let t1z = dvz - nz * relVelN0
+  let t2x: number, t2y: number, t2z: number
+  const lat2 = t1x * t1x + t1y * t1y + t1z * t1z
+  if (lat2 > 1.192092896e-07) {
+    const inv = 1 / Math.sqrt(lat2)
+    t1x *= inv; t1y *= inv; t1z *= inv
+    // Second tangent is unused (single-direction mode) but kept orthonormal so
+    // the cached Jacobian slots stay well-defined.
+    t2x = ny * t1z - nz * t1y
+    t2y = nz * t1x - nx * t1z
+    t2z = nx * t1y - ny * t1x
+  } else {
+    // btPlaneSpace1, verbatim.
+    if (Math.abs(nz) > 0.7071067811865475) {
+      const a = ny * ny + nz * nz
+      const k = 1 / Math.sqrt(a)
+      t1x = 0; t1y = -nz * k; t1z = ny * k
+      t2x = a * k; t2y = -nx * t1z; t2z = nx * t1y
+    } else {
+      const a = nx * nx + ny * ny
+      const k = 1 / Math.sqrt(a)
+      t1x = -ny * k; t1y = nx * k; t1z = 0
+      t2x = -nz * t1y; t2y = nz * t1x; t2z = a * k
+    }
+  }
   c.t1x = t1x; c.t1y = t1y; c.t1z = t1z
   c.t2x = t2x; c.t2y = t2y; c.t2z = t2z
 
@@ -867,15 +1118,70 @@ function setupContactRow(
   c.jacInvT2 = denomT2 > 0 ? 1 / denomT2 : 0
 }
 
-// ITER: one push-only normal row + two Coulomb friction rows. Friction
-// bound depends on the *current* applied normal impulse, so it tightens
-// as the normal row converges.
-function iterateContactRow(
+// ITER, normal row only — Bullet resolveSingleConstraintRowLowerLimit:
+// deltaImpulse = (rhs - relVel) * jacDiagABInv, accumulated impulse clamped at
+// the lower limit of 0 (push-only). `rhs` here is restitution + Baumgarte bias.
+function iterateContactNormal(
   c: Contact,
   lv: Float32Array,
   av: Float32Array,
   invMass: Float32Array,
 ): void {
+  const jacInvN = c.jacInvN
+  if (jacInvN <= 0) return
+  const imA = invMass[c.bodyA]
+  const imB = invMass[c.bodyB]
+  if (imA === 0 && imB === 0) return
+  const ai = c.bodyA * 3, bi = c.bodyB * 3
+  const rAx = c.rAx, rAy = c.rAy, rAz = c.rAz
+  const rBx = c.rBx, rBy = c.rBy, rBz = c.rBz
+  const nx = c.nx, ny = c.ny, nz = c.nz
+
+  const vAx = lv[ai + 0] + av[ai + 1] * rAz - av[ai + 2] * rAy
+  const vAy = lv[ai + 1] + av[ai + 2] * rAx - av[ai + 0] * rAz
+  const vAz = lv[ai + 2] + av[ai + 0] * rAy - av[ai + 1] * rAx
+  const vBx = lv[bi + 0] + av[bi + 1] * rBz - av[bi + 2] * rBy
+  const vBy = lv[bi + 1] + av[bi + 2] * rBx - av[bi + 0] * rBz
+  const vBz = lv[bi + 2] + av[bi + 0] * rBy - av[bi + 1] * rBx
+  const relVelN = (vBx - vAx) * nx + (vBy - vAy) * ny + (vBz - vAz) * nz
+
+  let dImpN = (c.bounceVel + c.biasVel - relVelN) * jacInvN
+  const oldN = c.appliedNormalImpulse
+  let newN = oldN + dImpN
+  if (newN < 0) { newN = 0; dImpN = -oldN }
+  c.appliedNormalImpulse = newN
+  if (dImpN === 0) return
+  if (imA > 0) {
+    lv[ai + 0] -= dImpN * imA * nx
+    lv[ai + 1] -= dImpN * imA * ny
+    lv[ai + 2] -= dImpN * imA * nz
+    av[ai + 0] -= dImpN * c.cAxN
+    av[ai + 1] -= dImpN * c.cAyN
+    av[ai + 2] -= dImpN * c.cAzN
+  }
+  if (imB > 0) {
+    lv[bi + 0] += dImpN * imB * nx
+    lv[bi + 1] += dImpN * imB * ny
+    lv[bi + 2] += dImpN * imB * nz
+    av[bi + 0] += dImpN * c.cBxN
+    av[bi + 1] += dImpN * c.cByN
+    av[bi + 2] += dImpN * c.cBzN
+  }
+}
+
+// ITER, friction pass. One Coulomb row (stock Bullet has
+// SOLVER_USE_2_FRICTION_DIRECTIONS off), bounded by ±friction · the normal
+// impulse accumulated so far. Bullet skips the row entirely while that is
+// still zero.
+function iterateContactFriction(
+  c: Contact,
+  lv: Float32Array,
+  av: Float32Array,
+  invMass: Float32Array,
+): void {
+  const muNormal = c.friction * c.appliedNormalImpulse
+  if (muNormal <= 0) return
+  if (c.jacInvT1 <= 0) return
   const imA = invMass[c.bodyA]
   const imB = invMass[c.bodyB]
   if (imA === 0 && imB === 0) return
@@ -889,109 +1195,32 @@ function iterateContactRow(
   const vBx = lv[bi + 0] + av[bi + 1] * rBz - av[bi + 2] * rBy
   const vBy = lv[bi + 1] + av[bi + 2] * rBx - av[bi + 0] * rBz
   const vBz = lv[bi + 2] + av[bi + 0] * rBy - av[bi + 1] * rBx
-  const dvx = vBx - vAx
-  const dvy = vBy - vAy
-  const dvz = vBz - vAz
+  const dvx = vBx - vAx, dvy = vBy - vAy, dvz = vBz - vAz
 
-  // Normal row.
-  const jacInvN = c.jacInvN
-  if (jacInvN > 0) {
-    const nx = c.nx, ny = c.ny, nz = c.nz
-    const relVelN = dvx * nx + dvy * ny + dvz * nz
-    let dImpN = (c.bounceVel - c.allowedApproachVel - relVelN) * jacInvN * c.sorGain
-    const oldN = c.appliedNormalImpulse
-    let newN = oldN + dImpN
-    if (newN < 0) { newN = 0; dImpN = -oldN }
-    c.appliedNormalImpulse = newN
-    if (dImpN !== 0) {
-      const cAxN = c.cAxN, cAyN = c.cAyN, cAzN = c.cAzN
-      const cBxN = c.cBxN, cByN = c.cByN, cBzN = c.cBzN
-      if (imA > 0) {
-        lv[ai + 0] -= dImpN * imA * nx
-        lv[ai + 1] -= dImpN * imA * ny
-        lv[ai + 2] -= dImpN * imA * nz
-        av[ai + 0] -= dImpN * cAxN
-        av[ai + 1] -= dImpN * cAyN
-        av[ai + 2] -= dImpN * cAzN
-      }
-      if (imB > 0) {
-        lv[bi + 0] += dImpN * imB * nx
-        lv[bi + 1] += dImpN * imB * ny
-        lv[bi + 2] += dImpN * imB * nz
-        av[bi + 0] += dImpN * cBxN
-        av[bi + 1] += dImpN * cByN
-        av[bi + 2] += dImpN * cBzN
-      }
-    }
-  }
-
-  // Friction. Bound = ±μ · current normal impulse.
-  const muNormal = c.friction * c.appliedNormalImpulse
-  if (muNormal <= 0) return
-
-  // Re-read dv after the normal impulse possibly changed lv/av.
-  const vAx2 = lv[ai + 0] + av[ai + 1] * rAz - av[ai + 2] * rAy
-  const vAy2 = lv[ai + 1] + av[ai + 2] * rAx - av[ai + 0] * rAz
-  const vAz2 = lv[ai + 2] + av[ai + 0] * rAy - av[ai + 1] * rAx
-  const vBx2 = lv[bi + 0] + av[bi + 1] * rBz - av[bi + 2] * rBy
-  const vBy2 = lv[bi + 1] + av[bi + 2] * rBx - av[bi + 0] * rBz
-  const vBz2 = lv[bi + 2] + av[bi + 0] * rBy - av[bi + 1] * rBx
-  const dvx2 = vBx2 - vAx2
-  const dvy2 = vBy2 - vAy2
-  const dvz2 = vBz2 - vAz2
-
-  applyFrictionTangent(
-    c, ai, bi, dvx2, dvy2, dvz2,
-    c.t1x, c.t1y, c.t1z,
-    c.cAxT1, c.cAyT1, c.cAzT1, c.cBxT1, c.cByT1, c.cBzT1,
-    c.jacInvT1, muNormal, imA, imB, lv, av, 1,
-  )
-  applyFrictionTangent(
-    c, ai, bi, dvx2, dvy2, dvz2,
-    c.t2x, c.t2y, c.t2z,
-    c.cAxT2, c.cAyT2, c.cAzT2, c.cBxT2, c.cByT2, c.cBzT2,
-    c.jacInvT2, muNormal, imA, imB, lv, av, 2,
-  )
-}
-
-function applyFrictionTangent(
-  c: Contact,
-  ai: number, bi: number,
-  dvx: number, dvy: number, dvz: number,
-  tx: number, ty: number, tz: number,
-  cAx: number, cAy: number, cAz: number,
-  cBx: number, cBy: number, cBz: number,
-  jacInv: number, muNormal: number,
-  imA: number, imB: number,
-  lv: Float32Array, av: Float32Array,
-  slot: 1 | 2,
-): void {
-  if (jacInv <= 0) return
-  const relVel = dvx * tx + dvy * ty + dvz * tz
-  let dImp = -relVel * jacInv * c.sorGain
-  const old = slot === 1 ? c.appliedFrictionImpulse1 : c.appliedFrictionImpulse2
+  const relVel = dvx * c.t1x + dvy * c.t1y + dvz * c.t1z
+  let dImp = -relVel * c.jacInvT1
+  const old = c.appliedFrictionImpulse1
   let next = old + dImp
-  if (next < -muNormal) { next = -muNormal; dImp = next - old }
-  else if (next > muNormal) { next = muNormal; dImp = next - old }
-  if (slot === 1) c.appliedFrictionImpulse1 = next
-  else c.appliedFrictionImpulse2 = next
-
+  if (next < -muNormal) next = -muNormal
+  else if (next > muNormal) next = muNormal
+  dImp = next - old
+  c.appliedFrictionImpulse1 = next
   if (dImp === 0) return
   if (imA > 0) {
-    lv[ai + 0] -= dImp * imA * tx
-    lv[ai + 1] -= dImp * imA * ty
-    lv[ai + 2] -= dImp * imA * tz
-    av[ai + 0] -= dImp * cAx
-    av[ai + 1] -= dImp * cAy
-    av[ai + 2] -= dImp * cAz
+    lv[ai + 0] -= dImp * imA * c.t1x
+    lv[ai + 1] -= dImp * imA * c.t1y
+    lv[ai + 2] -= dImp * imA * c.t1z
+    av[ai + 0] -= dImp * c.cAxT1
+    av[ai + 1] -= dImp * c.cAyT1
+    av[ai + 2] -= dImp * c.cAzT1
   }
   if (imB > 0) {
-    lv[bi + 0] += dImp * imB * tx
-    lv[bi + 1] += dImp * imB * ty
-    lv[bi + 2] += dImp * imB * tz
-    av[bi + 0] += dImp * cBx
-    av[bi + 1] += dImp * cBy
-    av[bi + 2] += dImp * cBz
+    lv[bi + 0] += dImp * imB * c.t1x
+    lv[bi + 1] += dImp * imB * c.t1y
+    lv[bi + 2] += dImp * imB * c.t1z
+    av[bi + 0] += dImp * c.cBxT1
+    av[bi + 1] += dImp * c.cByT1
+    av[bi + 2] += dImp * c.cBzT1
   }
 }
 
@@ -1016,6 +1245,19 @@ function eulerXYZQuatInto(x: number, y: number, z: number, out: Float32Array): v
 }
 
 // Euler XYZ from a 3×3 rotation matrix (row-major elements).
+//
+// ⚠ TRANSPOSED RELATIVE TO BULLET. Bullet's matrixToEulerXYZ (btGeneric6DofConstraint.cpp)
+// reads asin(r02) and atan2(-r12, r22); this reads asin(r20) and atan2(-r21, r22).
+// Every angular DOF here is therefore the NEGATION of Bullet's, and the code
+// compensates by driving angular rows with +k where Bullet uses −k, and by
+// treating a low violation as Bullet's high one. The two flips cancel, so
+// nothing is wrong — but they must be flipped TOGETHER.
+//
+// Porting Bullet's sign without also swapping the violation enum makes every
+// limit drive its joint further out of range: measured mean velocity-reversal
+// 0.59 with jerk 1912 (an explosion), improving to 0.40 and then 0.137 as each
+// half was corrected. If you ever port more Bullet joint code, either flip both
+// or change this function to Bullet's convention and flip every consumer.
 function matrixToEulerXYZ(
   r00: number, r01: number,
   r10: number, r11: number,
@@ -1037,4 +1279,98 @@ function matrixToEulerXYZ(
     out[1] = Math.PI * 0.5
     out[2] = 0
   }
+}
+
+
+// Seed a row from the persistent manifold and apply that impulse up front —
+// Bullet's setup does this inline (m_appliedImpulse = cp.m_appliedImpulse *
+// m_warmstartingFactor, then applyImpulse). Contact points are matched in body
+// A's local frame so the identity survives the bodies moving.
+function warmStartContact(
+  c: Contact,
+  store: RigidBodyStore,
+  manifolds: ManifoldCache,
+  lv: Float32Array,
+  av: Float32Array,
+  invMass: Float32Array,
+): void {
+  const imA = invMass[c.bodyA]
+  const imB = invMass[c.bodyB]
+  if (imA === 0 && imB === 0) return
+  worldToLocal(store, c.bodyA, c.rAx, c.rAy, c.rAz, _mfA)
+  const prev = manifolds.find(c.bodyA, c.bodyB, _mfA[0], _mfA[1], _mfA[2])
+  if (prev === null) {
+    c.age = 0
+    return
+  }
+  c.age = prev.age + 1
+  const n = prev.normalImpulse * WARMSTARTING_FACTOR
+  const f1 = prev.frictionImpulse1 * WARMSTARTING_FACTOR
+  const f2 = prev.frictionImpulse2 * WARMSTARTING_FACTOR
+  c.appliedNormalImpulse = n
+  c.appliedFrictionImpulse1 = f1
+  c.appliedFrictionImpulse2 = f2
+  applyContactImpulse(c, lv, av, imA, imB, c.nx, c.ny, c.nz, c.cAxN, c.cAyN, c.cAzN, c.cBxN, c.cByN, c.cBzN, n)
+  if (c.jacInvT1 > 0)
+    applyContactImpulse(c, lv, av, imA, imB, c.t1x, c.t1y, c.t1z, c.cAxT1, c.cAyT1, c.cAzT1, c.cBxT1, c.cByT1, c.cBzT1, f1)
+  if (c.jacInvT2 > 0)
+    applyContactImpulse(c, lv, av, imA, imB, c.t2x, c.t2y, c.t2z, c.cAxT2, c.cAyT2, c.cAzT2, c.cBxT2, c.cByT2, c.cBzT2, f2)
+}
+
+function applyContactImpulse(
+  c: Contact, lv: Float32Array, av: Float32Array,
+  imA: number, imB: number,
+  dx: number, dy: number, dz: number,
+  cAx: number, cAy: number, cAz: number,
+  cBx: number, cBy: number, cBz: number,
+  j: number,
+): void {
+  if (j === 0) return
+  const ai = c.bodyA * 3, bi = c.bodyB * 3
+  if (imA > 0) {
+    lv[ai + 0] -= j * imA * dx; lv[ai + 1] -= j * imA * dy; lv[ai + 2] -= j * imA * dz
+    av[ai + 0] -= j * cAx; av[ai + 1] -= j * cAy; av[ai + 2] -= j * cAz
+  }
+  if (imB > 0) {
+    lv[bi + 0] += j * imB * dx; lv[bi + 1] += j * imB * dy; lv[bi + 2] += j * imB * dz
+    av[bi + 0] += j * cBx; av[bi + 1] += j * cBy; av[bi + 2] += j * cBz
+  }
+}
+
+/** Store every solved row back into the manifold for the next substep. */
+export function saveContactImpulses(
+  store: RigidBodyStore,
+  contacts: ContactPool,
+  manifolds: ManifoldCache,
+): void {
+  for (let ci = 0; ci < contacts.count; ci++) {
+    const c = contacts.get(ci)
+    worldToLocal(store, c.bodyA, c.rAx, c.rAy, c.rAz, _mfA)
+    worldToLocal(store, c.bodyB, c.rBx, c.rBy, c.rBz, _mfB)
+    manifolds.store(
+      c.bodyA, c.bodyB,
+      _mfA[0], _mfA[1], _mfA[2],
+      _mfB[0], _mfB[1], _mfB[2],
+      c.appliedNormalImpulse, c.appliedFrictionImpulse1, c.appliedFrictionImpulse2,
+      c.age,
+    )
+  }
+  manifolds.endStep()
+}
+
+const _mfA = new Float32Array(3)
+const _mfB = new Float32Array(3)
+
+// Rotate a world-space lever arm into the body's local frame (R^T · v).
+function worldToLocal(store: RigidBodyStore, i: number, x: number, y: number, z: number, out: Float32Array): void {
+  const i4 = i * 4
+  const qx = store.orientations[i4 + 0], qy = store.orientations[i4 + 1]
+  const qz = store.orientations[i4 + 2], qw = store.orientations[i4 + 3]
+  // v' = conj(q) * v * q
+  const tx = 2 * (qy * z - qz * y)
+  const ty = 2 * (qz * x - qx * z)
+  const tz = 2 * (qx * y - qy * x)
+  out[0] = x - qw * tx + (qy * tz - qz * ty)
+  out[1] = y - qw * ty + (qz * tx - qx * tz)
+  out[2] = z - qw * tz + (qx * ty - qy * tx)
 }

@@ -51,11 +51,18 @@ export interface Contact {
   cBxN: number; cByN: number; cBzN: number   // rB × n
   jacInvN: number
   bounceVel: number   // restitution reference, captured at setup from initial relVelN
-  /** Per-contact relaxation gain, 1/max(rows on A, rows on B). See CONTACT_SOR_MIN. */
-  sorGain: number
-  // Approach speed this row is allowed to leave alone: gap / dt for a
-  // speculative row, 0 once the shapes actually touch. See setupContactRow.
-  allowedApproachVel: number
+  /** Substeps this contact point has persisted (from the manifold cache).
+   *  Bullet kills restitution past m_restingContactRestitutionThreshold = 2. */
+  age: number
+  /** Penetration term routed to the SPLIT (pseudo-velocity) channel instead of
+   *  the real one, when the contact is deeper than the split threshold. */
+  rhsPenetration: number
+  /** Accumulated impulse on the split channel — Bullet's m_appliedPushImpulse. */
+  appliedPushImpulse: number
+  /** Baumgarte bias, depth·ERP/dt — Bullet 2.75's positionalError. Positive
+   *  when penetrating (pushes apart), negative when separated (allows the
+   *  approach that closes the gap). See CONTACT_ERP. */
+  biasVel: number
   // Friction tangent 1:
   t1x: number; t1y: number; t1z: number
   cAxT1: number; cAyT1: number; cAzT1: number
@@ -84,8 +91,10 @@ function makeContact(): Contact {
     cBxN: 0, cByN: 0, cBzN: 0,
     jacInvN: 0,
     bounceVel: 0,
-    sorGain: 1,
-    allowedApproachVel: 0,
+    age: 0,
+    rhsPenetration: 0,
+    appliedPushImpulse: 0,
+    biasVel: 0,
     t1x: 0, t1y: 0, t1z: 0,
     cAxT1: 0, cAyT1: 0, cAzT1: 0,
     cBxT1: 0, cByT1: 0, cBzT1: 0,
@@ -108,6 +117,7 @@ export class ContactPool {
       c.appliedNormalImpulse = 0
       c.appliedFrictionImpulse1 = 0
       c.appliedFrictionImpulse2 = 0
+      c.appliedPushImpulse = 0
       this.count++
       return c
     }
