@@ -19,6 +19,31 @@ import type { Contact, ContactPool } from "./contact"
 
 const BOUNCE_THRESHOLD = 2.0
 
+// Successive over-relaxation factor on CONTACT rows only (joints untouched).
+// Each contact row independently drives the relative velocity at its own point
+// to zero; when a dress panel carries up to 43 of them at once, they all
+// correct the same motion and the body is over-braked, differently every
+// substep. Scaling each row's step damps that without changing the fixed
+// point — the accumulated impulse still converges to the same answer, just
+// approached rather than overshot.
+//
+// The gain is PER CONTACT, scaled by how contended its two bodies are, not a
+// flat constant. A flat factor was measured first and is wrong: it also slows
+// the well-conditioned rows, and a body resting on a SINGLE contact can then
+// no longer cancel its approach velocity within the iteration budget, so it
+// creeps forever instead of settling (托特 peak speed at 15 s: 0.11 at gain
+// 1.0, 0.46 at 0.5, 0.72 at 0.3 — a permanent limit cycle on a one-contact
+// body). Over-constraint is a local property, so the remedy has to be local.
+//
+// gain = 1 / max(rows on A, rows on B), floored. One contact → 1.0, exact and
+// settling preserved; a dress panel sharing 20 rows → 0.05, damped. This is
+// the standard mass-splitting blend toward Jacobi in the contended cluster.
+const CONTACT_SOR_MIN = 0.12
+
+// Per-body contact-row counts for the gain above; grown on demand, refilled
+// each substep. Module-level so the solve allocates nothing.
+let _rowCount = new Int32Array(0)
+
 // Ceilings on limit-correction velocity. In normal operation limit errors are
 // tiny; a large error only appears after a discontinuity (teleport, stall,
 // deep penetration), and feeding err·ERP/dt to the solver unclamped then
@@ -93,8 +118,23 @@ export function solveConstraints(
   for (let c = 0; c < constraints.length; c++) {
     setupConstraint(constraints[c], c, cache, store, dt, invDt)
   }
+  // How many contact rows each body carries this substep — the per-contact
+  // relaxation gain below is a function of the more contended of its two
+  // bodies. Counting is O(contacts), done once, before any setup.
+  if (_rowCount.length < store.count) _rowCount = new Int32Array(store.count)
+  else _rowCount.fill(0, 0, store.count)
+  // Only DYNAMIC bodies are counted. A static body — above all the ground —
+  // collects a row from every body resting on it, and letting that inflate the
+  // count crushes the gain of each of those contacts to the floor, so nothing
+  // resting on the ground can build enough impulse and it creeps instead of
+  // settling. A body with invMass 0 cannot be over-braked in the first place.
   for (let ci = 0; ci < contacts.count; ci++) {
-    setupContactRow(contacts.get(ci), lv, av, invMass, W)
+    const c = contacts.get(ci)
+    if (invMass[c.bodyA] > 0) _rowCount[c.bodyA]++
+    if (invMass[c.bodyB] > 0) _rowCount[c.bodyB]++
+  }
+  for (let ci = 0; ci < contacts.count; ci++) {
+    setupContactRow(contacts.get(ci), lv, av, invMass, W, invDt)
   }
 
   for (let iter = 0; iter < iterations; iter++) {
@@ -705,6 +745,7 @@ function setupContactRow(
   av: Float32Array,
   invMass: Float32Array,
   W: Float32Array,
+  invDt: number,
 ): void {
   const ai = c.bodyA * 3
   const bi = c.bodyB * 3
@@ -747,6 +788,26 @@ function setupContactRow(
   c.bounceVel = c.restitution > 0 && relVelN0 < -BOUNCE_THRESHOLD
     ? -c.restitution * relVelN0
     : 0
+
+  // Speculative rows (depth < 0 — the shapes are inside the margin band but
+  // NOT touching) must not brake a body that hasn't arrived yet. Their whole
+  // job is to stop it crossing the surface within this substep, so the
+  // approach speed they leave alone is exactly the one that closes the
+  // remaining gap in dt; only the excess above that is cancelled.
+  //
+  // Without this the row targets relVelN = 0 like a touching contact and
+  // stops approaching bodies dead up to CONTACT_MARGIN away from anything.
+  // The push-only clamp does NOT prevent that — it only forbids a negative
+  // (pulling) impulse, not a large positive one on a body in mid-air. On a
+  // dress rig half of all contact rows are speculative and 88% of them fire,
+  // which is the field of invisible brakes the cloth was shaking against.
+  c.allowedApproachVel = c.depth < 0 ? -c.depth * invDt : 0
+
+  // Relaxation gain, from the more contended of the two bodies (see
+  // CONTACT_SOR_MIN). A lone contact keeps gain 1.0 and stays exact.
+  const contended = _rowCount[c.bodyA] > _rowCount[c.bodyB] ? _rowCount[c.bodyA] : _rowCount[c.bodyB]
+  const gain = contended > 1 ? 1 / contended : 1
+  c.sorGain = gain < CONTACT_SOR_MIN ? CONTACT_SOR_MIN : gain
 
   // Friction tangent basis. Pick the axis least aligned with n.
   let t1x: number, t1y: number, t1z: number
@@ -837,7 +898,7 @@ function iterateContactRow(
   if (jacInvN > 0) {
     const nx = c.nx, ny = c.ny, nz = c.nz
     const relVelN = dvx * nx + dvy * ny + dvz * nz
-    let dImpN = (c.bounceVel - relVelN) * jacInvN
+    let dImpN = (c.bounceVel - c.allowedApproachVel - relVelN) * jacInvN * c.sorGain
     const oldN = c.appliedNormalImpulse
     let newN = oldN + dImpN
     if (newN < 0) { newN = 0; dImpN = -oldN }
@@ -907,7 +968,7 @@ function applyFrictionTangent(
 ): void {
   if (jacInv <= 0) return
   const relVel = dvx * tx + dvy * ty + dvz * tz
-  let dImp = -relVel * jacInv
+  let dImp = -relVel * jacInv * c.sorGain
   const old = slot === 1 ? c.appliedFrictionImpulse1 : c.appliedFrictionImpulse2
   let next = old + dImp
   if (next < -muNormal) { next = -muNormal; dImp = next - old }

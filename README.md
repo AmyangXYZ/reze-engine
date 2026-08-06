@@ -86,10 +86,10 @@ engine/src/
     slots.ts           per-render-class fs() shell (stencil/alpha) around the graph body
     presets/           the 9 built-in shader graphs (hair, face, eye, cloth, …)
 
-  physics/           in-house rigid-body solver (~2.5k lines)
+  physics/           in-house rigid-body solver (~4.2k lines)
     physics.ts         RezePhysics: bone↔body sync, fixed-step accumulator + interpolation
     solver.ts          sequential-impulse PGS (joint + contact rows)
-    contact.ts         narrowphase (analytical sphere/box/capsule pairs) + contact pool
+    contact.ts         narrowphase (analytical sphere/box/capsule pairs, incl. box-box) + contact pool
     constraint.ts      6DOF spring joints   ·   world.ts  step, gravity + wind
     body.ts            SoA rigid-body store  ·  types.ts
 
@@ -325,15 +325,16 @@ Validation catches material conflicts, type mismatches, cycles, and bad links wi
 
 ## Physics
 
-In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsule colliders, 6DOF spring joints), ~2.5k lines of TypeScript, no external dependency, at quality comparable to Bullet's defaults. A fixed-timestep accumulator runs at a constant **60 Hz** (≤6 substeps/frame) so spring impulse, damping, and integration stay deterministic; dynamic bodies are **render-interpolated** between substeps to stay smooth when the display rate ≠ 60 Hz.
+In-house sequential-impulse rigid-body solver for PMX rigs (sphere / box / capsule colliders, 6DOF spring joints), ~4.2k lines of TypeScript, no external dependency, at quality comparable to Bullet's defaults. A fixed-timestep accumulator runs at a constant **60 Hz** (≤6 substeps/frame) so spring impulse, damping, and integration stay deterministic; dynamic bodies are **render-interpolated** between substeps to stay smooth when the display rate ≠ 60 Hz.
 
 **Per substep:** `predict velocities → broad + narrowphase → solve constraints (10 iters) → split-impulse position correction → integrate`.
 
 - **Solver** — projected Gauss-Seidel, joint rows + contact rows in one loop. Joints are 6DOF spring constraints (3 linear + 3 angular) with stop-ERP limit correction. Linear rows pivot on each body's own joint-frame origin (Spring2-style, not Bullet 2.7x's shared mid-anchor), so a violated joint pulls itself back together instead of degenerating into torque and "breaking".
 - **Implicit spring-dampers** — each sprung axis solves the backward-Euler soft constraint `relVel⁺ + (k/γ)·err + s·λ = 0` (`γ = c + h·k`, `s = 1/(h·γ)`), unconditionally stable for any authored stiffness, with damping `c = 2ζ√(k·m_eff)` intrinsic to the row. Resting cloth genuinely settles: the previous clamped velocity-drive could inject energy far from equilibrium but not absorb it near it, so static dresses slowly "boiled" — measured 15× lower resting velocity after the change, with authored stiffness now delivered in full (no deadbeat clamp).
 - **Angular limits** — hybrid: small violations (< 0.5 rad, the resting-cloth regime) use per-axis Euler stop rows, which converge cleanly and keep resting cloth still; larger violations switch to a single geodesic row toward the Euler-clamped target rotation, because per-axis Euler rows chase phantom errors near the ±90° singularity and pump energy. Ranged stops are unilateral (accumulated impulse clamped to the corrective sign) so a limit pushes back into range but never brakes natural recovery; locked axes stay bilateral equality joints. Spring rows stay per-axis, with stiffness clamped to the `k·dt² ≤ ¼` stability bound.
-- **Narrowphase** — analytical sphere-sphere / -capsule / -box and capsule-capsule / -box. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
-- **Speculative contacts** (`margin 0.04`) fire at near-touch with a push-only clamp — inert until real overlap, but they stop fast bodies tunneling thin surfaces in one substep.
+- **Narrowphase** — analytical sphere-sphere / -capsule / -box, capsule-capsule / -box, and box-box (SAT + face clipping, up to 4 points per manifold). MMD dress rigs are built from box panels, and box-box is the majority of collidable pairs on those models — without it cloth passes through cloth. Capsule-capsule emits multiple contacts along near-parallel axes so cloth can't pivot around a single closest point.
+- **Speculative contacts** (`margin 0.04`) fire at near-touch and cancel only the approach velocity in excess of what closes the remaining gap in one substep (`gap/dt`), so they stop fast bodies tunneling thin surfaces while staying inert until the body would actually arrive. The push-only clamp does not achieve that on its own — it forbids a pulling impulse, not a large pushing one on a body still in mid-air.
+- **Contact relaxation** — each contact row's gain is `1/max(rows on A, rows on B)` over dynamic bodies (floor 0.12). Every row drives the relative velocity at its own point to zero, so a dress panel carrying dozens at once is over-braked, differently each substep; a body on a lone contact keeps full gain and still settles exactly. A flat factor damps the well-conditioned rows too and leaves single-contact bodies creeping instead of settling.
 - **Split-impulse correction** resolves penetration by a mass-weighted translation _outside_ the velocity solver, so joint pulls can't fight separation.
 - **Kinematic advancement** — bone-driven bodies move toward the frame's bone pose incrementally per substep, with velocities derived over the fixed step, so the solver never sees more than one 60 Hz step of anchor motion regardless of render dt.
 - **Discontinuity guards** — a bone-pose jump beyond continuous motion (timeline scrub, long stall) rigidly carries each dynamic body along with its kinematic root's transform delta and zeroes momentum instead of dragging cloth across the gap; correction velocities are clamped (120 u/s linear, 30 rad/s angular), per-step travel is capped, and any body that still goes non-finite is restored to its previous substep pose.

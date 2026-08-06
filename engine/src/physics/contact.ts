@@ -4,16 +4,23 @@
 // positive normal impulse pushes B away from A. `rA` / `rB` are world-space
 // lever arms from each CG to the contact point. Depth is positive when
 // shapes overlap, ≤ 0 for speculative contacts inside the margin band.
-// Box-box not implemented (PMX rigs rarely use it and it needs SAT + clipping).
+// Box-box is SAT + face clipping (see detectBoxBox) — MMD dress rigs are built
+// from box panels, and it is the majority of collidable pairs on those models.
 
 import { RigidbodyShape } from "./types"
 import type { RigidBodyStore } from "./body"
 
 // Speculative contact range. Depth is reported relative to the un-inflated
 // surface, so values 0 ≥ depth ≥ −CONTACT_MARGIN cover the "near touch but
-// not overlapping yet" case. The push-only impulse clamp keeps these inert
-// until actual overlap, but they prevent fast bodies from crossing a thin
+// not overlapping yet" case. They exist so a fast body cannot cross a thin
 // surface in one substep without ever generating a contact.
+//
+// What keeps them inert until the body would actually arrive is the solver's
+// `allowedApproachVel` (gap / dt), NOT the push-only impulse clamp — the clamp
+// only forbids a negative (pulling) impulse and does nothing to stop a large
+// positive one from stopping a body dead in mid-air. This comment used to
+// claim otherwise, and the bug it hid was worth 88% of speculative rows firing
+// on a dress rig. See setupContactRow.
 export const CONTACT_MARGIN = 0.04
 
 export interface Contact {
@@ -44,6 +51,11 @@ export interface Contact {
   cBxN: number; cByN: number; cBzN: number   // rB × n
   jacInvN: number
   bounceVel: number   // restitution reference, captured at setup from initial relVelN
+  /** Per-contact relaxation gain, 1/max(rows on A, rows on B). See CONTACT_SOR_MIN. */
+  sorGain: number
+  // Approach speed this row is allowed to leave alone: gap / dt for a
+  // speculative row, 0 once the shapes actually touch. See setupContactRow.
+  allowedApproachVel: number
   // Friction tangent 1:
   t1x: number; t1y: number; t1z: number
   cAxT1: number; cAyT1: number; cAzT1: number
@@ -72,6 +84,8 @@ function makeContact(): Contact {
     cBxN: 0, cByN: 0, cBzN: 0,
     jacInvN: 0,
     bounceVel: 0,
+    sorGain: 1,
+    allowedApproachVel: 0,
     t1x: 0, t1y: 0, t1z: 0,
     cAxT1: 0, cAyT1: 0, cAzT1: 0,
     cBxT1: 0, cByT1: 0, cBzT1: 0,
@@ -731,9 +745,17 @@ function detectSphereBox(store: RigidBodyStore, a: number, b: number, pool: Cont
 
 // --- Capsule–box -----------------------------------------------------------
 // Walk the capsule's segment (in box-local space) toward the box, sample
-// sphere-box at the converged parameter plus both endpoints. Endpoint
-// samples catch caps grazing a face when the closest-point parameter sits
-// at one end of the segment.
+// sphere-box at the converged parameter plus both endpoints, and keep the
+// DEEPEST sample. Endpoint samples catch caps grazing a face when the
+// closest-point parameter sits at one end of the segment.
+//
+// Deliberately one contact, not a manifold along the touching segment. A line
+// of contacts here does stop a panel pivoting into a leg, and it was tried:
+// penetration fell, but idle jitter on a 688-body rig rose because every extra
+// contact is another shove from the position-correction pass, which the joint
+// springs hand straight back. Cloth that buzzes reads worse than cloth that
+// clips, so this keeps a little 穿模 in exchange for stillness. Box-box is a
+// different case — those panels had NO collision at all, so it is pure gain.
 function detectCapsuleBox(store: RigidBodyStore, a: number, b: number, pool: ContactPool): void {
   const pos = store.positions,
     sz = store.size
@@ -914,6 +936,372 @@ function detectCapsuleBox(store: RigidBodyStore, a: number, b: number, pool: Con
   combineMaterials(store, a, b, c)
 }
 
+// --- Box–box ---------------------------------------------------------------
+// SAT over the 15 candidate axes, then face clipping for a multi-point
+// manifold. Everything below happens in A's local frame: B's centre and axes
+// are transformed in once, so the 15 tests and the clipping all read as plain
+// vector maths instead of repeated quaternion work.
+//
+// Why this exists at all: MMD dress rigs are built from flat box PANELS, and
+// panel-against-panel is the collision that keeps skirt layers out of each
+// other. Measured across seven shipped models, box-box is 45–70% of every
+// collidable pair on models whose riggers left skirt self-collision enabled —
+// all of it silently dropped before this. MMD's own physics is Bullet, which
+// dispatches box-box through btBoxBoxDetector (ODE's dBoxBox: this same
+// 15-axis SAT plus face clipping), so rigs are authored assuming it works.
+//
+// The pair count is not the frame cost: the AABB pass upstream filters first,
+// and in a rest pose only ~220 of 诗蔻蒂's 60k box-box candidates reach here.
+
+// Scratch, module-level so a frame of narrowphase allocates nothing.
+const _bbBax = new Float32Array(9) // B's axes in A's frame, row j = axis j
+const _bbC = new Float32Array(3) // B's centre in A's frame
+const _bbAxis = new Float32Array(3) // best separating axis, A's frame
+const _bbClip = new Float32Array(24) // clip buffer: up to 8 points
+const _bbClip2 = new Float32Array(24)
+const _bbDepth = new Float32Array(8)
+const _bbTmp = new Float32Array(3)
+// A's axes in A's own frame are the identity; kept as a constant so the
+// reference/incident selection can treat both boxes through one code path
+// without allocating a basis per call.
+const _bbIdent = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1])
+const _bbRefH = new Float32Array(3)
+const _bbIncH = new Float32Array(3)
+const _bbPA = new Float32Array(3)
+const _bbHA = new Float32Array(3)
+const _bbHB = new Float32Array(3)
+
+// A face axis has to lose by a real margin before an edge axis wins. Near
+// ties are common between two flat panels lying against each other, and an
+// edge axis there yields one point where a face yields four — the manifold
+// would flicker between them frame to frame and the panel would rock.
+const EDGE_AXIS_BIAS = 1.05
+
+function detectBoxBox(store: RigidBodyStore, a: number, b: number, pool: ContactPool): void {
+  const ai = a * 3,
+    bi = b * 3
+  const sz = store.size
+  const hAx = sz[ai + 0], hAy = sz[ai + 1], hAz = sz[ai + 2]
+  const hBx = sz[bi + 0], hBy = sz[bi + 1], hBz = sz[bi + 2]
+
+  // B's centre, in A's frame. The body index here is A, not B — transforming
+  // B's own centre by B's own transform yields the origin every time, which
+  // makes every SAT distance zero and every pair maximally overlapping.
+  worldToBodyLocal(store, a, store.positions[bi + 0], store.positions[bi + 1], store.positions[bi + 2], _bbC)
+  const cx = _bbC[0], cy = _bbC[1], cz = _bbC[2]
+
+  // B's three axes, in A's frame: RAᵀ · RB. loadBodyRot writes one body at a
+  // time, so read B's columns out before loading A over the top of them.
+  loadBodyRot(store, b)
+  const b00 = _rot[0], b01 = _rot[1], b02 = _rot[2]
+  const b10 = _rot[3], b11 = _rot[4], b12 = _rot[5]
+  const b20 = _rot[6], b21 = _rot[7], b22 = _rot[8]
+  loadBodyRot(store, a)
+  const a00 = _rot[0], a01 = _rot[1], a02 = _rot[2]
+  const a10 = _rot[3], a11 = _rot[4], a12 = _rot[5]
+  const a20 = _rot[6], a21 = _rot[7], a22 = _rot[8]
+  // Column j of RB is B's axis j in world; RAᵀ · that is it in A's frame.
+  for (let j = 0; j < 3; j++) {
+    const wx = j === 0 ? b00 : j === 1 ? b01 : b02
+    const wy = j === 0 ? b10 : j === 1 ? b11 : b12
+    const wz = j === 0 ? b20 : j === 1 ? b21 : b22
+    _bbBax[j * 3 + 0] = a00 * wx + a10 * wy + a20 * wz
+    _bbBax[j * 3 + 1] = a01 * wx + a11 * wy + a21 * wz
+    _bbBax[j * 3 + 2] = a02 * wx + a12 * wy + a22 * wz
+  }
+
+  // --- SAT. Track the axis of MINIMUM overlap; that is the shallowest way out
+  //     and therefore the contact normal.
+  let bestOverlap = Infinity
+  let bestAxis = -1 // 0-2 = A's faces, 3-5 = B's faces, 6-14 = edge crosses
+  let bestNx = 0, bestNy = 0, bestNz = 0
+
+  // `scale` lets the edge axes be judged slightly harder — see EDGE_AXIS_BIAS.
+  const test = (nx: number, ny: number, nz: number, id: number, scale: number): boolean => {
+    const len2 = nx * nx + ny * ny + nz * nz
+    // Degenerate cross product: the two edges are parallel, so this axis adds
+    // nothing that the face axes have not already covered.
+    if (len2 < 1e-12) return true
+    const inv = 1 / Math.sqrt(len2)
+    const ux = nx * inv, uy = ny * inv, uz = nz * inv
+    const projA = hAx * Math.abs(ux) + hAy * Math.abs(uy) + hAz * Math.abs(uz)
+    const projB =
+      hBx * Math.abs(ux * _bbBax[0] + uy * _bbBax[1] + uz * _bbBax[2]) +
+      hBy * Math.abs(ux * _bbBax[3] + uy * _bbBax[4] + uz * _bbBax[5]) +
+      hBz * Math.abs(ux * _bbBax[6] + uy * _bbBax[7] + uz * _bbBax[8])
+    const dist = Math.abs(ux * cx + uy * cy + uz * cz)
+    const overlap = projA + projB - dist
+    // A gap wider than the speculative band: no contact, and no need to test
+    // the rest — one separating axis is proof.
+    if (overlap < -CONTACT_MARGIN) return false
+    if (overlap * scale < bestOverlap) {
+      bestOverlap = overlap * scale
+      bestAxis = id
+      bestNx = ux; bestNy = uy; bestNz = uz
+    }
+    return true
+  }
+
+  if (!test(1, 0, 0, 0, 1)) return
+  if (!test(0, 1, 0, 1, 1)) return
+  if (!test(0, 0, 1, 2, 1)) return
+  for (let j = 0; j < 3; j++) {
+    if (!test(_bbBax[j * 3 + 0], _bbBax[j * 3 + 1], _bbBax[j * 3 + 2], 3 + j, 1)) return
+  }
+  for (let i = 0; i < 3; i++) {
+    const axi = i === 0 ? 1 : 0, ayi = i === 1 ? 1 : 0, azi = i === 2 ? 1 : 0
+    for (let j = 0; j < 3; j++) {
+      const bx = _bbBax[j * 3 + 0], by = _bbBax[j * 3 + 1], bz = _bbBax[j * 3 + 2]
+      if (!test(ayi * bz - azi * by, azi * bx - axi * bz, axi * by - ayi * bx, 6 + i * 3 + j, EDGE_AXIS_BIAS)) return
+    }
+  }
+  if (bestAxis < 0) return
+
+  // Orient the normal A → B, matching the contact convention.
+  if (bestNx * cx + bestNy * cy + bestNz * cz < 0) {
+    bestNx = -bestNx; bestNy = -bestNy; bestNz = -bestNz
+  }
+  _bbAxis[0] = bestNx; _bbAxis[1] = bestNy; _bbAxis[2] = bestNz
+
+  if (bestAxis >= 6) {
+    emitBoxEdgeContact(store, a, b, bestOverlap / EDGE_AXIS_BIAS, (bestAxis - 6) / 3 | 0, (bestAxis - 6) % 3,
+      hAx, hAy, hAz, hBx, hBy, hBz, cx, cy, cz, pool)
+    return
+  }
+  emitBoxFaceManifold(store, a, b, bestAxis, hAx, hAy, hAz, hBx, hBy, hBz, cx, cy, cz, pool)
+}
+
+// Write one contact from a point given in A's LOCAL frame, with the manifold's
+// shared world normal. Both lever arms come from the same world point: the
+// clipped point sits on the incident face, within CONTACT_MARGIN of the
+// reference face, so splitting them would be false precision.
+function emitBoxContact(
+  store: RigidBodyStore,
+  a: number,
+  b: number,
+  lx: number, ly: number, lz: number,
+  depth: number,
+  pool: ContactPool,
+): void {
+  const ai = a * 3, bi = b * 3
+  bodyLocalToWorldDir(store, a, lx, ly, lz, _bbTmp)
+  const wx = _bbTmp[0] + store.positions[ai + 0]
+  const wy = _bbTmp[1] + store.positions[ai + 1]
+  const wz = _bbTmp[2] + store.positions[ai + 2]
+  bodyLocalToWorldDir(store, a, _bbAxis[0], _bbAxis[1], _bbAxis[2], _bbTmp)
+  const c = pool.acquire()
+  c.bodyA = a
+  c.bodyB = b
+  c.nx = _bbTmp[0]; c.ny = _bbTmp[1]; c.nz = _bbTmp[2]
+  c.depth = depth
+  c.rAx = wx - store.positions[ai + 0]
+  c.rAy = wy - store.positions[ai + 1]
+  c.rAz = wz - store.positions[ai + 2]
+  c.rBx = wx - store.positions[bi + 0]
+  c.rBy = wy - store.positions[bi + 1]
+  c.rBz = wz - store.positions[bi + 2]
+  combineMaterials(store, a, b, c)
+}
+
+// Clip a polygon against the plane dot(p, t) ≤ offset (Sutherland–Hodgman).
+// Points are xyz triples packed into `src`; returns the new count.
+function clipPolyByPlane(
+  src: Float32Array, n: number,
+  tx: number, ty: number, tz: number, offset: number,
+  dst: Float32Array,
+): number {
+  let out = 0
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n
+    const px = src[i * 3], py = src[i * 3 + 1], pz = src[i * 3 + 2]
+    const qx = src[j * 3], qy = src[j * 3 + 1], qz = src[j * 3 + 2]
+    const dp = px * tx + py * ty + pz * tz - offset
+    const dq = qx * tx + qy * ty + qz * tz - offset
+    if (dp <= 0) {
+      dst[out * 3] = px; dst[out * 3 + 1] = py; dst[out * 3 + 2] = pz
+      out++
+    }
+    // Sign change: the edge crosses the plane, so the crossing point joins the
+    // polygon. Guard the divide — a denominator this small means the edge lies
+    // in the plane, and both endpoints are already handled by the tests above.
+    if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
+      const den = dp - dq
+      if (Math.abs(den) > 1e-12 && out < 8) {
+        const s = dp / den
+        dst[out * 3] = px + (qx - px) * s
+        dst[out * 3 + 1] = py + (qy - py) * s
+        dst[out * 3 + 2] = pz + (qz - pz) * s
+        out++
+      }
+    }
+    if (out >= 8) break
+  }
+  return out
+}
+
+// Face-vs-face: clip the incident face against the reference face's four side
+// planes, then keep whatever is at or below the reference plane. This is what
+// yields a multi-point manifold — the reason a flat panel resting on another
+// stops pivoting about a single point.
+function emitBoxFaceManifold(
+  store: RigidBodyStore,
+  a: number, b: number,
+  bestAxis: number,
+  hAx: number, hAy: number, hAz: number,
+  hBx: number, hBy: number, hBz: number,
+  cx: number, cy: number, cz: number,
+  pool: ContactPool,
+): void {
+  const refIsA = bestAxis < 3
+  const refAxisIdx = refIsA ? bestAxis : bestAxis - 3
+  // Reference basis, half extents and centre — all in A's frame. When A is the
+  // reference its axes ARE the frame, hence the identity rows.
+  const refAx = refIsA ? _bbIdent : _bbBax
+  const incAx = refIsA ? _bbBax : _bbIdent
+  const refH = _bbRefH, incH = _bbIncH
+  refH[0] = refIsA ? hAx : hBx; refH[1] = refIsA ? hAy : hBy; refH[2] = refIsA ? hAz : hBz
+  incH[0] = refIsA ? hBx : hAx; incH[1] = refIsA ? hBy : hAy; incH[2] = refIsA ? hBz : hAz
+  const refCx = refIsA ? 0 : cx, refCy = refIsA ? 0 : cy, refCz = refIsA ? 0 : cz
+  const incCx = refIsA ? cx : 0, incCy = refIsA ? cy : 0, incCz = refIsA ? cz : 0
+
+  // Outward normal of the reference face, pointing at the incident box.
+  // _bbAxis runs A → B, so B-as-reference faces the other way.
+  const sgn = refIsA ? 1 : -1
+  const nx = _bbAxis[0] * sgn, ny = _bbAxis[1] * sgn, nz = _bbAxis[2] * sgn
+
+  // Incident face: the one whose outward normal is most opposed to n.
+  let incIdx = 0, incDot = Infinity, incSign = 1
+  for (let k = 0; k < 3; k++) {
+    const d = incAx[k * 3] * nx + incAx[k * 3 + 1] * ny + incAx[k * 3 + 2] * nz
+    const s = d > 0 ? -1 : 1
+    const v = d * s
+    if (v < incDot) { incDot = v; incIdx = k; incSign = s }
+  }
+
+  // Its four corners, from the face centre along the two remaining axes.
+  const u = (incIdx + 1) % 3, v = (incIdx + 2) % 3
+  const fx = incCx + incAx[incIdx * 3] * incSign * incH[incIdx]
+  const fy = incCy + incAx[incIdx * 3 + 1] * incSign * incH[incIdx]
+  const fz = incCz + incAx[incIdx * 3 + 2] * incSign * incH[incIdx]
+  let n0 = 0
+  for (let iu = 0; iu < 2; iu++) {
+    const su = iu === 0 ? 1 : -1
+    for (let iv = 0; iv < 2; iv++) {
+      const sv = iv === 0 ? 1 : -1
+      // Wound consistently (++, +−, −−, −+) so the clip walks a real quad.
+      const s2 = su === 1 ? sv : -sv
+      _bbClip[n0 * 3] = fx + incAx[u * 3] * incH[u] * su + incAx[v * 3] * incH[v] * s2
+      _bbClip[n0 * 3 + 1] = fy + incAx[u * 3 + 1] * incH[u] * su + incAx[v * 3 + 1] * incH[v] * s2
+      _bbClip[n0 * 3 + 2] = fz + incAx[u * 3 + 2] * incH[u] * su + incAx[v * 3 + 2] * incH[v] * s2
+      n0++
+    }
+  }
+
+  // Clip against the reference face's four side planes.
+  const ru = (refAxisIdx + 1) % 3, rv = (refAxisIdx + 2) % 3
+  let src = _bbClip, dst = _bbClip2, cnt = n0
+  for (let plane = 0; plane < 4; plane++) {
+    const ax = plane < 2 ? ru : rv
+    const sgn2 = plane % 2 === 0 ? 1 : -1
+    const tx = refAx[ax * 3] * sgn2, ty = refAx[ax * 3 + 1] * sgn2, tz = refAx[ax * 3 + 2] * sgn2
+    const offset = refCx * tx + refCy * ty + refCz * tz + refH[ax]
+    cnt = clipPolyByPlane(src, cnt, tx, ty, tz, offset, dst)
+    const t = src; src = dst; dst = t
+    if (cnt === 0) return
+  }
+
+  // Keep what is at or below the reference face plane.
+  const planeD = (refCx + nx * refH[refAxisIdx]) * nx + (refCy + ny * refH[refAxisIdx]) * ny +
+    (refCz + nz * refH[refAxisIdx]) * nz
+  let kept = 0
+  for (let i = 0; i < cnt; i++) {
+    const sep = src[i * 3] * nx + src[i * 3 + 1] * ny + src[i * 3 + 2] * nz - planeD
+    if (sep > CONTACT_MARGIN) continue
+    src[kept * 3] = src[i * 3]
+    src[kept * 3 + 1] = src[i * 3 + 1]
+    src[kept * 3 + 2] = src[i * 3 + 2]
+    _bbDepth[kept] = -sep
+    kept++
+  }
+  if (kept === 0) return
+
+  // Cap the manifold at Bullet's four. Clipping a quad by four planes can
+  // reach eight points, and every extra one is another solver row for a
+  // patch the deepest four already describe. Deepest-first so the points
+  // that matter survive the cut.
+  if (kept > 4) {
+    for (let i = 1; i < kept; i++) {
+      const d = _bbDepth[i]
+      const px = src[i * 3], py = src[i * 3 + 1], pz = src[i * 3 + 2]
+      let j = i - 1
+      while (j >= 0 && _bbDepth[j] < d) {
+        _bbDepth[j + 1] = _bbDepth[j]
+        src[(j + 1) * 3] = src[j * 3]
+        src[(j + 1) * 3 + 1] = src[j * 3 + 1]
+        src[(j + 1) * 3 + 2] = src[j * 3 + 2]
+        j--
+      }
+      _bbDepth[j + 1] = d
+      src[(j + 1) * 3] = px; src[(j + 1) * 3 + 1] = py; src[(j + 1) * 3 + 2] = pz
+    }
+    kept = 4
+  }
+  for (let i = 0; i < kept; i++) {
+    emitBoxContact(store, a, b, src[i * 3], src[i * 3 + 1], src[i * 3 + 2], _bbDepth[i], pool)
+  }
+}
+
+// Edge-vs-edge: one point, at the midpoint of the closest approach between the
+// two supporting edges. Single-point is correct here — two crossed edges touch
+// at a point, unlike two faces.
+function emitBoxEdgeContact(
+  store: RigidBodyStore,
+  a: number, b: number,
+  depth: number,
+  i: number, j: number,
+  hAx: number, hAy: number, hAz: number,
+  hBx: number, hBy: number, hBz: number,
+  cx: number, cy: number, cz: number,
+  pool: ContactPool,
+): void {
+  const hA = _bbHA, hB = _bbHB
+  hA[0] = hAx; hA[1] = hAy; hA[2] = hAz
+  hB[0] = hBx; hB[1] = hBy; hB[2] = hBz
+  const nx = _bbAxis[0], ny = _bbAxis[1], nz = _bbAxis[2]
+
+  // A's supporting edge: offset along the two axes that are NOT the edge
+  // direction, each toward B.
+  const pA = _bbPA
+  pA[0] = 0; pA[1] = 0; pA[2] = 0
+  for (let k = 0; k < 3; k++) {
+    if (k === i) continue
+    const d = k === 0 ? nx : k === 1 ? ny : nz
+    pA[k] = hA[k] * (d >= 0 ? 1 : -1)
+  }
+  const dAx = i === 0 ? 1 : 0, dAy = i === 1 ? 1 : 0, dAz = i === 2 ? 1 : 0
+
+  // B's, offset the other way — its edge faces back toward A.
+  let pBx = cx, pBy = cy, pBz = cz
+  for (let k = 0; k < 3; k++) {
+    if (k === j) continue
+    const ax = _bbBax[k * 3], ay = _bbBax[k * 3 + 1], az = _bbBax[k * 3 + 2]
+    const s = ax * nx + ay * ny + az * nz >= 0 ? -1 : 1
+    pBx += ax * hB[k] * s; pBy += ay * hB[k] * s; pBz += az * hB[k] * s
+  }
+  const dBx = _bbBax[j * 3], dBy = _bbBax[j * 3 + 1], dBz = _bbBax[j * 3 + 2]
+
+  closestPointsTwoSegments(
+    pA[0] - dAx * hA[i], pA[1] - dAy * hA[i], pA[2] - dAz * hA[i],
+    pA[0] + dAx * hA[i], pA[1] + dAy * hA[i], pA[2] + dAz * hA[i],
+    pBx - dBx * hB[j], pBy - dBy * hB[j], pBz - dBz * hB[j],
+    pBx + dBx * hB[j], pBy + dBy * hB[j], pBz + dBz * hB[j],
+    _cpA, _cpB,
+  )
+  emitBoxContact(store, a, b,
+    (_cpA[0] + _cpB[0]) * 0.5, (_cpA[1] + _cpB[1]) * 0.5, (_cpA[2] + _cpB[2]) * 0.5,
+    depth, pool)
+}
+
 // Dispatch a pair to the matching narrowphase. Caller has already done
 // broadphase + group/mask filtering. Some shape pairs (sphere-A capsule-B
 // etc.) reuse a canonical implementation via swap + flipLastNormal.
@@ -935,7 +1323,7 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
     // end of the pool — pushing those two bodies together instead of apart.
     const before = pool.count
     detectSphereCapsule(store, b, a, pool)
-    if (pool.count > before) flipLastNormal(pool)
+    flipNormalsFrom(pool, before)
     return
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Capsule) {
@@ -949,7 +1337,7 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
   if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Sphere) {
     const before = pool.count
     detectSphereBox(store, b, a, pool)
-    if (pool.count > before) flipLastNormal(pool)
+    flipNormalsFrom(pool, before)
     return
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Box) {
@@ -959,17 +1347,24 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
   if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Capsule) {
     const before = pool.count
     detectCapsuleBox(store, b, a, pool)
-    if (pool.count > before) flipLastNormal(pool)
+    flipNormalsFrom(pool, before)
     return
   }
-  // Box-box left unimplemented.
+  if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Box) {
+    detectBoxBox(store, a, b, pool)
+  }
 }
 
-// After a swapped detect* call, the last contact's normal points the wrong
-// way and lever arms are mismatched. Flip and re-anchor.
-function flipLastNormal(pool: ContactPool): void {
-  if (pool.count === 0) return
-  const c = pool.get(pool.count - 1)
+// After a swapped detect* call, the produced contacts' normals point the wrong
+// way and lever arms are mismatched. Flip and re-anchor EVERY contact the call
+// emitted, not just the last: capsule-box now returns up to three, and flipping
+// one of them would leave the others pulling the pair together instead of
+// pushing it apart.
+function flipNormalsFrom(pool: ContactPool, from: number): void {
+  for (let i = from; i < pool.count; i++) flipOneNormal(pool.get(i))
+}
+
+function flipOneNormal(c: Contact): void {
   const ta = c.bodyA
   c.bodyA = c.bodyB
   c.bodyB = ta
