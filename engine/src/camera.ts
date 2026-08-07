@@ -4,6 +4,11 @@ import type { CameraPose } from "./camera-animation"
 /** Far cap / zoom limit; large enough for wide shots without clipping distant ground */
 const FAR_CAP = 8000
 const FAR_MIN = 200
+/** The character-framing value the cloth z-fighting fix settled on — never go below it. */
+const NEAR_MIN = 0.5
+/** ~40cm in MMD units. Past this the near plane would start clipping geometry a
+ *  user has deliberately pushed the camera up against. */
+const NEAR_MAX = 5
 
 export class Camera {
   alpha: number
@@ -226,8 +231,29 @@ export class Camera {
     this.far = Math.min(FAR_CAP, Math.max(FAR_MIN, this.radius * 12 + margin))
   }
 
+  /**
+   * Near plane scales with how far out you are framing.
+   *
+   * A 24-bit non-reversed depth buffer spends most of its precision just past
+   * the near plane, so what survives at distance is governed by the far/near
+   * ratio. 0.5 was chosen for character framing and fixed coplanar cloth there
+   * (see `near` above) — but a stage puts the floor 5–20× further out, where the
+   * same ratio leaves neighbouring surfaces sharing a depth value. They then win
+   * and lose per pixel as the camera turns, which reads as flickering bands and
+   * cracks across the floor.
+   *
+   * Tying near to the framing keeps character shots byte-identical (radius ~26
+   * still lands on the 0.5 floor) and buys back an order of magnitude once you
+   * pull out to see a whole stage. Capped so it can never clip something the
+   * user is deliberately close to.
+   */
+  private updateNearFromRadius(): void {
+    this.near = Math.min(NEAR_MAX, Math.max(NEAR_MIN, this.radius / 50))
+  }
+
   getProjectionMatrix(): Mat4 {
     this.updateFarFromRadius()
+    this.updateNearFromRadius()
     Mat4.perspectiveInto(this._projMat.values, this.fov, this.aspect, this.near, this.far)
     return this._projMat
   }

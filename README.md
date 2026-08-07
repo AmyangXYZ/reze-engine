@@ -18,6 +18,8 @@ npm install reze-engine
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies; structure-of-arrays solver, scene gravity and wind, a world floor so hair and hems rest on the ground instead of clipping through it, and per-frame load shedding that holds framerate on weak devices
 - **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
+- **PMX morphs** — vertex, group, bone and material morphs, the last carrying MMD's multiply/add blend so an author's colour and on/off switches work; `getSupportedMorphIndices()` reports what the renderer can actually drive, so a UI never offers a dead control
+- **Stage models** — a PMX added as environment rather than cast: no physics, no IK, no outline hulls, and the pose pass skipped while it is idle. Same materials and style groups as any model, and it suppresses the built-in ground plane it would otherwise z-fight with
 - **Clip blending & locomotion** — weighted multi-clip pose blending, crossfades, and a game-style character controller (idle/run/sprint speed blend, authored stop skids, code-driven root motion) — the [demo](https://reze.one) is WASD-playable
 - **State machine & clip events** — declarative animation states (clips or delegates like the LocomotionController) with guarded crossfade transitions; time-triggered clip callbacks on any playback path
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
@@ -110,7 +112,11 @@ One WebGPU **Engine** per page (singleton after `init()`). Models load by URL **
 engine.init()
 engine.loadModel(name, path)                 // or ({ files, pmxFile? }) for folder upload
 engine.getModel(name) / getModelNames() / removeModel(name)
-engine.setModelTransform(name, { position?, rotation?, scale?, visible? }) / getModelTransform(name)  // place a stage, scale or hide a model (scale is uniform)
+engine.setModelTransform(name, { position?, rotation?, scale?, visible? }) / getModelTransform(name)  // place, scale or hide a model (scale is uniform)
+
+engine.loadStage(name, { files, pmxFile?, transform? })   // a PMX as ENVIRONMENT, not cast: same geometry and materials (style groups work on it unchanged — that is what makes pure-PMX stages worth supporting), but no physics, no IK, no outline hulls, and the pose pass is skipped while it is idle. A stage is usually the heaviest mesh in the scene and the one that never moves
+engine.addStage(model, pmxPath, { name?, transform?, assetReader? })   // the same, from an already-loaded Model
+engine.groundIsSuppressed()                  // true while a stage is present — its own floor and addGround's plane both sit at y=0, so the engine refuses to draw the plane rather than z-fight. addGround's settings are kept and come back when the stage is removed
 
 engine.autoStyleGroups(name, overrides?)     // default style groups by material name
 engine.applyStyleGroups(name, groups) / upsertStyleGroup / removeStyleGroup / getStyleGroups
@@ -157,7 +163,9 @@ model.getAnimationProgress()                 // { current, duration (s), playing
 model.exportVmd(name)                        // → ArrayBuffer (Shift-JIS bone/morph names)
 
 model.rotateBones({ 首: quat }, ms?) / moveBones({ センター: vec3 }, ms?)
-model.setMorphWeight(name, weight, ms?)
+model.setMorphWeight(name, weight, ms?)      // drives vertex, group, bone and material morphs alike
+model.getMorphing()                          // { morphs: [{ name, type, … }] } — PMX type: 0 group, 1 vertex, 2 bone, 3–7 UV, 8 material, 9 flip, 10 impulse
+model.getSupportedMorphIndices()             // indices this renderer can actually move: vertex, bone, material, and group morphs resolving to one of those. UV morphs are parsed but not yet applied; flip and impulse are PMX 2.1 and unsupported. Filter a morph UI by this so it never shows a control that does nothing
 model.resetAllBones() / resetAllMorphs()
 model.getBoneWorldPosition(name)
 

@@ -32,6 +32,10 @@ const _convMat = new Float32Array(16)
 // Blend-path scratch: per-entry sample target and the crossfade's two fixed entries.
 const _blendQ = new Quat(0, 0, 0, 1)
 const _blendT = new Vec3(0, 0, 0)
+
+// Bone-morph scratch: the weighted rotation, slerped out of identity.
+const _boneMorphQ = new Quat(0, 0, 0, 1)
+const _boneMorphIdentity = new Quat(0, 0, 0, 1)
 export interface ClipEventInfo {
   clip: string
   /** The registered event time, seconds. */
@@ -131,12 +135,56 @@ export interface GroupMorphReference {
   ratio: number
 }
 
+// Bone morph offset data (type 2). A stage's doors, platforms and hatches are
+// posed with these — there is no VMD to drive them, so the weight IS the pose.
+export interface BoneMorphOffset {
+  boneIndex: number
+  translation: [number, number, number]
+  /** Rotation quaternion (x, y, z, w). */
+  rotation: [number, number, number, number]
+}
+
+/** PMX material-morph blend mode. Multiply lerps toward base*morph; add offsets from base. */
+export const MATERIAL_MORPH_MULTIPLY = 0
+export const MATERIAL_MORPH_ADD = 1
+
+// Material morph offset data (type 8). Stage artists ship colour and on/off
+// switches this way: alpha to 0 hides a part, a diffuse tint recolours a set.
+export interface MaterialMorphOffset {
+  /** -1 targets EVERY material in the model, per the PMX spec. */
+  materialIndex: number
+  /** MATERIAL_MORPH_MULTIPLY | MATERIAL_MORPH_ADD */
+  offsetType: number
+  diffuse: [number, number, number, number]
+  specular: [number, number, number]
+  shininess: number
+  ambient: [number, number, number]
+  edgeColor: [number, number, number, number]
+  edgeSize: number
+  textureCoeff: [number, number, number, number]
+  sphereCoeff: [number, number, number, number]
+  toonCoeff: [number, number, number, number]
+}
+
+// UV morph offset data (types 3–7). Type 3 is the base UV channel; 4–7 are the
+// additional UV channels, which this engine does not carry — kept so the panel
+// can tell "unsupported" from "absent".
+export interface UvMorphOffset {
+  vertexIndex: number
+  /** (u, v, z, w) — only u/v apply to the base channel. */
+  offset: [number, number, number, number]
+}
+
 // Morph definition
 export interface Morph {
   name: string
-  type: number // 0=group, 1=vertex, 2=bone, 3=UV, 8=material
+  /** 0=group, 1=vertex, 2=bone, 3–7=UV, 8=material, 9=flip, 10=impulse. */
+  type: number
   vertexOffsets: VertexMorphOffset[] // Only for type 1 (vertex morph)
   groupReferences?: GroupMorphReference[] // Only for type 0 (group morph)
+  boneOffsets?: BoneMorphOffset[] // Only for type 2
+  materialOffsets?: MaterialMorphOffset[] // Only for type 8
+  uvOffsets?: UvMorphOffset[] // Only for types 3–7
 }
 
 export interface Morphing {
@@ -285,6 +333,24 @@ export class Model {
   // Runtime morph state
   private runtimeMorph!: MorphRuntime
   private morphsDirty: boolean = false // Flag indicating if morphs need to be applied
+
+  // Bone morphs (type 2), flattened once at load so the per-frame pass is a
+  // straight walk with no allocation. Empty for models without them, which is
+  // most characters — a stage's doors and platforms are the common case.
+  private boneMorphPlan: { morphIndex: number; boneIndex: number; translation: Vec3; rotation: Quat }[] = []
+  // Bones any bone morph touches, plus their locals as they were BEFORE the last
+  // application. A pose source rewrites the locals it owns every frame, but a
+  // stage usually has no clip at all — nothing would reset these, and the offset
+  // would compound frame after frame into a slow drift.
+  private boneMorphBones: number[] = []
+  private boneMorphRestoreR: Quat[] = []
+  private boneMorphRestoreT: Vec3[] = []
+  private boneMorphApplied = false
+  /** A full pose pass has run, so the world matrices are real. See isIdle. */
+  private posedOnce = false
+  // Set whenever effective weights change, for material/UV consumers that live
+  // outside this class. Vertex morphs use morphWeightsDirty (GPU) instead.
+  private auxMorphDirty = true
 
   // Root transform — model's placement in world space, independent of bones.
   // Folded into skin matrices (see getSkinMatrices) so every pass (main VS,
@@ -567,6 +633,119 @@ export class Model {
       }, {} as Record<string, number>),
       weights: new Float32Array(morphCount),
     }
+    const boneCount = this.skeleton.bones.length
+    this.boneMorphPlan = []
+    for (let i = 0; i < morphCount; i++) {
+      const morph = this.morphing.morphs[i]
+      if (morph.type !== 2 || !morph.boneOffsets) continue
+      for (const off of morph.boneOffsets) {
+        if (off.boneIndex < 0 || off.boneIndex >= boneCount) continue
+        this.boneMorphPlan.push({
+          morphIndex: i,
+          boneIndex: off.boneIndex,
+          translation: new Vec3(off.translation[0], off.translation[1], off.translation[2]),
+          rotation: new Quat(off.rotation[0], off.rotation[1], off.rotation[2], off.rotation[3]),
+        })
+      }
+    }
+    const touched = new Set(this.boneMorphPlan.map((e) => e.boneIndex))
+    this.boneMorphBones = [...touched]
+    this.boneMorphRestoreR = this.boneMorphBones.map(() => Quat.identity())
+    this.boneMorphRestoreT = this.boneMorphBones.map(() => Vec3.zeros())
+    this.boneMorphApplied = false
+  }
+
+  /**
+   * Bone morphs (type 2) compose over whatever the pose sources produced, the
+   * same way boneRotationOffsets do — they are an offset on the animated local
+   * transform, not a replacement for it. Re-applied every frame because each
+   * pose source rewrites the locals it touches.
+   *
+   * Stages are the reason this exists: a door or a lift is rigged as a bone
+   * morph and there is no VMD anywhere that drives it.
+   */
+  private applyBoneMorphs(): void {
+    if (this.boneMorphPlan.length === 0) return
+
+    // Undo the previous application first. With a clip running this is a no-op
+    // in effect — the pose source already overwrote these bones — but a stage
+    // has no clip, so without it the same offset would be re-added every frame.
+    if (this.boneMorphApplied) {
+      for (let i = 0; i < this.boneMorphBones.length; i++) {
+        const b = this.boneMorphBones[i]
+        this.runtimeSkeleton.localRotations[b].set(this.boneMorphRestoreR[i])
+        this.runtimeSkeleton.localTranslations[b].set(this.boneMorphRestoreT[i])
+      }
+    }
+    for (let i = 0; i < this.boneMorphBones.length; i++) {
+      const b = this.boneMorphBones[i]
+      this.boneMorphRestoreR[i].set(this.runtimeSkeleton.localRotations[b])
+      this.boneMorphRestoreT[i].set(this.runtimeSkeleton.localTranslations[b])
+    }
+    this.boneMorphApplied = true
+
+    const weights = this.getEffectiveMorphWeights()
+    for (const entry of this.boneMorphPlan) {
+      const w = weights[entry.morphIndex]
+      if (w < 0.0001) continue
+      const t = this.runtimeSkeleton.localTranslations[entry.boneIndex]
+      t.x += entry.translation.x * w
+      t.y += entry.translation.y * w
+      t.z += entry.translation.z * w
+      // Scale the rotation by weight the way MMD does — slerp out of identity,
+      // then compose. Multiplying components would not stay a unit quaternion.
+      const r = this.runtimeSkeleton.localRotations[entry.boneIndex]
+      Quat.slerpInto(_boneMorphIdentity, entry.rotation, w, _boneMorphQ)
+      Quat.multiplyInto(r, _boneMorphQ, r)
+    }
+  }
+
+  /** True (once) when effective morph weights changed — the engine re-derives
+   *  material-morph uniforms from it. Separate from the GPU vertex path's flag
+   *  so both can consume the same change. */
+  consumeAuxMorphDirty(): boolean {
+    const d = this.auxMorphDirty
+    this.auxMorphDirty = false
+    return d
+  }
+
+  /**
+   * Morph indices this model can actually act on, so a UI never offers a control
+   * that moves nothing.
+   *
+   * Driven directly: vertex (1), bone (2), material (8). Excluded: UV (3–7),
+   * which are parsed and kept but not yet applied; flip (9) and impulse (10),
+   * which are PMX 2.1 and would need the rigidbody solver.
+   *
+   * A group morph (0) is only as alive as what it points at — one referencing
+   * nothing but UV morphs is just as dead as the UV morphs themselves, so it is
+   * resolved rather than assumed.
+   */
+  getSupportedMorphIndices(): number[] {
+    const morphs = this.morphing.morphs
+    const drivable = (t: number) => t === 1 || t === 2 || t === 8
+    // Groups can reference groups, so walk with a seen-set rather than recursing.
+    const resolves = (start: number): boolean => {
+      const seen = new Set<number>()
+      const stack = [start]
+      while (stack.length > 0) {
+        const i = stack.pop()!
+        if (seen.has(i) || i < 0 || i >= morphs.length) continue
+        seen.add(i)
+        const m = morphs[i]
+        if (drivable(m.type)) return true
+        if (m.type === 0 && m.groupReferences) {
+          for (const ref of m.groupReferences) stack.push(ref.morphIndex)
+        }
+      }
+      return false
+    }
+    const out: number[] = []
+    for (let i = 0; i < morphs.length; i++) {
+      const t = morphs[i].type
+      if (drivable(t) || (t === 0 && resolves(i))) out.push(i)
+    }
+    return out
   }
 
   // Tween update - processes all tweens together with a single time reference
@@ -983,6 +1162,11 @@ export class Model {
       this.runtimeMorph.weights[idx] = clampedWeight
       this.tweenState.morphActive[idx] = 0
       this.applyMorphs()
+      // Vertex and material morphs are done by applyMorphs alone, but a bone
+      // morph lands in the pose pass — and a model with no clip (every stage)
+      // reports idle, so without this the pass never runs and the switch does
+      // nothing. Costs one redundant applyMorphs on the next frame.
+      if (this.boneMorphPlan.length > 0) this.morphsDirty = true
       try {
         Engine.getInstance().markVertexBufferDirty(this)
       } catch {
@@ -1046,6 +1230,11 @@ export class Model {
     for (let i = 0; i < morphCount; i++) {
       effectiveWeights[i] = Math.max(0, Math.min(1, effectiveWeights[i]))
     }
+
+    // Bone morphs read these every frame, but material/UV consumers live outside
+    // this class and need telling. Set on BOTH paths — a model whose only morphs
+    // are material morphs never enables the GPU vertex path at all.
+    this.auxMorphDirty = true
 
     // GPU path: the compute pass applies the vertex offsets from these weights.
     if (this.gpuMorphEnabled) {
@@ -1913,6 +2102,42 @@ export class Model {
   // within that. A host driving bones directly — motion capture writing FK
   // rotations every frame with no clip playing — turns it off wholesale, because
   // there is no motion present to carry the per-chain answer.
+  /**
+   * Nothing can have moved this frame: no clip, no blend, no live tween, no
+   * morph weight change.
+   *
+   * Environment geometry is in this state almost every frame, so the engine
+   * skips the whole pose pass — sampling, world matrices, and the skin-matrix
+   * upload — for a stage that reports idle. A stage is usually the heaviest mesh
+   * in the scene and the one that never moves; paying a full pose pass for it
+   * every frame is the thing worth not doing.
+   */
+  isIdle(): boolean {
+    // Never idle before the first pose pass. The constructor leaves the world
+    // matrices identity, so skin = world × inverseBind collapses every vertex
+    // into bone-local space — the mesh piles up at the origin. A cast member is
+    // saved by running update() on frame 1 regardless; a stage that reported
+    // idle immediately would render as a heap and never recover.
+    if (!this.posedOnce) return false
+    return (
+      !this.morphsDirty &&
+      this.oneShot === null &&
+      this.crossfade === null &&
+      (this.blendEntries === null || this.blendEntries.length === 0) &&
+      this.animationState.getCurrentClip() === null &&
+      !this.hasActiveTweens()
+    )
+  }
+
+  /** Any live rotation / translation / morph tween. */
+  private hasActiveTweens(): boolean {
+    const s = this.tweenState
+    for (let i = 0; i < s.rotActive.length; i++) if (s.rotActive[i] === 1) return true
+    for (let i = 0; i < s.transActive.length; i++) if (s.transActive[i] === 1) return true
+    for (let i = 0; i < s.morphActive.length; i++) if (s.morphActive[i] === 1) return true
+    return false
+  }
+
   update(deltaTime: number, ikEnabled = true): boolean {
     // Update tween time (in milliseconds)
     this.tweenTimeMs += deltaTime * 1000
@@ -1955,8 +2180,13 @@ export class Model {
       this.morphsDirty = false
     }
 
+    // After the pose sources and the constant offsets, before the world pass —
+    // bone morphs must survive into the world matrices IK then reads.
+    this.applyBoneMorphs()
+
     // Compute world matrices (needed for IK solving to read bone positions)
     this.computeWorldMatrices()
+    this.posedOnce = true
 
     // Solve IK chains (modifies localRotations with final IK rotations). Chains
     // the clip switched off are skipped inside.

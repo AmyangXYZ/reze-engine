@@ -1,6 +1,6 @@
 import { Camera } from "./camera"
 import { Mat4, Quat, Vec3 } from "./math"
-import { Model, type Material } from "./model"
+import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
@@ -429,7 +429,21 @@ interface ModelInstance {
   mainPerInstanceBindGroup: GPUBindGroup
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
+  /** Environment geometry added via addStage — no physics, no IK, and it
+   *  suppresses the built-in ground. See addStage for why each of those. */
+  isStage: boolean
+  /** A pose pass ran since the last skin-matrix upload. Always true for cast
+   *  members; false for an idle stage, which is the point. */
+  skinMatricesDirty: boolean
   hiddenMaterials: Set<string>
+  /** Materials a material morph has driven to zero alpha. Kept apart from
+   *  hiddenMaterials so a morph switching a part off never clobbers the user's
+   *  own visibility toggle, and vice versa. */
+  morphHiddenMaterials: Set<string>
+  /** Material-morph targets, or null when the model has no type-8 morphs. */
+  materialMorphTargets: MaterialMorphTarget[] | null
+  /** The same targets by PMX material index, so a named offset is one lookup. */
+  materialMorphByIndex: Map<number, MaterialMorphTarget> | null
   physics: RezePhysics | null
   vertexBufferNeedsUpdate: boolean
   gpuMorph: GpuMorph | null
@@ -440,6 +454,30 @@ interface ModelInstance {
   // Per-group compile generation — an async compile finishing after a newer edit/remove
   // on the same id is discarded (stale-write guard).
   styleGroupGen: Map<string, number>
+}
+
+/**
+ * One material a type-8 morph can reach, with the uniform block as it loaded.
+ *
+ * Material morphs are re-derived from base every time a weight changes rather
+ * than accumulated, because weights go down as well as up and a running total
+ * drifts. The buffer is already COPY_DST, so this is a writeBuffer, not a
+ * rebuild.
+ */
+interface MaterialMorphTarget {
+  /** Index into the PMX material array — what MaterialMorphOffset points at. */
+  pmxIndex: number
+  materialName: string
+  buffer: GPUBuffer
+  /** The 16-float MaterialUniforms block as createMaterialUniformBuffer wrote it. */
+  base: Float32Array
+  /** Scratch for the morphed block, so the per-change pass allocates nothing. */
+  work: Float32Array
+  /** What was last uploaded. `applyMorphs` marks weights dirty on every frame of
+   *  any clip carrying morph tracks — i.e. every character with a face VMD — so
+   *  without this the pass would re-upload byte-identical material blocks
+   *  forever on behalf of a switch that never moves. */
+  last: Float32Array
 }
 
 // Per-model GPU vertex-morph compute state. Present only for models with vertex morphs.
@@ -3083,7 +3121,44 @@ export class Engine {
     return model
   }
 
-  async addModel(model: Model, pmxPath: string, name?: string, assetReader?: AssetReader): Promise<string> {
+  /** loadModel's folder/zip path for a stage. Shares the whole prelude — only
+   *  what the PMX becomes differs. */
+  async loadStage(
+    name: string,
+    options: LoadModelFromFilesOptions & { transform?: Partial<ModelTransform> },
+  ): Promise<Model> {
+    const { model, pmxKey, reader } = await this.openPmxFromFiles(name, options)
+    await this.addStage(model, pmxKey, { name, transform: options.transform, assetReader: reader })
+    return model
+  }
+
+  /** Read a PMX out of a picked folder / expanded zip. Shared by loadModel and
+   *  loadStage so the file-map and path handling exist in exactly one place. */
+  private async openPmxFromFiles(
+    name: string,
+    options: LoadModelFromFilesOptions,
+  ): Promise<{ model: Model; pmxKey: string; reader: AssetReader }> {
+    const pmxFile = options.pmxFile ?? findFirstPmxFileInList(options.files)
+    if (!pmxFile) throw new Error("No .pmx file found in the selected folder")
+    const map = fileListToMap(options.files)
+    // `||`, not `??`: flat-picked files carry webkitRelativePath === "" (see
+    // fileListToMap) — `""` must fall through to the filename.
+    const pmxKey = normalizeAssetPath(
+      (pmxFile as File & { webkitRelativePath?: string }).webkitRelativePath || pmxFile.name,
+    )
+    const reader = createFileMapAssetReader(map)
+    const model = await PmxLoader.loadFromReader(reader, pmxKey)
+    model.setName(name)
+    return { model, pmxKey, reader }
+  }
+
+  async addModel(
+    model: Model,
+    pmxPath: string,
+    name?: string,
+    assetReader?: AssetReader,
+    options?: { stage?: boolean },
+  ): Promise<string> {
     const requested = name ?? model.name
     let key = requested
     let n = 1
@@ -3093,8 +3168,44 @@ export class Engine {
     const reader = assetReader ?? createFetchAssetReader()
     const basePath = deriveBasePathFromPmxPath(pmxPath)
     model.setAssetContext(reader, basePath)
-    await this.setupModelInstance(key, model, basePath, reader)
+    await this.setupModelInstance(key, model, basePath, reader, options?.stage ?? false)
     return key
+  }
+
+  /**
+   * Add a PMX as the scene's environment rather than as a character.
+   *
+   * A stage is the same geometry and the same materials — style groups and
+   * shader graphs work on it unchanged, which is the whole reason pure-PMX
+   * stages are worth supporting — but it is not a performer:
+   *
+   *  - no physics. A stage's rigidbodies are set dressing for MMD's solver and
+   *    cost a full simulation island for scenery that never moves.
+   *  - no IK. Nothing drives a stage's chains, and solving them every frame is
+   *    pure waste on what is usually the heaviest mesh in the scene.
+   *  - no per-frame pose work while it is idle: with no clip and no morph
+   *    change there is nothing to recompute, so update is skipped entirely.
+   *  - it owns the floor. See groundIsSuppressed — the built-in ground plane
+   *    and a stage's own floor both sit at y=0 and z-fight.
+   *
+   * Bone and material morphs still apply, because that is how a stage's doors,
+   * lifts and colour switches are rigged.
+   */
+  async addStage(
+    model: Model,
+    pmxPath: string,
+    options?: { name?: string; transform?: Partial<ModelTransform>; assetReader?: AssetReader },
+  ): Promise<string> {
+    const key = await this.addModel(model, pmxPath, options?.name, options?.assetReader, { stage: true })
+    if (options?.transform) this.setModelTransform(key, options.transform)
+    return key
+  }
+
+  /** True while a stage is in the scene, which is when the built-in ground plane
+   *  must not draw. */
+  groundIsSuppressed(): boolean {
+    for (const inst of this.modelInstances.values()) if (inst.isStage) return true
+    return false
   }
 
   removeModel(name: string): void {
@@ -3144,12 +3255,18 @@ export class Engine {
    * character — its colliders won't scale; scale stages (which are typically physics-free).
    */
   setModelTransform(name: string, transform: Partial<ModelTransform>): void {
-    const model = this.modelInstances.get(name)?.model
-    if (!model) return
+    const inst = this.modelInstances.get(name)
+    const model = inst?.model
+    if (!inst || !model) return
     if (transform.position) model.setPosition(transform.position)
     if (transform.rotation) model.setRotation(transform.rotation)
     if (transform.scale !== undefined) model.setScale(transform.scale)
     if (transform.visible !== undefined) model.setVisible(transform.visible)
+    // The root transform is baked into the skin matrices, so moving a model is a
+    // reason to re-upload them even though no pose pass ran. A cast member gets
+    // one every frame anyway; an idle stage would otherwise never see the change
+    // — which is exactly the case this API exists to serve.
+    inst.skinMatricesDirty = true
   }
 
   /** Read a model's scene transform (for serialization into a scene descriptor). */
@@ -3316,8 +3433,22 @@ export class Engine {
     let physicsMs = 0
     this.forEachInstance((inst) => {
       const tAnim = performance.now()
-      const verticesChanged = inst.model.update(deltaTime, this.ikEnabled)
+      // A stage never solves IK — nothing drives its chains — and skips the pose
+      // pass entirely while it is idle. Morph changes still come through, since
+      // that is the one thing a stage's controls do move.
+      const stageIdle = inst.isStage && inst.model.isIdle()
+      let verticesChanged = false
+      if (!stageIdle) {
+        verticesChanged = inst.model.update(deltaTime, inst.isStage ? false : this.ikEnabled)
+        inst.skinMatricesDirty = true
+      }
       animMs += performance.now() - tAnim
+      // Material morphs ride the same weight change as vertex morphs but land in
+      // uniform buffers, so they consume their own flag — a model whose only
+      // morphs are material morphs never enters the GPU vertex path below.
+      if (inst.materialMorphTargets && inst.model.consumeAuxMorphDirty()) {
+        this.applyMaterialMorphs(inst)
+      }
       if (inst.gpuMorph) {
         // GPU path: on a weight change, upload effective weights (thresholding tiny values
         // to 0 to match the CPU skip) and flag the compute dispatch for this frame.
@@ -3401,6 +3532,7 @@ export class Engine {
     model: Model,
     basePath: string,
     assetReader: AssetReader,
+    isStage = false,
   ): Promise<void> {
     const vertices = model.getVertices()
     const skinning = model.getSkinning()
@@ -3458,7 +3590,10 @@ export class Engine {
     this.device.queue.writeBuffer(indexBuffer, 0, indices)
 
     const rbs = model.getRigidbodies()
-    const physics = rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
+    // A stage never simulates, so its bodies are never built — constructing the
+    // solver for the heaviest mesh in the scene and dropping it afterwards was
+    // both wasted work and an invariant maintained in the wrong place.
+    const physics = !isStage && rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
     // Adopt the scene's air, or a model added mid-session would fall under
     // different gravity from the ones already on stage.
     if (physics) {
@@ -3510,7 +3645,13 @@ export class Engine {
       mainPerInstanceBindGroup,
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
+      isStage,
+      // Seeded true: the bind pose has to reach the GPU once before any frame.
+      skinMatricesDirty: true,
       hiddenMaterials: new Set(),
+      morphHiddenMaterials: new Set(),
+      materialMorphTargets: null,
+      materialMorphByIndex: null,
       physics,
       vertexBufferNeedsUpdate: false,
       gpuMorph,
@@ -3803,9 +3944,25 @@ export class Engine {
     // 頭 bone index for the eye shader's rear-view gate (-1 when absent).
     const headBoneIndex = model.getSkeleton().bones.findIndex((b) => b.name === "頭")
 
+    // Materials a type-8 morph can reach. -1 in an offset means "all of them",
+    // so the presence of ANY material morph makes every material a target.
+    const morphedMaterials = new Set<number>()
+    for (const morph of model.getMorphing().morphs) {
+      if (morph.type !== 8 || !morph.materialOffsets) continue
+      for (const off of morph.materialOffsets) {
+        if (off.materialIndex < 0) for (let i = 0; i < materials.length; i++) morphedMaterials.add(i)
+        else morphedMaterials.add(off.materialIndex)
+      }
+    }
+    const morphTargets: MaterialMorphTarget[] = []
+
     let currentIndexOffset = 0
     let materialId = 0
+    // The PMX index, which is what a material morph points at — distinct from
+    // materialId, which only counts materials that produced a draw.
+    let pmxMaterialIndex = -1
     for (const mat of materials) {
+      pmxMaterialIndex++
       const indexCount = mat.vertexCount
       if (indexCount === 0) continue
       materialId++
@@ -3857,6 +4014,19 @@ export class Engine {
 
       const materialUniformBuffer = this.createMaterialUniformBuffer(prefix + mat.name, mat, sphereMode, headBoneIndex)
       inst.gpuBuffers.push(materialUniformBuffer)
+      if (morphedMaterials.has(pmxMaterialIndex)) {
+        const base = this.materialUniformData(mat, sphereMode, headBoneIndex)
+        morphTargets.push({
+          pmxIndex: pmxMaterialIndex,
+          materialName: mat.name,
+          buffer: materialUniformBuffer,
+          base,
+          work: new Float32Array(base.length),
+          // Seeded from base: that is what createMaterialUniformBuffer already
+          // uploaded, so an unmorphed material never writes a first time.
+          last: Float32Array.from(base),
+        })
+      }
 
       const textureView = diffuseTexture.createView()
       const baseBindGroupEntries: GPUBindGroupEntry[] = [
@@ -3878,8 +4048,13 @@ export class Engine {
       // its own hull where it is see-through instead of us skipping it here.
       // Drawn interleaved right after this material's color draw (babylon-mmd's
       // per-mesh afterRender outline stage) — see drawMaterials.
+      // Stages get no outline hulls. The inverted hull is a SECOND full draw of
+      // the material's geometry, and stage PMX routinely set the edge flag across
+      // every material — on the heaviest mesh in the scene that doubles the
+      // geometry submitted per frame to draw cartoon outlines around
+      // architecture, which is not the look anyone is after.
       let outline: DrawCall["outline"]
-      if ((mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
+      if (!inst.isStage && (mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
         const materialUniformData = new Float32Array([
           mat.edgeColor[0],
           mat.edgeColor[1],
@@ -3939,16 +4114,18 @@ export class Engine {
     // by render-class when groups are assigned. Array.sort is stable → PMX order preserved
     // within a bucket.
     this.sortDrawCalls(inst)
+
+    inst.materialMorphTargets = morphTargets.length > 0 ? morphTargets : null
+    inst.materialMorphByIndex = inst.materialMorphTargets
+      ? new Map(morphTargets.map((t) => [t.pmxIndex, t]))
+      : null
+    // Seed from the current weights: a scene can open with a switch already on.
+    if (inst.materialMorphTargets) this.applyMaterialMorphs(inst)
   }
 
-  private createMaterialUniformBuffer(
-    label: string,
-    mat: Material,
-    sphereMode: number,
-    headBoneIndex: number,
-  ): GPUBuffer {
-    // Matches the WGSL MaterialUniforms struct in common.ts — 64 bytes
-    // (diffuse+alpha | ambient+shininess | specular+sphereMode | headIdx+pad).
+  /** Matches the WGSL MaterialUniforms struct in common.ts — 64 bytes
+   *  (diffuse+alpha | ambient+shininess | specular+sphereMode | headIdx+pad). */
+  private materialUniformData(mat: Material, sphereMode: number, headBoneIndex: number): Float32Array {
     const data = new Float32Array(16)
     data[0] = mat.diffuse[0]
     data[1] = mat.diffuse[1]
@@ -3963,7 +4140,107 @@ export class Engine {
     data[10] = mat.specular[2]
     data[11] = sphereMode
     data[12] = headBoneIndex
-    return this.createUniformBuffer(`material uniform: ${label}`, data)
+    return data
+  }
+
+  private createMaterialUniformBuffer(
+    label: string,
+    mat: Material,
+    sphereMode: number,
+    headBoneIndex: number,
+  ): GPUBuffer {
+    return this.createUniformBuffer(
+      `material uniform: ${label}`,
+      this.materialUniformData(mat, sphereMode, headBoneIndex),
+    )
+  }
+
+  /**
+   * Re-derive every morph-targeted material's uniform block from base and push
+   * the ones that moved.
+   *
+   * Blend maths follow MMD (and babylon-mmd's _applyMaterialMorph): multiply
+   * lerps from base toward base*morph, add offsets from base. Weight 0 must
+   * therefore land exactly on base, which is why this recomputes rather than
+   * accumulates.
+   *
+   * A material driven to zero alpha is dropped from the draw instead of being
+   * written through: the opaque/transparent bucket is decided at load from the
+   * PMX alpha, so an opaque draw cannot become see-through by uniform alone.
+   * Full-off is the switch stage artists actually ship (帽子消失 and friends);
+   * a partial fade on a material that loaded opaque still will not blend.
+   */
+  private applyMaterialMorphs(inst: ModelInstance): void {
+    const targets = inst.materialMorphTargets
+    if (!targets) return
+    const morphs = inst.model.getMorphing().morphs
+    const weights = inst.model.getEffectiveMorphWeights()
+
+    for (const target of targets) {
+      target.work.set(target.base)
+    }
+
+    for (let i = 0; i < morphs.length; i++) {
+      const w = weights[i]
+      if (w < 0.0001) continue
+      const morph = morphs[i]
+      if (morph.type !== 8 || !morph.materialOffsets) continue
+      for (const off of morph.materialOffsets) {
+        // A named material resolves in one lookup. Only the -1 wildcard walks
+        // every target — and once any offset uses it, every material in the
+        // model is a target, so scanning per offset would be quadratic on the
+        // large stages this is meant to serve.
+        const hit = off.materialIndex >= 0 ? inst.materialMorphByIndex?.get(off.materialIndex) : undefined
+        const affected = off.materialIndex >= 0 ? (hit ? [hit] : []) : targets
+        for (const target of affected) {
+          const d = target.work
+          if (off.offsetType === MATERIAL_MORPH_MULTIPLY) {
+            d[0] += (d[0] * off.diffuse[0] - d[0]) * w
+            d[1] += (d[1] * off.diffuse[1] - d[1]) * w
+            d[2] += (d[2] * off.diffuse[2] - d[2]) * w
+            d[3] += (d[3] * off.diffuse[3] - d[3]) * w
+            d[4] += (d[4] * off.ambient[0] - d[4]) * w
+            d[5] += (d[5] * off.ambient[1] - d[5]) * w
+            d[6] += (d[6] * off.ambient[2] - d[6]) * w
+            d[7] += (d[7] * off.shininess - d[7]) * w
+            d[8] += (d[8] * off.specular[0] - d[8]) * w
+            d[9] += (d[9] * off.specular[1] - d[9]) * w
+            d[10] += (d[10] * off.specular[2] - d[10]) * w
+          } else {
+            d[0] += off.diffuse[0] * w
+            d[1] += off.diffuse[1] * w
+            d[2] += off.diffuse[2] * w
+            d[3] += off.diffuse[3] * w
+            d[4] += off.ambient[0] * w
+            d[5] += off.ambient[1] * w
+            d[6] += off.ambient[2] * w
+            d[7] += off.shininess * w
+            d[8] += off.specular[0] * w
+            d[9] += off.specular[1] * w
+            d[10] += off.specular[2] * w
+          }
+        }
+      }
+    }
+
+    inst.morphHiddenMaterials.clear()
+    for (const target of targets) {
+      const d = target.work
+      // Alpha is the switch; clamp the rest so a stacked multiply cannot send a
+      // colour negative and light the material from the inside.
+      for (let k = 0; k < 11; k++) if (d[k] < 0) d[k] = 0
+      if (d[3] < 0.0001) inst.morphHiddenMaterials.add(target.materialName)
+      let changed = false
+      for (let k = 0; k < 11; k++) {
+        if (d[k] !== target.last[k]) {
+          changed = true
+          break
+        }
+      }
+      if (!changed) continue
+      target.last.set(d)
+      this.device.queue.writeBuffer(target.buffer, 0, d as ArrayBufferView<ArrayBuffer>)
+    }
   }
 
   private createUniformBuffer(label: string, data: Float32Array | Uint32Array): GPUBuffer {
@@ -3977,7 +4254,7 @@ export class Engine {
   }
 
   private shouldRenderDrawCall(inst: ModelInstance, drawCall: DrawCall): boolean {
-    return !inst.hiddenMaterials.has(drawCall.materialName)
+    return !inst.hiddenMaterials.has(drawCall.materialName) && !inst.morphHiddenMaterials.has(drawCall.materialName)
   }
 
   private async createTextureFromLogicalPath(inst: ModelInstance, logicalPath: string): Promise<GPUTexture | null> {
@@ -4115,6 +4392,11 @@ export class Engine {
   }
 
   private renderGround(pass: GPURenderPassEncoder) {
+    // A stage brings its own floor. Both sit at y=0, so drawing the built-in
+    // plane underneath produces z-fighting across the whole scene — enforced
+    // here rather than left to callers, who cannot see the conflict coming.
+    // hasGround is left alone: remove the stage and the ground comes back.
+    if (this.groundIsSuppressed()) return
     if (!this.hasGround || !this.groundVertexBuffer || !this.groundIndexBuffer || !this.groundDrawCall) return
     pass.setPipeline(this.groundShadowPipeline)
     pass.setVertexBuffer(0, this.groundVertexBuffer)
@@ -5462,6 +5744,10 @@ export class Engine {
 
   private updateSkinMatrices() {
     this.forEachInstance((inst) => {
+      // Only a pose pass can change these, and an idle stage did not run one —
+      // re-uploading bones×64 bytes for scenery that never moves is the one
+      // per-frame cost a stage would otherwise still pay in full.
+      if (!inst.skinMatricesDirty) return
       const skinMatrices = inst.model.getSkinMatrices()
       this.device.queue.writeBuffer(
         inst.skinMatrixBuffer,
@@ -5470,6 +5756,7 @@ export class Engine {
         skinMatrices.byteOffset,
         skinMatrices.byteLength,
       )
+      inst.skinMatricesDirty = false
     })
   }
 

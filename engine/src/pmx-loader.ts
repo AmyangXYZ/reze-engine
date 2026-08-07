@@ -9,6 +9,9 @@ import {
   Morphing,
   VertexMorphOffset,
   GroupMorphReference,
+  BoneMorphOffset,
+  MaterialMorphOffset,
+  UvMorphOffset,
   IKLink,
 } from "./model"
 import { Mat4, Vec3 } from "./math"
@@ -533,6 +536,11 @@ export class PmxLoader {
             vertexOffsets: [],
             groupReferences: [],
           }
+          // Allocated only for the type that uses them, so `morph.boneOffsets`
+          // being undefined means "not that kind of morph" rather than "empty".
+          if (morphType === 2) morph.boneOffsets = []
+          else if (morphType >= 3 && morphType <= 7) morph.uvOffsets = []
+          else if (morphType === 8) morph.materialOffsets = []
 
           // Parse vertex morphs (type 1)
           if (morphType === 1) {
@@ -569,60 +577,92 @@ export class PmxLoader {
               }
             }
           } else {
-            // Skip other morph types for now
+            // Bone, UV and material morphs are kept; flip and impulse (PMX 2.1)
+            // are still read past — nothing in the wild uses them, and impulse
+            // would need to drive rigidbodies.
             for (let j = 0; j < offsetCount; j++) {
               if (this.offset >= this.view.buffer.byteLength) {
                 break
               }
               if (morphType === 2) {
                 // Bone morph
-                this.getNonVertexIndex(this.boneIndexSize) // boneIndex
-                this.getFloat32() // x
-                this.getFloat32() // y
-                this.getFloat32() // z
-                this.getFloat32() // rotation quaternion x
-                this.getFloat32() // rotation quaternion y
-                this.getFloat32() // rotation quaternion z
-                this.getFloat32() // rotation quaternion w
+                const boneIndex = this.getNonVertexIndex(this.boneIndexSize)
+                const tx = this.getFloat32()
+                const ty = this.getFloat32()
+                const tz = this.getFloat32()
+                const rx = this.getFloat32()
+                const ry = this.getFloat32()
+                const rz = this.getFloat32()
+                const rw = this.getFloat32()
+                if (boneIndex >= 0) {
+                  const offset: BoneMorphOffset = {
+                    boneIndex,
+                    translation: [tx, ty, tz],
+                    rotation: [rx, ry, rz, rw],
+                  }
+                  morph.boneOffsets!.push(offset)
+                }
               } else if (morphType >= 3 && morphType <= 7) {
                 // UV morph + additional UV channels 1-4; offset is always a Float4 per spec
-                this.getIndex(this.vertexIndexSize) // vertexIndex
-                this.getFloat32() // x
-                this.getFloat32() // y
-                this.getFloat32() // z
-                this.getFloat32() // w
+                const vertexIndex = this.getIndex(this.vertexIndexSize)
+                const x = this.getFloat32()
+                const y = this.getFloat32()
+                const z = this.getFloat32()
+                const w = this.getFloat32()
+                if (vertexIndex >= 0 && vertexIndex < this.vertexCount) {
+                  const offset: UvMorphOffset = { vertexIndex, offset: [x, y, z, w] }
+                  morph.uvOffsets!.push(offset)
+                }
               } else if (morphType === 8) {
                 // Material morph
-                this.getNonVertexIndex(this.materialIndexSize) // materialIndex
-                this.getUint8() // offsetType
-                this.getFloat32() // diffuse r
-                this.getFloat32() // diffuse g
-                this.getFloat32() // diffuse b
-                this.getFloat32() // diffuse a
-                this.getFloat32() // specular r
-                this.getFloat32() // specular g
-                this.getFloat32() // specular b
-                this.getFloat32() // specular power
-                this.getFloat32() // ambient r
-                this.getFloat32() // ambient g
-                this.getFloat32() // ambient b
-                this.getFloat32() // edgeColor r
-                this.getFloat32() // edgeColor g
-                this.getFloat32() // edgeColor b
-                this.getFloat32() // edgeColor a
-                this.getFloat32() // edgeSize
-                this.getFloat32() // textureCoeff r
-                this.getFloat32() // textureCoeff g
-                this.getFloat32() // textureCoeff b
-                this.getFloat32() // textureCoeff a
-                this.getFloat32() // sphereCoeff r
-                this.getFloat32() // sphereCoeff g
-                this.getFloat32() // sphereCoeff b
-                this.getFloat32() // sphereCoeff a
-                this.getFloat32() // toonCoeff r
-                this.getFloat32() // toonCoeff g
-                this.getFloat32() // toonCoeff b
-                this.getFloat32() // toonCoeff a
+                const materialIndex = this.getNonVertexIndex(this.materialIndexSize)
+                const offsetType = this.getUint8()
+                const diffuseR = this.getFloat32()
+                const diffuseG = this.getFloat32()
+                const diffuseB = this.getFloat32()
+                const diffuseA = this.getFloat32()
+                const specularR = this.getFloat32()
+                const specularG = this.getFloat32()
+                const specularB = this.getFloat32()
+                const shininess = this.getFloat32()
+                const ambientR = this.getFloat32()
+                const ambientG = this.getFloat32()
+                const ambientB = this.getFloat32()
+                const edgeR = this.getFloat32()
+                const edgeG = this.getFloat32()
+                const edgeB = this.getFloat32()
+                const edgeA = this.getFloat32()
+                const edgeSize = this.getFloat32()
+                const texR = this.getFloat32()
+                const texG = this.getFloat32()
+                const texB = this.getFloat32()
+                const texA = this.getFloat32()
+                const sphR = this.getFloat32()
+                const sphG = this.getFloat32()
+                const sphB = this.getFloat32()
+                const sphA = this.getFloat32()
+                const toonR = this.getFloat32()
+                const toonG = this.getFloat32()
+                const toonB = this.getFloat32()
+                const toonA = this.getFloat32()
+                // -1 is legal and means "every material" — kept as-is so the
+                // applier can fan it out without a second convention.
+                if (materialIndex >= -1) {
+                  const offset: MaterialMorphOffset = {
+                    materialIndex,
+                    offsetType,
+                    diffuse: [diffuseR, diffuseG, diffuseB, diffuseA],
+                    specular: [specularR, specularG, specularB],
+                    shininess,
+                    ambient: [ambientR, ambientG, ambientB],
+                    edgeColor: [edgeR, edgeG, edgeB, edgeA],
+                    edgeSize,
+                    textureCoeff: [texR, texG, texB, texA],
+                    sphereCoeff: [sphR, sphG, sphB, sphA],
+                    toonCoeff: [toonR, toonG, toonB, toonA],
+                  }
+                  morph.materialOffsets!.push(offset)
+                }
               } else if (morphType === 9) {
                 // Flip morph (PMX 2.1): same layout as group morph
                 this.getNonVertexIndex(this.morphIndexSize) // morphIndex

@@ -52,7 +52,17 @@ export { BODY_GRAPH } from "./graph/presets/body"
 export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 export { EYE_GRAPH } from "./graph/presets/eye"
 export { FACE_GRAPH } from "./graph/presets/face"
-export { Model, type ClipEventInfo } from "./model"
+export {
+  Model,
+  MATERIAL_MORPH_MULTIPLY,
+  MATERIAL_MORPH_ADD,
+  type ClipEventInfo,
+  type Morph,
+  type Morphing,
+  type BoneMorphOffset,
+  type MaterialMorphOffset,
+  type UvMorphOffset,
+} from "./model"
 export { Vec3, Quat, Mat4, easeInOut, type EulerOrder } from "./math"
 export type {
   AnimationClip,
