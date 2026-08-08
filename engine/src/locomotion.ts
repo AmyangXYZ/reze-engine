@@ -291,6 +291,34 @@ export class LocomotionController {
     this.yaw = yaw
   }
 
+  /** Teleport PLUS a hard reset of every transient motion commitment: any
+   *  in-flight authored stop/turn (whose stored start position would otherwise
+   *  keep driving the root from where it began), the exit ghost, speed and
+   *  momentum, the heading-hold gate, and the held inputs. For handing the
+   *  root back after an externally-driven action (a root-motion clip state):
+   *  wherever the action ended is simply where she now stands. */
+  reset(x: number, y: number, z: number, yaw = 0): void {
+    this.position.setXYZ(x, y, z)
+    this.yaw = wrapAngle(yaw)
+    this.dirX = Math.sin(this.yaw)
+    this.dirZ = Math.cos(this.yaw)
+    this.speedLevel = 0
+    this.recentSpeed = 0
+    this.headingHold = 0
+    this.headingDirX = 0
+    this.headingDirY = 0
+    this.gaitPhase = 0
+    this.stopping = null
+    this.turning = null
+    this.runTurning = null
+    this.exitGhost = null
+    this.inputX = 0
+    this.inputY = 0
+    this.inputSprint = false
+    this.inputForward = 0
+    this.inputSteer = 0
+  }
+
   /** Strafe mode: hold the body at this world yaw (a camera forward, a lock-on target)
    *  while setMove's vector drives the directional strafe ring — requires
    *  clips.strafeRun. null returns to turn-toward-movement. */

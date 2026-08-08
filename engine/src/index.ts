@@ -57,6 +57,7 @@ export {
   MATERIAL_MORPH_MULTIPLY,
   MATERIAL_MORPH_ADD,
   type ClipEventInfo,
+  type RootMotionProfile,
   type Morph,
   type Morphing,
   type BoneMorphOffset,

@@ -44,6 +44,15 @@ export interface ClipEventInfo {
   weight: number
 }
 
+/** A clip's authored horizontal root path, lifted off センター by
+ *  Model.extractRootMotion: per-key offsets from the FIRST key, raw clip
+ *  units, clip space (rest facing -Z). `frames` are VMD frames (30fps). */
+export interface RootMotionProfile {
+  frames: number[]
+  x: number[]
+  z: number[]
+}
+
 const _fadeEntries: BlendEntry[] = [
   { name: "", time: 0, weight: 0 },
   { name: "", time: 0, weight: 0 },
@@ -1525,6 +1534,61 @@ export class Model {
 
   getClip(name: string): AnimationClip | null {
     return this.animationState.getAnimationClip(name)
+  }
+
+  /** Lift a clip's authored horizontal root path off センター so the host can
+   *  drive the MODEL ROOT along it — game-style root motion. The clip keeps
+   *  its vertical bob but its horizontal センター flattens to `rest` (default
+   *  0,0): a displaced first frame — common in per-pose game exports — would
+   *  otherwise ride the whole clip as a constant and visibly slide off during
+   *  the exit crossfade. Pass the pack's NEUTRAL standing offset (the idle
+   *  clip's first センター key) as `rest` so the flattened pose blends into
+   *  the surrounding states without even a micro-slide. The removed path
+   *  returns RELATIVE TO THE FIRST KEY, raw clip units, clip space (rest
+   *  facing -Z). Leg-IK target position tracks lose the same path so feet
+   *  keep oscillating around the body. Call once per clip, after
+   *  loadVmd/loadClip; null if the clip or its センター track doesn't exist. */
+  extractRootMotion(name: string, rest?: { x?: number; z?: number }): RootMotionProfile | null {
+    const clip = this.animationState.getAnimationClip(name)
+    const track = clip?.boneTracks.get("センター")
+    if (!clip || !track || track.length === 0) return null
+    const restX = rest?.x ?? 0
+    const restZ = rest?.z ?? 0
+    const frames: number[] = []
+    const x: number[] = []
+    const z: number[] = []
+    const pathX: number[] = [] // horizontal removed (rel. rest), for the IK tracks
+    const pathZ: number[] = []
+    const x0 = track[0].translation.x
+    const z0 = track[0].translation.z
+    for (const kf of track) {
+      frames.push(kf.frame)
+      x.push(kf.translation.x - x0)
+      z.push(kf.translation.z - z0)
+      pathX.push(kf.translation.x - restX)
+      pathZ.push(kf.translation.z - restZ)
+      kf.translation.x = restX
+      kf.translation.z = restZ
+    }
+    for (const [bone, kfs] of clip.boneTracks) {
+      if (!bone.includes("ＩＫ")) continue
+      for (const kf of kfs) {
+        kf.translation.x -= Model.sampleTrack(frames, pathX, kf.frame)
+        kf.translation.z -= Model.sampleTrack(frames, pathZ, kf.frame)
+      }
+    }
+    return { frames, x, z }
+  }
+
+  /** Linear sample of a keyed scalar track at fractional frame f. */
+  private static sampleTrack(frames: number[], values: number[], f: number): number {
+    const n = frames.length
+    if (f <= frames[0]) return values[0]
+    if (f >= frames[n - 1]) return values[n - 1]
+    let i = 1
+    while (frames[i] < f) i++
+    const t = (f - frames[i - 1]) / (frames[i] - frames[i - 1])
+    return values[i - 1] + (values[i] - values[i - 1]) * t
   }
 
   exportVmd(name: string): ArrayBuffer {

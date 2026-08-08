@@ -2909,6 +2909,15 @@ export class Engine {
   setCameraBeta(b: number): void {
     this.camera.beta = b
   }
+  /** Vertical field of view in radians (default π/4). While a camera VMD
+   *  drives the view it animates fov itself; the orbit value set here is
+   *  restored when the VMD releases the camera. */
+  getCameraFov(): number {
+    return this.camera.fov
+  }
+  setCameraFov(fov: number): void {
+    this.camera.fov = fov
+  }
 
   // Step 5: Create lighting buffers
   private setupLighting() {
