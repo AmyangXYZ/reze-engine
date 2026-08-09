@@ -15,6 +15,7 @@ npm install reze-engine
 - **Anime-style rendering** — toon-ramp NPR over a Principled GGX BSDF, mixed per material
 - **Shader-graph materials** — every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph, fully customizable
 - **HDR pipeline** — bloom, Filmic tone mapping, ASC CDL colour grading, 4× MSAA, Apple-TBDR-friendly targets
+- **Depth of field** — a bladed-bokeh gather in the composite pass, focusing automatically on the character's own depth span. It reads the scene pass's existing depth buffer rather than a G-buffer, and while it is off that buffer is never even stored — the feature costs nothing until you turn it on
 - **In-house TS physics** — sequential-impulse rigid bodies for PMX rigs with rest-stable implicit spring-dampers, zero dependencies; structure-of-arrays solver, scene gravity and wind, a world floor so hair and hems rest on the ground instead of clipping through it, and per-frame load shedding that holds framerate on weak devices
 - **Math library** — the shared Vec3/Quat/Mat4 layer of the Reze family: euler orders, swing-twist, shortest-arc, look-rotation, zero-alloc `*Into` variants
 - **VMD animation** — MMD IK with per-chain enable read from the motion, morphs on a GPU compute path, and VMD export
