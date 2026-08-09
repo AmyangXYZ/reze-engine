@@ -5,6 +5,7 @@ import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
+import { ParticleSystem, type ParticleEmitOptions } from "./particles"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
 import type { WindOptions } from "./physics/world"
@@ -110,7 +111,8 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
       "带", // straps and bands: 头带/发带/背带/腰带
       "绳", // ropes: 背绳/腰绳
       "纱", // gauze/veils: 头纱
-      "肩布", // shoulder cloth/drape
+      "巾", // kerchiefs/scarves: 头巾/领巾/围巾
+      "布", // cloth panels: 肩布/腰布
       "背球", // back ornament sphere
       "腰花", // waist flower
       "花蕊", // flower pistil ornament
@@ -716,6 +718,8 @@ export class Engine {
   private multisampleMaskTexture!: GPUTexture
   private maskResolveTexture!: GPUTexture
   private maskResolveView!: GPUTextureView
+  /** One-shot particle emissions (emitParticles); lazily built on first emit. */
+  private particles: ParticleSystem | null = null
   private renderPassDescriptor!: GPURenderPassDescriptor
   private compositePassDescriptor!: GPURenderPassDescriptor
   // Two specialized composite pipelines via WGSL pipeline-override constants.
@@ -2919,6 +2923,24 @@ export class Engine {
     this.camera.fov = fov
   }
 
+  /** Fire a one-shot particle effect (see ParticleEmitOptions): "burst" scatters
+   *  glowing sparks from the given world points, "converge" condenses them onto
+   *  the points. Pair with Model.sampleSurfacePoints for dissolve/materialize
+   *  transitions shaped like the model. Stateless GPU particles — the emission
+   *  cleans itself up when it expires. */
+  emitParticles(opts: ParticleEmitOptions): void {
+    if (!this.device) return
+    if (!this.particles) {
+      this.particles = new ParticleSystem(this.device, this.cameraUniformBuffer, {
+        hdr: this.hdrFormat,
+        mask: Engine.BLOOM_MASK_FORMAT,
+        depth: "depth24plus-stencil8",
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+      })
+    }
+    this.particles.emit(opts, performance.now() / 1000)
+  }
+
   // Step 5: Create lighting buffers
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
@@ -3074,6 +3096,8 @@ export class Engine {
     this.forEachInstance((inst) => inst.model.stop())
     if (Engine.instance === this) Engine.instance = null
     if (this.camera) this.camera.detachControl()
+    this.particles?.dispose()
+    this.particles = null
 
     // Remove raycasting event listeners
     if (this.onRaycast) {
@@ -3475,7 +3499,11 @@ export class Engine {
       } else if (verticesChanged) {
         inst.vertexBufferNeedsUpdate = true
       }
-      if (inst.physics && this.physicsEnabled) {
+      // Hidden models keep animating (cheap, and a reveal must not pop a stale
+      // pose) but skip cloth simulation entirely — a roster of resident
+      // alternate skins would otherwise pay full physics for invisible cloth.
+      // Hosts that reveal after long hiding reset physics anyway (resetPhysics).
+      if (inst.physics && this.physicsEnabled && inst.model.visible) {
         const tPhys = performance.now()
         inst.physics.step(deltaTime, inst.model.getWorldMatrices(), inst.model.getBoneInverseBindMatrices())
         physicsMs += performance.now() - tPhys
@@ -5111,6 +5139,9 @@ export class Engine {
       this.forEachInstance((inst) => {
         if (inst.model.visible) this.renderModelTransparentPhase(pass, inst)
       })
+    // Particle emissions last: additive light over everything, depth-tested
+    // against the scene, feeding the bloom mask so the sparks glow.
+    this.particles?.draw(pass, performance.now() / 1000)
     pass.end()
 
     // Bloom pyramid (EEVEE 3.6):

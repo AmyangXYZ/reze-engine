@@ -84,9 +84,13 @@ export class AnimationStateMachine {
     return this.current.time
   }
 
-  /** Force a transition now, regardless of the transition table. */
-  go(to: string, fade?: number): void {
-    this.begin(to, fade ?? this.defaultFade)
+  /** Force a transition now, regardless of the transition table. `atTime`
+   *  enters the state with its clock already at that many seconds — for
+   *  handoffs that must continue a clip mid-flight (e.g. swapping model
+   *  skins mid-action: the new machine picks up exactly where the old
+   *  one's state stood). */
+  go(to: string, fade?: number, atTime?: number): void {
+    this.begin(to, fade ?? this.defaultFade, atTime)
   }
 
   update(dt: number): void {
@@ -137,7 +141,7 @@ export class AnimationStateMachine {
     return true
   }
 
-  private begin(to: string, fade: number): void {
+  private begin(to: string, fade: number, atTime = 0): void {
     const def = this.states[to]
     if (!def) throw new Error(`Unknown state "${to}"`)
     this.current.def.onExit?.(to)
@@ -145,7 +149,7 @@ export class AnimationStateMachine {
     // three-way mixes) — the current state becomes the outgoing one.
     this.fading = fade > 0 ? { state: this.current, elapsed: 0, duration: fade } : null
     const from = this.current.name
-    this.current = { name: to, def, time: 0 }
+    this.current = { name: to, def, time: atTime }
     def.onEnter?.(from)
   }
 
