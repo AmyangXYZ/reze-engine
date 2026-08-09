@@ -66,9 +66,50 @@ override APPLY_GAMMA: bool = true;
 // viewU[9] = (grade slope.rgb, grade on/off) — see grade() below.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
+// The scene pass's own MSAA depth buffer, bound depth-only. NOT an extra
+// render target: when depth of field is off the scene pass discards depth
+// (TBDR tile memory never spills) and this binding is never read — the whole
+// feature costs one uniform branch. When on, the pass stores depth and the
+// gather below reads sample 0.
+@group(0) @binding(8) var depthTex: texture_depth_multisampled_2d;
+// dofU[0] = (enabled, focusDistance, focusRange, aperture)
+// dofU[1] = (maxBlurRadiusPx, bladeCount, sampleCount, anamorphicRatio)
+// dofU[2] = (projA, projB, _, _) — z-buffer → camera-space depth inversion,
+//           viewZ = projB / (z - projA), rebuilt per frame because near/far
+//           track the camera radius. Cleared depth (1.0) inverts to the far
+//           plane, so empty sky reads as maximally defocused background.
+@group(0) @binding(9) var<uniform> dofU: array<vec4<f32>, 3>;
 
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
 const FILMIC_LUT_W: f32 = 256.0;
+
+fn linearDepth(coord: vec2<i32>) -> f32 {
+  let z = textureLoad(depthTex, coord, 0);
+  // projA > 1 for every valid z in [0,1], so the divisor never crosses zero.
+  return clamp(dofU[2].y / (z - dofU[2].x), 0.05, 100000.0);
+}
+
+/** Signed circle of confusion in device pixels — negative in front of the
+ *  focus band, positive behind it, zero inside it. */
+fn circleOfConfusion(depth: f32) -> f32 {
+  let focus = max(dofU[0].y, 0.05);
+  let halfRange = max(dofU[0].z * 0.5, 0.01);
+  let delta = depth - focus;
+  let outside = max(abs(delta) - halfRange, 0.0);
+  let radius = min(outside / max(depth, 0.05) * dofU[0].w * dofU[1].x, dofU[1].x);
+  return select(-radius, radius, delta >= 0.0);
+}
+
+/** Premultiplied scene color (HDR + bloom) at an arbitrary pixel, for the
+ *  bokeh gather. Explicit-LOD sampling only — legal in non-uniform flow. */
+fn sceneSample(coord: vec2<i32>, fullSzI: vec2<i32>, fullSz: vec2f) -> vec4f {
+  let p = clamp(coord, vec2<i32>(0), fullSzI - vec2<i32>(1));
+  let sAlpha = textureLoad(maskTex, p, 0).g;
+  let sHdr = textureLoad(hdrTex, p, 0).rgb / max(sAlpha, 1e-6);
+  let sUv = (vec2f(p) + vec2f(0.5)) / fullSz;
+  let sBloom = textureSampleLevel(bloomTex, bloomSamp, sUv, 0.0).rgb * viewU[1].xyz * viewU[1].w;
+  return vec4f((sHdr + sBloom) * sAlpha, sAlpha);
+}
 
 fn filmic(x: f32) -> f32 {
   // Reference checkpoints (Blender 3.6 Filmic MHC, sobotka/filmic-blender
@@ -124,7 +165,59 @@ const COMPOSITE_BODY = /* wgsl */ `
   let intensity = viewU[1].w;
   let bloom = textureSampleLevel(bloomTex, bloomSamp, bloomUv, 0.0).rgb * tint * intensity;
   let combined = straight + bloom;
-  let exposed = combined * exp2(viewU[0].x);
+
+  // ── Depth of field ──
+  // Single-pass golden-angle gather over a polygonal (bladed) disk, in
+  // premultiplied HDR before tonemap. Near-field taps that see focused
+  // background are heavily down-weighted so a sharp subject doesn't bleed into
+  // a blurred foreground; the reverse leak (background bokeh over the subject
+  // edge) is damped less — that soft halo is what real lenses do. Scene layer
+  // only: the composited background (solid / 360 / effect) stays sharp, which
+  // is invisible while it sits at infinity behind a far-blurred stage.
+  var scenePm = vec4f(combined * alpha, alpha);
+  if (dofU[0].x > 0.5) {
+    let centerDepth = linearDepth(coord);
+    let centerCoc = circleOfConfusion(centerDepth);
+    let radius = abs(centerCoc);
+    if (radius > 0.35) {
+      let fullSzI = vec2<i32>(fullSz);
+      let sampleCount = clamp(dofU[1].z, 6.0, 24.0);
+      let blades = clamp(dofU[1].y, 3.0, 12.0);
+      let sector = 6.28318530718 / blades;
+      var accum = scenePm;
+      var weightSum = 1.0;
+      for (var i = 0u; i < 24u; i++) {
+        if (f32(i) >= sampleCount) { break; }
+        let fi = f32(i) + 0.5;
+        let ring = sqrt(fi / sampleCount);
+        let angle = fi * 2.39996323;
+        let localAngle = (fract((angle + 3.14159265359) / sector) - 0.5) * sector;
+        let polygonRadius = cos(3.14159265359 / blades) / max(cos(localAngle), 0.01);
+        var disk = vec2f(cos(angle), sin(angle)) * ring * polygonRadius;
+        disk.x *= max(dofU[1].w, 0.25);
+        let sp = coord + vec2<i32>(round(disk * radius));
+        let cp = clamp(sp, vec2<i32>(0), fullSzI - vec2<i32>(1));
+        let sampleDepth = linearDepth(cp);
+        let sampleCoc = circleOfConfusion(sampleDepth);
+        var w = 1.0;
+        if (centerCoc < 0.0 && sampleDepth > centerDepth + dofU[0].z) {
+          w *= 0.08;
+        } else if (centerCoc > 0.0 && sampleDepth > centerDepth + dofU[0].z * 2.0) {
+          w *= 0.35;
+        }
+        // A tap only contributes where its own blur circle reaches this pixel.
+        let sampleRadius = abs(sampleCoc);
+        w *= mix(0.2, 1.0, smoothstep(ring * radius - 1.0, ring * radius + 1.0, sampleRadius));
+        accum += sceneSample(cp, fullSzI, fullSz) * w;
+        weightSum += w;
+      }
+      scenePm = mix(scenePm, accum / max(weightSum, 1e-5), smoothstep(0.35, 1.75, radius));
+    }
+  }
+  let sceneAlpha = scenePm.a;
+  let sceneStraight = scenePm.rgb / max(sceneAlpha, 1e-6);
+
+  let exposed = sceneStraight * exp2(viewU[0].x);
   let tm = vec3f(filmic(exposed.r), filmic(exposed.g), filmic(exposed.b));
   var disp = max(tm, vec3f(0.0));
   // Grade the SCENE only, before the display gamma. Deliberately not applied to
@@ -158,7 +251,7 @@ const COMPOSITE_BODY = /* wgsl */ `
     }
     BG_EFFECT_CALL
   }
-  return vec4f(disp * alpha + bgPm * (1.0 - alpha), alpha + bgA * (1.0 - alpha));
+  return vec4f(disp * sceneAlpha + bgPm * (1.0 - sceneAlpha), sceneAlpha + bgA * (1.0 - sceneAlpha));
 }
 `
 
@@ -192,7 +285,9 @@ const USES_DERIVATIVES = /\b(?:fwidth|dpdx|dpdy)(?:Fine|Coarse)?\s*\(/
  *  uniform control flow and forgo the gate. */
 function coverageGate(effect?: CompositeEffectSource | null): string {
   const gated = !effect || !USES_DERIVATIVES.test(effect.wgsl)
-  return gated ? "&& alpha < 0.999" : ""
+  // sceneAlpha, not alpha: the bokeh gather spreads coverage, so a pixel the
+  // sharp scene fully covered can end up needing background behind its blur.
+  return gated ? "&& sceneAlpha < 0.999" : ""
 }
 
 export function buildCompositeShader(effect?: CompositeEffectSource | null): string {

@@ -1141,42 +1141,6 @@ export class Model {
     return this.skeleton.inverseBindMatrices
   }
 
-  /** World-space positions of `count` vertices sampled evenly across the mesh
-   *  under the CURRENT pose — the model's skinning replayed on the CPU for
-   *  this one call, root transform included. Feed to Engine.emitParticles for
-   *  dissolve/materialize effects shaped like the model itself. */
-  sampleSurfacePoints(count: number): Float32Array {
-    const skin = this.getSkinMatrices()
-    const joints = this.skinning.joints
-    const weights = this.skinning.weights
-    const n = this.vertexCount
-    const c = Math.max(1, Math.min(count, n))
-    const out = new Float32Array(c * 3)
-    const step = n / c
-    for (let i = 0; i < c; i++) {
-      const v = Math.min(n - 1, Math.floor(i * step + Math.random() * step))
-      const vi = v * VERTEX_STRIDE
-      const px = this.vertexData[vi]
-      const py = this.vertexData[vi + 1]
-      const pz = this.vertexData[vi + 2]
-      let x = 0
-      let y = 0
-      let z = 0
-      for (let j = 0; j < 4; j++) {
-        const w = weights[v * 4 + j] / 255
-        if (w === 0) continue
-        const m = joints[v * 4 + j] * 16
-        x += w * (skin[m] * px + skin[m + 4] * py + skin[m + 8] * pz + skin[m + 12])
-        y += w * (skin[m + 1] * px + skin[m + 5] * py + skin[m + 9] * pz + skin[m + 13])
-        z += w * (skin[m + 2] * px + skin[m + 6] * py + skin[m + 10] * pz + skin[m + 14])
-      }
-      out[i * 3] = x
-      out[i * 3 + 1] = y
-      out[i * 3 + 2] = z
-    }
-    return out
-  }
-
   getSkinMatrices(): Float32Array {
     const boneCount = this.skeleton.bones.length
     const worldMats = this.runtimeSkeleton.worldMatrices

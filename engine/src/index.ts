@@ -1,12 +1,14 @@
 export {
   Engine,
   DEFAULT_BLOOM_OPTIONS,
+  DEFAULT_DEPTH_OF_FIELD_OPTIONS,
   DEFAULT_VIEW_TRANSFORM,
   DEFAULT_COLOR_GRADING,
   type ColorGradingOptions,
   type EngineStats,
   type EngineOptions,
   type BloomOptions,
+  type DepthOfFieldOptions,
   type ViewTransformOptions,
   type LoadModelFromFilesOptions,
   type MaterialPreset,
@@ -99,4 +101,3 @@ export { PmxLoader } from "./pmx-loader"
 export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"
 export type { WindOptions } from "./physics/world"
-export { type ParticleEmitOptions } from "./particles"

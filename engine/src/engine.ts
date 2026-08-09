@@ -5,7 +5,6 @@ import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
-import { ParticleSystem, type ParticleEmitOptions } from "./particles"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
 import type { WindOptions } from "./physics/world"
@@ -274,6 +273,42 @@ export const DEFAULT_BLOOM_OPTIONS: BloomOptions = {
   color: new Vec3(1.0, 0.7247558832168579, 0.6487361788749695),
   intensity: 0.05,
   clamp: 0.0,
+}
+
+/** Camera depth of field — a bokeh gather in the composite pass. Costs nothing
+ *  while disabled: the scene pass discards its depth buffer and the composite
+ *  branch never runs. Enabled, the pass stores depth and the gather reads it. */
+export type DepthOfFieldOptions = {
+  enabled: boolean
+  /** "auto" focuses the first visible character each frame — the camera-space
+   *  depth span of its bones sets both distance and a floor on range — so a
+   *  dancer stays sharp without anyone touching a slider. "manual" uses
+   *  focusDistance/focusRange as given. */
+  focusMode: "auto" | "manual"
+  /** Camera-space distance to the focus plane (MMD units). */
+  focusDistance: number
+  /** Depth band that stays perfectly sharp, centered on focusDistance. In auto
+   *  mode this is a minimum — the band never cuts into the subject. */
+  focusRange: number
+  /** Blur strength scale; 1 is a natural lens, higher is dreamier. */
+  aperture: number
+  /** Largest blur circle, in device pixels. */
+  maxBlurRadius: number
+  /** Bokeh polygon blade count (3–12); 6 is the classic hexagon. */
+  bladeCount: number
+  /** Gather tap count: 8 / 16 / 24. */
+  quality: "performance" | "balanced" | "cinematic"
+}
+
+export const DEFAULT_DEPTH_OF_FIELD_OPTIONS: DepthOfFieldOptions = {
+  enabled: false,
+  focusMode: "auto",
+  focusDistance: 25,
+  focusRange: 2,
+  aperture: 1,
+  maxBlurRadius: 18,
+  bladeCount: 6,
+  quality: "balanced",
 }
 
 /** Blender Color Management / View (rendering.txt: Filmic, exposure, gamma). `look` is reserved for future curve tweaks. */
@@ -718,8 +753,6 @@ export class Engine {
   private multisampleMaskTexture!: GPUTexture
   private maskResolveTexture!: GPUTexture
   private maskResolveView!: GPUTextureView
-  /** One-shot particle emissions (emitParticles); lazily built on first emit. */
-  private particles: ParticleSystem | null = null
   private renderPassDescriptor!: GPURenderPassDescriptor
   private compositePassDescriptor!: GPURenderPassDescriptor
   // Two specialized composite pipelines via WGSL pipeline-override constants.
@@ -731,6 +764,12 @@ export class Engine {
   private morphComputeBindGroupLayout!: GPUBindGroupLayout
   private compositeBindGroupLayout!: GPUBindGroupLayout
   private compositeBindGroup!: GPUBindGroup
+  private depthOfField: DepthOfFieldOptions = { ...DEFAULT_DEPTH_OF_FIELD_OPTIONS }
+  private dofUniformBuffer!: GPUBuffer
+  private dofUniformData = new Float32Array(12)
+  private dofFocusScratch = new Vec3(0, 0, 0)
+  /** Depth-only view of the scene's MSAA depth buffer, read by the DoF gather. */
+  private depthReadView: GPUTextureView | null = null
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
   private readonly compositeUniformData = new Float32Array(40)
@@ -1082,7 +1121,7 @@ export class Engine {
   }
 
   private rebuildCompositeBindGroup(): void {
-    if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView) return
+    if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView || !this.depthReadView) return
     this.compositeBindGroup = this.device.createBindGroup({
       label: "composite bind group",
       layout: this.compositeBindGroupLayout,
@@ -1095,6 +1134,8 @@ export class Engine {
         { binding: 5, resource: this.filmicLutView },
         { binding: 6, resource: this.backdropEquirectView ?? this.fallbackEquirectView },
         { binding: 7, resource: { buffer: this.backgroundEffect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
+        { binding: 8, resource: this.depthReadView },
+        { binding: 9, resource: { buffer: this.dofUniformBuffer } },
       ],
     })
   }
@@ -1306,6 +1347,86 @@ export class Engine {
   }
 
   /** Patch bloom; GPU uniforms update immediately if `init()` has run. */
+  /** Camera depth of field (see DepthOfFieldOptions). Free while disabled —
+   *  the scene pass only stores its depth buffer on frames the gather reads. */
+  setDepthOfField(patch: Partial<DepthOfFieldOptions>): void {
+    this.depthOfField = { ...this.depthOfField, ...patch }
+    if (!this.device || !this.dofUniformBuffer) return
+    if (this.depthOfField.enabled) {
+      this.writeDepthOfFieldUniforms()
+    } else {
+      // One last write so the shader's uniform branch reads a clean zero.
+      this.dofUniformData[0] = 0
+      this.device.queue.writeBuffer(this.dofUniformBuffer, 0, this.dofUniformData)
+    }
+  }
+
+  getDepthOfField(): DepthOfFieldOptions {
+    return { ...this.depthOfField }
+  }
+
+  /** Auto-focus target: the camera-space depth span of the first visible
+   *  character's bones. Focus sits at the span's midpoint; the range covers the
+   *  span plus a margin for what bones don't reach (shoes, hair, cloth). */
+  private getModelBodyFocus(): { distance: number; range: number } | null {
+    if (!this.camera) return null
+    const view = this.camera.getViewMatrix().values
+    for (const inst of this.modelInstances.values()) {
+      if (!inst.model.visible || inst.isStage) continue
+      const model = inst.model
+      const matrices = model.getWorldMatrices()
+      if (matrices.length === 0) continue
+      const scale = model.scale
+      const local = this.dofFocusScratch
+      let minDepth = Infinity
+      let maxDepth = -Infinity
+      for (const matrix of matrices) {
+        const values = matrix.values
+        // Bone matrices are model-space; apply the same root transform the
+        // renderer bakes into skinning, then take camera-space z.
+        local.setXYZ(values[12] * scale, values[13] * scale, values[14] * scale)
+        Quat.rotateVecInto(model.rotation, local, local)
+        const x = model.position.x + local.x
+        const y = model.position.y + local.y
+        const z = model.position.z + local.z
+        const depth = view[2] * x + view[6] * y + view[10] * z + view[14]
+        if (!Number.isFinite(depth) || depth <= this.camera.near) continue
+        minDepth = Math.min(minDepth, depth)
+        maxDepth = Math.max(maxDepth, depth)
+      }
+      if (Number.isFinite(minDepth) && Number.isFinite(maxDepth)) {
+        const span = Math.max(0, maxDepth - minDepth)
+        const meshMargin = Math.max(2.0, span * 0.15)
+        return { distance: (minDepth + maxDepth) * 0.5, range: Math.max(2.0, span + meshMargin) }
+      }
+    }
+    return null
+  }
+
+  private writeDepthOfFieldUniforms(): void {
+    if (!this.device || !this.dofUniformBuffer) return
+    const d = this.depthOfField
+    const u = this.dofUniformData
+    const auto = d.focusMode === "auto" ? this.getModelBodyFocus() : null
+    u[0] = d.enabled ? 1 : 0
+    u[1] = auto?.distance ?? Math.max(d.focusDistance, 0.05)
+    // In auto mode the authored range is a floor — the sharp band never cuts
+    // into the character's own depth span.
+    u[2] = Math.max(d.focusRange, auto?.range ?? 0.02, 0.02)
+    u[3] = Math.max(d.aperture, 0)
+    u[4] = Math.max(d.maxBlurRadius, 0)
+    u[5] = Math.min(12, Math.max(3, Math.round(d.bladeCount)))
+    u[6] = d.quality === "performance" ? 8 : d.quality === "cinematic" ? 24 : 16
+    u[7] = 1 // anamorphic ratio, reserved (the shader clamps ≥ 0.25)
+    // viewZ = projB / (z − projA), the inverse of perspectiveInto's z mapping.
+    // near/far track the camera radius, so these refresh every enabled frame.
+    const near = this.camera.near
+    const far = this.camera.far
+    u[8] = (far + near) / (far - near)
+    u[9] = (-2 * near * far) / (far - near)
+    this.device.queue.writeBuffer(this.dofUniformBuffer, 0, u)
+  }
+
   setBloomOptions(patch: Partial<BloomOptions>): void {
     const b = this.bloomSettings
     if (patch.enabled !== undefined) b.enabled = patch.enabled
@@ -2172,6 +2293,12 @@ export class Engine {
       size: 160,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    this.dofUniformBuffer = this.device.createBuffer({
+      label: "depth of field uniforms",
+      // 3 × vec4f — see the dofU comment in composite.ts.
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
     this.bgParamsDummyBuffer = this.device.createBuffer({
       label: "bg effect params (dummy)",
       size: 16,
@@ -2194,6 +2321,15 @@ export class Engine {
         // User background-effect params — dummy buffer when no effect is set. The
         // layout is explicit, so the base shader legally ignores the binding.
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The scene pass's MSAA depth, depth-only aspect — read by the DoF
+        // gather. Contents are undefined while DoF is off (the scene pass
+        // discards depth then), and the shader never reads it then either.
+        {
+          binding: 8,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "depth", viewDimension: "2d", multisampled: true },
+        },
+        { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({
@@ -2439,10 +2575,13 @@ export class Engine {
         size: [width, height],
         sampleCount: Engine.MULTISAMPLE_COUNT,
         format: "depth24plus-stencil8",
-        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        // TEXTURE_BINDING for the DoF gather — a usage flag, not a copy; the
+        // zero-cost-when-off story lives in depthStoreOp, not here.
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
 
       const depthTextureView = this.depthTexture.createView()
+      this.depthReadView = this.depthTexture.createView({ aspect: "depth-only" })
 
       // storeOp="discard" on MSAA views keeps per-sample data in Apple TBDR tile memory —
       // only the resolveTarget (hdrResolveTexture / maskResolveView) gets written to RAM.
@@ -2923,24 +3062,6 @@ export class Engine {
     this.camera.fov = fov
   }
 
-  /** Fire a one-shot particle effect (see ParticleEmitOptions): "burst" scatters
-   *  glowing sparks from the given world points, "converge" condenses them onto
-   *  the points. Pair with Model.sampleSurfacePoints for dissolve/materialize
-   *  transitions shaped like the model. Stateless GPU particles — the emission
-   *  cleans itself up when it expires. */
-  emitParticles(opts: ParticleEmitOptions): void {
-    if (!this.device) return
-    if (!this.particles) {
-      this.particles = new ParticleSystem(this.device, this.cameraUniformBuffer, {
-        hdr: this.hdrFormat,
-        mask: Engine.BLOOM_MASK_FORMAT,
-        depth: "depth24plus-stencil8",
-        sampleCount: Engine.MULTISAMPLE_COUNT,
-      })
-    }
-    this.particles.emit(opts, performance.now() / 1000)
-  }
-
   // Step 5: Create lighting buffers
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
@@ -3096,8 +3217,6 @@ export class Engine {
     this.forEachInstance((inst) => inst.model.stop())
     if (Engine.instance === this) Engine.instance = null
     if (this.camera) this.camera.detachControl()
-    this.particles?.dispose()
-    this.particles = null
 
     // Remove raycasting event listeners
     if (this.onRaycast) {
@@ -5093,6 +5212,14 @@ export class Engine {
     this.updateCameraUniforms()
     this.updateShadowLightVP()
 
+    // Depth of field's entire disabled cost is this branch: depth stays in
+    // TBDR tile memory (discard) unless the composite gather reads it this
+    // frame. Enabled frames also refresh the uniforms — auto-focus tracks the
+    // character and the depth-inversion constants track near/far.
+    const dofOn = this.depthOfField.enabled
+    this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = dofOn ? "store" : "discard"
+    if (dofOn) this.writeDepthOfFieldUniforms()
+
     const encoder = this.device.createCommandEncoder()
 
     // GPU vertex morphs: write morphed positions into vertex buffers before any pass reads
@@ -5139,9 +5266,6 @@ export class Engine {
       this.forEachInstance((inst) => {
         if (inst.model.visible) this.renderModelTransparentPhase(pass, inst)
       })
-    // Particle emissions last: additive light over everything, depth-tested
-    // against the scene, feeding the bloom mask so the sparks glow.
-    this.particles?.draw(pass, performance.now() / 1000)
     pass.end()
 
     // Bloom pyramid (EEVEE 3.6):
