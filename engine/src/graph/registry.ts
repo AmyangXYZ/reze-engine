@@ -298,7 +298,7 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   bsdf_diffuse: {
     inputs: { color: C([0.8, 0.8, 0.8], true) },
     outputs: { color: "color" },
-    emit: (a) => `${a.color} * shader_to_rgb_diffuse(n, l, sun, amb, shadow)`,
+    emit: (a) => `${a.color} * shader_to_rgb_lit(n, l, sun, amb, shadow)`,
   },
 
   // ── Nodes with no meaning on a PMX, answered honestly with a constant ──
@@ -569,10 +569,35 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   },
 
   // ── Lighting capture ──
+  /**
+   * Shader → RGB on a white diffuse closure, reduced to a scalar.
+   *
+   * Rec.709 luminance, kept exactly as it was: every shipped preset ramps this,
+   * and changing the weights would move every terminator in the library.
+   */
   shader_to_rgb_diffuse: {
     inputs: {},
     outputs: { value: "float" },
     emit: () => `shader_to_rgb_diffuse(n, l, sun, amb, shadow)`,
+  },
+
+  /**
+   * The same closure as a COLOUR, which is what Blender's Shader to RGB
+   * actually returns.
+   *
+   * A warm sun against a cool ambient radiates warm light and cool shadow, and
+   * that colour IS the look in most of this style. Reducing it to luminance
+   * first — the only thing reachable before — leaves every ramp working on grey.
+   *
+   * Linking this into a scalar socket still yields a float, because Blender's
+   * own implicit Color → Value conversion (BT.601) happens at the link. So the
+   * two nodes differ only in whether the graph wants the colour or the scalar,
+   * and each gets Blender's answer for its own question.
+   */
+  shader_to_rgb: {
+    inputs: {},
+    outputs: { color: "color" },
+    emit: () => `shader_to_rgb_lit(n, l, sun, amb, shadow)`,
   },
 
   // ── Vector ──

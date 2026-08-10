@@ -545,11 +545,34 @@ fn layer_weight_facing(blend: f32, n: vec3f, v: vec3f) -> f32 {
 // Eevee captures lit diffuse: (albedo/π)*sun*N·L*shadow + ambient (linear). Albedo=1.
 // Matches default.ts direct term scale so VALTORGB thresholds from Blender JSON stay valid.
 
-fn shader_to_rgb_diffuse(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f, shadow: f32) -> f32 {
+/**
+ * Shader → RGB on a white diffuse closure, as a COLOUR.
+ *
+ * Blender's ShaderToRGB hands back what the closure actually radiates, and that
+ * is coloured: a warm sun against a cool ambient gives warm light and cool
+ * shadow, which is most of what an NPR ramp is reading. Collapsing it to
+ * luminance first — which this used to do — throws that away and leaves every
+ * ramp working on grey.
+ *
+ * Feeding this into a scalar socket still yields a float, because Blender's own
+ * implicit Color → Value conversion (BT.601, see color_to_value) does it at the
+ * link. So a graph that wants the scalar gets Blender's scalar, and one that
+ * wants the colour now gets that too.
+ *
+ * The maths matches 5.2's bxdf_diffuse_eval, which is saturate(dot(N,L))
+ * integrated against a cosine distribution: radiance = E·N·L/π for the sun, plus
+ * the world's own irradiance. EEVEE Next's extra transport — probe GI, virtual
+ * shadow maps, ray-traced bounce — is machinery rather than a term, and is not
+ * here.
+ */
+fn shader_to_rgb_lit(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f, shadow: f32) -> vec3f {
   const PI_S: f32 = 3.141592653589793;
   let ndotl = max(dot(n, l), 0.0);
-  let rgb = sun_rgb * (ndotl * shadow / PI_S) + ambient_rgb;
-  return luminance_rec709_linear(rgb);
+  return sun_rgb * (ndotl * shadow / PI_S) + ambient_rgb;
+}
+
+fn shader_to_rgb_diffuse(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f, shadow: f32) -> f32 {
+  return luminance_rec709_linear(shader_to_rgb_lit(n, l, sun_rgb, ambient_rgb, shadow));
 }
 
 // ─── BUMP node ──────────────────────────────────────────────────────
