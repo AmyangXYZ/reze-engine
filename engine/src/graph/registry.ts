@@ -235,6 +235,86 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   "mix/value": { inputs: { fac: F(0.5), a: C([1, 1, 1], true), b: C() }, outputs: { color: "color" }, emit: (a) => `mix_value(${a.fac}, ${a.a}, ${a.b})` },
   "mix/color": { inputs: { fac: F(0.5), a: C([1, 1, 1], true), b: C() }, outputs: { color: "color" }, emit: (a) => `mix_color_blend(${a.fac}, ${a.a}, ${a.b})` },
 
+  // ── RGB Curves, sampled. See rgb_curve in nodes.ts for why five. ──
+  rgb_curve: {
+    inputs: {
+      color: C([1, 1, 1], true),
+      fac: F(1),
+      y0: F(0),
+      y1: F(0.25),
+      y2: F(0.5),
+      y3: F(0.75),
+      y4: F(1),
+    },
+    outputs: { color: "color" },
+    emit: (a) => `mix(${a.color}, rgb_curve(${a.color}, ${a.y0}, ${a.y1}, ${a.y2}, ${a.y3}, ${a.y4}), ${a.fac})`,
+  },
+  // UV Map — one layer on a PMX, which is the mesh UV the texture node uses.
+  uv_map: {
+    inputs: {},
+    outputs: { uv: "vector" },
+    contextOutputs: { uv: "vec3f(input.uv, 0.0)" },
+  },
+
+  // ── Normal Map, Vector Transform ──
+  normal_map: {
+    inputs: { color: C([0.5, 0.5, 1], true), strength: F(1) },
+    outputs: { normal: "vector" },
+    emit: (a) => `node_normal_map(${a.color}, ${a.strength}, n, input.worldPos, input.uv)`,
+  },
+  "vector_transform/world_to_camera": {
+    inputs: { vector: V([0, 0, 0], true) },
+    outputs: { vector: "vector" },
+    emit: (a) => `vector_world_to_camera(${a.vector})`,
+  },
+  "vector_transform/camera_to_world": {
+    inputs: { vector: V([0, 0, 0], true) },
+    outputs: { vector: "vector" },
+    emit: (a) => `vector_camera_to_world(${a.vector})`,
+  },
+  "vector_transform/point_world_to_camera": {
+    inputs: { vector: V([0, 0, 0], true) },
+    outputs: { vector: "vector" },
+    emit: (a) => `point_world_to_camera(${a.vector})`,
+  },
+
+  // ── Shader nodes. Shaders travel as RGB here (see shader_to_rgb_diffuse), so
+  // a "transparent" shader is the colour that contributes nothing; the actual
+  // cutout is the group's alphaMode, which is where transparency belongs in a
+  // rasteriser without order-independent blending.
+  bsdf_transparent: { inputs: {}, outputs: { color: "color" }, emit: () => `vec3f(0.0)` },
+  bsdf_diffuse: {
+    inputs: { color: C([0.8, 0.8, 0.8], true) },
+    outputs: { color: "color" },
+    emit: (a) => `${a.color} * shader_to_rgb_diffuse(n, l, sun, amb, shadow)`,
+  },
+
+  // ── Nodes with no meaning on a PMX, answered honestly with a constant ──
+  // Each returns what Blender returns for the absent case, so a graph that reads
+  // one degrades to a sensible look instead of failing to compile. Documented
+  // rather than silently wrong.
+  //
+  // attribute: MMD meshes carry no vertex colour layer, so Color reads white and
+  // Fac reads 1 — the identity for the multiply these usually feed.
+  attribute: {
+    inputs: {},
+    outputs: { color: "color", fac: "float" },
+    contextOutputs: { color: "vec3f(1.0)", fac: "1.0" },
+  },
+  // object_info: one model, one instance — Random is the only field with a real
+  // use (per-instance variation) and there are no instances to vary.
+  object_info: {
+    inputs: {},
+    outputs: { location: "vector", color: "color", random: "float" },
+    contextOutputs: { location: "vec3f(0.0)", color: "vec3f(1.0)", random: "0.0" },
+  },
+  // light_path: this is a raster pass, so every shaded fragment IS a camera ray.
+  light_path: {
+    inputs: {},
+    outputs: { is_camera_ray: "float", is_shadow_ray: "float", ray_depth: "float" },
+    contextOutputs: { is_camera_ray: "1.0", is_shadow_ray: "0.0", ray_depth: "0.0" },
+  },
+
   // ── Image Texture on a style-group slot ──
   // The PMX gives a material ONE image; this style needs several, so the extra
   // maps ride on the group. Slot is part of the type because it selects a

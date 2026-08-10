@@ -184,6 +184,87 @@ fn math_arctan2(a: f32, b: f32) -> f32 { return atan2(a, b); }
 fn math_radians(a: f32) -> f32 { return radians(a); }
 fn math_degrees(a: f32) -> f32 { return degrees(a); }
 
+// ─── RGB Curves, as five samples ──────────────────────────────────
+
+/**
+ * Blender's RGB Curves holds arbitrary control points, which cannot cross into a
+ * shader as sockets. So the curve arrives SAMPLED: five values at t = 0, .25,
+ * .5, .75, 1, and this rebuilds it with the same monotone (Fritsch-Carlson)
+ * interpolation the Filmic LUT uses — C1 continuous, and it cannot overshoot,
+ * which matters because a curve that overshoots turns a highlight roll-off into
+ * a bright ring.
+ *
+ * Five points captures the levels-and-contrast adjustments these curves are
+ * actually used for. A curve with more structure than that will not survive, and
+ * should be a ramp instead.
+ */
+fn curve_slope(d0: f32, d1: f32) -> f32 {
+  if (d0 * d1 <= 0.0) { return 0.0; }
+  let m = (d0 + d1) * 0.5;
+  return sign(d0) * min(abs(m), 2.0 * min(abs(d0), abs(d1)));
+}
+fn curve5(t0: f32, y0: f32, y1: f32, y2: f32, y3: f32, y4: f32) -> f32 {
+  let t = clamp(t0, 0.0, 1.0) * 4.0;
+  let i = min(floor(t), 3.0);
+  let f = t - i;
+  let ys = array<f32, 5>(y0, y1, y2, y3, y4);
+  let k = i32(i);
+  let pa = ys[k];
+  let pb = ys[k + 1];
+  // Secants either side of each knot, clamped at the ends.
+  let dPrev = select(ys[max(k, 1)] - ys[max(k, 1) - 1], pb - pa, k == 0);
+  let dHere = pb - pa;
+  let dNext = select(ys[min(k + 2, 4)] - ys[min(k + 1, 3)], pb - pa, k == 3);
+  let m0 = curve_slope(dPrev, dHere);
+  let m1 = curve_slope(dHere, dNext);
+  let f2 = f * f;
+  let f3 = f2 * f;
+  return (2.0 * f3 - 3.0 * f2 + 1.0) * pa + (f3 - 2.0 * f2 + f) * m0 +
+         (-2.0 * f3 + 3.0 * f2) * pb + (f3 - f2) * m1;
+}
+fn rgb_curve(c: vec3f, y0: f32, y1: f32, y2: f32, y3: f32, y4: f32) -> vec3f {
+  return vec3f(
+    curve5(c.r, y0, y1, y2, y3, y4),
+    curve5(c.g, y0, y1, y2, y3, y4),
+    curve5(c.b, y0, y1, y2, y3, y4),
+  );
+}
+
+// ─── Normal Map / Vector Transform ────────────────────────────────
+
+/**
+ * Normal Map, with the tangent frame derived rather than read.
+ *
+ * Blender reads a per-vertex tangent; PMX files do not carry one, so there is
+ * nothing to read. The frame is rebuilt per-pixel from screen-space derivatives
+ * of position and UV — the standard substitute, exact on flat-ish shading and
+ * off only where UVs are severely sheared. Cheaper than the alternative (running
+ * a tangent-generation pass over every imported mesh) and invisible on the
+ * character work this is for.
+ */
+fn node_normal_map(color: vec3f, strength: f32, N: vec3f, worldPos: vec3f, uv: vec2f) -> vec3f {
+  let dp1 = dpdx(worldPos);
+  let dp2 = dpdy(worldPos);
+  let duv1 = dpdx(uv);
+  let duv2 = dpdy(uv);
+  let det = duv1.x * duv2.y - duv2.x * duv1.y;
+  if (abs(det) < 1e-12) { return N; }
+  let inv = 1.0 / det;
+  let T = safe_normal((dp1 * duv2.y - dp2 * duv1.y) * inv);
+  let B = safe_normal(cross(N, T));
+  // Tangent-space [0,1] → [-1,1], then into world.
+  let t = color * 2.0 - vec3f(1.0);
+  let mapped = safe_normal(T * t.x + B * t.y + N * t.z);
+  return safe_normal(mix(N, mapped, clamp(strength, 0.0, 1.0)));
+}
+
+/** Vector Transform, world ↔ camera. Object space IS world here: a PMX model is
+ *  placed by its own transform and shaded in world space, so there is no
+ *  separate object frame to convert into. */
+fn vector_world_to_camera(v: vec3f) -> vec3f { return (camera.view * vec4f(v, 0.0)).xyz; }
+fn vector_camera_to_world(v: vec3f) -> vec3f { return (transpose(camera.view) * vec4f(v, 0.0)).xyz; }
+fn point_world_to_camera(p: vec3f) -> vec3f { return (camera.view * vec4f(p, 1.0)).xyz; }
+
 // ─── Style-group image maps (Image Texture on a non-PMX slot) ──────
 // One function per slot because WGSL has no texture arrays-of-bindings here; the
 // slot is topology, exactly like a Math node's operation.
