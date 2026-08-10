@@ -31,6 +31,7 @@ import {
   BLOOM_DOWNSAMPLE_SHADER_WGSL,
   BLOOM_UPSAMPLE_SHADER_WGSL,
 } from "./shaders/passes/bloom"
+import { AGX_LUT_GZ, AGX_LUT_SIZE } from "./shaders/agx-lut"
 import { buildCompositeShader } from "./shaders/passes/composite"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
@@ -333,7 +334,7 @@ export type ViewTransformOptions = {
    *
    * "filmic" is Blender 3.6's Filmic, Medium High Contrast, baked as a LUT.
    */
-  transform: "filmic" | "standard"
+  transform: "agx" | "filmic" | "standard"
 }
 
 // Matches the reference Blender project: Filmic view, Medium High Contrast look,
@@ -815,6 +816,8 @@ export class Engine {
      *  STORE its depth, which it otherwise discards into tile memory. */
     hasForeground: boolean
   } | null = null
+  private agxLutTexture: GPUTexture | null = null
+  private agxFallbackTexture!: GPUTexture
   /** Bound at composite binding 7 when no effect (or a param-less one) is set. */
   private bgParamsDummyBuffer!: GPUBuffer
   private compositePipelineLayout!: GPUPipelineLayout
@@ -1092,7 +1095,7 @@ export class Engine {
     // rebuilt per effect, so the compiled variant IS the flag.
     u[11] = this.backdropEquirectView ? 2 : bg ? 1 : 0
     // Which display transform forms the frame (see viewTransform in composite.ts).
-    u[25] = v.transform === "standard" ? 1 : 0
+    u[25] = v.transform === "agx" ? 2 : v.transform === "standard" ? 1 : 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
@@ -1163,6 +1166,7 @@ export class Engine {
         { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
+        { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
       ],
     })
   }
@@ -1653,6 +1657,37 @@ export class Engine {
   // smooth gradients) while still passing through every anchor (look preserved) and staying
   // monotone (no tonemap overshoot/ringing). Domain is uniform in log2 space: anchor k sits
   // at t=k, k=0..13 (t = log2(linear)+10). See composite.ts::filmic for the sampling map.
+  /**
+   * Decompress and upload Blender's AgX cube.
+   *
+   * Deliberately off the critical path: it is 723 KB once inflated, and a frame
+   * rendered before it lands should show the scene under whatever transform is
+   * already there rather than wait. Until then binding 10 holds a 1×1×1 stand-in,
+   * which is only ever sampled if someone selects AgX in that window.
+   */
+  private async loadAgxLut(): Promise<void> {
+    try {
+      const packed = Uint8Array.from(atob(AGX_LUT_GZ), (ch) => ch.charCodeAt(0))
+      const stream = new Blob([packed]).stream().pipeThrough(new DecompressionStream("gzip"))
+      const bytes = new Uint8Array(await new Response(stream).arrayBuffer())
+      const n = AGX_LUT_SIZE
+      if (bytes.byteLength !== n * n * n * 4) throw new Error(`AgX LUT is ${bytes.byteLength} bytes, expected ${n ** 3 * 4}`)
+      const tex = this.device.createTexture({
+        label: "AgX 57³ LUT",
+        size: [n, n, n],
+        dimension: "3d",
+        format: "rgb10a2unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      // .cube order is red fastest, which is exactly a 3D texture's own layout.
+      this.device.queue.writeTexture({ texture: tex }, bytes, { bytesPerRow: n * 4, rowsPerImage: n }, [n, n, n])
+      this.agxLutTexture = tex
+      this.rebuildCompositeBindGroup()
+    } catch {
+      // A missing LUT costs AgX, not the renderer — the other transforms stand.
+    }
+  }
+
   private bakeFilmicLut() {
     const anchors = [
       0.0028, 0.0068, 0.0151, 0.0313, 0.061, 0.112, 0.192, 0.306, 0.459, 0.631, 0.82, 0.907, 0.962, 0.989,
@@ -2065,6 +2100,14 @@ export class Engine {
 
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
     this.bakeBrdfLut()
+    this.agxFallbackTexture = this.device.createTexture({
+      label: "AgX LUT fallback",
+      size: [1, 1, 1],
+      dimension: "3d",
+      format: "rgb10a2unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    void this.loadAgxLut()
     this.bakeFilmicLut()
 
     // Now that shadow resources exist, create the main per-frame bind group
@@ -2400,6 +2443,9 @@ export class Engine {
           texture: { sampleType: "depth", viewDimension: "2d", multisampled: true },
         },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // AgX's 57³ cube. Decompressed and uploaded off the critical path, so a
+        // 1×1×1 stand-in keeps the bind group valid until it arrives.
+        { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({

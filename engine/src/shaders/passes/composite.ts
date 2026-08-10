@@ -104,6 +104,9 @@ override APPLY_GAMMA: bool = true;
 //           track the camera radius. Cleared depth (1.0) inverts to the far
 //           plane, so empty sky reads as maximally defocused background.
 @group(0) @binding(9) var<uniform> dofU: array<vec4<f32>, 3>;
+// Blender's AgX, as the 57³ lookup it ships as rather than a reconstruction of
+// it. Sampled in the log-encoded E-Gamut space the cube expects — see agxTransform.
+@group(0) @binding(10) var agxLut: texture_3d<f32>;
 
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
 const FILMIC_LUT_W: f32 = 256.0;
@@ -155,13 +158,47 @@ fn srgb_encode(x: f32) -> f32 {
   return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
 }
 
-/** Which display transform, chosen per frame at viewU[6].y (0 filmic, 1 standard).
+/**
+ * AgX, the chain config.ocio states for "AgX Base Rec.1886" on an sRGB display:
+ *
+ *   scene-linear Rec.709 → 3x3 into FilmLight E-Gamut
+ *   → log2 across 25 stops, [-12.47393, +12.5261] → 0..1
+ *   → the 57³ cube
+ *   → Rec.1886 (pure γ2.4) decoded, then re-encoded as sRGB for the swapchain
+ *
+ * The last step is not pedantry: Rec.1886 is a pure power law and sRGB has a
+ * linear toe, so skipping it lifts the darkest few code values.
+ *
+ * Blender interpolates the cube tetrahedrally and a GPU sampler is trilinear.
+ * The difference is small and confined to saturated gradients; if it ever shows,
+ * tetrahedral is a dozen lines here.
+ */
+fn agxTransform(c: vec3f) -> vec3f {
+  let m = mat3x3<f32>(
+    vec3f(0.55937113, 0.07622071, 0.06552670),
+    vec3f(0.30478326, 0.78797183, 0.16454675),
+    vec3f(0.13584556, 0.13580748, 0.76992653),
+  );
+  let e = m * max(c, vec3f(0.0));
+  // The cube's domain: an unlit pixel would take log2 to -inf, so floor it at
+  // the bottom stop rather than sampling outside the LUT.
+  let t = clamp((log2(max(e, vec3f(1e-10))) + vec3f(12.47393)) / 25.0, vec3f(0.0), vec3f(1.0));
+  // Half-texel inset, so the end stops are the cube's own values and not a blend
+  // with the clamp-to-edge border.
+  let n = 57.0;
+  let uvw = t * ((n - 1.0) / n) + (0.5 / n);
+  let formed = textureSampleLevel(agxLut, bloomSamp, uvw, 0.0).rgb;
+  let linear = pow(max(formed, vec3f(0.0)), vec3f(2.4));
+  return vec3f(srgb_encode(linear.r), srgb_encode(linear.g), srgb_encode(linear.b));
+}
+
+/** Which display transform, chosen per frame at viewU[6].y (0 filmic, 1 standard, 2 agx).
  *  A uniform branch rather than a pipeline variant: switching is rare, and both
  *  arms are cheap enough that specialising the pipeline would buy nothing. */
 fn viewTransform(c: vec3f) -> vec3f {
-  if (viewU[6].y > 0.5) {
-    return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b));
-  }
+  let mode = viewU[6].y;
+  if (mode > 1.5) { return agxTransform(c); }
+  if (mode > 0.5) { return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b)); }
   return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));
 }
 
