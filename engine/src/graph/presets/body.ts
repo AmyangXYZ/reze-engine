@@ -55,7 +55,7 @@ export const BODY_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular: 0.5, roughness: 0.3, spec_clamp: 10.0, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 0.5, roughness: 0.3, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "p_sum", type: "add_shader" },
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.5 } },
@@ -92,7 +92,7 @@ export const BODY_GRAPH: ShaderGraph = {
     { from: { node: "noise_ramp", socket: "fac_out" }, to: { node: "principled_base", socket: "fac" } },
     { from: { node: "bc", socket: "color" }, to: { node: "principled_base", socket: "a" } },
     { from: { node: "bc", socket: "color" }, to: { node: "p_emit", socket: "color" } },
-    { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "bump", socket: "vector" }, to: { node: "principled", socket: "normal" } },
     { from: { node: "principled", socket: "color" }, to: { node: "p_sum", socket: "a" } },
     { from: { node: "p_emit", socket: "color" }, to: { node: "p_sum", socket: "b" } },

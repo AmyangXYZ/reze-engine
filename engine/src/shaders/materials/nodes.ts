@@ -858,6 +858,20 @@ fn pmx_sphere_map(base: vec3f, strength: f32, N: vec3f) -> vec3f {
   return base + sphere_rgb * amount;
 }
 
+/**
+ * Principled v2 reflectance: IOR sets it, the level scales it.
+ *
+ * Blender 3.6 took Specular directly, where 0.5 meant f0 = 0.04. v2 computes
+ * f0 from IOR — ((ior-1)/(ior+1))² — and Specular IOR Level scales that, with
+ * 0.5 meaning "the IOR's own value". Returned in the 3.6 convention the BSDF
+ * below still speaks (f0 = 0.08 · specular), so the two agree at their defaults
+ * and v2 wins whenever a preset moves either socket.
+ */
+fn principled_specular(ior: f32, level: f32) -> f32 {
+  let r = (ior - 1.0) / max(ior + 1.0, 1e-6);
+  return (r * r * 2.0 * max(level, 0.0)) / 0.08;
+}
+
 struct PrincipledIn {
   base: vec3f,
   metallic: f32,

@@ -44,7 +44,7 @@ export const HAIR_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular: 1.0, roughness: 0.3, spec_clamp: 10.0, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 1.0, roughness: 0.3, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.2 } },
   ],
@@ -71,7 +71,7 @@ export const HAIR_GRAPH: ShaderGraph = {
     { from: { node: "gate", socket: "value" }, to: { node: "gate_scale", socket: "a" } },
     { from: { node: "mix_shader_002", socket: "color" }, to: { node: "npr_add", socket: "a" } },
     { from: { node: "gate_scale", socket: "value" }, to: { node: "npr_add", socket: "b" } },
-    { from: { node: "bc", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "bc", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "npr_add", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "mix_shader_001", socket: "b" } },
   ],

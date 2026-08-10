@@ -109,6 +109,18 @@ const RAMP_OUTPUTS: Record<string, SockT> = { color: "color", alpha: "float", fa
 // routing through the BT.601 color→float conversion instead would change the value.
 const RAMP_SELECT = { color: ".rgb", alpha: ".a", fac_out: ".r" }
 
+/** Principled v2 reflectance, evaluated at compile time when it can be. */
+function foldSpecular(ior: string, level: string): string {
+  const i = Number(ior)
+  const l = Number(level)
+  if (!Number.isFinite(i) || !Number.isFinite(l)) return `principled_specular(${ior}, ${level})`
+  const r = (i - 1) / Math.max(i + 1, 1e-6)
+  // Snapped to 9 significant digits: the arithmetic leaves double noise
+  // (0.2² · 2 · 0.5 / 0.08 = 0.5000000000000001) that is meaningless in an f32
+  // and only makes the emitted shader harder to read.
+  return fmtFloat(Number(((r * r * 2 * Math.max(l, 0)) / 0.08).toPrecision(9)))
+}
+
 export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // ── Context inputs (template locals; no emission) ──
   texture: {
@@ -613,19 +625,56 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // ── Principled BSDF (frozen 3.6 legacy-EEVEE semantics: eval_principled port) ──
   // normal defaults to the template's shading normal; link a bump/normal_map chain
   // to perturb it (body/cloth_rough noise bump).
+  /**
+   * Principled BSDF, Blender 5.2 socket names.
+   *
+   * v2 (4.0+) renamed most of what a graph touches and re-derived one of them,
+   * which is exactly where a transcribed port goes quietly wrong: Specular
+   * became "Specular IOR Level" and no longer sets reflectance directly — IOR
+   * does, and the level scales it. So f0 is computed the v2 way here, and the
+   * defaults land on 0.04 for ior 1.5 at level 0.5, matching both versions at
+   * their defaults while tracking v2 when a preset moves either.
+   *
+   * Emission Strength defaults to 0 in v2 where 3.6's Emission was visible, so a
+   * naive port turns every emissive material black. Following v2 means honouring
+   * that default and letting the preset say otherwise.
+   *
+   * Not implemented, and not silently wrong — a graph setting these gets the
+   * base BSDF rather than a wrong approximation of them: Coat, Transmission,
+   * Subsurface, Anisotropic, Thin Film. They need path-traced or
+   * multi-scatter machinery this renderer does not have.
+   */
   principled: {
     inputs: {
-      base: C([0.8, 0.8, 0.8], true),
+      base_color: C([0.8, 0.8, 0.8], true),
       metallic: F(0),
-      specular: F(0.5),
       roughness: F(0.5),
-      spec_clamp: F(1e30),
-      sheen: F(0),
+      ior: F(1.5),
+      specular_ior_level: F(0.5),
+      sheen_weight: F(0),
       sheen_tint: F(0),
+      emission_color: C([1, 1, 1]),
+      emission_strength: F(0),
       normal: { type: "vector", contextDefault: "n" },
+      /** Ours, not Blender's: caps firefly speculars from noise-bumped NDF
+       *  aliasing, which EEVEE hides behind TAA and we have none. */
+      spec_clamp: F(1e30),
     },
     outputs: { color: "color" },
-    emit: (a) =>
-      `eval_principled(PrincipledIn(${a.base}, ${a.metallic}, ${a.specular}, ${a.roughness}, ${a.spec_clamp}, ${a.sheen}, ${a.sheen_tint}), ${a.normal}, l, v, sun, amb, shadow)`,
+    emit: (a) => {
+      // Fold the reflectance when both sockets are literals, which is nearly
+      // always. It keeps the emitted WGSL as tight as the 3.6 form was — and at
+      // the defaults it folds to exactly 0.5, which is what 3.6's Specular held,
+      // so the two versions agree byte-for-byte where a preset changed nothing.
+      const spec = foldSpecular(a.ior, a.specular_ior_level)
+      const bsdf =
+        `eval_principled(PrincipledIn(${a.base_color}, ${a.metallic}, ` +
+        `${spec}, ${a.roughness}, ` +
+        `${a.spec_clamp}, ${a.sheen_weight}, ${a.sheen_tint}), ${a.normal}, l, v, sun, amb, shadow)`
+      // v2 defaults Emission Strength to 0, which is the overwhelming case. Emit
+      // the term only when it can do something, so the common shader carries no
+      // dead add and the output stays readable.
+      return a.emission_strength === "0.0" ? bsdf : `${bsdf} + ${a.emission_color} * ${a.emission_strength}`
+    },
   },
 }

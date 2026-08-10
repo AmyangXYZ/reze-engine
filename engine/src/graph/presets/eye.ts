@@ -18,13 +18,13 @@ export const EYE_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular: 0.5, roughness: 0.5, spec_clamp: 1e30, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 0.5, roughness: 0.5, spec_clamp: 1e30, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "emission", type: "emission", inputs: { strength: 1.5 } },
     { id: "add", type: "add_shader" },
   ],
   links: [
-    { from: { node: "tex", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "tex", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "tex", socket: "color" }, to: { node: "emission", socket: "color" } },
     { from: { node: "principled", socket: "color" }, to: { node: "add", socket: "a" } },
     { from: { node: "emission", socket: "color" }, to: { node: "add", socket: "b" } },

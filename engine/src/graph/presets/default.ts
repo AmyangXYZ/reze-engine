@@ -18,13 +18,13 @@ export const DEFAULT_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular: 0.5, roughness: 0.5, spec_clamp: 10.0, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 0.5, roughness: 0.5, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
   ],
   links: [
     { from: { node: "tex", socket: "color" }, to: { node: "base", socket: "a" } },
     { from: { node: "mat", socket: "color" }, to: { node: "base", socket: "b" } },
-    { from: { node: "base", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
   ],
   output: { node: "principled", socket: "color" },
 }

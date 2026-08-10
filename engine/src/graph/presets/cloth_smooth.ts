@@ -27,7 +27,7 @@ export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular: 0.8, roughness: 0.5, spec_clamp: 10.0, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 0.8, roughness: 0.5, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.8999999761581421 } },
   ],
@@ -48,7 +48,7 @@ export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
     { from: { node: "hue_004", socket: "color" }, to: { node: "npr_overlay", socket: "b" } },
     { from: { node: "npr_overlay", socket: "color" }, to: { node: "npr_emit", socket: "color" } },
     { from: { node: "tex", socket: "color" }, to: { node: "principled_base", socket: "color" } },
-    { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "npr_emit", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "mix_shader_001", socket: "b" } },
   ],

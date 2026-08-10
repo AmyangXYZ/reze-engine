@@ -30,7 +30,7 @@ export const METAL_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 1.0, specular: 1.0, roughness: 0.3, spec_clamp: 1e30, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 1.0, specular_ior_level: 1.0, roughness: 0.3, spec_clamp: 1e30, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.6967 } },
   ],
@@ -53,7 +53,7 @@ export const METAL_GRAPH: ShaderGraph = {
     { from: { node: "voro_ramp", socket: "fac_out" }, to: { node: "albedo", socket: "fac" } },
     { from: { node: "voro_ramp", socket: "fac_out" }, to: { node: "albedo", socket: "a" } },
     { from: { node: "hue_006", socket: "color" }, to: { node: "albedo", socket: "b" } },
-    { from: { node: "albedo", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "albedo", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "npr_emit", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "mix_shader_001", socket: "b" } },
   ],

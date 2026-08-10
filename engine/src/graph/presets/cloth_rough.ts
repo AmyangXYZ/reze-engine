@@ -30,7 +30,7 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular: 0.8, roughness: 0.8187, spec_clamp: 10.0, sheen: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 0.8, roughness: 0.8187, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.8999999761581421 } },
   ],
@@ -55,7 +55,7 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
     { from: { node: "noise_ramp", socket: "fac_out" }, to: { node: "bump", socket: "height" } },
     { from: { node: "geo", socket: "normal" }, to: { node: "bump", socket: "normal" } },
     { from: { node: "tex", socket: "color" }, to: { node: "principled_base", socket: "color" } },
-    { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base" } },
+    { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "bump", socket: "vector" }, to: { node: "principled", socket: "normal" } },
     { from: { node: "npr_emit", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "mix_shader_001", socket: "b" } },
