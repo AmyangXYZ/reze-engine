@@ -207,7 +207,11 @@ fn curve5(t0: f32, y0: f32, y1: f32, y2: f32, y3: f32, y4: f32) -> f32 {
   let t = clamp(t0, 0.0, 1.0) * 4.0;
   let i = min(floor(t), 3.0);
   let f = t - i;
-  let ys = array<f32, 5>(y0, y1, y2, y3, y4);
+  // A var, not a let: WGSL only allows a dynamic index on a REFERENCE, and a
+  // let-bound array is a value. Indexing it with a runtime k is a compile error —
+  // and because this file is concatenated into every material shader, that error
+  // took every graph in the library down with it, not just curves.
+  var ys = array<f32, 5>(y0, y1, y2, y3, y4);
   let k = i32(i);
   let pa = ys[k];
   let pb = ys[k + 1];
