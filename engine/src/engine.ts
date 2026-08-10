@@ -323,7 +323,17 @@ export type ViewTransformOptions = {
   exposure: number
   /** After Filmic, display gamma (`pow(rgb, 1/gamma)`). */
   gamma: number
-  look: "default" | "medium_high_contrast"
+  /**
+   * Which display transform the frame is formed with.
+   *
+   * "standard" is Blender's Standard: the sRGB encoding and nothing else, which
+   * is what NPR and anime work uses — the colours the graph computes are the
+   * colours that land, with no film curve reinterpreting them. Both of the
+   * reference Wuthering Waves projects render this way.
+   *
+   * "filmic" is Blender 3.6's Filmic, Medium High Contrast, baked as a LUT.
+   */
+  transform: "filmic" | "standard"
 }
 
 // Matches the reference Blender project: Filmic view, Medium High Contrast look,
@@ -331,7 +341,7 @@ export type ViewTransformOptions = {
 export const DEFAULT_VIEW_TRANSFORM: ViewTransformOptions = {
   exposure: 0.6,
   gamma: 1.0,
-  look: "medium_high_contrast",
+  transform: "filmic",
 }
 
 /** Color grading applied to the tonemapped scene (ASC CDL — see grade() in
@@ -984,7 +994,7 @@ export class Engine {
     return {
       exposure: partial?.exposure ?? d.exposure,
       gamma: partial?.gamma ?? d.gamma,
-      look: partial?.look ?? d.look,
+      transform: partial?.transform ?? d.transform,
     }
   }
 
@@ -1004,7 +1014,7 @@ export class Engine {
 
   getViewTransformOptions(): ViewTransformOptions {
     const v = this.viewTransform
-    return { exposure: v.exposure, gamma: v.gamma, look: v.look }
+    return { exposure: v.exposure, gamma: v.gamma, transform: v.transform }
   }
 
   private colorGrading: ColorGradingOptions = {
@@ -1047,7 +1057,7 @@ export class Engine {
     const v = this.viewTransform
     if (patch.exposure !== undefined) v.exposure = patch.exposure
     if (patch.gamma !== undefined) v.gamma = patch.gamma
-    if (patch.look !== undefined) v.look = patch.look
+    if (patch.transform !== undefined) v.transform = patch.transform
     if (this.device && this.compositeUniformBuffer) {
       this.writeCompositeViewUniforms()
     }
@@ -1079,8 +1089,10 @@ export class Engine {
     u[10] = bg?.z ?? 0
     // Base-layer mode only. A user effect is a separate LAYER over whichever
     // base is active, and needs no flag of its own: the composite pipeline is
-    // rebuilt per effect, so the compiled variant IS the flag. u[25] is spare.
+    // rebuilt per effect, so the compiled variant IS the flag.
     u[11] = this.backdropEquirectView ? 2 : bg ? 1 : 0
+    // Which display transform forms the frame (see viewTransform in composite.ts).
+    u[25] = v.transform === "standard" ? 1 : 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,

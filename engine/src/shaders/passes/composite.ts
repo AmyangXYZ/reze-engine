@@ -84,7 +84,7 @@ override APPLY_GAMMA: bool = true;
 //            the compiled variant IS the flag.
 // viewU[3] = (camera right, tanHalfFov·aspect); viewU[4] = (camera up, tanHalfFov);
 // viewU[5] = (camera forward, _) — refreshed per frame while skybox/effect active.
-// viewU[6] = (time seconds, _, canvas width, canvas height).
+// viewU[6] = (time seconds, view transform id, canvas width, canvas height).
 // viewU[7] = (grade offset.rgb, contrast);  viewU[8] = (grade power.rgb, saturation);
 // viewU[9] = (grade slope.rgb, grade on/off) — see grade() below.
 // viewU[10] = (camera world position, _) — refreshed with the basis above.
@@ -145,6 +145,24 @@ fn filmic(x: f32) -> f32 {
   let u = (t * (FILMIC_LUT_W - 1.0) / 13.0 + 0.5) / FILMIC_LUT_W;
   // textureSampleLevel (explicit LOD, no derivatives) is legal in non-uniform flow.
   return textureSampleLevel(filmicLut, bloomSamp, vec2f(u, 0.5), 0.0).r;
+}
+
+/** The sRGB display encoding — Blender's "Standard" view transform, which is what
+ *  NPR work uses: no film curve at all, so the colours a graph computes are the
+ *  colours that land. Not a 2.2 power law; sRGB has a linear toe. */
+fn srgb_encode(x: f32) -> f32 {
+  let c = max(x, 0.0);
+  return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
+}
+
+/** Which display transform, chosen per frame at viewU[6].y (0 filmic, 1 standard).
+ *  A uniform branch rather than a pipeline variant: switching is rare, and both
+ *  arms are cheap enough that specialising the pipeline would buy nothing. */
+fn viewTransform(c: vec3f) -> vec3f {
+  if (viewU[6].y > 0.5) {
+    return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b));
+  }
+  return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));
 }
 
 /** Canvas size in pixels — for user effects (aspect correction). */
@@ -260,8 +278,7 @@ const COMPOSITE_BODY = /* wgsl */ `
   let sceneStraight = scenePm.rgb / max(sceneAlpha, 1e-6);
 
   let exposed = sceneStraight * exp2(viewU[0].x);
-  let tm = vec3f(filmic(exposed.r), filmic(exposed.g), filmic(exposed.b));
-  var disp = max(tm, vec3f(0.0));
+  var disp = max(viewTransform(exposed), vec3f(0.0));
   // Grade the SCENE only, before the display gamma. Deliberately not applied to
   // the background: it keeps a picked background color exactly as picked, and —
   // load-bearing — leaves green-screen mode's key color unshifted so chroma
