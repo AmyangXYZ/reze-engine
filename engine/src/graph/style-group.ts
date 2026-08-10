@@ -22,6 +22,20 @@ export type StyleGroup = {
   renderClass?: RenderClass
   /** Alpha-handling axis, orthogonal to renderClass. Default "opaque". */
   alphaMode?: AlphaMode
+  /**
+   * Extra image maps for this group's shading, up to four.
+   *
+   * A PMX material carries exactly ONE image, and a Blender-authored look is
+   * usually built on more than that — a lightmap encoding shadow thresholds and
+   * specular masks in its channels, a ramp, a detail map. Those belong to the
+   * LOOK rather than to the model, so they ride on the group: the same graph
+   * applied to another character brings its own maps with it.
+   *
+   * Read by the `tex_image/0`…`tex_image/3` nodes, in order. A slot left empty
+   * (or a graph reading past the end) samples 1×1 white, so a missing map is a
+   * no-op rather than a failure.
+   */
+  images?: (ImageBitmap | HTMLImageElement | HTMLCanvasElement | null)[]
 }
 
 export type GroupDiagnostic = { groupId: string; diagnostics: Diagnostic[]; ok: boolean }

@@ -184,6 +184,15 @@ fn math_arctan2(a: f32, b: f32) -> f32 { return atan2(a, b); }
 fn math_radians(a: f32) -> f32 { return radians(a); }
 fn math_degrees(a: f32) -> f32 { return degrees(a); }
 
+// ─── Style-group image maps (Image Texture on a non-PMX slot) ──────
+// One function per slot because WGSL has no texture arrays-of-bindings here; the
+// slot is topology, exactly like a Math node's operation.
+
+fn group_tex0(uv: vec2f) -> vec4f { return textureSample(groupTexture0, diffuseSampler, uv); }
+fn group_tex1(uv: vec2f) -> vec4f { return textureSample(groupTexture1, diffuseSampler, uv); }
+fn group_tex2(uv: vec2f) -> vec4f { return textureSample(groupTexture2, diffuseSampler, uv); }
+fn group_tex3(uv: vec2f) -> vec4f { return textureSample(groupTexture3, diffuseSampler, uv); }
+
 // ─── VECTOR MATH node operations ───────────────────────────────────
 
 fn vector_add(a: vec3f, b: vec3f) -> vec3f { return a + b; }

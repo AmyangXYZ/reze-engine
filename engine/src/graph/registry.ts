@@ -235,6 +235,36 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   "mix/value": { inputs: { fac: F(0.5), a: C([1, 1, 1], true), b: C() }, outputs: { color: "color" }, emit: (a) => `mix_value(${a.fac}, ${a.a}, ${a.b})` },
   "mix/color": { inputs: { fac: F(0.5), a: C([1, 1, 1], true), b: C() }, outputs: { color: "color" }, emit: (a) => `mix_color_blend(${a.fac}, ${a.a}, ${a.b})` },
 
+  // ── Image Texture on a style-group slot ──
+  // The PMX gives a material ONE image; this style needs several, so the extra
+  // maps ride on the group. Slot is part of the type because it selects a
+  // binding, which is topology rather than a value. The uv input defaults to the
+  // mesh UV, matching an unlinked Vector socket in Blender.
+  "tex_image/0": {
+    inputs: { uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" } },
+    outputs: { color: "color", alpha: "float" },
+    outputSelect: { color: ".rgb", alpha: ".a" },
+    emit: (a) => `group_tex0(${a.uv}.xy)`,
+  },
+  "tex_image/1": {
+    inputs: { uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" } },
+    outputs: { color: "color", alpha: "float" },
+    outputSelect: { color: ".rgb", alpha: ".a" },
+    emit: (a) => `group_tex1(${a.uv}.xy)`,
+  },
+  "tex_image/2": {
+    inputs: { uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" } },
+    outputs: { color: "color", alpha: "float" },
+    outputSelect: { color: ".rgb", alpha: ".a" },
+    emit: (a) => `group_tex2(${a.uv}.xy)`,
+  },
+  "tex_image/3": {
+    inputs: { uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" } },
+    outputs: { color: "color", alpha: "float" },
+    outputSelect: { color: ".rgb", alpha: ".a" },
+    emit: (a) => `group_tex3(${a.uv}.xy)`,
+  },
+
   // ── Blender 5.2 colour utilities ──
   separate_color: {
     inputs: { color: C([1, 1, 1], true) },

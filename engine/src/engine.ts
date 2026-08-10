@@ -187,6 +187,9 @@ type GroupInstall = {
   /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
   uniformBuffer: GPUBuffer
+  /** The group's own image maps, uploaded once per apply and owned here — the
+   *  install destroys them when it is replaced, so a re-apply cannot leak. */
+  images?: (GPUTexture | null)[]
   slotMap: StyleSlot[]
   /** Serialized (graph + renderClass + alphaMode) — lets applyStyleGroups skip recompiling
    *  an unchanged group. */
@@ -1911,6 +1914,13 @@ export class Engine {
         // StyleUniforms for compiled graph shaders (adjust-tier sliders). Hand-written
         // presets simply don't declare it — a layout may carry bindings a shader ignores.
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // Style-group image maps. A PMX material carries one image; a
+        // Blender-authored look needs a lightmap or ramp beside it, and those
+        // belong to the GROUP rather than to the model's own material data.
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 8, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
 
@@ -3293,7 +3303,7 @@ export class Engine {
     // explicit destroy). Per-model group buffers are torn down in removeModel; the shared
     // zero buffer is engine-owned.
     this.forEachInstance((inst) => {
-      for (const install of inst.styleGroups.values()) install.uniformBuffer.destroy()
+      for (const install of inst.styleGroups.values()) this.destroyInstall(install)
       inst.styleGroups.clear()
     })
     this.zeroStyleBuffer?.destroy()
@@ -3442,7 +3452,7 @@ export class Engine {
       buf.destroy()
     }
     // Per-group StyleUniforms buffers aren't in gpuBuffers (allocated post-load).
-    for (const install of inst.styleGroups.values()) install.uniformBuffer.destroy()
+    for (const install of inst.styleGroups.values()) this.destroyInstall(install)
     this.modelInstances.delete(name)
   }
 
@@ -3524,11 +3534,50 @@ export class Engine {
 
   // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
   // (the group's buffer when grouped, or the shared zero buffer when ungrouped).
-  private createMaterialBindGroup(label: string, baseEntries: GPUBindGroupEntry[], styleBuffer: GPUBuffer): GPUBindGroup {
+  /** A group's uniform buffer and its maps have the same lifetime — freeing one
+   *  without the other is how a re-apply leaks GPU memory a frame at a time. */
+  private destroyInstall(install: GroupInstall): void {
+    install.uniformBuffer.destroy()
+    for (const tex of install.images ?? []) tex?.destroy()
+  }
+
+  /** Upload a group's image maps. Sources are decoded images the host already
+   *  holds; the engine never fetches, matching how models and motions arrive. */
+  private uploadGroupImages(group: StyleGroup): (GPUTexture | null)[] | undefined {
+    if (!group.images?.length) return undefined
+    return group.images.slice(0, 4).map((src) => {
+      if (!src) return null
+      const width = Math.max(1, "naturalWidth" in src ? src.naturalWidth : src.width)
+      const height = Math.max(1, "naturalHeight" in src ? src.naturalHeight : src.height)
+      const tex = this.device.createTexture({
+        label: `group map: ${group.id}`,
+        size: [width, height],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.device.queue.copyExternalImageToTexture({ source: src }, { texture: tex }, [width, height])
+      return tex
+    })
+  }
+
+  private createMaterialBindGroup(
+    label: string,
+    baseEntries: GPUBindGroupEntry[],
+    styleBuffer: GPUBuffer,
+    groupImages?: (GPUTexture | null)[],
+  ): GPUBindGroup {
+    // Every material bind group in the engine is built here, which is why the
+    // group's maps are threaded through this one function rather than patched in
+    // at each call site — an unset slot reads white, never stale.
+    const slots: GPUBindGroupEntry[] = []
+    for (let i = 0; i < 4; i++) {
+      const tex = groupImages?.[i] ?? this.fallbackMaterialTexture
+      slots.push({ binding: 5 + i, resource: tex.createView() })
+    }
     return this.device.createBindGroup({
       label,
       layout: this.mainPerMaterialBindGroupLayout,
-      entries: [...baseEntries, { binding: 4, resource: { buffer: styleBuffer } }],
+      entries: [...baseEntries, { binding: 4, resource: { buffer: styleBuffer } }, ...slots],
     })
   }
 
@@ -5500,7 +5549,7 @@ export class Engine {
     for (const [id, install] of inst.styleGroups) {
       if (!nextIds.has(id)) {
         inst.styleGroupGen.set(id, (inst.styleGroupGen.get(id) ?? 0) + 1)
-        install.uniformBuffer.destroy()
+        this.destroyInstall(install)
         inst.styleGroups.delete(id)
       }
     }
@@ -5537,7 +5586,7 @@ export class Engine {
     const install = inst?.styleGroups.get(groupId)
     if (!inst || !install) return
     inst.styleGroupGen.set(groupId, (inst.styleGroupGen.get(groupId) ?? 0) + 1) // discard in-flight compile
-    install.uniformBuffer.destroy()
+    this.destroyInstall(install)
     inst.styleGroups.delete(groupId)
     this.assignDrawCallGroups(inst, this.currentClaims(inst))
   }
@@ -5548,7 +5597,7 @@ export class Engine {
     if (!inst) return
     for (const [id, install] of inst.styleGroups) {
       inst.styleGroupGen.set(id, (inst.styleGroupGen.get(id) ?? 0) + 1)
-      install.uniformBuffer.destroy()
+      this.destroyInstall(install)
     }
     inst.styleGroups.clear()
     this.assignDrawCallGroups(inst, new Map())
@@ -5648,6 +5697,9 @@ export class Engine {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       })
 
+    // The outgoing install's maps go with it — a re-apply that changes images
+    // would otherwise strand the old textures for the life of the model.
+    const previousImages = inst.styleGroups.get(group.id)?.images
     inst.styleGroups.set(group.id, {
       group,
       renderClass,
@@ -5656,9 +5708,11 @@ export class Engine {
       pipelineNoDepthWrite,
       overEyesPipeline,
       uniformBuffer,
+      images: this.uploadGroupImages(group),
       slotMap: result.slotMap,
       signature,
     })
+    for (const tex of previousImages ?? []) tex?.destroy()
     this.writeGroupDefaults(uniformBuffer, group, result.slotMap)
     return { ok: true, diagnostics, slotMap: result.slotMap }
   }
@@ -5679,6 +5733,7 @@ export class Engine {
         `material: ${dc.materialName}`,
         dc.baseBindGroupEntries,
         install ? install.uniformBuffer : this.zeroStyleBuffer,
+        install?.images,
       )
     }
     this.sortDrawCalls(inst)

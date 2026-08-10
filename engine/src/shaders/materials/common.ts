@@ -88,6 +88,16 @@ struct LightVP { viewProj: mat4x4f, };
 // 1×1 white fallback bound here.
 @group(2) @binding(2) var toonTexture: texture_2d<f32>;
 @group(2) @binding(3) var sphereTexture: texture_2d<f32>;
+// Extra maps supplied by the STYLE GROUP rather than by the PMX — the lightmap /
+// ILM / ramp textures a Blender-authored look is built on. A PMX material carries
+// exactly one image, and this whole family of shading encodes shadow thresholds,
+// specular masks and material IDs in the channels of a second and third. Unset
+// slots get the 1×1 white fallback, so a graph reading one that was never
+// supplied sees white rather than garbage.
+@group(2) @binding(5) var groupTexture0: texture_2d<f32>;
+@group(2) @binding(6) var groupTexture1: texture_2d<f32>;
+@group(2) @binding(7) var groupTexture2: texture_2d<f32>;
+@group(2) @binding(8) var groupTexture3: texture_2d<f32>;
 
 // Four-bone blended normals can cancel to ~zero on physics-driven parts
 // (opposing bone rotations at 50/50 weights) — normalize(0) is 0/0 = NaN,
