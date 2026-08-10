@@ -131,10 +131,120 @@ fn ramp_cardinal(f: f32, p0: f32, c0: vec4f, p1: f32, c1: vec4f) -> vec4f {
 
 // ─── MATH node operations ───────────────────────────────────────────
 
+// Transcribed from Blender 5.2's gpu_shader_common_math.glsl, including the
+// safe-guards — a Math node that divides by zero yields 0 there, not inf, and a
+// graph written against that behaviour relies on it.
 fn math_add(a: f32, b: f32) -> f32 { return a + b; }
+fn math_subtract(a: f32, b: f32) -> f32 { return a - b; }
 fn math_multiply(a: f32, b: f32) -> f32 { return a * b; }
+fn math_divide(a: f32, b: f32) -> f32 { return select(0.0, a / b, b != 0.0); }
+fn math_multiply_add(a: f32, b: f32, c: f32) -> f32 { return a * b + c; }
 fn math_power(a: f32, b: f32) -> f32 { return pow(max(a, 0.0), b); }
+fn math_logarithm(a: f32, b: f32) -> f32 { return select(0.0, log(a) / log(b), a > 0.0 && b > 0.0 && b != 1.0); }
+fn math_sqrt(a: f32) -> f32 { return sqrt(max(a, 0.0)); }
+fn math_inversesqrt(a: f32) -> f32 { return inverseSqrt(max(a, 1e-8)); }
+fn math_absolute(a: f32) -> f32 { return abs(a); }
+fn math_exponent(a: f32) -> f32 { return exp(a); }
+fn math_minimum(a: f32, b: f32) -> f32 { return min(a, b); }
+fn math_maximum(a: f32, b: f32) -> f32 { return max(a, b); }
+fn math_less_than(a: f32, b: f32) -> f32 { return select(0.0, 1.0, a < b); }
 fn math_greater_than(a: f32, b: f32) -> f32 { return select(0.0, 1.0, a > b); }
+fn math_sign(a: f32) -> f32 { return sign(a); }
+// The tolerance floors at 1e-5 in Blender, so a zero third input still compares.
+fn math_compare(a: f32, b: f32, c: f32) -> f32 { return select(0.0, 1.0, abs(a - b) <= max(c, 1e-5)); }
+fn math_smooth_min(a: f32, b: f32, c: f32) -> f32 {
+  if (c == 0.0) { return min(a, b); }
+  let h = max(c - abs(a - b), 0.0) / c;
+  return min(a, b) - h * h * h * c * (1.0 / 6.0);
+}
+fn math_smooth_max(a: f32, b: f32, c: f32) -> f32 { return -math_smooth_min(-a, -b, c); }
+fn math_round(a: f32) -> f32 { return floor(a + 0.5); }
+fn math_floor(a: f32) -> f32 { return floor(a); }
+fn math_ceil(a: f32) -> f32 { return ceil(a); }
+fn math_truncate(a: f32) -> f32 { return trunc(a); }
+fn math_fraction(a: f32) -> f32 { return a - floor(a); }
+// Blender's MODULO is fmod (truncated), not floorMod — the sign follows a.
+fn math_modulo(a: f32, b: f32) -> f32 { return select(0.0, a - b * trunc(a / b), b != 0.0); }
+fn math_floored_modulo(a: f32, b: f32) -> f32 { return select(0.0, a - floor(a / b) * b, b != 0.0); }
+fn math_snap(a: f32, b: f32) -> f32 { return floor(select(0.0, a / b, b != 0.0)) * b; }
+fn math_wrap(a: f32, b: f32, c: f32) -> f32 {
+  let range = b - c;
+  return select(c, a - range * floor((a - c) / range), range != 0.0);
+}
+fn math_pingpong(a: f32, b: f32) -> f32 {
+  return select(0.0, abs(fract((a - b) / (b * 2.0)) * b * 2.0 - b), b != 0.0);
+}
+fn math_sine(a: f32) -> f32 { return sin(a); }
+fn math_cosine(a: f32) -> f32 { return cos(a); }
+fn math_tangent(a: f32) -> f32 { return tan(a); }
+fn math_arcsine(a: f32) -> f32 { return asin(clamp(a, -1.0, 1.0)); }
+fn math_arccosine(a: f32) -> f32 { return acos(clamp(a, -1.0, 1.0)); }
+fn math_arctangent(a: f32) -> f32 { return atan(a); }
+fn math_arctan2(a: f32, b: f32) -> f32 { return atan2(a, b); }
+fn math_radians(a: f32) -> f32 { return radians(a); }
+fn math_degrees(a: f32) -> f32 { return degrees(a); }
+
+// ─── VECTOR MATH node operations ───────────────────────────────────
+
+fn vector_add(a: vec3f, b: vec3f) -> vec3f { return a + b; }
+fn vector_subtract(a: vec3f, b: vec3f) -> vec3f { return a - b; }
+fn vector_multiply(a: vec3f, b: vec3f) -> vec3f { return a * b; }
+fn vector_divide(a: vec3f, b: vec3f) -> vec3f {
+  return vec3f(math_divide(a.x, b.x), math_divide(a.y, b.y), math_divide(a.z, b.z));
+}
+fn vector_multiply_add(a: vec3f, b: vec3f, c: vec3f) -> vec3f { return a * b + c; }
+fn vector_cross(a: vec3f, b: vec3f) -> vec3f { return cross(a, b); }
+fn vector_project(a: vec3f, b: vec3f) -> vec3f {
+  let l = dot(b, b);
+  return select(vec3f(0.0), b * (dot(a, b) / l), l != 0.0);
+}
+fn vector_reflect(a: vec3f, b: vec3f) -> vec3f { return reflect(a, safe_normal(b)); }
+fn vector_refract(a: vec3f, b: vec3f, ior: f32) -> vec3f { return refract(a, safe_normal(b), ior); }
+fn vector_faceforward(a: vec3f, b: vec3f, c: vec3f) -> vec3f {
+  return select(a, -a, dot(b, c) < 0.0);
+}
+fn vector_dot(a: vec3f, b: vec3f) -> f32 { return dot(a, b); }
+fn vector_distance(a: vec3f, b: vec3f) -> f32 { return length(a - b); }
+fn vector_length(a: vec3f) -> f32 { return length(a); }
+fn vector_scale(a: vec3f, s: f32) -> vec3f { return a * s; }
+// Blender returns the zero vector rather than NaN for a degenerate input.
+fn vector_normalize(a: vec3f) -> vec3f {
+  let l = length(a);
+  return select(vec3f(0.0), a / l, l > 0.0);
+}
+fn vector_absolute(a: vec3f) -> vec3f { return abs(a); }
+fn vector_minimum(a: vec3f, b: vec3f) -> vec3f { return min(a, b); }
+fn vector_maximum(a: vec3f, b: vec3f) -> vec3f { return max(a, b); }
+fn vector_floor(a: vec3f) -> vec3f { return floor(a); }
+fn vector_ceil(a: vec3f) -> vec3f { return ceil(a); }
+fn vector_fraction(a: vec3f) -> vec3f { return a - floor(a); }
+fn vector_modulo(a: vec3f, b: vec3f) -> vec3f {
+  return vec3f(math_modulo(a.x, b.x), math_modulo(a.y, b.y), math_modulo(a.z, b.z));
+}
+fn vector_snap(a: vec3f, b: vec3f) -> vec3f {
+  return vec3f(math_snap(a.x, b.x), math_snap(a.y, b.y), math_snap(a.z, b.z));
+}
+fn vector_wrap(a: vec3f, b: vec3f, c: vec3f) -> vec3f {
+  return vec3f(math_wrap(a.x, b.x, c.x), math_wrap(a.y, b.y, c.y), math_wrap(a.z, b.z, c.z));
+}
+
+/** Vector Rotate, axis-angle form — Rodrigues about an arbitrary axis. */
+fn vector_rotate_axis(v: vec3f, center: vec3f, axis: vec3f, angle: f32) -> vec3f {
+  let n = safe_normal(axis);
+  let p = v - center;
+  let c = cos(angle);
+  return center + p * c + cross(n, p) * sin(angle) + n * dot(n, p) * (1.0 - c);
+}
+fn vector_rotate_euler(v: vec3f, center: vec3f, rot: vec3f) -> vec3f {
+  let p = v - center;
+  let cx = cos(rot.x); let sx = sin(rot.x);
+  let cy = cos(rot.y); let sy = sin(rot.y);
+  let cz = cos(rot.z); let sz = sin(rot.z);
+  // XYZ order, matching Blender's default euler.
+  let rx = vec3f(p.x, p.y * cx - p.z * sx, p.y * sx + p.z * cx);
+  let ry = vec3f(rx.x * cy + rx.z * sy, rx.y, -rx.x * sy + rx.z * cy);
+  return center + vec3f(ry.x * cz - ry.y * sz, ry.x * sz + ry.y * cz, ry.z);
+}
 
 // Blender's implicit Color → Float socket conversion uses BT.601 grayscale
 // (rgb_to_grayscale in blenkernel/intern/node.cc). When a material graph plugs a
@@ -167,6 +277,137 @@ fn mix_lighten(fac: f32, a: vec3f, b: vec3f) -> vec3f {
 // Blender Mix (Color) blend LINEAR_LIGHT: result = mix(A, A + 2*B - 1, Fac)
 fn mix_linear_light(fac: f32, a: vec3f, b: vec3f) -> vec3f {
   return mix(a, a + 2.0 * b - vec3f(1.0), fac);
+}
+
+// The rest of Blender's blend set, transcribed from
+// gpu_shader_material_mix_color.glsl. Note DODGE, BURN and DIVIDE are
+// per-channel with their own guards there, not vector expressions.
+fn mix_add(fac: f32, a: vec3f, b: vec3f) -> vec3f { return mix(a, a + b, fac); }
+fn mix_subtract(fac: f32, a: vec3f, b: vec3f) -> vec3f { return mix(a, a - b, fac); }
+fn mix_darken(fac: f32, a: vec3f, b: vec3f) -> vec3f { return mix(a, min(a, b), fac); }
+fn mix_difference(fac: f32, a: vec3f, b: vec3f) -> vec3f { return mix(a, abs(a - b), fac); }
+fn mix_exclusion(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  return max(mix(a, a + b - 2.0 * a * b, fac), vec3f(0.0));
+}
+fn mix_screen(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  let facm = 1.0 - fac;
+  return vec3f(1.0) - (vec3f(facm) + fac * (vec3f(1.0) - b)) * (vec3f(1.0) - a);
+}
+fn mix_soft_light(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  let facm = 1.0 - fac;
+  let scr = vec3f(1.0) - (vec3f(1.0) - b) * (vec3f(1.0) - a);
+  return facm * a + fac * ((vec3f(1.0) - a) * b * a + a * scr);
+}
+fn mix_dodge_1(fac: f32, a: f32, b: f32) -> f32 {
+  if (a == 0.0) { return 0.0; }
+  let t = 1.0 - fac * b;
+  if (t <= 0.0) { return 1.0; }
+  return min(a / t, 1.0);
+}
+fn mix_dodge(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  return vec3f(mix_dodge_1(fac, a.r, b.r), mix_dodge_1(fac, a.g, b.g), mix_dodge_1(fac, a.b, b.b));
+}
+fn mix_burn_1(fac: f32, a: f32, b: f32) -> f32 {
+  let facm = 1.0 - fac;
+  let t = facm + fac * b;
+  if (t <= 0.0) { return 0.0; }
+  return clamp(1.0 - (1.0 - a) / t, 0.0, 1.0);
+}
+fn mix_burn(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  return vec3f(mix_burn_1(fac, a.r, b.r), mix_burn_1(fac, a.g, b.g), mix_burn_1(fac, a.b, b.b));
+}
+fn mix_divide_1(fac: f32, a: f32, b: f32) -> f32 {
+  return select(a, (1.0 - fac) * a + fac * a / b, b != 0.0);
+}
+fn mix_divide(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  return vec3f(mix_divide_1(fac, a.r, b.r), mix_divide_1(fac, a.g, b.g), mix_divide_1(fac, a.b, b.b));
+}
+// The HSV-routed blends: take one channel from B, the rest from A.
+fn mix_hue(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  let hsvB = rgb_to_hsv(b);
+  if (hsvB.y == 0.0) { return a; }
+  var hsv = rgb_to_hsv(a);
+  hsv.x = hsvB.x;
+  return mix(a, hsv_to_rgb(hsv), fac);
+}
+fn mix_saturation(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  var hsv = rgb_to_hsv(a);
+  if (hsv.y == 0.0) { return a; }
+  hsv.y = mix(hsv.y, rgb_to_hsv(b).y, fac);
+  return hsv_to_rgb(hsv);
+}
+fn mix_color_blend(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  let hsvB = rgb_to_hsv(b);
+  if (hsvB.y == 0.0) { return a; }
+  var hsv = rgb_to_hsv(a);
+  hsv.x = hsvB.x;
+  hsv.y = hsvB.y;
+  return mix(a, hsv_to_rgb(hsv), fac);
+}
+fn mix_value(fac: f32, a: vec3f, b: vec3f) -> vec3f {
+  var hsv = rgb_to_hsv(a);
+  hsv.z = mix(hsv.z, rgb_to_hsv(b).z, fac);
+  return hsv_to_rgb(hsv);
+}
+
+// ─── Colour utility nodes ──────────────────────────────────────────
+
+/** Gamma node — Blender guards the zero case rather than emitting NaN. */
+fn node_gamma(c: vec3f, g: f32) -> vec3f {
+  return vec3f(
+    select(0.0, pow(c.r, g), c.r > 0.0),
+    select(0.0, pow(c.g, g), c.g > 0.0),
+    select(0.0, pow(c.b, g), c.b > 0.0),
+  );
+}
+
+/** Map Range, linear, with the clamp Blender applies when the toggle is on. */
+fn map_range_linear(v: f32, fromMin: f32, fromMax: f32, toMin: f32, toMax: f32) -> f32 {
+  let d = fromMax - fromMin;
+  return select(0.0, toMin + ((v - fromMin) / d) * (toMax - toMin), d != 0.0);
+}
+fn map_range_clamped(v: f32, fromMin: f32, fromMax: f32, toMin: f32, toMax: f32) -> f32 {
+  let r = map_range_linear(v, fromMin, fromMax, toMin, toMax);
+  return clamp(r, min(toMin, toMax), max(toMin, toMax));
+}
+/** Map Range, smoothstep interpolation. */
+fn map_range_smooth(v: f32, fromMin: f32, fromMax: f32, toMin: f32, toMax: f32) -> f32 {
+  let d = fromMax - fromMin;
+  if (d == 0.0) { return 0.0; }
+  let t = clamp((v - fromMin) / d, 0.0, 1.0);
+  return toMin + (t * t * (3.0 - 2.0 * t)) * (toMax - toMin);
+}
+
+/** RGB→HSL and back, for Separate/Combine Color's HSL mode. */
+fn rgb_to_hsl(c: vec3f) -> vec3f {
+  let mx = max(c.r, max(c.g, c.b));
+  let mn = min(c.r, min(c.g, c.b));
+  let l = (mx + mn) * 0.5;
+  if (mx == mn) { return vec3f(0.0, 0.0, l); }
+  let d = mx - mn;
+  let s = select(d / (2.0 - mx - mn), d / (mx + mn), l <= 0.5);
+  var h: f32;
+  if (mx == c.r) { h = (c.g - c.b) / d + select(0.0, 6.0, c.g < c.b); }
+  else if (mx == c.g) { h = (c.b - c.r) / d + 2.0; }
+  else { h = (c.r - c.g) / d + 4.0; }
+  return vec3f(h / 6.0, s, l);
+}
+fn hsl_channel(p: f32, q: f32, t0: f32) -> f32 {
+  var t = fract(t0);
+  if (t < 1.0 / 6.0) { return p + (q - p) * 6.0 * t; }
+  if (t < 0.5) { return q; }
+  if (t < 2.0 / 3.0) { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+  return p;
+}
+fn hsl_to_rgb(hsl: vec3f) -> vec3f {
+  if (hsl.y == 0.0) { return vec3f(hsl.z); }
+  let q = select(hsl.z + hsl.y - hsl.z * hsl.y, hsl.z * (1.0 + hsl.y), hsl.z < 0.5);
+  let p = 2.0 * hsl.z - q;
+  return vec3f(
+    hsl_channel(p, q, hsl.x + 1.0 / 3.0),
+    hsl_channel(p, q, hsl.x),
+    hsl_channel(p, q, hsl.x - 1.0 / 3.0),
+  );
 }
 
 // Luminance for Shader→RGB scalar gates (linear RGB, Rec.709 weights)

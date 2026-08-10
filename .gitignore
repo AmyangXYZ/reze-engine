@@ -27,3 +27,12 @@ scripts/dump_scene_world.py
 # Commercial Unity animation pack — raw FBX sources are never committed/redistributed.
 # The converted VMDs (vmd/) ship with the demo; regenerate via reze-rig's fbx2vmd.
 web/public/unity-fbx-locomotion/Animations/
+
+# Blender source, unpacked for reference while porting node semantics to 5.2.
+# READ, never vendored: the port lives in our own WGSL, and the licences differ.
+blender-5.2.0/
+blender-*.tar.xz
+
+# Reference Blender projects — read to learn what to port, never redistributed.
+*.blend
+*.blend1
