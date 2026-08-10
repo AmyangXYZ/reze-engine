@@ -17,8 +17,8 @@ export {
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,
-  type BackgroundEffectParamValue,
-  type BackgroundEffectResult,
+  type EffectParamValue,
+  type EffectResult,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export {

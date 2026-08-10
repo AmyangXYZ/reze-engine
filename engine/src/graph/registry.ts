@@ -146,6 +146,17 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     contextOutputs: { color: "material.diffuseColor" },
   },
 
+  // The PMX material's sphere map, which is where an MMD model keeps its
+  // highlights — every PMX ships one, and hair without it reads flat. The mode
+  // is the material's own (.sph multiplies the shaded base, .spa adds a
+  // highlight), so a graph asks for the effect and the model decides which; a
+  // material with no sphere texture is an exact no-op.
+  sphere_map: {
+    inputs: { base: C([0, 0, 0], true), strength: F(1) },
+    outputs: { color: "color" },
+    emit: (a) => `pmx_sphere_map(${a.base}, ${a.strength}, n)`,
+  },
+
   // ── Literals as nodes (for editor ergonomics; inlined literals work too) ──
   value: { inputs: { value: F(0) }, outputs: { value: "float" }, emit: (a) => a.value },
   rgb: { inputs: { color: C() }, outputs: { color: "color" }, emit: (a) => a.color },

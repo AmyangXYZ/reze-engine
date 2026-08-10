@@ -506,6 +506,27 @@ fn principled_sheen(NV: f32) -> f32 {
 //   sheen          — 0 disables. Scales the sheen diffuse add; cloth/stockings use ~0.7.
 //   sheen_tint     — 0 = white sheen, 1 = fully tinted by base. Multiplied by sheen,
 //                    so value is don't-care when sheen=0.
+// The PMX sphere map, applied the way MMD applies it: the texture is a
+// VIEW-SPACE lighting mask, sampled by the camera-space normal rather than by
+// any UV the mesh carries, which is why it tracks the viewer and reads as a
+// highlight. The material's own mode picks the operator — .sph (1) multiplies
+// the shaded base, .spa (2) adds — so a graph asks for the effect and the model
+// decides which it meant. Mode 0, or a material with no sphere texture (the 1×1
+// white fallback is bound then), is an exact no-op.
+fn pmx_sphere_map(base: vec3f, strength: f32, N: vec3f) -> vec3f {
+  if (material.sphereMode < 0.5) {
+    return base;
+  }
+  let camera_n = safe_normal((camera.view * vec4f(N, 0.0)).xyz);
+  let sphere_uv = clamp(camera_n.xy * 0.5 + vec2f(0.5), vec2f(0.0), vec2f(1.0));
+  let sphere_rgb = textureSample(sphereTexture, diffuseSampler, sphere_uv).rgb;
+  let amount = max(strength, 0.0);
+  if (material.sphereMode < 1.5) {
+    return mix(base, base * sphere_rgb, min(amount, 1.0));
+  }
+  return base + sphere_rgb * amount;
+}
+
 struct PrincipledIn {
   base: vec3f,
   metallic: f32,

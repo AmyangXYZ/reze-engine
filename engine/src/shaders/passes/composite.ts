@@ -2,30 +2,51 @@
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
 //
 // The shader is a TEMPLATE: buildCompositeShader() emits either the base pass or
-// a variant with a user background effect injected (setBackgroundEffect). The
-// effect is background mode 3, a sibling of the 360 equirect (mode 2) — it reuses
-// the same per-pixel view-ray reconstruction and composites in display space
-// under the scene, so it never affects lighting, bloom, or tonemapping.
+// a variant with user WGSL injected at one or both effect MOUNTS (setEffect).
+// The two mounts are the same idea on either side of the scene:
+//
+//   background(...)  under the scene — a sibling of the 360 equirect (mode 2),
+//                    reusing the same per-pixel view-ray reconstruction.
+//   foreground(...)  over the finished frame, handed the scene's depth in metres
+//                    so it can be occluded by whatever it passes behind.
+//
+// Both composite in display space, so neither affects lighting, bloom, or
+// tonemapping, and both are captured by offline export like any background.
 
-/** What a user background effect must define, documented once:
+/** What user effect WGSL may define, documented once. A file declares its own
+ *  mounts by which of these it defines — defining both is how one file is one
+ *  weather system (dark sky behind, rain in front):
  *
  *    fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f
+ *    fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f
  *
- *  - `ray`  — normalized world-space view direction of this pixel (left-handed,
- *             +Z forward; identical to what the 360 skybox samples by).
- *  - `uv`   — 0..1 across the canvas, origin bottom-left (shadertoy-style).
- *  - `time` — seconds since the effect was applied.
+ *  - `ray`   — normalized world-space view direction of this pixel (left-handed,
+ *              +Z forward; identical to what the 360 skybox samples by).
+ *  - `uv`    — 0..1 across the canvas, origin bottom-left (shadertoy-style).
+ *  - `time`  — seconds since the effect was applied.
+ *  - `depth` — FOREGROUND ONLY. Camera-space distance in metres of whatever the
+ *              scene drew at this pixel, the far plane where it drew nothing.
+ *              Compare a particle's own distance against it and the model
+ *              occludes it; fog needs no comparison at all, its alpha simply IS
+ *              a function of distance.
  *  - `bgResolution()` — canvas size in pixels, for aspect correction.
- *  - declared params arrive as `params.<name>` (f32 or vec3f).
- *  Return display-space sRGB + alpha, 0..1. The effect is a LAYER: it is
- *  over-composited onto the base background (solid color / 360 equirect /
- *  transparent) and sits behind the scene — alpha 0 lets the base show
- *  through, so e.g. a starfield returns stars with a transparent sky. */
+ *  - declared params arrive as `params.<name>` (f32 or vec3f), shared by both.
+ *
+ *  Return display-space sRGB + alpha, 0..1. Both mounts are alpha-composited
+ *  LAYERS, so alpha is what decides how much they replace: a background effect
+ *  at alpha 1 covers the base (solid color / 360 equirect / transparent) and at
+ *  0 lets it through, which is how a starfield is stars over the user's color;
+ *  a foreground at alpha 1 covers the frame. No mode flag anywhere — the alpha
+ *  channel already says it. */
 export type CompositeEffectSource = {
-  /** User WGSL defining `background(...)` (plus any helpers it wants). */
+  /** The user's WGSL verbatim: helpers plus whichever entry points it defines. */
   wgsl: string
-  /** Codegen'd `struct BgParams {...}` + binding decl; empty when no params. */
+  /** Codegen'd `struct EffectParams {...}` + binding decl; empty when no params. */
   paramsDecl: string
+  /** Defines `fn background(...)` — mount under the scene. */
+  hasBackground: boolean
+  /** Defines `fn foreground(...)` — mount over the finished frame. */
+  hasForeground: boolean
 }
 
 const COMPOSITE_HEAD = /* wgsl */ `
@@ -39,7 +60,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 10>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 11>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -58,19 +79,23 @@ override APPLY_GAMMA: bool = true;
 // viewU[2] = (background.rgb, mode) — display-space sRGB, composited UNDER the
 //            scene post-tonemap. BASE-layer mode: 0 transparent (DOM shows),
 //            1 solid color, 2 = 360 equirect skybox sampled by view ray. A user
-//            WGSL effect is a separate LAYER over the base (viewU[6].y flag).
+//            WGSL effect is a separate LAYER over the base — no mode of its own,
+//            and no on/off uniform either: the pipeline is REBUILT per effect, so
+//            the compiled variant IS the flag.
 // viewU[3] = (camera right, tanHalfFov·aspect); viewU[4] = (camera up, tanHalfFov);
 // viewU[5] = (camera forward, _) — refreshed per frame while skybox/effect active.
-// viewU[6] = (time seconds, effect on/off, canvas width, canvas height).
+// viewU[6] = (time seconds, _, canvas width, canvas height).
 // viewU[7] = (grade offset.rgb, contrast);  viewU[8] = (grade power.rgb, saturation);
 // viewU[9] = (grade slope.rgb, grade on/off) — see grade() below.
+// viewU[10] = (camera world position, _) — refreshed with the basis above.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 // The scene pass's own MSAA depth buffer, bound depth-only. NOT an extra
-// render target: when depth of field is off the scene pass discards depth
-// (TBDR tile memory never spills) and this binding is never read — the whole
-// feature costs one uniform branch. When on, the pass stores depth and the
-// gather below reads sample 0.
+// render target: with neither depth of field nor a foreground effect active the
+// scene pass discards depth (TBDR tile memory never spills) and this binding is
+// never read. Either feature makes the pass store it instead, and both read
+// sample 0 — the DoF gather, and linearDepth() for the depth handed to
+// foreground().
 @group(0) @binding(8) var depthTex: texture_depth_multisampled_2d;
 // dofU[0] = (enabled, focusDistance, focusRange, aperture)
 // dofU[1] = (maxBlurRadiusPx, bladeCount, sampleCount, anamorphicRatio)
@@ -122,8 +147,25 @@ fn filmic(x: f32) -> f32 {
   return textureSampleLevel(filmicLut, bloomSamp, vec2f(u, 0.5), 0.0).r;
 }
 
-/** Canvas size in pixels — for user background effects (aspect correction). */
+/** Canvas size in pixels — for user effects (aspect correction). */
 fn bgResolution() -> vec2f { return viewU[6].zw; }
+
+/** The camera's world position. */
+fn bgCameraPos() -> vec3f { return viewU[10].xyz; }
+
+/** Where in the WORLD the scene drew this pixel — the depth handed to
+ *  foreground() turned into a place. Without it an effect can only think in
+ *  distances from the lens, which is no use to anything that belongs somewhere:
+ *  fog lying on the ground has to know where the ground is.
+ *
+ *  depth measures along the VIEW AXIS, not along the ray, so it is divided by
+ *  the ray's projection onto camera-forward before being walked out. At the far
+ *  plane (nothing drawn) this lands a very long way off, which is what a sky
+ *  should do to anything reading it. */
+fn bgWorldPos(ray: vec3f, depth: f32) -> vec3f {
+  let axis = max(dot(normalize(ray), viewU[5].xyz), 1e-4);
+  return bgCameraPos() + normalize(ray) * (depth / axis);
+}
 
 /** Color grading, applied to the tonemapped SCENE (not the background — see the
  *  call site). The core is ASC CDL, the film-industry interchange standard:
@@ -236,40 +278,54 @@ const COMPOSITE_BODY = /* wgsl */ `
   let bg = viewU[2];
   var bgA = select(0.0, 1.0, bg.w > 0.5);
   var bgPm = bg.rgb * bgA;  // premultiplied accumulator
-  let fxOn = viewU[6].y > 0.5;
-  if ((bg.w > 1.5 || fxOn) COVERAGE_GATE) {
-    // The equirect and any effect both need this pixel's world-space view ray,
-    // rebuilt from the camera basis. The dome sits at infinity (no parallax) —
-    // PhotoDome-style, display-only.
-    let ndc = vec2f(fragCoord.x / fullSz.x * 2.0 - 1.0, 1.0 - fragCoord.y / fullSz.y * 2.0);
-    let dir = normalize(viewU[5].xyz + ndc.x * viewU[3].w * viewU[3].xyz + ndc.y * viewU[4].w * viewU[4].xyz);
+  // This pixel's world-space view ray, rebuilt from the camera basis — what the
+  // equirect samples by, and what both effect mounts navigate by. The dome sits
+  // at infinity (no parallax): PhotoDome-style, display-only. Hoisted out of the
+  // branch below because the foreground mount is past the end of it; it is pure
+  // arithmetic on uniforms, which every backend sinks into whatever reads it.
+  let ndc = vec2f(fragCoord.x / fullSz.x * 2.0 - 1.0, 1.0 - fragCoord.y / fullSz.y * 2.0);
+  let dir = normalize(viewU[5].xyz + ndc.x * viewU[3].w * viewU[3].xyz + ndc.y * viewU[4].w * viewU[4].xyz);
+  if (BACKGROUND_COND) {
     if (bg.w > 1.5) {
       // LH world (+Z forward): longitude = atan2(x, z), Babylon-PhotoDome convention.
       let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
       let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
       bgPm = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
     }
-    BG_EFFECT_CALL
+    BACKGROUND_CALL
   }
-  return vec4f(disp * sceneAlpha + bgPm * (1.0 - sceneAlpha), sceneAlpha + bgA * (1.0 - sceneAlpha));
+  // The frame, premultiplied: scene over background. A var, not the return
+  // expression, because the foreground mount composites onto it.
+  var outRgb = disp * sceneAlpha + bgPm * (1.0 - sceneAlpha);
+  var outA = sceneAlpha + bgA * (1.0 - sceneAlpha);
+  FOREGROUND_CALL
+  return vec4f(outRgb, outA);
 }
 `
 
-// Base variant: no effect installed, the flag is never set — the ray block only
-// runs for the equirect, and there is nothing to add. (`dir` may go unused when
-// this compiles with mode<2 shaders; WGSL is fine with an unused let.)
-const NO_EFFECT_CALL = `_ = dir;`
-
 // uv flipped to bottom-left origin (shadertoy convention); clamped so a stray
 // effect can't push negatives/NaN into the premultiplied composite. Standard
-// OVER onto the base layer.
-const EFFECT_CALL = /* wgsl */ `
-    if (fxOn) {
-      let bgUv = vec2f(fragCoord.x / fullSz.x, 1.0 - fragCoord.y / fullSz.y);
-      let fx = clamp(background(dir, bgUv, viewU[6].x), vec4f(0.0), vec4f(1.0));
-      bgPm = fx.rgb * fx.a + bgPm * (1.0 - fx.a);
-      bgA = fx.a + bgA * (1.0 - fx.a);
-    }
+// OVER onto the base layer. No `if` around it: the pipeline is rebuilt per
+// effect, so this text only exists in variants whose WGSL defines background().
+const BACKGROUND_CALL = /* wgsl */ `
+    let bgUv = vec2f(fragCoord.x / fullSz.x, 1.0 - fragCoord.y / fullSz.y);
+    let bgFx = clamp(background(dir, bgUv, viewU[6].x), vec4f(0.0), vec4f(1.0));
+    bgPm = bgFx.rgb * bgFx.a + bgPm * (1.0 - bgFx.a);
+    bgA = bgFx.a + bgA * (1.0 - bgFx.a);
+`
+
+// Same OVER, one layer later — onto the finished frame rather than onto the
+// base. Ungated by design: a foreground runs at every pixel, including the ones
+// the model covers, because covering them is the point.
+const FOREGROUND_CALL = /* wgsl */ `
+  let fgUv = vec2f(fragCoord.x / fullSz.x, 1.0 - fragCoord.y / fullSz.y);
+  // The scene's own depth, so the effect can tell what is in front of it: a
+  // petal compares its distance against this and lets the model take the pixel,
+  // and fog's alpha is nothing but a function of it. Pixels the scene never drew
+  // read the far plane, so distance fog closes over the backdrop too.
+  let fgFx = clamp(foreground(dir, fgUv, viewU[6].x, linearDepth(coord)), vec4f(0.0), vec4f(1.0));
+  outRgb = fgFx.rgb * fgFx.a + outRgb * (1.0 - fgFx.a);
+  outA = fgFx.a + outA * (1.0 - fgFx.a);
 `
 
 // Derivative builtins are illegal in non-uniform control flow (WGSL uniformity
@@ -277,33 +333,41 @@ const EFFECT_CALL = /* wgsl */ `
 // effect code that doesn't use them. Checked textually at build time.
 const USES_DERIVATIVES = /\b(?:fwidth|dpdx|dpdy)(?:Fine|Coarse)?\s*\(/
 
-/** Skip the whole background block (equirect sample + effect) behind pixels the
- *  model fully covers — the composite multiplies the result by (1 - alpha) = 0
- *  there anyway, and on a full-screen effect that's a third or more of the frame
- *  (the cost Safari feels most). The equirect uses explicit-LOD sampling, which
- *  is always legal in non-uniform flow; only derivative-using effects must keep
- *  uniform control flow and forgo the gate. */
-function coverageGate(effect?: CompositeEffectSource | null): string {
-  const gated = !effect || !USES_DERIVATIVES.test(effect.wgsl)
+/** The condition on the background block (equirect sample + background effect).
+ *
+ *  Two jobs. It skips the block behind pixels the model fully covers — the
+ *  composite multiplies the result by (1 - alpha) = 0 there anyway, and on a
+ *  full-screen effect that's a third or more of the frame (the cost Safari feels
+ *  most). And with no background effect compiled in, it also skips the block
+ *  entirely unless the equirect needs it.
+ *
+ *  The equirect uses explicit-LOD sampling, which is always legal in non-uniform
+ *  flow; only derivative-using effects must keep uniform control flow and forgo
+ *  the coverage half. The test is textual over the whole file, so a foreground
+ *  that uses fwidth costs the background its gate — conservative, and only ever
+ *  in the direction of correctness. (The foreground mount itself sits in uniform
+ *  flow, so derivatives are always legal there.) */
+function backgroundCondition(effect?: CompositeEffectSource | null): string {
   // sceneAlpha, not alpha: the bokeh gather spreads coverage, so a pixel the
   // sharp scene fully covered can end up needing background behind its blur.
-  return gated ? "&& sceneAlpha < 0.999" : ""
+  const coverage = "sceneAlpha < 0.999"
+  if (!effect?.hasBackground) return `bg.w > 1.5 && ${coverage}`
+  return USES_DERIVATIVES.test(effect.wgsl) ? "true" : coverage
 }
 
 export function buildCompositeShader(effect?: CompositeEffectSource | null): string {
-  if (!effect)
-    return (
-      COMPOSITE_HEAD +
-      COMPOSITE_BODY.replace("BG_EFFECT_CALL", NO_EFFECT_CALL).replace("COVERAGE_GATE", coverageGate(null))
-    )
+  const body = COMPOSITE_BODY.replace("BACKGROUND_COND", backgroundCondition(effect))
+    .replace("BACKGROUND_CALL", effect?.hasBackground ? BACKGROUND_CALL.trim() : "")
+    .replace("FOREGROUND_CALL", effect?.hasForeground ? FOREGROUND_CALL.trim() : "")
+  if (!effect) return COMPOSITE_HEAD + body
   return (
     COMPOSITE_HEAD +
-    "\n// ── user background effect (setBackgroundEffect) ──\n" +
+    "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +
     effect.wgsl +
     "\n" +
-    COMPOSITE_BODY.replace("BG_EFFECT_CALL", EFFECT_CALL.trim()).replace("COVERAGE_GATE", coverageGate(effect))
+    body
   )
 }
 

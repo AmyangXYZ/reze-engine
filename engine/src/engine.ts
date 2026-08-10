@@ -235,14 +235,17 @@ export type SunOptions = {
   direction?: Vec3
 }
 
-/** A background-effect param: number → f32, vector-like → vec3f (see
- *  setBackgroundEffect). Structural {x,y,z} rather than the Vec3 class so
- *  JSON-derived values (a shared scene document's params) pass straight in. */
-export type BackgroundEffectParamValue = number | { x: number; y: number; z: number }
-export type BackgroundEffectResult = {
+/** An effect param: number → f32, vector-like → vec3f (see setEffect).
+ *  Structural {x,y,z} rather than the Vec3 class so JSON-derived values (a
+ *  shared scene document's params) pass straight in. */
+export type EffectParamValue = number | { x: number; y: number; z: number }
+export type EffectResult = {
   ok: boolean
   /** Compile/validation errors, line:col relative to the USER's WGSL. */
   diagnostics: string[]
+  /** Which mounts the WGSL declared — `fn background` / `fn foreground`. Both
+   *  false only on a failed compile, since defining neither IS the failure. */
+  mounts: { background: boolean; foreground: boolean }
 }
 
 export type CameraOptions = {
@@ -772,7 +775,10 @@ export class Engine {
   private depthReadView: GPUTextureView | null = null
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
-  private readonly compositeUniformData = new Float32Array(40)
+  // 11 × vec4f — see the viewU comment in composite.ts. The last one is the
+  // camera's world position, which is what lets a foreground effect turn the
+  // depth it is handed into a PLACE (bgWorldPos) rather than a distance.
+  private readonly compositeUniformData = new Float32Array(44)
   /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
   private backgroundColor: Vec3 | null = null
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
@@ -780,21 +786,27 @@ export class Engine {
   private backdropEquirectView: GPUTextureView | null = null
   private fallbackEquirectTexture!: GPUTexture
   private fallbackEquirectView!: GPUTextureView
-  // User WGSL background effect (background mode 3, setBackgroundEffect). The
-  // composite pipelines are REBUILT with the user code injected; params live in
-  // their own uniform buffer so setBackgroundEffectParam is a write, not a
+  // The scene's user WGSL effect (setEffect). ONE per scene, mounted under the
+  // scene, over it, or both — whichever of background()/foreground() the code
+  // defines. The composite pipelines are REBUILT with the user code injected;
+  // params live in their own uniform buffer so setEffectParam is a write, not a
   // recompile (the same instant tier as setStyleParam).
-  private backgroundEffect: {
+  private effect: {
     wgsl: string
     paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
     paramsBuffer: GPUBuffer | null
     paramsData: Float32Array<ArrayBuffer>
+    /** Mounted under the scene. */
+    hasBackground: boolean
+    /** Mounted over the finished frame — and the reason the scene pass has to
+     *  STORE its depth, which it otherwise discards into tile memory. */
+    hasForeground: boolean
   } | null = null
   /** Bound at composite binding 7 when no effect (or a param-less one) is set. */
   private bgParamsDummyBuffer!: GPUBuffer
   private compositePipelineLayout!: GPUPipelineLayout
-  /** time=0 origin for the active effect — reset each setBackgroundEffect. */
-  private bgEffectEpochMs = 0
+  /** time=0 origin for the active effect — reset each setEffect. */
+  private effectEpochMs = 0
   private compositeBloomView: GPUTextureView | null = null
 
   // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
@@ -1062,10 +1074,10 @@ export class Engine {
     u[8] = bg?.x ?? 0
     u[9] = bg?.y ?? 0
     u[10] = bg?.z ?? 0
-    // Base-layer mode; a user effect is a separate LAYER flagged at u[25] and
-    // over-composited onto whichever base is active.
+    // Base-layer mode only. A user effect is a separate LAYER over whichever
+    // base is active, and needs no flag of its own: the composite pipeline is
+    // rebuilt per effect, so the compiled variant IS the flag. u[25] is spare.
     u[11] = this.backdropEquirectView ? 2 : bg ? 1 : 0
-    u[25] = this.backgroundEffect ? 1 : 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
@@ -1133,7 +1145,7 @@ export class Engine {
         { binding: 4, resource: this.maskResolveView },
         { binding: 5, resource: this.filmicLutView },
         { binding: 6, resource: this.backdropEquirectView ?? this.fallbackEquirectView },
-        { binding: 7, resource: { buffer: this.backgroundEffect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
+        { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
       ],
@@ -1200,45 +1212,72 @@ export class Engine {
   }
 
   /**
-   * Install a WGSL background effect (shadertoy-style) as a LAYER between the
-   * base background and the scene: rendered per-pixel in the composite pass and
-   * over-composited onto whichever base is active (solid color, 360 equirect,
-   * or transparency) — its alpha lets the base show through, so a starfield is
-   * stars over the user's background color. Display-space: never affects
-   * lighting, bloom, or tonemapping, and is captured by offline export like any
-   * background.
-   *
-   * `wgsl` must define:
+   * Install the scene's WGSL effect (shadertoy-style), rendered per-pixel in the
+   * composite pass. ONE effect per scene, and the code says where it mounts by
+   * which of these it defines — either, or both in one file:
    *
    *     fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f
+   *     fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f
    *
-   * where `ray` is the pixel's normalized world-space view direction (LH, +Z
-   * forward — what the skybox samples by), `uv` is 0..1 bottom-left origin,
-   * `time` is seconds since apply, and `bgResolution()` gives the canvas size.
-   * Return sRGB + alpha. Declared `params` arrive as `params.<name>` (number →
-   * f32, Vec3 → vec3f) and are later tweaked without recompiling via
-   * setBackgroundEffectParam.
+   * `background` is a LAYER between the base background and the scene,
+   * over-composited onto whichever base is active (solid color, 360 equirect, or
+   * transparency) — its alpha lets the base show through, so a starfield is
+   * stars over the user's background color. `foreground` composites over the
+   * finished frame instead, which is where rain, snow, petals and fog live, and
+   * is handed `depth`: the camera-space distance in metres of whatever the scene
+   * drew at that pixel (the far plane where it drew nothing). Compare a
+   * particle's own distance against it and the model occludes it; fog just reads
+   * it, since fog's alpha IS a function of distance.
    *
-   * Compiles off the hot path (async pipelines): on failure the previous
-   * background is KEPT and diagnostics are returned with line numbers relative
-   * to the user's WGSL. Pass null to remove the effect.
+   * `ray` is the pixel's normalized world-space view direction (LH, +Z forward —
+   * what the skybox samples by), `uv` is 0..1 bottom-left origin, `time` is
+   * seconds since apply, and `bgResolution()` gives the canvas size. Return sRGB
+   * + alpha; alpha is the only "how much does this replace" control there is.
+   * Declared `params` arrive as `params.<name>` (number → f32, Vec3 → vec3f),
+   * shared by both mounts, and are later tweaked without recompiling via
+   * setEffectParam.
+   *
+   * Both mounts are display-space: neither affects lighting, bloom or
+   * tonemapping, and both are captured by offline export. A foreground makes the
+   * scene pass STORE its depth buffer (it otherwise discards it into tile
+   * memory) for as long as one is installed.
+   *
+   * Compiles off the hot path (async pipelines): on failure the previous effect
+   * is KEPT and diagnostics are returned with line numbers relative to the
+   * user's WGSL. Pass null to remove the effect.
    */
-  async setBackgroundEffect(
-    wgsl: string | null,
-    params?: Record<string, BackgroundEffectParamValue>,
-  ): Promise<BackgroundEffectResult> {
-    if (!this.device) return { ok: false, diagnostics: ["setBackgroundEffect requires init() to have run"] }
+  async setEffect(wgsl: string | null, params?: Record<string, EffectParamValue>): Promise<EffectResult> {
+    const noMounts = { background: false, foreground: false }
+    if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts }
 
     if (wgsl === null) {
-      this.backgroundEffect?.paramsBuffer?.destroy()
-      this.backgroundEffect = null
+      this.effect?.paramsBuffer?.destroy()
+      this.effect = null
       const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
       this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
       this.compositePipelineGamma = this.makeCompositePipeline(module, true, "composite pipeline (gamma!=1)")
       this.rebuildCompositeBindGroup()
       this.writeCompositeViewUniforms()
-      return { ok: true, diagnostics: [] }
+      return { ok: true, diagnostics: [], mounts: noMounts }
     }
+
+    // ── Which mounts did the author ask for? A declaration, not a setting: the
+    // entry points present in the source are the ones compiled in. Matching the
+    // `fn` keyword is enough to be safe against a `foreground` LOCAL or a call
+    // to one — those never follow `fn`.
+    const hasBackground = /\bfn\s+background\s*\(/.test(wgsl)
+    const hasForeground = /\bfn\s+foreground\s*\(/.test(wgsl)
+    if (!hasBackground && !hasForeground) {
+      return {
+        ok: false,
+        diagnostics: [
+          "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f " +
+            "or fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f (or both)",
+        ],
+        mounts: noMounts,
+      }
+    }
+    const mounts = { background: hasBackground, foreground: hasForeground }
 
     // ── Params: codegen a WGSL struct and mirror its uniform layout on the CPU.
     // Fields are emitted in declaration order; offsets follow WGSL's natural
@@ -1250,7 +1289,7 @@ export class Engine {
     let cursor = 0
     for (const [name, value] of entries) {
       if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
-        return { ok: false, diagnostics: [`invalid param name "${name}" (must be a WGSL identifier)`] }
+        return { ok: false, diagnostics: [`invalid param name "${name}" (must be a WGSL identifier)`], mounts }
       }
       const isVec = typeof value !== "number"
       const align = isVec ? 16 : 4
@@ -1270,22 +1309,22 @@ export class Engine {
       }
     }
     const paramsDecl = entries.length
-      ? `struct BgParams {\n${fields.join("\n")}\n}\n@group(0) @binding(7) var<uniform> params: BgParams;\n`
+      ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(7) var<uniform> params: EffectParams;\n`
       : ""
 
     // ── Compile with validation captured, not thrown at the console. Line
     // numbers in diagnostics are rebased to the USER's source.
-    const source = buildCompositeShader({ wgsl, paramsDecl })
+    const source = buildCompositeShader({ wgsl, paramsDecl, hasBackground, hasForeground })
     const userLineOffset = source.slice(0, source.indexOf(wgsl)).split("\n").length - 1
     this.device.pushErrorScope("validation")
-    const module = this.device.createShaderModule({ label: "composite shader (bg effect)", code: source })
+    const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
     const info = await module.getCompilationInfo()
     const scopeErr = await this.device.popErrorScope()
     const diagnostics = info.messages
       .filter((m) => m.type === "error")
       .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
     if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
-    if (diagnostics.length > 0) return { ok: false, diagnostics }
+    if (diagnostics.length > 0) return { ok: false, diagnostics, mounts }
     let identity: GPURenderPipeline
     let gamma: GPURenderPipeline
     try {
@@ -1303,37 +1342,42 @@ export class Engine {
           primitive: { topology: "triangle-list" },
         })
       ;[identity, gamma] = await Promise.all([
-        make(false, "composite pipeline (bg effect, gamma=1)"),
-        make(true, "composite pipeline (bg effect, gamma!=1)"),
+        make(false, "composite pipeline (effect, gamma=1)"),
+        make(true, "composite pipeline (effect, gamma!=1)"),
       ])
     } catch (e) {
-      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts }
     }
 
     // ── Swap — only now does the old effect (and its params buffer) go away.
-    this.backgroundEffect?.paramsBuffer?.destroy()
+    this.effect?.paramsBuffer?.destroy()
     let paramsBuffer: GPUBuffer | null = null
     if (entries.length) {
       paramsBuffer = this.device.createBuffer({
-        label: "bg effect params",
+        label: "effect params",
         size: paramsData.byteLength,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       })
       this.device.queue.writeBuffer(paramsBuffer, 0, paramsData)
     }
-    this.backgroundEffect = { wgsl, paramLayout: layout, paramsBuffer, paramsData }
+    this.effect = { wgsl, paramLayout: layout, paramsBuffer, paramsData, hasBackground, hasForeground }
     this.compositePipelineIdentity = identity
     this.compositePipelineGamma = gamma
-    this.bgEffectEpochMs = performance.now()
+    this.effectEpochMs = performance.now()
     this.rebuildCompositeBindGroup()
     this.writeCompositeViewUniforms()
-    return { ok: true, diagnostics: [] }
+    return { ok: true, diagnostics: [], mounts }
   }
 
-  /** Write one background-effect param (declared at setBackgroundEffect) — a
-   *  uniform write, no recompile; the instant tier, like setStyleParam. */
-  setBackgroundEffectParam(name: string, value: BackgroundEffectParamValue): void {
-    const fx = this.backgroundEffect
+  /** Which mounts the installed effect declared. Both false when none is set. */
+  getEffectMounts(): { background: boolean; foreground: boolean } {
+    return { background: this.effect?.hasBackground ?? false, foreground: this.effect?.hasForeground ?? false }
+  }
+
+  /** Write one effect param (declared at setEffect) — a uniform write, no
+   *  recompile; the instant tier, like setStyleParam. */
+  setEffectParam(name: string, value: EffectParamValue): void {
+    const fx = this.effect
     if (!fx || !fx.paramsBuffer) return
     const slot = fx.paramLayout.get(name)
     if (!slot) return
@@ -1407,7 +1451,10 @@ export class Engine {
     if (!this.device || !this.dofUniformBuffer) return
     const d = this.depthOfField
     const u = this.dofUniformData
-    const auto = d.focusMode === "auto" ? this.getModelBodyFocus() : null
+    // `d.enabled &&`, because a foreground effect also drives this write (for
+    // projA/projB alone) and auto-focus walks every visible character's bones —
+    // work nothing would read with the gather switched off.
+    const auto = d.enabled && d.focusMode === "auto" ? this.getModelBodyFocus() : null
     u[0] = d.enabled ? 1 : 0
     u[1] = auto?.distance ?? Math.max(d.focusDistance, 0.05)
     // In auto mode the authored range is a floor — the sharp band never cuts
@@ -2286,11 +2333,12 @@ export class Engine {
     // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      // 10 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
+      // 11 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
       // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray ·
-      // (time, _, canvas width, canvas height) for user background effects ·
-      // three grade vectors (CDL offset+contrast, power+saturation, slope+flag).
-      size: 160,
+      // (time, _, canvas width, canvas height) for user effects · three grade
+      // vectors (CDL offset+contrast, power+saturation, slope+flag) · camera
+      // world position, for an effect placing itself in the scene.
+      size: 176,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.dofUniformBuffer = this.device.createBuffer({
@@ -3008,6 +3056,13 @@ export class Engine {
   /** True if a (non-empty) camera VMD is loaded, regardless of enabled state. */
   hasCameraVmd(): boolean {
     return this.cameraAnimation !== null
+  }
+
+  /** Seconds the loaded camera VMD runs for — its last keyframe — or 0 with none
+   *  loaded. A timeline cannot draw a lane to scale without it, and the camera's
+   *  length is its own: it does not have to match any model's clip. */
+  getCameraVmdDuration(): number {
+    return this.cameraAnimation?.duration ?? 0
   }
 
   /** Drop the loaded camera VMD and return to orbit control. */
@@ -5213,12 +5268,20 @@ export class Engine {
     this.updateShadowLightVP()
 
     // Depth of field's entire disabled cost is this branch: depth stays in
-    // TBDR tile memory (discard) unless the composite gather reads it this
-    // frame. Enabled frames also refresh the uniforms — auto-focus tracks the
-    // character and the depth-inversion constants track near/far.
+    // TBDR tile memory (discard) unless something in the composite reads it this
+    // frame. Two things can — the DoF gather, and the depth handed to a
+    // foreground effect — and either one makes the pass store it.
+    //
+    // The uniform refresh is shared for the same reason: linearDepth() inverts
+    // the z-buffer with projA/projB out of dofU[2], which track the camera's
+    // near/far and so must be rewritten every frame either reader is live. A
+    // foreground with a stale pair would read metres from the wrong frustum. The
+    // write leaves dofU[0].x at 0 while DoF is off, so refreshing it does not
+    // switch the gather on.
     const dofOn = this.depthOfField.enabled
-    this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = dofOn ? "store" : "discard"
-    if (dofOn) this.writeDepthOfFieldUniforms()
+    const depthRead = dofOn || (this.effect?.hasForeground ?? false)
+    this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
+    if (depthRead) this.writeDepthOfFieldUniforms()
 
     const encoder = this.device.createCommandEncoder()
 
@@ -5881,7 +5944,7 @@ export class Engine {
     // is LEFT-HANDED (+Z forward, see Mat4.lookAtInto), so the world-space
     // right/up/FORWARD vectors are rows 0/1/2 of its rotation block directly
     // (column-major storage: row i = values[i], values[i+4], values[i+8]).
-    if ((this.backdropEquirectView || this.backgroundEffect) && this.compositeUniformBuffer) {
+    if ((this.backdropEquirectView || this.effect) && this.compositeUniformBuffer) {
       const v = viewMatrix.values
       const u = this.compositeUniformData
       const tanHalf = Math.tan((this.camera.fov ?? Math.PI / 4) / 2)
@@ -5899,9 +5962,15 @@ export class Engine {
       u[22] = v[10]
       u[23] = 0
       // Effect clock + canvas size (viewU[6]) — written on the same refresh.
-      u[24] = (performance.now() - this.bgEffectEpochMs) / 1000
+      u[24] = (performance.now() - this.effectEpochMs) / 1000
       u[26] = this.canvas.width
       u[27] = this.canvas.height
+      // Camera world position (viewU[10]) — the other half of bgWorldPos. It
+      // rides this refresh rather than writeCompositeViewUniforms because it
+      // changes every frame the camera does, exactly like the basis above.
+      u[40] = cameraPos.x
+      u[41] = cameraPos.y
+      u[42] = cameraPos.z
       this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
     }
   }
