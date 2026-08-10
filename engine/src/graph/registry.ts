@@ -52,15 +52,19 @@ export function fmtValue(value: SocketValue, type: SockT): string {
     if (x === y && y === z) return `vec3f(${fmtFloat(x)})`
     return `vec3f(${fmtFloat(x)}, ${fmtFloat(y)}, ${fmtFloat(z)})`
   }
-  if (type !== "vec4") throw new Error(`vec4 literal on ${type} socket`)
+  if (type === "float") throw new Error(`color literal on float socket`)
+  // Blender's colour sockets are RGBA, so a ported literal arrives with four
+  // components whatever it feeds. Only a stop colour keeps the alpha; every other
+  // socket here is a vec3 and drops it, which is what Blender does downstream.
+  if (type !== "vec4") return fmtValue([value[0], value[1], value[2]], type)
   return `vec4f(${value.map(fmtFloat).join(", ")})`
 }
 
 /** Does a literal's shape fit a socket type? (Scalar splats onto color/vector/vec4.) */
 export function literalFits(value: SocketValue, type: SockT): boolean {
   if (typeof value === "number") return true
-  if (value.length === 3) return type !== "float"
-  return type === "vec4"
+  // 3 and 4 components both fit anything but a float — see fmtValue on RGBA.
+  return type !== "float"
 }
 
 // ─── Implicit socket conversions (Blender-faithful) ──────────────────
@@ -149,6 +153,44 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       reflection: "reflect(-v, n)",
     },
   },
+  // The scene's key light. Blender NPR presets rarely use a diffuse closure —
+  // they build their own term, typically dot(normal, direction) pushed through a
+  // ramp or a soft threshold band, because that is what gives an anime shader its
+  // hard terminator. Reaching that term needs the direction as a value, which no
+  // other node exposes: `shader_to_rgb*` and `bsdf_diffuse` bake the whole closure
+  // and hand back a result. `shadow` is the same cascade sample those closures
+  // take, so a graph can tint its own shadow instead of accepting theirs.
+  //
+  // A ported graph reads `direction` where the Blender original read an Attribute
+  // fed by a light empty; the empty and our sun mean the same thing.
+  light: {
+    inputs: {},
+    outputs: { direction: "vector", color: "color", ambient: "color", shadow: "float" },
+    contextOutputs: { direction: "l", color: "sun", ambient: "amb", shadow: "shadow" },
+  },
+
+  // The head bone's world basis — what an SDF face shadow is built on.
+  //
+  // That technique compares a face-shaped distance field against the light's
+  // angle IN THE HEAD'S OWN FRAME, so the shadow sweeps across the face as the
+  // light moves and stays put as the head turns. Without the frame there is
+  // nothing to measure the angle against, and the effect cannot be expressed at
+  // all. `right` also carries the sign that mirrors the field's U coordinate,
+  // which is how one half-face texture serves both sides.
+  //
+  // Read from the 頭 bone's skinning matrix, already bound to the fragment stage
+  // for the eye's rear-view gate. A model without that bone falls back to bone 0
+  // rather than sampling out of bounds; the face shadow is then wrong, not unsafe.
+  head_basis: {
+    inputs: {},
+    outputs: { forward: "vector", right: "vector", up: "vector" },
+    contextOutputs: {
+      forward: "(-normalize(skinMats[u32(max(material.headBoneIndex, 0.0))][2].xyz))",
+      right: "normalize(skinMats[u32(max(material.headBoneIndex, 0.0))][0].xyz)",
+      up: "normalize(skinMats[u32(max(material.headBoneIndex, 0.0))][1].xyz)",
+    },
+  },
+
   // PMX material's diffuse color (the authored base tint). Multiply the diffuse texture
   // by this for the MMD-correct base — untextured materials carry their color here, so a
   // texture-only base would render them white.
@@ -474,8 +516,28 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputSelect: RAMP_SELECT,
     emit: (a) => `ramp_constant_edge_aa(${a.fac}, ${a.edge}, ${a.color0}, ${a.color1})`,
   },
+  // Blender ColorRamp LINEAR with three arbitrary stops. A two-stop ramp cannot
+  // express a shadow that passes through a colour on its way — a warm terminator
+  // between cool shadow and lit skin is three stops, and that middle band is
+  // where a lot of NPR character lives. Decomposing it into two ramps and a
+  // select costs three extra nodes and stops reading as a ramp.
+  ramp_linear_3: {
+    inputs: {
+      fac: F(0.5, true),
+      pos0: F(0),
+      color0: V4([0, 0, 0, 1]),
+      pos1: F(0.5),
+      color1: V4([0.5, 0.5, 0.5, 1]),
+      pos2: F(1),
+      color2: V4([1, 1, 1, 1]),
+    },
+    outputs: RAMP_OUTPUTS,
+    outputSelect: RAMP_SELECT,
+    emit: (a) =>
+      `ramp_linear3(${a.fac}, ${a.pos0}, ${a.color0}, ${a.pos1}, ${a.color1}, ${a.pos2}, ${a.color2})`,
+  },
   // Blender ColorRamp LINEAR with 3 stops black→white→black (triangular peak at 0.5).
-  // The only >2-stop ramp the presets use; folded to closed form like the hand port.
+  // Folded to closed form like the hand port.
   ramp_tri: {
     inputs: { fac: F(0.5, true) },
     outputs: { value: "float" },
@@ -703,3 +765,35 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     },
   },
 }
+
+// ─── Blender socket parity ────────────────────────────────────────────
+// Blender's Math node carries three Value inputs whatever operation is selected,
+// its Vector Math node three Vectors plus a Scale, and Vector Rotate the union of
+// every rotation type's inputs. Sockets are part of the node, not of the mode.
+//
+// Declaring the same set here is what makes a port mechanical: a transcriber maps
+// socket-for-socket and never has to know which inputs a given operation happens
+// to read. The emit functions read only what their operation uses, so the added
+// sockets change no generated WGSL — an unread one is inert.
+//
+// Applied as a pass rather than written into each entry so that every operation
+// KEEPS the default it already declared (divide's b is 1, not 0). Only genuinely
+// missing sockets are added.
+function widen(prefix: string, sockets: Record<string, InputSpec>): void {
+  for (const [key, spec] of Object.entries(NODE_REGISTRY)) {
+    if (!key.startsWith(prefix)) continue
+    for (const [name, def] of Object.entries(sockets)) {
+      if (!(name in spec.inputs)) spec.inputs[name] = def
+    }
+  }
+}
+
+widen("math/", { a: F(0), b: F(0), c: F(0) })
+widen("vector_math/", { a: V(), b: V(), c: V(), scale: F(1) })
+widen("vector_rotate/", {
+  vector: V([0, 0, 0], true),
+  center: V(),
+  axis: V([0, 0, 1]),
+  angle: F(0),
+  rotation: V(),
+})

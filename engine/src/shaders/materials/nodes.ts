@@ -122,6 +122,15 @@ fn ramp_linear(f: f32, p0: f32, c0: vec4f, p1: f32, c1: vec4f) -> vec4f {
   return mix(c0, c1, t);
 }
 
+// LINEAR ramp, three stops. Both halves are evaluated and selected between rather
+// than branched on, so there is no divergence; saturate outside each span already
+// gives Blender's clamp-to-end-stop behaviour.
+fn ramp_linear3(f: f32, p0: f32, c0: vec4f, p1: f32, c1: vec4f, p2: f32, c2: vec4f) -> vec4f {
+  let lo = mix(c0, c1, saturate((f - p0) / max(p1 - p0, 1e-6)));
+  let hi = mix(c1, c2, saturate((f - p1) / max(p2 - p1, 1e-6)));
+  return select(lo, hi, f >= p1);
+}
+
 fn ramp_cardinal(f: f32, p0: f32, c0: vec4f, p1: f32, c1: vec4f) -> vec4f {
   // cardinal spline with 2 stops degrades to smoothstep
   let t = saturate((f - p0) / max(p1 - p0, 1e-6));

@@ -41,6 +41,8 @@ export { NODE_REGISTRY, type NodeSpec, type SockT } from "./graph/registry"
 export { RENDER_CLASSES, type RenderClass, type AlphaMode, type RenderClassInfo } from "./graph/render-class"
 export type {
   StyleGroup,
+  GroupImage,
+  GroupImageSource,
   GroupDiagnostic,
   ApplyStyleGroupsResult,
   ApplyStyleGroupResult,

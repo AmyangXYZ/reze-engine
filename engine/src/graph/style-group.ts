@@ -35,8 +35,38 @@ export type StyleGroup = {
    * (or a graph reading past the end) samples 1×1 white, so a missing map is a
    * no-op rather than a failure.
    */
-  images?: (ImageBitmap | HTMLImageElement | HTMLCanvasElement | null)[]
+  images?: (GroupImage | GroupImageSource | null)[]
 }
+
+export type GroupImageSource = ImageBitmap | HTMLImageElement | HTMLCanvasElement
+
+/**
+ * A group map, with the one thing the engine cannot infer from the pixels:
+ * whether they are colour.
+ *
+ * A PMX texture is always colour, so material textures are uploaded sRGB
+ * unconditionally. A group's maps are not — half of them are data whose channels
+ * encode thresholds, masks and distances, and running those through an sRGB
+ * decode bends every value. Blender asks the same question per image, and a
+ * ported look carries whatever answer it was authored with.
+ *
+ * A bare source reads as data (`srgb: false`), because a map that is silently
+ * mis-decoded as colour is the harder failure to see: it renders, just wrong.
+ */
+/**
+ * `premultiplied` — whether the upload should multiply RGB by alpha.
+ *
+ * Blender premultiplies a straight-alpha image for rendering, so a transparent
+ * pixel contributes nothing. A highlight texture is white everywhere with its
+ * shape only in alpha, and without this it screens to a white card instead of
+ * resolving to its shape. Left off for a channel-packed map, whose alpha is a
+ * separate signal and would scale colour by something unrelated.
+ *
+ * It has to happen HERE rather than in the host's decode: copyExternalImageToTexture
+ * converts to the destination's tagged alpha mode, so a premultiplied ImageBitmap
+ * copied into an untagged texture is un-premultiplied again on the way in.
+ */
+export type GroupImage = { source: GroupImageSource; srgb?: boolean; premultiplied?: boolean }
 
 export type GroupDiagnostic = { groupId: string; diagnostics: Diagnostic[]; ok: boolean }
 

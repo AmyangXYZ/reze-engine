@@ -85,7 +85,17 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
     "face",
     ["顔", "颜", "顏", "脸", "臉", "かお", "face", "舌", "tongue", "牙", "牙齿", "齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "唇", "歯茎", "gums"],
   ],
-  ["hair", ["前髪", "後髪", "髪", "髮", "头发", "頭髪", "もみあげ", "アホ毛", "ヘア", "hair", "ahoge", "bang"]],
+  // Simplified 发 is listed as compounds, never bare: it also writes 发光 (glow),
+  // and hair carries a renderClass, so a chance hit puts an emissive panel in the
+  // hair pass. Same reasoning as bare 口 being omitted from face above.
+  [
+    "hair",
+    [
+      "前髪", "後髪", "髪", "髮", "頭髪", "もみあげ", "アホ毛", "ヘア",
+      "头发", "前发", "后发", "长发", "短发", "发丝", "刘海", "辫", "马尾",
+      "hair", "ahoge", "bang",
+    ],
+  ],
   ["body", ["肌", "皮肤", "skin"]],
   ["metal", ["金属", "メタル", "metal", "earring", "耳环", "耳環"]],
   [
@@ -3603,17 +3613,25 @@ export class Engine {
    *  holds; the engine never fetches, matching how models and motions arrive. */
   private uploadGroupImages(group: StyleGroup): (GPUTexture | null)[] | undefined {
     if (!group.images?.length) return undefined
-    return group.images.slice(0, 4).map((src) => {
-      if (!src) return null
+    return group.images.slice(0, 4).map((entry) => {
+      if (!entry) return null
+      const wrapped = "source" in entry
+      const src = wrapped ? entry.source : entry
       const width = Math.max(1, "naturalWidth" in src ? src.naturalWidth : src.width)
       const height = Math.max(1, "naturalHeight" in src ? src.naturalHeight : src.height)
       const tex = this.device.createTexture({
         label: `group map: ${group.id}`,
         size: [width, height],
-        format: "rgba8unorm",
+        // Colour maps decode to linear on sample, the way material textures do;
+        // data maps must not, or every threshold packed in their channels moves.
+        format: wrapped && entry.srgb ? "rgba8unorm-srgb" : "rgba8unorm",
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
       })
-      this.device.queue.copyExternalImageToTexture({ source: src }, { texture: tex }, [width, height])
+      this.device.queue.copyExternalImageToTexture(
+        { source: src },
+        { texture: tex, premultipliedAlpha: wrapped && entry.premultiplied === true },
+        [width, height],
+      )
       return tex
     })
   }
@@ -5770,6 +5788,26 @@ export class Engine {
       slotMap: result.slotMap,
       signature,
     })
+    // Rebind this group's draw calls before the old textures go.
+    //
+    // assignDrawCallGroups only rebuilds a bind group when a material CHANGES
+    // group, which is the wrong test here: swapping the graph on a group a
+    // material already belongs to leaves its id alone while replacing the maps
+    // underneath it. The draw call then kept a bind group holding the outgoing
+    // textures — destroyed on the next line — so a graph swap either sampled the
+    // old maps, or the fallback white where the previous graph had none (which
+    // reads as a blown-out white material through any screen or add), or tripped
+    // a validation error on a destroyed texture. Only a reload cleared it.
+    const install = inst.styleGroups.get(group.id)
+    for (const dc of inst.drawCalls) {
+      if (!dc.baseBindGroupEntries || dc.groupId !== group.id) continue
+      dc.bindGroup = this.createMaterialBindGroup(
+        `material: ${dc.materialName}`,
+        dc.baseBindGroupEntries,
+        uniformBuffer,
+        install?.images,
+      )
+    }
     for (const tex of previousImages ?? []) tex?.destroy()
     this.writeGroupDefaults(uniformBuffer, group, result.slotMap)
     return { ok: true, diagnostics, slotMap: result.slotMap }

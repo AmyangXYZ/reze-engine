@@ -379,3 +379,157 @@ test("vector cannot implicitly feed a float socket (not a Blender conversion)", 
   assert.equal(r.ok, false)
   assert.ok(r.diagnostics.some((d) => d.message.includes("type mismatch")))
 })
+
+test("light exposes the sun as values a ported NPR graph can build its own diffuse from", () => {
+  // Blender NPR presets don't call a diffuse closure — they ramp dot(N, L)
+  // themselves. That needs the direction as a value, which only this node gives.
+  const graph = {
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "geo", type: "geometry" },
+      { id: "lt", type: "light" },
+      { id: "d", type: "vector_math/dot" },
+      { id: "half", type: "math/multiply_add", inputs: { b: 0.5, c: 0.5 } },
+      { id: "tint", type: "mix/multiply", inputs: { fac: 1 } },
+    ],
+    links: [
+      { from: { node: "geo", socket: "normal" }, to: { node: "d", socket: "a" } },
+      { from: { node: "lt", socket: "direction" }, to: { node: "d", socket: "b" } },
+      { from: { node: "d", socket: "value" }, to: { node: "half", socket: "a" } },
+      { from: { node: "half", socket: "value" }, to: { node: "tint", socket: "a" } },
+      { from: { node: "lt", socket: "color" }, to: { node: "tint", socket: "b" } },
+    ],
+    output: { node: "tint", socket: "color" },
+  }
+  const r = compileGraph(graph)
+  assert.deepEqual(r.diagnostics, [])
+  // The four sockets read the slot template's own locals, so no node is emitted
+  // for the light itself.
+  assert.ok(r.fsBody.includes("vector_dot(n, l)"))
+  assert.ok(r.fsBody.includes("sun"))
+  assert.ok(!r.fsBody.includes("n_lt ="))
+})
+
+test("light's shadow and ambient reach a graph that wants to tint its own shadow", () => {
+  const graph = {
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "lt", type: "light" },
+      { id: "mix", type: "mix/blend" },
+      { id: "tex", type: "texture" },
+    ],
+    links: [
+      { from: { node: "lt", socket: "shadow" }, to: { node: "mix", socket: "fac" } },
+      { from: { node: "lt", socket: "ambient" }, to: { node: "mix", socket: "a" } },
+      { from: { node: "tex", socket: "color" }, to: { node: "mix", socket: "b" } },
+    ],
+    output: { node: "mix", socket: "color" },
+  }
+  const r = compileGraph(graph)
+  assert.deepEqual(r.diagnostics, [])
+  assert.ok(r.fsBody.includes("mix_blend(shadow, amb, tex_color)"))
+})
+
+test("a math op accepts all three of Blender's Value sockets, used or not", () => {
+  // Sockets belong to the node, not the operation. A transcriber maps them
+  // socket-for-socket without knowing which ones the op reads.
+  const graph = {
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "tex", type: "texture" },
+      { id: "m", type: "math/add", inputs: { b: 0.25, c: 9 } },
+      { id: "mix", type: "mix/multiply", inputs: { fac: 1 } },
+    ],
+    links: [
+      { from: { node: "tex", socket: "alpha" }, to: { node: "m", socket: "a" } },
+      { from: { node: "tex", socket: "color" }, to: { node: "mix", socket: "a" } },
+      { from: { node: "m", socket: "value" }, to: { node: "mix", socket: "b" } },
+    ],
+    output: { node: "mix", socket: "color" },
+  }
+  const r = compileGraph(graph)
+  assert.deepEqual(r.diagnostics, [])
+  // c is inert on add — declared, unread, and absent from the emission.
+  assert.ok(r.fsBody.includes("math_add(tex_s.a, 0.25)"))
+  assert.ok(!r.fsBody.includes("9.0"))
+})
+
+test("divide keeps its own default when the parity pass adds the sockets it lacked", () => {
+  const r = compileGraph({
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "tex", type: "texture" },
+      { id: "d", type: "math/divide" },
+      { id: "mix", type: "mix/multiply", inputs: { fac: 1 } },
+    ],
+    links: [
+      { from: { node: "tex", socket: "alpha" }, to: { node: "d", socket: "a" } },
+      { from: { node: "tex", socket: "color" }, to: { node: "mix", socket: "a" } },
+      { from: { node: "d", socket: "value" }, to: { node: "mix", socket: "b" } },
+    ],
+    output: { node: "mix", socket: "color" },
+  })
+  assert.deepEqual(r.diagnostics, [])
+  // Not 0.0 — widening must not overwrite a declared default.
+  assert.ok(r.fsBody.includes("math_divide(tex_s.a, 1.0)"))
+})
+
+test("an RGBA literal fits a colour socket, dropping alpha as Blender does", () => {
+  const r = compileGraph({
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "tex", type: "texture" },
+      { id: "mix", type: "mix/multiply", inputs: { fac: 1, b: [0.25, 0.5, 0.75, 1] } },
+    ],
+    links: [{ from: { node: "tex", socket: "color" }, to: { node: "mix", socket: "a" } }],
+    output: { node: "mix", socket: "color" },
+  })
+  assert.deepEqual(r.diagnostics, [])
+  assert.ok(r.fsBody.includes("vec3f(0.25, 0.5, 0.75)"))
+})
+
+test("a ramp stop keeps its alpha, since vec4 is the one socket that has one", () => {
+  const r = compileGraph({
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "lt", type: "light" },
+      { id: "geo", type: "geometry" },
+      { id: "d", type: "vector_math/dot" },
+      { id: "r", type: "ramp_linear", inputs: { color1: [1, 0, 0, 0.5] } },
+    ],
+    links: [
+      { from: { node: "geo", socket: "normal" }, to: { node: "d", socket: "a" } },
+      { from: { node: "lt", socket: "direction" }, to: { node: "d", socket: "b" } },
+      { from: { node: "d", socket: "value" }, to: { node: "r", socket: "fac" } },
+    ],
+    output: { node: "r", socket: "color" },
+  })
+  assert.deepEqual(r.diagnostics, [])
+  assert.ok(r.fsBody.includes("vec4f(1.0, 0.0, 0.0, 0.5)"))
+})
+
+test("a colour literal still cannot sit on a float socket", () => {
+  const r = compileGraph({
+    version: 1,
+    name: "t",
+    nodes: [
+      { id: "tex", type: "texture" },
+      { id: "m", type: "math/add", inputs: { b: [1, 0, 0, 1] } },
+      { id: "mix", type: "mix/multiply", inputs: { fac: 1 } },
+    ],
+    links: [
+      { from: { node: "tex", socket: "alpha" }, to: { node: "m", socket: "a" } },
+      { from: { node: "tex", socket: "color" }, to: { node: "mix", socket: "a" } },
+      { from: { node: "m", socket: "value" }, to: { node: "mix", socket: "b" } },
+    ],
+    output: { node: "mix", socket: "color" },
+  })
+  assert.equal(r.ok, false)
+  assert.ok(r.diagnostics.some((d) => d.message.includes("doesn't fit float socket")))
+})
