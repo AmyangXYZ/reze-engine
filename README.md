@@ -28,6 +28,7 @@ npm install reze-engine
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 - **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
 - **WGSL scene effects** — a user shader (shadertoy-style) with two mounts, declared by which entry points the code defines: `background` composites between the background and the scene, `foreground` over the finished frame and is handed the scene's depth, so rain and petals are occluded by the character they pass behind and fog thickens with distance. Compile diagnostics and live-tweakable uniform params on both
+- **Effects that read the cast** — an effect declares the BONES it wants (`// @anchor 左手首 trail`) and gets their world position, velocity and facing, plus each character's floor point, hip and bounding sphere. `trail` additionally keeps that bone's recent PATH, sampled on the scene clock so a ribbon is identical in the editor, in an export and in a re-export. This is what a hand trail, a halo parented to a head, or a mark under a planted foot is made of
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
@@ -143,6 +144,29 @@ engine.setBackgroundColor(color | null)      // canvas background (display-space
 engine.setBackdropEquirect(source | null)    // 360° backdrop from an equirect (2:1) image — PhotoDome-style dome at infinity, follows the camera, display-only (no lighting/bloom influence); oversized panoramas auto-downscale to the device texture limit
 engine.setEffect(wgsl | null, params?)       // the scene's WGSL effect, mounted by which entry points the code defines — either, or both in one file. fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f is a LAYER between the base background (color/equirect/transparent) and the scene; fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f composites over the finished frame, which is where rain, snow, petals and fog live. ray = the pixel's world-space view direction (pans with the orbit, same mapping the skybox samples by), uv = 0..1 bottom-left origin, alpha = how much the layer replaces what is behind it. depth (foreground only) = camera-space metres of whatever the scene drew at that pixel, far plane where it drew nothing — compare a particle's own distance against it and the model occludes it; fog reads it directly, since fog's alpha IS a function of distance. Helpers: bgResolution() = canvas size in px, bgCameraPos() = the camera in world space, bgWorldPos(ray, depth) = the world point the scene drew at this pixel — the depth turned into a PLACE, which is what fog lying on the ground needs (it has to know where the ground is) and what keeps a pattern keyed to world position from swimming as the camera orbits. Compiles async off the hot path; on failure the previous effect is KEPT and {ok, diagnostics, mounts} returns line:col errors rebased to the user's code. Declared params ({name: number | {x,y,z}}) become a params.<name> uniform struct shared by both mounts. A foreground makes the scene pass STORE its depth buffer while installed (it is otherwise discarded into tile memory)
 engine.setEffectParam(name, value)           // write one declared param — a uniform write, no recompile (live slider tier)
+
+// ── What an effect can ask about the scene (WGSL, in scope at both mounts) ──
+// Named rz*; the older bg* spellings all still resolve and always will, because a
+// published scene pins the effect that calls them.
+rzResolution() -> vec2f                      // canvas size in px, for aspect correction
+rzCameraPos() -> vec3f                       // the lens, in world space
+rzWorldPos(ray, depth) -> vec3f              // the depth turned into a PLACE — what fog lying on the ground needs
+rzProject(p) -> vec3f                        // a world point as the camera sees it: xy the uv it lands on, z its distance along the VIEW AXIS. The exact inverse of the per-pixel ray, so anchored work can be measured in 2D instead of marched in 3D, and z compares directly against depth for occlusion. Negative behind the lens
+rzSubjectCount() -> i32                      // characters in the scene, up to 4 (stages excluded)
+rzSubjectHip(i) -> vec3f                     // where a character IS — at the HIPS, not on the floor. model.position + センター
+rzSubject(i) -> RzSubject                    // { root, center, bounds, valid } — root is the FLOOR under them (the model's origin, which PMX puts between the feet and which moves with a character placed on a stage), center is the hip, bounds is a generous cull sphere
+rzAnchor(subject, slot) -> RzAnchor          // { pos, vel, fwd, valid } for the slot-th bone this effect DECLARED. Slots are declaration order; valid is false on a rig that spells the bone differently, which is the normal case
+rzTrailCount(subject, slot) -> i32           // path samples available — loop to THIS, never to a constant
+rzTrail(subject, slot, i) -> vec4f           // sample i of that bone's path: xyz where it was, w how many seconds ago. i = 0 is now, running backwards in time
+
+// Declared at the top of the effect's own source, like the mounts:
+//   // @anchor 頭            → slot 0, position only
+//   // @anchor 左手首 trail  → slot 1, position AND its recent path
+// Only what a file names is resolved and uploaded, so naming none costs nothing
+// and nobody pays for a rig's other five hundred bones. Up to 8 anchors, 4
+// subjects, 128 samples (~2.1s at 60Hz) — all MINIMUMS: they can grow without
+// breaking a published effect, because effects read through these accessors and
+// loop to the count functions rather than indexing the buffer.
 engine.getEffectMounts()                     // { background, foreground } — what the installed effect declared; both false with none set
 engine.setColorGrading({ shadows?, midtones?, highlights?, contrast?, saturation? })   // ASC CDL grade on the TONEMAPPED scene: the three tonal colours are display-space sRGB with mid-grey (0.5,0.5,0.5) neutral — direction from neutral is the hue that range is pushed toward, distance is the amount, and going darker/lighter than 0.5 crushes or lifts it (shadows→CDL offset, midtones→power, highlights→slope). contrast pivots on 0.5; saturation is Rec.709. Uniforms-only, no pipeline rebuild — safe to call per frame from a slider. A neutral grade is flagged off and costs nothing per pixel
 engine.getColorGrading()                     // current grade, for serialising into a scene descriptor

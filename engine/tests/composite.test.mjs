@@ -9,7 +9,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { buildCompositeShader, COMPOSITE_SHADER_WGSL } from "../dist/shaders/passes/composite.js"
+import { buildCompositeShader, COMPOSITE_SHADER_WGSL, parseEffectAnchors } from "../dist/shaders/passes/composite.js"
 
 const BACKGROUND = "fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f { return vec4f(0.0); }"
 const FOREGROUND = "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f { return vec4f(0.0); }"
@@ -21,7 +21,7 @@ const source = (wgsl, hasBackground, hasForeground) =>
  *  substitution — real WGSL in this file is lower/camel case. */
 const PLACEHOLDER = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g
 /** The template's own compile-time constants, which legitimately look like one. */
-const ALLOWED = new Set(["APPLY_GAMMA", "FILMIC_LUT_W"])
+const ALLOWED = new Set(["APPLY_GAMMA", "FILMIC_LUT_W", "RZ_MAX_ANCHORS", "RZ_TRAIL_SAMPLES"])
 
 // Comments are prose and name things that don't exist in this file (engine-side
 // constants, the placeholders themselves) — scan the code the GPU sees.
@@ -80,4 +80,64 @@ test("user code and its params land ahead of the entry points", () => {
   })
   assert.ok(src.indexOf("struct EffectParams") < src.indexOf(BACKGROUND), "params declared before the user's code")
   assert.ok(src.indexOf(BACKGROUND) < src.indexOf("@fragment"), "user's code before the entry point that calls it")
+})
+
+// The bg* names are a COMPATIBILITY CONTRACT, not a deprecation with an end
+// date. A published link is immutable, so a scene pinning an effect that calls
+// bgWorldPos has to keep compiling forever — deleting one of these does not
+// break a test somewhere, it breaks scenes already shared with other people.
+// Every alias must also still be reachable BEFORE user code, since that is where
+// the effect calls it from.
+test("every bg* alias survives, ahead of the user's code", () => {
+  const src = buildCompositeShader(null)
+  const aliases = ["bgResolution", "bgCameraPos", "bgSubjectCount", "bgSubjectPos", "bgWorldPos"]
+  for (const name of aliases) {
+    assert.match(src, new RegExp(`fn ${name}\\s*\\(`), `${name} is pinned by published effects and must not be removed`)
+  }
+  const withUser = buildCompositeShader({
+    wgsl: BACKGROUND,
+    paramsDecl: "",
+    hasBackground: true,
+    hasForeground: false,
+  })
+  for (const name of aliases) {
+    assert.ok(withUser.indexOf(`fn ${name}`) < withUser.indexOf(BACKGROUND), `${name} declared before user code`)
+  }
+})
+
+test("the rz* API is what the aliases delegate to", () => {
+  const src = buildCompositeShader(null)
+  for (const name of ["rzResolution", "rzCameraPos", "rzSubjectCount", "rzSubjectHip", "rzWorldPos", "rzProject"]) {
+    assert.match(src, new RegExp(`fn ${name}\\s*\\(`), `${name} missing`)
+  }
+  // Delegation, not two copies: one body per value, so the alias cannot drift.
+  assert.match(src, /fn bgCameraPos\(\) -> vec3f \{ return rzCameraPos\(\); \}/)
+  assert.match(src, /fn bgSubjectPos\(i: i32\) -> vec3f \{ return rzSubjectHip\(i\); \}/)
+})
+
+// The pragma is a CONTRACT with effect authors: slot N is the Nth declaration.
+// Anything that quietly adds or drops one shifts every slot after it, so an
+// effect that was reading a hand starts reading a head.
+test("@anchor declares slots in order, and only at the start of a line", () => {
+  const src = [
+    "// @anchor 左手首 trail",
+    "  //  @anchor 頭",
+    "// mentioning @anchor 右手首 mid-sentence must not add a slot",
+    "fn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f {",
+    "  // @anchor 右足ＩＫ",
+    "  return vec4f(0.0);",
+    "}",
+  ].join("\n")
+  assert.deepEqual(parseEffectAnchors(src, 8), [
+    { bone: "左手首", trail: true },
+    { bone: "頭", trail: false },
+    { bone: "右足ＩＫ", trail: false },
+  ])
+  // Past the cap the extras are dropped, never wrapped: the slots that DID fit
+  // keep the meaning the author gave them.
+  assert.deepEqual(parseEffectAnchors(src, 2), [
+    { bone: "左手首", trail: true },
+    { bone: "頭", trail: false },
+  ])
+  assert.deepEqual(parseEffectAnchors("fn background() {}", 8), [])
 })

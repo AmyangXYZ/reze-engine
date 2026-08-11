@@ -968,6 +968,23 @@ export class Model {
     return this.runtimeSkeleton.worldMatrices[idx].getPosition()
   }
 
+  /**
+   * A bone's forward axis, normalised — which way a foot points, where a head
+   * looks. Model space, like getBoneWorldPosition: the caller composes the model
+   * transform on top if it wants world space.
+   *
+   * Column 2 of the world matrix. Null for a name this rig does not have, which
+   * is the ordinary case across rigs that spell bones differently.
+   */
+  getBoneWorldForward(boneName: string): Vec3 | null {
+    const idx = this.runtimeSkeleton.nameIndex[boneName]
+    if (idx === undefined || idx < 0) return null
+    const m = this.runtimeSkeleton.worldMatrices[idx].values
+    const len = Math.hypot(m[8], m[9], m[10])
+    if (len < 1e-8) return null
+    return new Vec3(m[8] / len, m[9] / len, m[10] / len)
+  }
+
   getSkinning(): Skinning {
     return this.skinning
   }

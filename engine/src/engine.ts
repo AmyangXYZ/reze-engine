@@ -34,7 +34,14 @@ import {
   BLOOM_UPSAMPLE_SHADER_WGSL,
 } from "./shaders/passes/bloom"
 import { AGX_LUT_GZ, AGX_LUT_SIZE } from "./shaders/agx-lut"
-import { buildCompositeShader } from "./shaders/passes/composite"
+import {
+  buildCompositeShader,
+  parseEffectAnchors,
+  EFFECT_ANCHORS,
+  EFFECT_SUBJECTS,
+  EFFECT_TRAIL_BASE,
+  EFFECT_TRAIL_SAMPLES,
+} from "./shaders/passes/composite"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
@@ -234,13 +241,42 @@ export type WorldOptions = {
 
 /** A model's scene placement — root offset baked into skinning + visibility. Serializable
  *  into a scene descriptor via getModelTransform. */
-/** How many character positions an effect can read (viewU[11..14]). */
-const MAX_EFFECT_SUBJECTS = 4
+/** How many character positions an effect can read (viewU[11..14]). Defined
+ *  beside the shader that reads them — the layout arithmetic has to agree. */
+const MAX_EFFECT_SUBJECTS = EFFECT_SUBJECTS
 /** Where a character IS, for an effect that follows them. センター carries a
  *  motion's root movement — walking, jumping — where the model transform only
  *  carries where the model was placed; 全ての親 is the fallback for a model that
  *  animates the true root instead. */
 const SUBJECT_BONES = ["センター", "全ての親"]
+
+/** How many bones one effect may name. Eight is already a lot for one file, and
+ *  this is a MINIMUM: raising it breaks nothing, because effects read through
+ *  rzAnchor() rather than indexing the buffer. Lowering it would. */
+const MAX_EFFECT_ANCHORS = EFFECT_ANCHORS
+
+/** Only for the bounding sphere's height. */
+const HEAD_BONE = "頭"
+
+/** Path samples kept per trailed anchor. ~2.1s at the sampling rate below, which
+ *  is a long ribbon — a dancer's arm draws most of a circle in that time.
+ *
+ *  A MINIMUM, like every cap here, and raising it is why that matters: effects
+ *  read through rzTrail and loop to rzTrailCount, so this went 64 → 128 without
+ *  touching a single published effect. Lowering it is the direction that breaks. */
+const TRAIL_SAMPLES = EFFECT_TRAIL_SAMPLES
+/** Sampled on the SCENE clock at a fixed rate, so a path is identical in the
+ *  editor, in an export and in a re-export, and its spacing does not change with
+ *  the display's refresh. */
+const TRAIL_HZ = 60
+const TRAIL_DT = 1 / TRAIL_HZ
+
+/** vec4 slots: four subjects × 3, then anchors × four subjects × 3, then the
+ *  trails — slot-major, four subjects each, TRAIL_SAMPLES apiece. */
+const CAST_SUBJECT_VEC4S = MAX_EFFECT_SUBJECTS * 3
+const CAST_ANCHOR_VEC4S = MAX_EFFECT_ANCHORS * MAX_EFFECT_SUBJECTS * 3
+const CAST_TRAIL_BASE = EFFECT_TRAIL_BASE
+const CAST_VEC4S = CAST_TRAIL_BASE + MAX_EFFECT_ANCHORS * MAX_EFFECT_SUBJECTS * TRAIL_SAMPLES
 
 export type ModelTransform = {
   position: Vec3
@@ -840,14 +876,38 @@ export class Engine {
     /** Mounted over the finished frame — and the reason the scene pass has to
      *  STORE its depth, which it otherwise discards into tile memory. */
     hasForeground: boolean
+    /** Bones the source asked for, in declaration order — rzAnchor's slots. Only
+     *  these are resolved and uploaded, so a file that names none costs nothing. */
+    anchors: { bone: string; trail: boolean }[]
   } | null = null
+  /** The cast, as the effect API sees it. Written per frame while an effect is
+   *  installed, and only up to what that effect actually declared. */
+  private castBuffer!: GPUBuffer
+  private castData!: Float32Array<ArrayBuffer>
+  /** Last frame's anchor world positions, for velocity. Keyed model id → slot. */
+  private anchorPrev = new Map<string, Float32Array>()
+  private castLastMs = 0
+  /** Recent path per trailed anchor, keyed "model\0slot". Newest first, so the
+   *  shader's index 0 is now — written by unshifting rather than by tracking a
+   *  head, because 64 is short and the alternative is an index the GPU side
+   *  would also have to know about. */
+  private anchorTrail = new Map<string, { pos: number[]; t: number[] }>()
+  /** Scene seconds, advanced by the frame delta — NOT wall time, so an offline
+   *  export samples the same path the editor showed. */
+  private sceneClock = 0
+  private trailAccum = 0
+  /** Trail samples owed this frame, computed once so every trail on every
+   *  character samples in lockstep and their paths stay comparable. */
+  private trailDue = 0
   private agxLutTexture: GPUTexture | null = null
   private agxFallbackTexture!: GPUTexture
   /** Bound at composite binding 7 when no effect (or a param-less one) is set. */
   private bgParamsDummyBuffer!: GPUBuffer
   private compositePipelineLayout!: GPUPipelineLayout
   /** time=0 origin for the active effect — reset each setEffect. */
-  private effectEpochMs = 0
+  /** Scene-clock reading when the current effect was installed. The effect's
+   *  `time` is measured from here — see where it is written. */
+  private effectEpochScene = 0
   private compositeBloomView: GPUTextureView | null = null
 
   // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
@@ -1191,6 +1251,7 @@ export class Engine {
 
   private rebuildCompositeBindGroup(): void {
     if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView || !this.depthReadView) return
+    if (!this.castBuffer) return
     this.compositeBindGroup = this.device.createBindGroup({
       label: "composite bind group",
       layout: this.compositeBindGroupLayout,
@@ -1206,6 +1267,7 @@ export class Engine {
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
         { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
+        { binding: 11, resource: { buffer: this.castBuffer } },
       ],
     })
   }
@@ -1337,6 +1399,14 @@ export class Engine {
     }
     const mounts = { background: hasBackground, foreground: hasForeground }
 
+    // ── Which bones did the author ask for? Same idea as the mounts above: a
+    // declaration in the source, not a setting somewhere else. Only what is
+    // named here gets resolved and uploaded, so naming none costs nothing and
+    // naming eight costs eight — rather than every rig's 500 bones costing
+    // everybody. Past the cap the extras are dropped rather than silently
+    // shifting every slot after them.
+    const anchors = parseEffectAnchors(wgsl, MAX_EFFECT_ANCHORS)
+
     // ── Params: codegen a WGSL struct and mirror its uniform layout on the CPU.
     // Fields are emitted in declaration order; offsets follow WGSL's natural
     // uniform rules (f32 align 4, vec3f align 16 size 12), computed identically
@@ -1418,10 +1488,16 @@ export class Engine {
       })
       this.device.queue.writeBuffer(paramsBuffer, 0, paramsData)
     }
-    this.effect = { wgsl, paramLayout: layout, paramsBuffer, paramsData, hasBackground, hasForeground }
+    this.effect = { wgsl, paramLayout: layout, paramsBuffer, paramsData, hasBackground, hasForeground, anchors }
+    // Velocities and paths restart from rest rather than continuing from
+    // whatever the last effect's slot 0 happened to be — the slots mean
+    // something different now, and a trail would otherwise draw a line from the
+    // old bone to the new one across the whole scene.
+    this.anchorPrev.clear()
+    this.anchorTrail.clear()
     this.compositePipelineIdentity = identity
     this.compositePipelineGamma = gamma
-    this.effectEpochMs = performance.now()
+    this.effectEpochScene = this.sceneClock
     this.rebuildCompositeBindGroup()
     this.writeCompositeViewUniforms()
     return { ok: true, diagnostics: [], mounts }
@@ -2457,6 +2533,15 @@ export class Engine {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    // Allocated at full size once rather than grown: it is ~7KB, the bind group
+    // would otherwise be rebuilt whenever an effect declared a different number
+    // of bones, and only the declared prefix is ever written.
+    this.castData = new Float32Array(CAST_VEC4S * 4)
+    this.castBuffer = this.device.createBuffer({
+      label: "effect cast data",
+      size: this.castData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
     this.compositeBindGroupLayout = this.device.createBindGroupLayout({
       label: "composite bind group layout",
       entries: [
@@ -2486,6 +2571,9 @@ export class Engine {
         // AgX's 57³ cube. Decompressed and uploaded off the critical path, so a
         // 1×1×1 stand-in keeps the bind group valid until it arrives.
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
+        // The cast, for rzSubject/rzAnchor. Always bound so the base shader's
+        // layout matches; the base shader simply never reads it.
+        { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({
@@ -5393,6 +5481,13 @@ export class Engine {
   }
 
   private renderWithDelta(deltaTime: number) {
+    // The scene clock, and the only clock a trail may sample on: renderFrame()
+    // drives offline export with an exact per-frame delta, so a path recorded
+    // against this is reproducible where one recorded against wall time is not.
+    this.sceneClock += deltaTime
+    this.trailAccum += deltaTime
+    this.trailDue = Math.floor(this.trailAccum / TRAIL_DT)
+    this.trailAccum -= this.trailDue * TRAIL_DT
     const tFrame = performance.now()
     this.frameAnimMsRaw = 0
     this.framePhysicsMsRaw = 0
@@ -6178,7 +6273,16 @@ export class Engine {
       u[22] = v[10]
       u[23] = 0
       // Effect clock + canvas size (viewU[6]) — written on the same refresh.
-      u[24] = (performance.now() - this.effectEpochMs) / 1000
+      // The effect clock, on the SCENE's time rather than the wall's.
+      //
+      // renderFrame() drives offline export as fast as the encoder will take
+      // frames, so wall time races ahead of the video's own time — a rain effect
+      // fell at the wrong rate in the export, a twinkle blinked at the wrong
+      // speed, and none of it matched what the editor had shown. Measured
+      // against the accumulated frame delta, an effect animates identically in
+      // the editor, in an export, and in a re-export, which is the same rule the
+      // trails already followed.
+      u[24] = this.sceneClock - this.effectEpochScene
       u[26] = this.canvas.width
       u[27] = this.canvas.height
       // Camera world position (viewU[10]) — the other half of bgWorldPos. It
@@ -6218,11 +6322,172 @@ export class Engine {
         u[44 + n * 4] = px
         u[45 + n * 4] = py
         u[46 + n * 4] = pz
+        this.writeCastEntry(inst, n, px, py, pz)
         n++
       })
       u[43] = n
       this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
+      // Only what an effect declared, and only while one is installed. A scene
+      // with no effect writes nothing here at all.
+      if (this.effect) {
+        // Up to the last trailed slot, not the whole buffer: an effect with no
+        // trails never uploads the 32KB it would otherwise pay for every frame.
+        let lastTrail = -1
+        for (let i = 0; i < this.effect.anchors.length; i++) if (this.effect.anchors[i].trail) lastTrail = i
+        const used =
+          lastTrail >= 0
+            ? CAST_TRAIL_BASE + (lastTrail * MAX_EFFECT_SUBJECTS + MAX_EFFECT_SUBJECTS) * TRAIL_SAMPLES
+            : CAST_SUBJECT_VEC4S + this.effect.anchors.length * MAX_EFFECT_SUBJECTS * 3
+        this.device.queue.writeBuffer(this.castBuffer, 0, this.castData, 0, used * 4)
+        this.castLastMs = performance.now()
+      }
     }
+  }
+
+  /**
+   * One character's slice of the effect API's view of the cast.
+   *
+   * `px/py/pz` is the hip point the caller just composed — passed in rather than
+   * recomputed, since it is the same two bone lookups.
+   *
+   * Bone positions are model-space, so each is scaled, rotated and translated by
+   * the model transform exactly as the hip point above was. Getting that wrong
+   * does not look wrong on a model standing at the origin, which is precisely
+   * how it would ship.
+   */
+  private writeCastEntry(inst: ModelInstance, n: number, px: number, py: number, pz: number): void {
+    const effect = this.effect
+    if (!effect) return
+    const m = inst.model
+    const cd = this.castData
+    const toWorld = (v: Vec3): Vec3 => {
+      v.setXYZ(v.x * m.scale, v.y * m.scale, v.z * m.scale)
+      Quat.rotateVecInto(m.rotation, v, v)
+      v.setXYZ(v.x + m.position.x, v.y + m.position.y, v.z + m.position.z)
+      return v
+    }
+
+    // The floor under this character: where the model was PLACED.
+    //
+    // A foot bone was the obvious answer and the wrong one. 足ＩＫ sits at the
+    // ANKLE, not on the sole — an ankle above the ground even standing still,
+    // and further still in heels — so a floor derived from it lands a hand's
+    // width up the leg, which is exactly where the first version of Footfalls
+    // drew its marks. A PMX's origin is between the feet on the floor by
+    // convention, and placing a character on a stage moves that origin with
+    // them, so the placement already answers "what is the ground here".
+    //
+    // Deliberately NOT the animated height: a jump lifts the character, not the
+    // floor, and a floor that follows a jump is not a floor.
+    const floorY = m.position.y
+    // Generous on purpose: this is for culling, and a sphere that is too small
+    // clips the effect it was meant to bound. Height is hip-to-head doubled;
+    // arm span is about height on a human, so half of it is the radius, and the
+    // rest is margin for a motion that reaches.
+    const head = m.getBoneWorldPosition(HEAD_BONE)
+    const height = head ? Math.max(0.01, toWorld(head).y - floorY) : Math.max(0.01, (py - floorY) * 2)
+    const b = n * 12
+    cd[b] = px
+    cd[b + 1] = floorY
+    cd[b + 2] = pz
+    cd[b + 3] = 1
+    cd[b + 4] = px
+    cd[b + 5] = py
+    cd[b + 6] = pz
+    cd[b + 8] = px
+    cd[b + 9] = floorY + height * 0.5
+    cd[b + 10] = pz
+    cd[b + 11] = height * 0.75
+
+    // Declared bones. Velocity is per model AND per slot, so two characters
+    // wearing the same effect never inherit each other's motion.
+    const anchors = effect.anchors
+    if (anchors.length === 0) return
+    let prev = this.anchorPrev.get(inst.name)
+    const dtMs = Math.max(1, performance.now() - this.castLastMs)
+    const invDt = 1000 / dtMs
+    if (!prev || prev.length !== anchors.length * 3) {
+      prev = new Float32Array(anchors.length * 3).fill(NaN)
+      this.anchorPrev.set(inst.name, prev)
+    }
+    for (let s = 0; s < anchors.length; s++) {
+      const a = CAST_SUBJECT_VEC4S * 4 + (s * MAX_EFFECT_SUBJECTS + n) * 12
+      const pos = m.getBoneWorldPosition(anchors[s].bone)
+      if (!pos) {
+        cd[a + 3] = 0
+        continue
+      }
+      toWorld(pos)
+      const p = s * 3
+      // NaN on the first frame a slot exists — a velocity out of nothing would
+      // be a spike, and a trail or a spark reading it would fire on load.
+      const vx = Number.isNaN(prev[p]) ? 0 : (pos.x - prev[p]) * invDt
+      const vy = Number.isNaN(prev[p]) ? 0 : (pos.y - prev[p + 1]) * invDt
+      const vz = Number.isNaN(prev[p]) ? 0 : (pos.z - prev[p + 2]) * invDt
+      prev[p] = pos.x
+      prev[p + 1] = pos.y
+      prev[p + 2] = pos.z
+      cd[a] = pos.x
+      cd[a + 1] = pos.y
+      cd[a + 2] = pos.z
+      cd[a + 3] = 1
+      cd[a + 4] = vx
+      cd[a + 5] = vy
+      cd[a + 6] = vz
+      if (anchors[s].trail) this.writeTrail(inst.name, s, n, pos, cd, a)
+      const fwd = m.getBoneWorldForward(anchors[s].bone)
+      if (fwd) {
+        Quat.rotateVecInto(m.rotation, fwd, fwd)
+        cd[a + 8] = fwd.x
+        cd[a + 9] = fwd.y
+        cd[a + 10] = fwd.z
+      }
+    }
+  }
+
+  /**
+   * One trailed anchor's recent path, sampled on the scene clock and written
+   * newest-first.
+   *
+   * Newest-first is what lets a ribbon be drawn by walking the index upward and
+   * fading on age, and it means the shader never needs to know where the ring's
+   * head is. Sixty-four entries is short enough that unshifting beats the
+   * bookkeeping an actual ring buffer would push onto the GPU side too.
+   *
+   * Sampling is gated on TRAIL_DT of SCENE time, so a 120Hz display and a 30fps
+   * export record the same path at the same spacing. A frame that covers several
+   * intervals emits several samples rather than one, or a fast hand would tear.
+   */
+  private writeTrail(model: string, slot: number, n: number, pos: Vec3, cd: Float32Array, anchorBase: number): void {
+    const key = `${model}\u0000${slot}`
+    let ring = this.anchorTrail.get(key)
+    if (!ring) {
+      ring = { pos: [], t: [] }
+      this.anchorTrail.set(key, ring)
+    }
+    if (this.trailDue > 0 || ring.pos.length === 0) {
+      const steps = Math.min(this.trailDue, 4)
+      for (let k = 0; k < Math.max(1, steps); k++) {
+        ring.pos.unshift(pos.x, pos.y, pos.z)
+        ring.t.unshift(this.sceneClock)
+        if (ring.t.length > TRAIL_SAMPLES) {
+          ring.t.length = TRAIL_SAMPLES
+          ring.pos.length = TRAIL_SAMPLES * 3
+        }
+      }
+    }
+    const count = ring.t.length
+    // Age rather than a timestamp: the shader would otherwise need the scene
+    // clock too, and there is only one place that has to know what time it is.
+    const base = (CAST_TRAIL_BASE + (slot * MAX_EFFECT_SUBJECTS + n) * TRAIL_SAMPLES) * 4
+    for (let i = 0; i < count; i++) {
+      cd[base + i * 4] = ring.pos[i * 3]
+      cd[base + i * 4 + 1] = ring.pos[i * 3 + 1]
+      cd[base + i * 4 + 2] = ring.pos[i * 3 + 2]
+      cd[base + i * 4 + 3] = this.sceneClock - ring.t[i]
+    }
+    // The count rides in the anchor's spare lane, so rzTrailCount is one read.
+    cd[anchorBase + 11] = count
   }
 
   private updateSkinMatrices() {

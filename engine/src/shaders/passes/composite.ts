@@ -29,7 +29,15 @@
  *              Compare a particle's own distance against it and the model
  *              occludes it; fog needs no comparison at all, its alpha simply IS
  *              a function of distance.
- *  - `bgResolution()` — canvas size in pixels, for aspect correction.
+ *  - `rzResolution()` — canvas size in pixels, for aspect correction.
+ *  - `rzCameraPos()`, `rzWorldPos(ray, depth)` — the lens, and the place a pixel
+ *              was drawn.
+ *  - `rzSubjectCount()`, `rzSubjectHip(i)` — the cast, at HIP height (see the
+ *              function; it is not the floor, and reading it as the floor is a
+ *              mistake this API's own comment used to invite).
+ *  - `rzProject(p)` — a world point as uv + view-axis distance; the cheap way to
+ *              anchor anything, and `z` compares directly against `depth`.
+ *  - the bg* spellings of all of the above still resolve, permanently.
  *  - declared params arrive as `params.<name>` (f32 or vec3f), shared by both.
  *
  *  Return display-space sRGB + alpha, 0..1. Both mounts are alpha-composited
@@ -38,6 +46,46 @@
  *  0 lets it through, which is how a starfield is stars over the user's color;
  *  a foreground at alpha 1 covers the frame. No mode flag anywhere — the alpha
  *  channel already says it. */
+/**
+ * The bones an effect asked for, in declaration order — the slots rzAnchor reads.
+ *
+ *     // @anchor 左手首 trail
+ *     // @anchor 頭
+ *
+ * A declaration in the source, like the mounts: what a file names is what gets
+ * resolved and uploaded, so naming none costs nothing and nobody pays for a
+ * rig's other five hundred bones. Anchored to the start of a line so that
+ * writing the word @anchor in ordinary prose does not silently add a slot —
+ * which would shift every slot after it.
+ *
+ * `trail` additionally keeps that bone's recent PATH, for rzTrail. Opt-in
+ * because a path is two orders of magnitude more data than a point, and most
+ * anchors want a point.
+ *
+ * Names are passed through verbatim: any bone the rig has works, and one it does
+ * not have simply reports invalid.
+ */
+export function parseEffectAnchors(wgsl: string, max: number): { bone: string; trail: boolean }[] {
+  return [...wgsl.matchAll(/^[ \t]*\/\/[ \t]*@anchor[ \t]+(\S+)([ \t]+trail)?[ \t]*$/gm)]
+    .map((m) => ({ bone: m[1], trail: m[2] !== undefined }))
+    .slice(0, max)
+}
+
+/**
+ * The caps the cast buffer is built to, shared by the shader below and by the
+ * engine that fills it. Interpolated into the WGSL rather than written twice:
+ * the layout arithmetic on both sides has to agree exactly, and two literals
+ * that must match are two literals that eventually will not.
+ *
+ * All three are MINIMUMS. Raising one breaks nothing, because effects read
+ * through accessors and loop to the count functions; lowering one does.
+ */
+export const EFFECT_SUBJECTS = 4
+export const EFFECT_ANCHORS = 8
+export const EFFECT_TRAIL_SAMPLES = 128
+/** vec4 slot where the trails begin — after the subjects and the anchors. */
+export const EFFECT_TRAIL_BASE = EFFECT_SUBJECTS * 3 + EFFECT_ANCHORS * EFFECT_SUBJECTS * 3
+
 export type CompositeEffectSource = {
   /** The user's WGSL verbatim: helpers plus whichever entry points it defines. */
   wgsl: string
@@ -107,6 +155,13 @@ override APPLY_GAMMA: bool = true;
 // Blender's AgX, as the 57³ lookup it ships as rather than a reconstruction of
 // it. Sampled in the log-encoded E-Gamut space the cube expects — see agxTransform.
 @group(0) @binding(10) var agxLut: texture_3d<f32>;
+// The cast, as data. Read through rzSubject/rzAnchor below — the LAYOUT IS NOT
+// STABLE and never will be, because it depends on what each effect declared.
+// Reading it directly is the one thing that would freeze it forever.
+//
+// vec4 slots: [0 .. 11] four subjects, three each (root+valid, hip, bounds);
+// then MAX_ANCHORS × four subjects, three each (pos+valid, vel, fwd).
+@group(0) @binding(11) var<storage, read> _rzCast: array<vec4f>;
 
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
 const FILMIC_LUT_W: f32 = 256.0;
@@ -202,29 +257,179 @@ fn viewTransform(c: vec3f) -> vec3f {
   return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));
 }
 
-/** Canvas size in pixels — for user effects (aspect correction). */
-fn bgResolution() -> vec2f { return viewU[6].zw; }
+// ── The effect API ────────────────────────────────────────────────────────────
+//
+// Named rz*, for the engine. The prefix earns its place twice: user code is
+// concatenated into THIS module, so an unprefixed rzAnchor() would collide with
+// exactly the helper an author would write, and the old bg* prefix stopped being
+// true in 0.41.0 when effects gained a mount over the finished frame.
+//
+// The bg* names below are permanent aliases, not a deprecation with an end date.
+// A published link is immutable, so a scene pinned to a bg* effect has to keep
+// compiling forever. They are one-line and inlined; no new function gets one.
+
+/** Canvas size in pixels — for aspect correction. */
+fn rzResolution() -> vec2f { return viewU[6].zw; }
 
 /** The camera's world position. */
-fn bgCameraPos() -> vec3f { return viewU[10].xyz; }
+fn rzCameraPos() -> vec3f { return viewU[10].xyz; }
 
 /** How many characters are in the scene, up to four. */
-fn bgSubjectCount() -> i32 { return i32(viewU[10].w); }
+fn rzSubjectCount() -> i32 { return i32(viewU[10].w); }
 
 /**
- * Where a character is standing, in world space.
+ * A world point as the camera sees it: xy the uv it lands on, z its distance
+ * along the VIEW AXIS in metres.
  *
- * An effect that wants to RESPOND to the cast — ripples under the feet, a glow
- * that follows someone, dust kicked up where they are — needs to know where
- * they are, and the ray and the depth cannot tell it: they describe the pixel,
- * not the scene. This is the model's root, which for a PMX is between the feet
- * on the floor, so it is already the contact point a ripple wants.
+ * The exact inverse of the ray this pass builds per pixel, so it is the cheap way
+ * to work with anything anchored in the world. Marching a curve or a trail in 3D
+ * costs a distance evaluation per sample per pixel; projecting its points once
+ * and measuring in 2D costs a subtraction, which is the difference between a
+ * ribbon that runs at 4K and one that does not.
+ *
+ * z is directly comparable to the depth handed to foreground(), so occlusion is
+ * a single test: draw where your z is nearer than the scene's. It is returned
+ * SIGNED and unclamped — behind the camera is negative, and worth rejecting
+ * before you use the uv, which is meaningless there.
+ */
+fn rzProject(p: vec3f) -> vec3f {
+  let d = p - viewU[10].xyz;
+  let z = dot(d, viewU[5].xyz);
+  // Guard only the divide. z itself is returned as it is, so the caller can see
+  // the sign; clamping it here would put points behind the lens on the horizon.
+  let inv = 1.0 / select(z, 1e-4, z < 1e-4);
+  let ndc = vec2f(dot(d, viewU[3].xyz) * inv / viewU[3].w, dot(d, viewU[4].xyz) * inv / viewU[4].w);
+  return vec3f(ndc * 0.5 + 0.5, z);
+}
+
+/** A character, as much of one as a shader needs. */
+struct RzSubject {
+  /** On the FLOOR, under the body — where a ring or a magic circle belongs. */
+  root: vec3f,
+  /** At the hips, the middle of the body — where an aura belongs. */
+  center: vec3f,
+  /** Bounding sphere: xyz centre, w radius. Deliberately generous — cull with it. */
+  bounds: vec4f,
+  /** False past the end of the cast, and every field is then zero. */
+  valid: bool,
+}
+
+/** One bone an effect asked for, by name, at the top of its own source. */
+struct RzAnchor {
+  pos: vec3f,
+  /** World units per second, from the previous frame. Direction for a trail,
+   *  magnitude for anything that should react to how hard someone is moving. */
+  vel: vec3f,
+  /** The bone's forward axis — which way a foot points, where a head looks. */
+  fwd: vec3f,
+  /** False when this rig has no such bone. Check it: the alternative is drawing
+   *  a hand effect at the world origin on every model that spells it differently. */
+  valid: bool,
+}
+
+const RZ_MAX_ANCHORS: i32 = ${EFFECT_ANCHORS};
+
+/**
+ * Character i. Loop to rzSubjectCount(), never to a constant — the caps here are
+ * MINIMUMS and are free to grow, which is only true while nobody hardcodes them.
+ */
+fn rzSubject(i: i32) -> RzSubject {
+  var s: RzSubject;
+  s.valid = i >= 0 && i < rzSubjectCount();
+  if (!s.valid) { return s; }
+  let b = i * 3;
+  s.root = _rzCast[b].xyz;
+  s.center = _rzCast[b + 1].xyz;
+  s.bounds = _rzCast[b + 2];
+  return s;
+}
+
+/**
+ * The slot-th bone this effect declared, on character subject.
+ *
+ * Slots are the order of the declarations at the top of your source:
+ *
+ *     // @anchor 左手首
+ *     // @anchor 頭
+ *
+ * gives you slot 0 and slot 1. Any bone name the model has works; valid is
+ * false when it does not have it, which is the normal case across rigs that
+ * spell things differently.
+ */
+fn rzAnchor(subject: i32, slot: i32) -> RzAnchor {
+  var a: RzAnchor;
+  a.valid = false;
+  if (subject < 0 || subject >= rzSubjectCount() || slot < 0 || slot >= RZ_MAX_ANCHORS) { return a; }
+  let b = ${EFFECT_SUBJECTS * 3} + (slot * ${EFFECT_SUBJECTS} + subject) * 3;
+  a.valid = _rzCast[b].w > 0.5;
+  a.pos = _rzCast[b].xyz;
+  a.vel = _rzCast[b + 1].xyz;
+  a.fwd = _rzCast[b + 2].xyz;
+  return a;
+}
+
+const RZ_TRAIL_SAMPLES: i32 = ${EFFECT_TRAIL_SAMPLES};
+
+/**
+ * How many path samples this anchor has. Zero unless it was declared with
+ * trail, and it climbs from zero as the trail fills after the effect loads.
+ *
+ * Loop to THIS, never to RZ_TRAIL_SAMPLES: the cap is a minimum and is free to
+ * grow, which stays true only while nobody hardcodes it.
+ */
+fn rzTrailCount(subject: i32, slot: i32) -> i32 {
+  if (subject < 0 || subject >= rzSubjectCount() || slot < 0 || slot >= RZ_MAX_ANCHORS) { return 0; }
+  return i32(_rzCast[${EFFECT_SUBJECTS * 3} + (slot * ${EFFECT_SUBJECTS} + subject) * 3 + 2].w);
+}
+
+/**
+ * Sample i of an anchor's path: xyz where it was, w how many seconds ago.
+ *
+ * i = 0 is NOW and they run backwards in time, so a ribbon is drawn by walking i
+ * upward and fading on .w. Sampled at a fixed rate on the SCENE clock, not the
+ * display's — so the path is identical in the editor, in an export, and in a
+ * re-export, and its spacing does not change with framerate.
+ *
+ * This is what a hand trail wants instead of position and velocity. One position
+ * and one velocity is a straight segment that jitters, because a velocity is a
+ * difference between two frames; a path is what actually happened.
+ */
+fn rzTrail(subject: i32, slot: i32, i: i32) -> vec4f {
+  let n = rzTrailCount(subject, slot);
+  if (i < 0 || i >= n) { return vec4f(0.0); }
+  let base = ${EFFECT_TRAIL_BASE} + (slot * ${EFFECT_SUBJECTS} + subject) * RZ_TRAIL_SAMPLES;
+  return _rzCast[base + i];
+}
+
+fn bgResolution() -> vec2f { return rzResolution(); }
+fn bgCameraPos() -> vec3f { return rzCameraPos(); }
+fn bgSubjectCount() -> i32 { return rzSubjectCount(); }
+
+/**
+ * Where a character IS, in world space — at the hips, not on the floor.
+ *
+ * An effect that wants to RESPOND to the cast — a glow that follows someone,
+ * dust kicked up where they are — needs to know where they are, and the ray and
+ * the depth cannot tell it: they describe the pixel, not the scene.
+ *
+ * The value is model.position + センター + 全ての親. センター sits at hip
+ * height on every standard MMD rig, so this is a point in the middle of the
+ * body. It is NOT the contact point: a ripple drawn here appears at the waist.
+ * Ground effects want the .xz of this and their own floor height, which is what
+ * the effects that shipped against it already do.
+ *
+ * The comment here used to claim it was "between the feet on the floor", which
+ * is where that habit came from. Left as it is regardless of the name: a
+ * published link is immutable, so every shared scene pinning an effect that
+ * reads this depends on it meaning exactly what it has always meant.
  *
  * Clamped rather than bounds-checked: an effect looping past the count reads the
  * last subject instead of sampling whatever follows the array, which is a wrong
  * ripple rather than an undefined one.
  */
-fn bgSubjectPos(i: i32) -> vec3f { return viewU[11 + clamp(i, 0, 3)].xyz; }
+fn rzSubjectHip(i: i32) -> vec3f { return viewU[11 + clamp(i, 0, 3)].xyz; }
+
+fn bgSubjectPos(i: i32) -> vec3f { return rzSubjectHip(i); }
 
 /** Where in the WORLD the scene drew this pixel — the depth handed to
  *  foreground() turned into a place. Without it an effect can only think in
@@ -235,10 +440,12 @@ fn bgSubjectPos(i: i32) -> vec3f { return viewU[11 + clamp(i, 0, 3)].xyz; }
  *  the ray's projection onto camera-forward before being walked out. At the far
  *  plane (nothing drawn) this lands a very long way off, which is what a sky
  *  should do to anything reading it. */
-fn bgWorldPos(ray: vec3f, depth: f32) -> vec3f {
+fn rzWorldPos(ray: vec3f, depth: f32) -> vec3f {
   let axis = max(dot(normalize(ray), viewU[5].xyz), 1e-4);
-  return bgCameraPos() + normalize(ray) * (depth / axis);
+  return rzCameraPos() + normalize(ray) * (depth / axis);
 }
+
+fn bgWorldPos(ray: vec3f, depth: f32) -> vec3f { return rzWorldPos(ray, depth); }
 
 /** Color grading, applied to the tonemapped SCENE (not the background — see the
  *  call site). The core is ASC CDL, the film-industry interchange standard:
