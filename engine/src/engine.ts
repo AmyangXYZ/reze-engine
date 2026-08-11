@@ -232,6 +232,14 @@ export type WorldOptions = {
 
 /** A model's scene placement — root offset baked into skinning + visibility. Serializable
  *  into a scene descriptor via getModelTransform. */
+/** How many character positions an effect can read (viewU[11..14]). */
+const MAX_EFFECT_SUBJECTS = 4
+/** Where a character IS, for an effect that follows them. センター carries a
+ *  motion's root movement — walking, jumping — where the model transform only
+ *  carries where the model was placed; 全ての親 is the fallback for a model that
+ *  animates the true root instead. */
+const SUBJECT_BONES = ["センター", "全ての親"]
+
 export type ModelTransform = {
   position: Vec3
   rotation: Quat
@@ -802,7 +810,7 @@ export class Engine {
   // 11 × vec4f — see the viewU comment in composite.ts. The last one is the
   // camera's world position, which is what lets a foreground effect turn the
   // depth it is handed into a PLACE (bgWorldPos) rather than a distance.
-  private readonly compositeUniformData = new Float32Array(44)
+  private readonly compositeUniformData = new Float32Array(60)
   /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
   private backgroundColor: Vec3 | null = null
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
@@ -2412,8 +2420,9 @@ export class Engine {
       // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray ·
       // (time, _, canvas width, canvas height) for user effects · three grade
       // vectors (CDL offset+contrast, power+saturation, slope+flag) · camera
-      // world position, for an effect placing itself in the scene.
-      size: 176,
+      // world position, for an effect placing itself in the scene · four
+      // character positions, for one that wants to respond to the cast.
+      size: 240,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.dofUniformBuffer = this.device.createBuffer({
@@ -6122,6 +6131,40 @@ export class Engine {
       u[40] = cameraPos.x
       u[41] = cameraPos.y
       u[42] = cameraPos.z
+      // Character positions (viewU[11..14]), count in viewU[10].w. Stages are
+      // excluded: an effect asking where the cast is means the characters, and a
+      // stage's origin is wherever its author put it, which is not a place
+      // anything is standing. Four is the cap because the uniform is small and a
+      // scene with five characters is not the case this serves.
+      let n = 0
+      this.forEachInstance((inst) => {
+        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage) return
+        const m = inst.model
+        // The model transform is only where the model was PLACED. A motion moves
+        // the character by animating bones, so an effect anchored to the
+        // transform never follows anyone anywhere — it sits at the spawn point
+        // while they walk out of it. Composed exactly as the follow camera
+        // composes it, for the same reason: bone matrices are model-space.
+        let px = m.position.x
+        let py = m.position.y
+        let pz = m.position.z
+        for (const bone of SUBJECT_BONES) {
+          const pos = m.getBoneWorldPosition(bone)
+          if (!pos) continue
+          const sc = m.scale
+          pos.setXYZ(pos.x * sc, pos.y * sc, pos.z * sc)
+          Quat.rotateVecInto(m.rotation, pos, pos)
+          px += pos.x
+          py += pos.y
+          pz += pos.z
+          break
+        }
+        u[44 + n * 4] = px
+        u[45 + n * 4] = py
+        u[46 + n * 4] = pz
+        n++
+      })
+      u[43] = n
       this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
     }
   }

@@ -60,7 +60,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 11>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 15>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -207,6 +207,24 @@ fn bgResolution() -> vec2f { return viewU[6].zw; }
 
 /** The camera's world position. */
 fn bgCameraPos() -> vec3f { return viewU[10].xyz; }
+
+/** How many characters are in the scene, up to four. */
+fn bgSubjectCount() -> i32 { return i32(viewU[10].w); }
+
+/**
+ * Where a character is standing, in world space.
+ *
+ * An effect that wants to RESPOND to the cast — ripples under the feet, a glow
+ * that follows someone, dust kicked up where they are — needs to know where
+ * they are, and the ray and the depth cannot tell it: they describe the pixel,
+ * not the scene. This is the model's root, which for a PMX is between the feet
+ * on the floor, so it is already the contact point a ripple wants.
+ *
+ * Clamped rather than bounds-checked: an effect looping past the count reads the
+ * last subject instead of sampling whatever follows the array, which is a wrong
+ * ripple rather than an undefined one.
+ */
+fn bgSubjectPos(i: i32) -> vec3f { return viewU[11 + clamp(i, 0, 3)].xyz; }
 
 /** Where in the WORLD the scene drew this pixel — the depth handed to
  *  foreground() turned into a place. Without it an effect can only think in
