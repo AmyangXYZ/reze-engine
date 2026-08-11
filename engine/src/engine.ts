@@ -1,5 +1,7 @@
 import { Camera } from "./camera"
+import { decodeDds, isDds } from "./dds-loader"
 import { Mat4, Quat, Vec3 } from "./math"
+import { decodePsd, isPsd } from "./psd-loader"
 import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { decodeTga } from "./tga-loader"
@@ -660,7 +662,9 @@ export class Engine {
   private device!: GPUDevice
   private context!: GPUCanvasContext
   private presentationFormat!: GPUTextureFormat
-  private camera!: Camera
+  // No `!`: the constructor assigns it, so the type is the guarantee. Every other
+  // `!` field here is genuinely absent until init() — this one no longer is.
+  private camera: Camera
   private cameraUniformBuffer!: GPUBuffer
   private cameraMatrixData = new Float32Array(36)
   // Blender-style scene config groups (resolved from EngineOptions)
@@ -987,6 +991,20 @@ export class Engine {
       target: options?.camera?.target ?? d.camera.target,
       fov: options?.camera?.fov ?? d.camera.fov,
     }
+    // Built HERE and not in setupCamera, because a host holds the Engine before
+    // init() resolves — the reference is assigned, then init is awaited — and it
+    // reads the camera in that window. isCameraVmdEnabled() on a camera that did
+    // not exist yet threw "Cannot read properties of undefined (reading
+    // 'vmdDriven')", which surfaces as the whole page failing to load. The Camera
+    // is pure math, so nothing about it needed the device; only its aspect and
+    // its input listeners do, and those still wait for a sized canvas.
+    this.camera = new Camera(
+      Math.PI,
+      Math.PI / 2.5,
+      this.cameraConfig.distance,
+      this.cameraConfig.target,
+      this.cameraConfig.fov,
+    )
     this.onRaycast = options?.onRaycast
     this.onGizmoDrag = options?.onGizmoDrag
     this.bloomSettings = Engine.mergeBloomDefaults(options?.bloom)
@@ -3049,14 +3067,8 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
-    this.camera = new Camera(
-      Math.PI,
-      Math.PI / 2.5,
-      this.cameraConfig.distance,
-      this.cameraConfig.target,
-      this.cameraConfig.fov,
-    )
-
+    // The camera came up with the engine (see the constructor). What waits for
+    // init is only what needs a device and a sized canvas.
     this.camera.aspect = this.canvas.width / this.canvas.height
     this.camera.attachControl(this.canvas)
   }
@@ -4623,21 +4635,28 @@ export class Engine {
       return null
     }
 
-    // Decode to either an ImageBitmap (web-native formats) or raw RGBA (TGA). .tga skips
-    // straight to the TGA decoder (createImageBitmap can't read it); other extensions try
-    // the browser decoder first, then fall back to TGA in case a .spa/.sph/etc. is TGA
-    // under its extension. Every failure is logged and soft — never throws to the caller.
+    // Decode to either an ImageBitmap (web-native formats) or raw RGBA (TGA, DDS, PSD).
+    //
+    // DDS and PSD are recognised by their MAGIC rather than their extension, because
+    // the extension lies often enough to matter — a converted stage's .tga is
+    // sometimes a DDS, and a repacked texture folder is full of .png that never
+    // stopped being Photoshop files. TGA has no magic to key on, so .tga skips
+    // straight to its decoder (createImageBitmap can't read it) and every other
+    // extension tries the browser first, then falls back to TGA in case a
+    // .spa/.sph/etc. is TGA underneath. Every failure is logged and soft — this
+    // never throws to the caller; the material just gets the white texture.
     let source: ImageBitmap | null = null
     let rgba: Uint8Array | null = null
     let width: number
     let height: number
 
+    const cpuDecoder = isDds(buffer) ? decodeDds : isPsd(buffer) ? decodePsd : null
     const isTga = logicalPath.toLowerCase().endsWith(".tga")
-    if (!isTga) {
+    if (!isTga && !cpuDecoder) {
       try {
         source = await createImageBitmap(new Blob([buffer]), { premultiplyAlpha: "none", colorSpaceConversion: "none" })
       } catch {
-        source = null // not a browser-native image — try TGA below
+        source = null // not a browser-native image — try the CPU decoders below
       }
     }
 
@@ -4646,7 +4665,7 @@ export class Engine {
       height = source.height
     } else {
       try {
-        const img = decodeTga(buffer)
+        const img = (cpuDecoder ?? decodeTga)(buffer)
         rgba = img.rgba
         width = img.width
         height = img.height

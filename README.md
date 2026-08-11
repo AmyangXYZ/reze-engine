@@ -34,8 +34,8 @@ See [Physics](#physics) and [Rendering](#rendering) for the internals.
 
 - [Reze Design](https://reze.design) (web-native scene composer & shader-graph styling)
 - [Reze Studio](https://reze.studio) (MMD animation editor)
-- [MiKaPo](https://mikapo.vercel.app) (motion capture)
-- [Reze Rig](https://reze-rig.vercel.app) (FBX→VMD retarget)
+- [MiKaPo](https://mikapo.reze.one) (motion capture)
+- [Reze Rig](https://rig.reze.one) (FBX→VMD retarget)
 - [Popo](https://popo.love) (LLM-generated poses)
 - [MPL](https://mmd-mpl.vercel.app) (motion language)
 
@@ -78,7 +78,8 @@ engine/src/
   pmx-loader.ts      PMX parser: mesh, bones, morphs, rigid bodies, joints
   vmd-loader.ts      VMD motion parser  ·  vmd-writer.ts  VMD export (Shift-JIS)
   asset-reader.ts    URL + local-folder asset resolution  ·  folder-upload.ts
-  tga-loader.ts      TGA decoder (formats createImageBitmap can't read)
+  tga-loader.ts      TGA decoder  ·  dds-loader.ts  DDS/BC1-3  ·  psd-loader.ts  PSD
+                     composite — the texture formats createImageBitmap can't read
   index.ts           public exports
 
   graph/             shader-graph → WGSL compiler — materials as data
@@ -240,6 +241,20 @@ if (picked.status === "single")
 VMD and other assets still load by URL when the path starts with `/` or `http(s):`; relative paths resolve against the PMX directory.
 
 **Any `File[]` works, not just folder picks** — files from plain multi-select or drag & drop carry `webkitRelativePath === ""` and key by **filename** instead (which may itself contain a path: hosts that extract a model `.zip` in-app can synthesize `new File(data, "model/tex/body.png")` and paths resolve exactly like a folder pick). Texture paths additionally fall back to **basename matching** — a PMX referencing `tex/body.png` finds a flat `body.png`; the same fallback rescues wrongly-cased directory names.
+
+### Texture formats
+
+PNG, JPEG, WebP and the rest of what the browser decodes, plus three it doesn't:
+
+| | |
+| --- | --- |
+| **TGA** | true-colour (16/24/32), grayscale and colour-mapped, raw or RLE — common in PMX packs, especially sphere maps |
+| **DDS** | BC1/BC2/BC3 (DXT1/3/5) and uncompressed BGRA/RGBA/24-bit, including `DX10` headers — what a stage converted out of a game usually carries |
+| **PSD** | the flattened composite of a PSD or PSB: RGB, grayscale, indexed and duotone, 8 or 16-bit, raw or RLE — texture packs are often shipped as the artist's working files |
+
+DDS and PSD are recognised by their **magic bytes rather than their extension**, because in these packs the extension is frequently wrong — a `.tga` that is really a DDS, a `.png` that never stopped being a Photoshop file. All three decode on the CPU to RGBA8, so DDS needs no `texture-compression-bc` device feature and works where that is unavailable.
+
+A texture that cannot be decoded is logged and skipped, and its material falls back to white — a model never fails to load over one bad file. Two known limits: a PSD saved with *Maximize Compatibility* off carries no usable composite, and CMYK/Lab PSDs are refused rather than converted without a profile.
 
 ### Interactive pose editing
 
