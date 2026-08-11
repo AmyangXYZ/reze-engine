@@ -92,6 +92,12 @@ export interface Bone {
   appendRatio?: number // 0..1
   appendRotate?: boolean
   appendMove?: boolean
+  /** 軸制限: this bone rotates ONLY about this axis (the twist bones use it). */
+  fixedAxis?: [number, number, number]
+  /** 変形階層: MMD poses whole layers in order, not bones in array order.
+   *  Parsed but not yet honoured — distinct from Model's `deformOrder`, which is
+   *  this engine's parent-before-child traversal. */
+  deformLayer?: number
   ikTargetIndex?: number // IK target bone index (if this bone is an IK effector)
   ikIteration?: number // IK iteration count
   ikLimitAngle?: number // IK rotation constraint (radians)
@@ -477,6 +483,9 @@ export class Model {
     this.applyMorphs()
   }
 
+  /** 軸制限 bones and their normalised axes — see applyFixedAxes. */
+  private fixedAxisBones: { index: number; x: number; y: number; z: number }[] = []
+
   private initializeRuntimeSkeleton(): void {
     const boneCount = this.skeleton.bones.length
 
@@ -488,6 +497,18 @@ export class Model {
       localRotations[i] = Quat.identity()
       localTranslations[i] = Vec3.zeros()
       worldMatrices[i] = Mat4.identity()
+    }
+
+    // 軸制限 bones, gathered once and normalised. A standard rig has four —
+    // the two arm twists and the two wrist twists — so this is a four-element
+    // walk per pose rather than a branch on every bone.
+    this.fixedAxisBones = []
+    for (let i = 0; i < boneCount; i++) {
+      const a = this.skeleton.bones[i].fixedAxis
+      if (!a) continue
+      const len = Math.hypot(a[0], a[1], a[2])
+      if (len < 1e-8) continue
+      this.fixedAxisBones.push({ index: i, x: a[0] / len, y: a[1] / len, z: a[2] / len })
     }
 
     this.runtimeSkeleton = {
@@ -673,19 +694,42 @@ export class Model {
    * Stages are the reason this exists: a door or a lift is rigged as a bone
    * morph and there is no VMD anywhere that drives it.
    */
+  /**
+   * Take the last frame's bone-morph offsets back off, before any pose source
+   * runs.
+   *
+   * This cannot live at the top of applyBoneMorphs, which is where it used to
+   * be. A pose source writes only the bones its clip keys, and it writes them
+   * from the clip — so restoring afterwards overwrote the freshly animated pose
+   * with a snapshot taken a frame earlier, and the re-snapshot immediately
+   * below then saved that same stale value again. The result was not a drift or
+   * a lag: every bone any bone morph touched stayed pinned to the first frame
+   * the model was posed at, permanently, and at ANY weight — the restore ran
+   * over the touched set before the weight test, so a morph sitting at 0 froze
+   * its bones just as hard as one at 1.
+   *
+   * It reads as "the arms don't animate" because arms are what these morphs
+   * touch: character models routinely ship T-Pose / A-Pose / ShouderBlend /
+   * ElbowBlend adjusters on 腕 and ひじ, and nothing else in the rig is a
+   * comparably popular bone-morph target.
+   */
+  private undoBoneMorphs(): void {
+    if (!this.boneMorphApplied) return
+    for (let i = 0; i < this.boneMorphBones.length; i++) {
+      const b = this.boneMorphBones[i]
+      this.runtimeSkeleton.localRotations[b].set(this.boneMorphRestoreR[i])
+      this.runtimeSkeleton.localTranslations[b].set(this.boneMorphRestoreT[i])
+    }
+    this.boneMorphApplied = false
+  }
+
   private applyBoneMorphs(): void {
     if (this.boneMorphPlan.length === 0) return
 
-    // Undo the previous application first. With a clip running this is a no-op
-    // in effect — the pose source already overwrote these bones — but a stage
-    // has no clip, so without it the same offset would be re-added every frame.
-    if (this.boneMorphApplied) {
-      for (let i = 0; i < this.boneMorphBones.length; i++) {
-        const b = this.boneMorphBones[i]
-        this.runtimeSkeleton.localRotations[b].set(this.boneMorphRestoreR[i])
-        this.runtimeSkeleton.localTranslations[b].set(this.boneMorphRestoreT[i])
-      }
-    }
+    // Snapshot the pose as the sources left it, so undoBoneMorphs can hand these
+    // bones back unmorphed at the top of the next frame. The two halves are a
+    // pair: without the undo a stage — which has no clip to rewrite its bones —
+    // would compound the same offset every frame.
     for (let i = 0; i < this.boneMorphBones.length; i++) {
       const b = this.boneMorphBones[i]
       this.boneMorphRestoreR[i].set(this.runtimeSkeleton.localRotations[b])
@@ -1922,6 +1966,39 @@ export class Model {
       : frameA.weight
   }
 
+  /**
+   * Hold 軸制限 bones to their own axis.
+   *
+   * A twist bone (腕捩 / 手捩) exists to rotate about the length of the limb and
+   * nothing else, and PMX says so by giving it a fixed axis. A VMD still keys it
+   * with a full quaternion, so without the constraint the bone bends as well as
+   * twists — and because the elbow is parented to 腕捩 and 腕捩1..3 inherit a
+   * fraction of it, that error is carried into the whole forearm and multiplied
+   * three ways down the arm. It is the most visible thing on the model.
+   *
+   * Projecting the quaternion's vector part onto the axis and renormalising is
+   * what keeps the twist and drops everything else; the same operation MMD and
+   * every faithful runtime performs.
+   *
+   * Applied to the STORED local rotation rather than inside a matrix path,
+   * because the append children read that array directly: constrain it once and
+   * the bone, its inheritors and a hand-posed gizmo all agree.
+   */
+  private applyFixedAxes(): void {
+    for (const a of this.fixedAxisBones) {
+      const q = this.runtimeSkeleton.localRotations[a.index]
+      const dot = q.x * a.x + q.y * a.y + q.z * a.z
+      const x = a.x * dot
+      const y = a.y * dot
+      const z = a.z * dot
+      const len = Math.sqrt(x * x + y * y + z * z + q.w * q.w)
+      if (len > 1e-8) {
+        const inv = 1 / len
+        q.setXYZW(x * inv, y * inv, z * inv, q.w * inv)
+      }
+    }
+  }
+
   private applyPoseFromClip(clip: AnimationClip | null, frame: number): void {
     if (!clip) return
     this.applyIkFromClip(clip, frame)
@@ -1941,6 +2018,7 @@ export class Model {
       this.runtimeSkeleton.localRotations[boneIdx].set(_animSlerp)
       this.runtimeSkeleton.localTranslations[boneIdx].set(localTranslation)
     }
+    this.applyFixedAxes()
 
     for (const [morphName, keyFrames] of clip.morphTracks.entries()) {
       const weight = this.sampleMorphTrack(morphName, keyFrames, frame, this.morphTrackIndices)
@@ -2084,6 +2162,7 @@ export class Model {
       this.runtimeSkeleton.localRotations[i].set(_blendQ)
       this.runtimeSkeleton.localTranslations[i].set(localTranslation)
     }
+    this.applyFixedAxes()
 
     const morphCount = morphAcc.length
     for (let i = 0; i < morphCount; i++) {
@@ -2237,6 +2316,13 @@ export class Model {
     const evWatch = this.clipEvents.size > 0 ? this.animationState.getCurrentAnimation() : null
     const evPrevFrame = evWatch !== null ? this.animationState.getCurrentFrame() : 0
     this.animationState.update(deltaTime)
+
+    // Hand the pose sources their bones unmorphed. A bone morph is an offset on
+    // top of the pose, so last frame's offset has to come off before this
+    // frame's pose goes on — taking it off afterwards is what froze every
+    // morph-touched bone at its first posed frame.
+    this.undoBoneMorphs()
+
     if (!this.clipApplySuspended) {
       if (this.oneShot !== null) {
         this.applyOneShot(deltaTime)
@@ -2378,7 +2464,9 @@ export class Model {
 
     // Handle append transformations (same logic as computeWorldMatrices)
     const appendParentIdx = b.appendParentIndex
-    const hasAppend = b.appendRotate &&
+    // `|| appendMove`: a move-only append (no rotation) was skipped altogether,
+    // because the guard demanded appendRotate before either branch could run.
+    const hasAppend = (b.appendRotate || b.appendMove) &&
       appendParentIdx !== undefined &&
       appendParentIdx >= 0 &&
       appendParentIdx < bones.length
@@ -2405,12 +2493,15 @@ export class Model {
           scratchQuat[2].setIdentity()
           Quat.slerpInto(scratchQuat[2], scratchQuat[0], absRatio, scratchQuat[1])
 
-          // finalRot = slerpResult * finalRot (rotation composition as quat mul)
+          // MMD composes the append on the RIGHT: own animated rotation first, then
+          // the inherited one (saba's `r = r * appendRotate`). We had it on the
+          // left, which is a different rotation whenever a bone carries BOTH its
+          // own key and an append — the twist bones, if a motion keys them.
           const sx = scratchQuat[1].x, sy = scratchQuat[1].y, sz = scratchQuat[1].z, sw = scratchQuat[1].w
-          const nx = sw * fx + sx * fw + sy * fz - sz * fy
-          const ny = sw * fy - sx * fz + sy * fw + sz * fx
-          const nz = sw * fz + sx * fy - sy * fx + sz * fw
-          const nw = sw * fw - sx * fx - sy * fy - sz * fz
+          const nx = fw * sx + fx * sw + fy * sz - fz * sy
+          const ny = fw * sy - fx * sz + fy * sw + fz * sx
+          const nz = fw * sz + fx * sy - fy * sx + fz * sw
+          const nw = fw * sw - fx * sx - fy * sy - fz * sz
           fx = nx; fy = ny; fz = nz; fw = nw
         }
 
@@ -2469,7 +2560,7 @@ export class Model {
 
       const appendParentIdx = b.appendParentIndex
       const hasAppend =
-        b.appendRotate && appendParentIdx !== undefined && appendParentIdx >= 0 && appendParentIdx < boneCount
+        (b.appendRotate || b.appendMove) && appendParentIdx !== undefined && appendParentIdx >= 0 && appendParentIdx < boneCount
 
       if (hasAppend) {
         const ratio = b.appendRatio === undefined ? 1 : Math.max(-1, Math.min(1, b.appendRatio))
@@ -2487,12 +2578,15 @@ export class Model {
             scratchQuat[2].setIdentity()
             Quat.slerpInto(scratchQuat[2], scratchQuat[0], absRatio, scratchQuat[1])
 
-            // finalRot = slerpResult * finalRot (quat mul)
+            // MMD composes the append on the RIGHT: own animated rotation first, then
+            // the inherited one (saba's `r = r * appendRotate`). We had it on the
+            // left, which is a different rotation whenever a bone carries BOTH its
+            // own key and an append — the twist bones, if a motion keys them.
             const sx = scratchQuat[1].x, sy = scratchQuat[1].y, sz = scratchQuat[1].z, sw = scratchQuat[1].w
-            const nx = sw * fx + sx * fw + sy * fz - sz * fy
-            const ny = sw * fy - sx * fz + sy * fw + sz * fx
-            const nz = sw * fz + sx * fy - sy * fx + sz * fw
-            const nw = sw * fw - sx * fx - sy * fy - sz * fz
+            const nx = fw * sx + fx * sw + fy * sz - fz * sy
+            const ny = fw * sy - fx * sz + fy * sw + fz * sx
+            const nz = fw * sz + fx * sy - fy * sx + fz * sw
+            const nw = fw * sw - fx * sx - fy * sy - fz * sz
             fx = nx; fy = ny; fz = nz; fw = nw
           }
 

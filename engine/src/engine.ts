@@ -648,6 +648,9 @@ function materialAlphaStats(
   return { avg: sum / n / 255, translucentFrac: translucent / n }
 }
 
+/** Tried in order when a PMX names a texture without an extension. */
+const TEXTURE_EXTENSION_GUESSES = [".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".spa", ".sph"]
+
 export class Engine {
   private static instance: Engine | null = null
 
@@ -3174,13 +3177,21 @@ export class Engine {
   // so a static stage in the scene never freezes the shot at frame 0. Falls back to the first
   // model, then to 0 (empty scene).
   private cameraClockTime(): number {
-    let first: number | null = null
+    let fallback: number | null = null
     for (const inst of this.modelInstances.values()) {
+      // Stages are skipped outright. Scenery carries no motion, and it is added
+      // BEFORE the cast — it paints while the models stream in behind it — so it
+      // is first in insertion order and was seeding this clock with its own
+      // permanent zero. In a scene with a stage, a camera VMD therefore sampled
+      // frame 0 forever and the shot never moved.
+      if (inst.isStage) continue
       const p = inst.model.getAnimationProgress()
-      if (first === null) first = p.current
       if (p.playing || p.paused) return p.current
+      // Otherwise the first cast member that actually HAS a clip: one still at
+      // bind pose must not claim the clock from one holding the motion.
+      if (fallback === null && p.duration > 0) fallback = p.current
     }
-    return first ?? 0
+    return fallback ?? 0
   }
 
   /** Current orbit eye position (spherical coords resolved to a point). */
@@ -4627,12 +4638,38 @@ export class Engine {
       return cached
     }
 
-    let buffer: ArrayBuffer
+    // PMX texture tables are hand-maintained, and they routinely carry entries
+    // that are not files. Two kinds show up constantly: a bare directory
+    // ("Textures", "spa\\"), which is a leftover placeholder pointing at nothing,
+    // and a name whose extension was dropped — where the texture is sitting right
+    // there on disk one suffix longer, and the material renders white for want of
+    // it. The first is answered by staying quiet, the second by trying.
+    let buffer: ArrayBuffer | null = null
+    let readError: unknown = null
     try {
       buffer = await inst.assetReader.readBinary(logicalPath)
     } catch (e) {
-      console.warn(`[reze] texture read failed: ${logicalPath}`, e instanceof Error ? e.message : e)
-      return null
+      readError = e
+    }
+    if (!buffer) {
+      const base = logicalPath.split(/[\\/]/).pop() ?? ""
+      // No basename at all: the entry named a directory. Nothing was ever meant
+      // to load, so this is not a failure worth a line in anyone's console.
+      if (!base) return null
+      if (!base.includes(".")) {
+        for (const ext of TEXTURE_EXTENSION_GUESSES) {
+          try {
+            buffer = await inst.assetReader.readBinary(`${logicalPath}${ext}`)
+            break
+          } catch {
+            // keep trying — the list is short and only runs for a broken entry
+          }
+        }
+      }
+      if (!buffer) {
+        console.warn(`[reze] texture read failed: ${logicalPath}`, readError instanceof Error ? readError.message : readError)
+        return null
+      }
     }
 
     // Decode to either an ImageBitmap (web-native formats) or raw RGBA (TGA, DDS, PSD).

@@ -354,6 +354,8 @@ export class PmxLoader {
         ikIteration?: number
         ikLimitAngle?: number
         ikLinks?: IKLink[]
+        fixedAxis?: [number, number, number]
+        deformLayer?: number
       }
       const abs: AbsBone[] = new Array(count)
       // PMX 2.x bone flags (best-effort common masks)
@@ -372,7 +374,7 @@ export class PmxLoader {
         const y = this.getFloat32()
         const z = this.getFloat32()
         const parentIndex = this.getNonVertexIndex(this.boneIndexSize)
-        this.getInt32() // transform order (skip)
+        const deformLayer = this.getInt32() // 変形階層
         const flags = this.getUint16()
 
         // Tail: bone index or offset vector3
@@ -397,11 +399,10 @@ export class PmxLoader {
           appendMove = (flags & FLAG_APPEND_MOVE) !== 0
         }
 
-        // Axis limit
+        // Axis limit (軸制限)
+        let fixedAxis: [number, number, number] | undefined = undefined
         if ((flags & FLAG_AXIS_LIMIT) !== 0) {
-          this.getFloat32()
-          this.getFloat32()
-          this.getFloat32()
+          fixedAxis = [this.getFloat32(), this.getFloat32(), this.getFloat32()]
         }
 
         // Local axis (two vectors x and z)
@@ -467,6 +468,8 @@ export class PmxLoader {
           appendRatio,
           appendRotate,
           appendMove,
+          fixedAxis,
+          deformLayer,
           ikTargetIndex,
           ikIteration,
           ikLimitAngle,
@@ -487,6 +490,8 @@ export class PmxLoader {
           appendRatio: a.appendRatio,
           appendRotate: a.appendRotate,
           appendMove: a.appendMove,
+          fixedAxis: a.fixedAxis,
+          deformLayer: a.deformLayer,
           ikTargetIndex: a.ikTargetIndex,
           ikIteration: a.ikIteration,
           ikLimitAngle: a.ikLimitAngle,

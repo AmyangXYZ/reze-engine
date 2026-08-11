@@ -355,24 +355,34 @@ export function bezierInterpolate(x1: number, x2: number, y1: number, y2: number
 
 const INV_127 = 1 / 127
 
+/**
+ * The 64 interpolation bytes of a VMD bone frame, as four bezier curves.
+ *
+ * MMD interleaves the channels rather than storing them one after another: byte
+ * `i` is channel i's x1, `i + 4` its y1, `i + 8` its x2, `i + 12` its y2, where
+ * the channels are X = 0, Y = 1, Z = 2 and ROTATION = 3. The remaining 48 bytes
+ * are the same record written three more times, each shifted a byte left — a
+ * legacy quirk, and not one to read from: real files in this repo disagree with
+ * their own shifted copies, so the first block is the only trustworthy one.
+ *
+ * Rotation used to read `raw[0..3]`, which is not rotation's curve at all — it
+ * is the x1 byte of all four channels in a row. On an ordinary keyframe that
+ * evaluates to a bezier with both control points at y = 0: the curve holds near
+ * zero for most of the interval and then snaps to 1 at its end. Applied to every
+ * bone's rotation on every keyframe interval, which is essentially all of an MMD
+ * motion, it reads as a dance that stutters between poses instead of flowing
+ * through them.
+ */
 export function rawInterpolationToBoneInterpolation(raw: Uint8Array): BoneInterpolation {
+  const channel = (i: number): ControlPoint[] => [
+    { x: raw[i], y: raw[i + 4] },
+    { x: raw[i + 8], y: raw[i + 12] },
+  ]
   return {
-    rotation: [
-      { x: raw[0], y: raw[2] },
-      { x: raw[1], y: raw[3] },
-    ],
-    translationX: [
-      { x: raw[0], y: raw[4] },
-      { x: raw[8], y: raw[12] },
-    ],
-    translationY: [
-      { x: raw[16], y: raw[20] },
-      { x: raw[24], y: raw[28] },
-    ],
-    translationZ: [
-      { x: raw[32], y: raw[36] },
-      { x: raw[40], y: raw[44] },
-    ],
+    translationX: channel(0),
+    translationY: channel(1),
+    translationZ: channel(2),
+    rotation: channel(3),
   }
 }
 
