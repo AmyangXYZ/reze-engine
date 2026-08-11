@@ -28,8 +28,28 @@ export class RezePhysics {
   private readonly maxSubSteps = 6
   /** EMA of one world.step's CPU cost; drives catch-up load shedding. */
   private stepCostEmaMs = 0.5
-  /** Max ms a single frame may spend catching up physics before shedding. */
-  private readonly stepBudgetMs = 8
+  /**
+   * Share of the frame a single frame may spend catching physics up before it
+   * sheds the backlog instead.
+   *
+   * A FRACTION, not a fixed millisecond count, and that distinction is the whole
+   * point. It used to be a flat 8ms — about half a frame at 60Hz, which is what
+   * it was tuned against. The moment anything else made frames longer (a heavy
+   * effect, a weak GPU) the frame grew and the budget did not, so at 30Hz
+   * physics was allowed a QUARTER of the frame while needing twice the
+   * substeps. It shed work it could easily afford, and shedding discards time —
+   * so physics ran fractionally slow-motion against a character moving at full
+   * speed, which is exactly what hair and skirts lagging behind the body looks
+   * like.
+   *
+   * At 60Hz this reproduces the old 8ms almost exactly, so nothing that was
+   * tuned against it moves.
+   */
+  private readonly stepBudgetFraction = 0.5
+  /** Floor and ceiling on that share: a very short frame still gets enough to
+   *  make progress, and a very long one must not spend all of itself here. */
+  private readonly stepBudgetMinMs = 8
+  private readonly stepBudgetMaxMs = 24
 
   // Fixed-timestep render interpolation ("Fix Your Timestep"): the dynamic body pose is
   // rendered as lerp(prev, curr, alpha) between the last two completed substeps, where
@@ -260,7 +280,11 @@ export class RezePhysics {
     // state (6× step cost every frame; iOS "starts smooth, then stays slow").
     // Catching up must never cost more than a frame-budget slice: shed the backlog
     // instead (physics runs fractionally slow-motion for a beat; framerate holds).
-    const affordable = Math.max(1, Math.floor(this.stepBudgetMs / Math.max(0.05, this.stepCostEmaMs)))
+    const budgetMs = Math.min(
+      this.stepBudgetMaxMs,
+      Math.max(this.stepBudgetMinMs, dt * 1000 * this.stepBudgetFraction),
+    )
+    const affordable = Math.max(1, Math.floor(budgetMs / Math.max(0.05, this.stepCostEmaMs)))
     if (nSub > affordable) nSub = affordable
     for (let k = 0; k < nSub; k++) {
       this.savePrevState()
