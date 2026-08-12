@@ -42,6 +42,17 @@ export class CameraAnimation {
     return this.frames.length
   }
 
+  /**
+   * Every keyframe's frame index, ascending.
+   *
+   * For a host drawing the track: a camera VMD is sparse and punchy compared to
+   * a dance, so where its keys sit IS where its cuts and moves are. The poses
+   * stay private — a timeline wants the rhythm, not the camera.
+   */
+  keyframeIndices(): number[] {
+    return this.frames.map((f) => f.frame)
+  }
+
   /** Sample the camera pose at time `t` (seconds). Clamps to the track ends; null if empty. */
   sample(t: number): CameraPose | null {
     const frames = this.frames

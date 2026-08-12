@@ -3255,6 +3255,12 @@ export class Engine {
     return this.cameraAnimation?.duration ?? 0
   }
 
+  /** Every camera keyframe's frame index — what a timeline draws as its cuts.
+   *  Empty when no camera VMD is loaded. */
+  getCameraVmdKeyframes(): number[] {
+    return this.cameraAnimation?.keyframeIndices() ?? []
+  }
+
   /** Drop the loaded camera VMD and return to orbit control. */
   clearCameraVmd(): void {
     this.cameraAnimation = null
