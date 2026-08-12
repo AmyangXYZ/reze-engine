@@ -1,4 +1,4 @@
-import { AnimationClip, BoneInterpolation } from "./animation"
+import { AnimationClip, BoneInterpolation, ControlPoint } from "./animation"
 
 const VMD_HEADER = "Vocaloid Motion Data 0002"
 const HEADER_SIZE = 30
@@ -189,34 +189,34 @@ function writeFixedShiftJIS(buffer: ArrayBuffer, offset: number, str: string, ma
 
 /**
  * Convert BoneInterpolation back to the 64-byte raw VMD interpolation table.
- * Exact inverse of rawInterpolationToBoneInterpolation in animation.ts.
+ * Exact inverse of rawInterpolationToBoneInterpolation in animation.ts — see the
+ * layout note there for why the record is written four times.
  */
 function boneInterpolationToRaw(interp: BoneInterpolation): Uint8Array {
+  // The one 16-byte record: each channel's x1 / y1 / x2 / y2, interleaved.
+  const record = new Uint8Array(16)
+  const put = (c: number, cp: ControlPoint[]): void => {
+    record[c] = cp[0].x
+    record[c + 4] = cp[0].y
+    record[c + 8] = cp[1].x
+    record[c + 12] = cp[1].y
+  }
+  put(0, interp.translationX)
+  put(1, interp.translationY)
+  put(2, interp.translationZ)
+  put(3, interp.rotation)
+
+  // Copy `r` starts at byte r * 16 and holds record[r..15], so channel r's own
+  // bytes land where the reader (and MMD, and babylon-mmd) look for them.
   const raw = new Uint8Array(64)
-
-  // Rotation: [{x: raw[0], y: raw[2]}, {x: raw[1], y: raw[3]}]
-  raw[0] = interp.rotation[0].x
-  raw[1] = interp.rotation[1].x
-  raw[2] = interp.rotation[0].y
-  raw[3] = interp.rotation[1].y
-
-  // TranslationX: [{x: raw[0], y: raw[4]}, {x: raw[8], y: raw[12]}]
-  // raw[0] already set by rotation (shared byte)
-  raw[4] = interp.translationX[0].y
-  raw[8] = interp.translationX[1].x
-  raw[12] = interp.translationX[1].y
-
-  // TranslationY: [{x: raw[16], y: raw[20]}, {x: raw[24], y: raw[28]}]
-  raw[16] = interp.translationY[0].x
-  raw[20] = interp.translationY[0].y
-  raw[24] = interp.translationY[1].x
-  raw[28] = interp.translationY[1].y
-
-  // TranslationZ: [{x: raw[32], y: raw[36]}, {x: raw[40], y: raw[44]}]
-  raw[32] = interp.translationZ[0].x
-  raw[36] = interp.translationZ[0].y
-  raw[40] = interp.translationZ[1].x
-  raw[44] = interp.translationZ[1].y
+  for (let r = 0; r < 4; r++) {
+    for (let i = r; i < 16; i++) raw[r * 16 + (i - r)] = record[i]
+  }
+  // Bytes 2 and 3 of the first copy are not interpolation — they are the physics
+  // toggle. 0x0000 is "physics on", which is what both reference motions carry and
+  // the only state a clip can round-trip: BoneInterpolation does not model the flag.
+  raw[2] = 0
+  raw[3] = 0
 
   return raw
 }

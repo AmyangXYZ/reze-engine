@@ -358,26 +358,35 @@ const INV_127 = 1 / 127
 /**
  * The 64 interpolation bytes of a VMD bone frame, as four bezier curves.
  *
- * MMD interleaves the channels rather than storing them one after another: byte
- * `i` is channel i's x1, `i + 4` its y1, `i + 8` its x2, `i + 12` its y2, where
- * the channels are X = 0, Y = 1, Z = 2 and ROTATION = 3. The remaining 48 bytes
- * are the same record written three more times, each shifted a byte left — a
- * legacy quirk, and not one to read from: real files in this repo disagree with
- * their own shifted copies, so the first block is the only trustworthy one.
+ * One 16-byte record carries all four channels interleaved: byte `c` is channel
+ * c's x1, `c + 4` its y1, `c + 8` its x2, `c + 12` its y2, for X = 0, Y = 1,
+ * Z = 2, ROTATION = 3. MMD then writes that record four times over the 64 bytes,
+ * each copy shifted one byte further left, so copy `r` starts at byte `r * 16`
+ * and holds `record[r..15]` (the bytes past the record's end are uninitialised
+ * junk — both motions in this repo have arbitrary values there).
  *
- * Rotation used to read `raw[0..3]`, which is not rotation's curve at all — it
- * is the x1 byte of all four channels in a row. On an ordinary keyframe that
- * evaluates to a bezier with both control points at y = 0: the curve holds near
- * zero for most of the interval and then snaps to 1 at its end. Applied to every
- * bone's rotation on every keyframe interval, which is essentially all of an MMD
- * motion, it reads as a dance that stutters between poses instead of flowing
- * through them.
+ * The shifted copies are not decoration, and reading channel c out of copy 0 is
+ * the bug this function exists to not have. MMD reuses bytes 2 and 3 of the FIRST
+ * copy for the per-keyframe physics toggle (`(raw[2] << 8) | raw[3]`; 0 = physics
+ * on) — it overwrites Z's x1 and, more damagingly, ROTATION's x1 with zero, on
+ * every keyframe of every real motion file. Rotation is what an MMD dance is
+ * almost entirely made of, so an x1 pinned to 0 turns every eased keyframe
+ * interval into a curve that leaps early and coasts: the dance arrives at each
+ * pose ahead of the beat and sits there.
+ *
+ * So each channel is read out of its OWN copy, at `c * 16`, where the record's
+ * byte c survives the physics field. This is what babylon-mmd does (vmdLoader.ts,
+ * `boneKeyFrameInterpolation[c * 16 + {0, 8, 4, 12}]`) and the copies agree with
+ * each other byte-for-byte in both motions here.
  */
 export function rawInterpolationToBoneInterpolation(raw: Uint8Array): BoneInterpolation {
-  const channel = (i: number): ControlPoint[] => [
-    { x: raw[i], y: raw[i + 4] },
-    { x: raw[i + 8], y: raw[i + 12] },
-  ]
+  const channel = (c: number): ControlPoint[] => {
+    const b = c * 16
+    return [
+      { x: raw[b], y: raw[b + 4] },
+      { x: raw[b + 8], y: raw[b + 12] },
+    ]
+  }
   return {
     translationX: channel(0),
     translationY: channel(1),
