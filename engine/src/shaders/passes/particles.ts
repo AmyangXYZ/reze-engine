@@ -27,7 +27,9 @@ export type CastLayout = { subjects: number; samples: number; base: number; trai
  * particleInit reading the same recorded history the trail draws from. One
  * effect file, two mounts, one buffer.
  */
-function castApi(cast: CastLayout): string {
+/** Shared with the sim pass, which reads the same buffer for the same reason:
+ *  a kernel that displaces fog has to know where the dancer's feet are. */
+export function castApi(cast: CastLayout): string {
   return `
 const RZ_SUBJECTS: i32 = ${cast.subjects};
 const RZ_SAMPLES: i32 = ${cast.samples};

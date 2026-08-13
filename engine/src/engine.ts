@@ -52,6 +52,13 @@ import {
   particleEntryPoints,
   PARTICLE_STRIDE,
 } from "./shaders/passes/particles"
+import {
+  SIM_FORMAT,
+  SIM_MAX,
+  buildSimShader,
+  parseSimSize,
+  simEntryPoint,
+} from "./shaders/passes/sim"
 import { buildTrailShader, trailEntryPoints, TRAIL_SUBDIVISIONS } from "./shaders/passes/trails"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
@@ -868,6 +875,30 @@ export class Engine {
   private static readonly MAX_PARTICLES = 65536
   private particleFrame = 0
   /**
+   * The installed effect's persistent grid, or null when it declared none.
+   *
+   * Two textures, not one, and read/write alternate between them every frame:
+   * a shader cannot coherently read and write the same texture, so this is not
+   * an optimisation but the only correct shape. `parity` says which one holds
+   * the CURRENT grid — the one everything else samples.
+   */
+  private sim: {
+    size: number
+    textures: [GPUTexture, GPUTexture]
+    /** Sampled views, for reading. */
+    read: [GPUTextureView, GPUTextureView]
+    pipeline: GPUComputePipeline
+    layout: GPUBindGroupLayout
+    /** Bind groups per parity: binds[i] reads textures[i], writes the other. */
+    binds: [GPUBindGroup, GPUBindGroup]
+    uniform: GPUBuffer
+    data: Float32Array
+    parity: number
+    frame: number
+  } | null = null
+  private simSampler!: GPUSampler
+  private simFallbackView!: GPUTextureView
+  /**
    * The installed effect's ribbons, or null when it declared none.
    *
    * No buffer of its own: it reads the very same path history the field-based
@@ -899,8 +930,8 @@ export class Engine {
   private fieldFullH = 0
   private fieldPipeline: GPURenderPipeline | null = null
   private fieldBindGroupLayout!: GPUBindGroupLayout
+  private fieldBindGroups: [GPUBindGroup, GPUBindGroup] | null = null
   private fieldPipelineLayout!: GPUPipelineLayout
-  private fieldBindGroup: GPUBindGroup | null = null
   /**
    * The audio analysis buffer every effect module binds: header
    * [frames, bands, secondsPerFrame, audioTime], then [level, band0..bandN-1]
@@ -1380,21 +1411,38 @@ export class Engine {
     this.device.queue.writeBuffer(this.fieldUniformBuffer, 0, new Float32Array([w, h, this.fieldFullW, this.fieldFullH]))
   }
 
+  /**
+   * ONE PER GRID PARITY.
+   *
+   * The sim alternates which texture holds the current grid, so the field pass
+   * needs a bind group for each — built once here rather than rebuilt every
+   * frame, which is what a single group would force and is pure waste for a
+   * change that only ever toggles between two known states.
+   */
   private rebuildFieldBindGroup(): void {
     if (!this.device || !this.depthReadView || !this.fieldUniformBuffer) return
-    this.fieldBindGroup = this.device.createBindGroup({
-      label: "field layer bind group",
-      layout: this.fieldBindGroupLayout,
-      entries: [
-        { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
-        { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
-        { binding: 8, resource: this.depthReadView },
-        { binding: 9, resource: { buffer: this.dofUniformBuffer } },
-        { binding: 11, resource: { buffer: this.castBuffer } },
-        { binding: 13, resource: { buffer: this.audioBuffer } },
-        { binding: 14, resource: { buffer: this.fieldUniformBuffer } },
-      ],
-    })
+    // Captured, so the null guard above survives into the closure.
+    const depth = this.depthReadView
+    const build = (grid: GPUTextureView) =>
+      this.device.createBindGroup({
+        label: "field layer bind group",
+        layout: this.fieldBindGroupLayout,
+        entries: [
+          { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
+          { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
+          { binding: 8, resource: depth },
+          { binding: 9, resource: { buffer: this.dofUniformBuffer } },
+          { binding: 11, resource: { buffer: this.castBuffer } },
+          { binding: 13, resource: { buffer: this.audioBuffer } },
+          { binding: 14, resource: { buffer: this.fieldUniformBuffer } },
+          { binding: 17, resource: grid },
+          { binding: 18, resource: this.simSampler },
+        ],
+      })
+    const sim = this.sim
+    this.fieldBindGroups = sim
+      ? [build(sim.read[0]), build(sim.read[1])]
+      : [build(this.simFallbackView), build(this.simFallbackView)]
   }
 
   /**
@@ -1500,6 +1548,7 @@ export class Engine {
       this.effect = null
       this.releaseParticles()
       this.releaseTrails()
+      this.releaseSim()
       this.fieldPipeline = null
       const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
       this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
@@ -1624,7 +1673,9 @@ export class Engine {
     // module (buildFieldShader), so a bad effect can no longer produce errors at
     // line numbers in a shader the author never wrote — and installing one no
     // longer recompiles the composite's tone-mapping half at all.
-    const fieldEffect = hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground } : null
+    const simSize = simEntryPoint(wgsl) ? parseSimSize(wgsl, SIM_MAX) || 256 : 0
+    const fieldEffect =
+      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, simSize } : null
     const source = buildCompositeShader(fieldEffect)
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
@@ -1693,6 +1744,12 @@ export class Engine {
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       particles = built.state
     }
+    let sim: NonNullable<Engine["sim"]> | null = null
+    if (simEntryPoint(wgsl)) {
+      const built = await this.buildSim(wgsl, anchors.filter((a) => a.trail).length)
+      if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
+      sim = built.state
+    }
     let trails: NonNullable<Engine["trails"]> | null = null
     if (wantsTrails) {
       // Only anchors that asked for `trail` have a path to draw; a ribbon on a
@@ -1714,8 +1771,10 @@ export class Engine {
     this.effect?.paramsBuffer?.destroy()
     this.releaseParticles()
     this.releaseTrails()
+    this.releaseSim()
     this.particles = particles
     this.trails = trails
+    this.sim = sim
     this.fieldPipeline = fieldPipeline
     // `// @fullres`: an effect that draws SUB-PIXEL detail — hairline curves,
     // scanlines — declares it and pays full price; everything soft stays at
@@ -2088,7 +2147,7 @@ export class Engine {
    *  upsample. Runs the whole quad — uniform control flow, so effects may use
    *  derivatives freely, which the old inline path had to forbid. */
   private renderFieldPass(encoder: GPUCommandEncoder): void {
-    if (!this.fieldPipeline || !this.fieldBgView || !this.fieldFgView || !this.fieldBindGroup) return
+    if (!this.fieldPipeline || !this.fieldBgView || !this.fieldFgView || !this.fieldBindGroups) return
     const pass = encoder.beginRenderPass({
       label: "field layer",
       colorAttachments: [
@@ -2097,7 +2156,9 @@ export class Engine {
       ],
     })
     pass.setPipeline(this.fieldPipeline)
-    pass.setBindGroup(0, this.fieldBindGroup)
+    // The grid the sim just WROTE, which after its parity flip is the one at
+    // `parity` — an effect reads this frame's simulation, not last frame's.
+    pass.setBindGroup(0, this.fieldBindGroups[this.sim?.parity ?? 0])
     pass.draw(3)
     pass.end()
   }
@@ -2122,6 +2183,155 @@ export class Engine {
     this.particles?.buffer.destroy()
     this.particles?.uniform.destroy()
     this.particles = null
+  }
+
+  /**
+   * Compile and allocate the effect's persistent grid.
+   *
+   * The textures are created ZEROED, which is the contract a kernel is written
+   * against: rzSimFrame() is 0 on the first step and every value it reads is
+   * zero, so seeding is just "if frame is 0, return the initial state".
+   */
+  private async buildSim(
+    wgsl: string,
+    trailSlots: number,
+  ): Promise<{ ok: true; state: NonNullable<Engine["sim"]> } | { ok: false; diagnostics: string[] }> {
+    const size = parseSimSize(wgsl, SIM_MAX) || 256
+    const cast = {
+      subjects: MAX_EFFECT_SUBJECTS,
+      samples: TRAIL_SAMPLES,
+      base: MAX_EFFECT_SUBJECTS * 3,
+      trailBase: CAST_TRAIL_BASE,
+      slots: trailSlots,
+    }
+    const code = buildSimShader(wgsl, size, cast)
+    const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
+    this.device.pushErrorScope("validation")
+    const module = this.device.createShaderModule({ label: "sim step", code })
+    const info = await module.getCompilationInfo()
+    const scopeErr = await this.device.popErrorScope()
+    const diagnostics = info.messages
+      .filter((m) => m.type === "error")
+      .map((m) => `${Math.max(0, m.lineNum - offset)}:${m.linePos} ${m.message}`)
+    if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
+    if (diagnostics.length) return { ok: false, diagnostics }
+
+    const layout = this.device.createBindGroupLayout({
+      label: "sim bind layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: "filtering" } },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.COMPUTE,
+          storageTexture: { access: "write-only", format: SIM_FORMAT, viewDimension: "2d" },
+        },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      ],
+    })
+
+    const make = (n: number) =>
+      this.device.createTexture({
+        label: `sim grid ${n}`,
+        size: [size, size],
+        format: SIM_FORMAT,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+      })
+    const textures: [GPUTexture, GPUTexture] = [make(0), make(1)]
+    const read: [GPUTextureView, GPUTextureView] = [textures[0].createView(), textures[1].createView()]
+    const uniform = this.device.createBuffer({
+      label: "sim uniforms",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+
+    this.device.pushErrorScope("validation")
+    try {
+      const pipeline = await this.device.createComputePipelineAsync({
+        label: "sim step pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        compute: { module, entryPoint: "main" },
+      })
+      const scoped = await this.device.popErrorScope()
+      if (scoped) {
+        textures[0].destroy()
+        textures[1].destroy()
+        uniform.destroy()
+        return { ok: false, diagnostics: [scoped.message] }
+      }
+      // One per parity: binds[i] READS textures[i] and WRITES the other.
+      const bindFor = (i: number) =>
+        this.device.createBindGroup({
+          layout,
+          entries: [
+            { binding: 0, resource: { buffer: uniform } },
+            { binding: 1, resource: read[i] },
+            { binding: 2, resource: this.simSampler },
+            { binding: 3, resource: textures[1 - i].createView() },
+            { binding: 4, resource: { buffer: this.castBuffer } },
+            { binding: 5, resource: { buffer: this.audioBuffer } },
+            { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
+          ],
+        })
+      return {
+        ok: true,
+        state: {
+          size,
+          textures,
+          read,
+          pipeline,
+          layout,
+          binds: [bindFor(0), bindFor(1)],
+          uniform,
+          data: new Float32Array(4),
+          parity: 0,
+          frame: 0,
+        },
+      }
+    } catch (e) {
+      await this.device.popErrorScope()
+      textures[0].destroy()
+      textures[1].destroy()
+      uniform.destroy()
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
+    }
+  }
+
+  private releaseSim(): void {
+    this.sim?.textures[0].destroy()
+    this.sim?.textures[1].destroy()
+    this.sim?.uniform.destroy()
+    this.sim = null
+  }
+
+  /**
+   * Step the grid, before anything reads it.
+   *
+   * Outside the render pass, like the particle step and for the same reason —
+   * and before the field pass, or an effect samples a grid one frame stale.
+   */
+  private stepSim(encoder: GPUCommandEncoder, deltaTime: number): void {
+    const sim = this.sim
+    if (!sim) return
+    sim.data[0] = this.sceneClock - this.effectEpochScene
+    // Clamped like the particle step: a backgrounded tab returns with a delta of
+    // whole seconds, and one unclamped step of an advection kernel throws the
+    // whole grid off its own edge.
+    sim.data[1] = Math.min(0.1, Math.max(0, deltaTime))
+    sim.data[2] = sim.size
+    sim.data[3] = sim.frame++
+    this.device.queue.writeBuffer(sim.uniform, 0, sim.data.buffer as ArrayBuffer)
+    const cp = encoder.beginComputePass({ label: "sim" })
+    cp.setPipeline(sim.pipeline)
+    cp.setBindGroup(0, sim.binds[sim.parity])
+    const groups = Math.ceil(sim.size / 8)
+    cp.dispatchWorkgroups(groups, groups)
+    cp.end()
+    // The freshly written texture is now the current one.
+    sim.parity = 1 - sim.parity
   }
 
   /** Which mounts the installed effect declared. Both false when none is set. */
@@ -2554,6 +2764,25 @@ export class Engine {
       })
       .createView()
 
+    // CLAMPED, not repeated. A grid holds a bounded patch of world — a pool of
+    // fog, a stretch of water — and a kernel that reads past its edge means to
+    // ask what is just outside, not to wrap around to the far side of it.
+    this.simSampler = this.device.createSampler({
+      label: "sim grid sampler",
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+    })
+    this.simFallbackView = this.device
+      .createTexture({
+        label: "sim grid fallback (1x1 zero)",
+        size: [1, 1],
+        format: SIM_FORMAT,
+        usage: GPUTextureUsage.TEXTURE_BINDING,
+      })
+      .createView()
+
     this.audioFallbackBuffer = this.device.createBuffer({
       label: "audio analysis fallback (silence)",
       size: 32,
@@ -2584,6 +2813,8 @@ export class Engine {
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 17, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: 18, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ],
     })
     this.fieldPipelineLayout = this.device.createPipelineLayout({
@@ -6347,6 +6578,9 @@ export class Engine {
       this.shadowMapPopulated = hasModels
     }
 
+    // Before the particles and before the field pass: both may read the grid,
+    // and a grid stepped after them is one frame stale in everything that used it.
+    this.stepSim(encoder, deltaTime)
     this.stepParticles(encoder, deltaTime)
 
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)

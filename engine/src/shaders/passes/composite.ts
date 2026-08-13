@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { simClockApi, simReadApi } from "./sim"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
 //
@@ -96,6 +97,8 @@ export type CompositeEffectSource = {
   hasBackground: boolean
   /** Defines `fn foreground(...)` — mount over the finished frame. */
   hasForeground: boolean
+  /** Grid resolution when the effect declared `// @sim`, else 0. */
+  simSize: number
 }
 
 const COMPOSITE_HEAD = /* wgsl */ `
@@ -267,7 +270,22 @@ fn viewTransform(c: vec3f) -> vec3f {
   if (mode > 0.5) { return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b)); }
   return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));
 }
+`
 
+/**
+ * The scene half of the effect API — camera, projection, cast, trails.
+ *
+ * Split out of COMPOSITE_HEAD so the SIM pass can have it too. One effect file
+ * is spliced into every module it has a mount in, so a file with both a grid and
+ * a foreground compiles its foreground inside the sim shader, where every
+ * rzCameraPos() in it has to resolve. Sharing the block is better than stubbing
+ * it twice, and it means a kernel can legitimately ask where a bone is — which
+ * is exactly what a wake wants.
+ *
+ * Depends on `viewU` and `_rzCast` being declared by the including module, and
+ * on nothing else: no textures, no samplers.
+ */
+export const EFFECT_SCENE_API = /* wgsl */ `
 // ── The effect API ────────────────────────────────────────────────────────────
 //
 // Named rz*, for the engine. The prefix earns its place twice: user code is
@@ -657,7 +675,8 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
     .replace("FOREGROUND_CALL", effect?.hasForeground ? FOREGROUND_CALL.trim() : "")
   // The composite is STATIC either way now: the user's code compiles in the
   // field module alone, and the composite only decides whether to sample it.
-  return COMPOSITE_HEAD + audioApi(0, 13) + body
+  return COMPOSITE_HEAD +
+    EFFECT_SCENE_API + audioApi(0, 13) + body
 }
 
 /**
@@ -678,7 +697,13 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     : ""
   return (
     COMPOSITE_HEAD +
+    EFFECT_SCENE_API +
     audioApi(0, 13) +
+    // The persistent grid, always bound — a 1×1 of zeroes when the effect has
+    // none, so rzSim() is a function that always exists rather than one an
+    // author has to know whether they are allowed to call.
+    simReadApi(0, 17, 18, effect.simSize) +
+    simClockApi("viewU[6].x") +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +
