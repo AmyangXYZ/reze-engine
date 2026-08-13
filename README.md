@@ -27,7 +27,11 @@ npm install reze-engine
 - **Interactive editing** — GPU picking, transform gizmo, bone/material selection
 - **Camera** — orbit, bone-follow, or a driven MMD camera VMD; ground + PCF shadows, multi-model scenes
 - **Offline rendering** — frame-accurate stepping (`renderFrame`) at any resolution (`setRenderSize`) for video export; background color, 360° equirect backdrop, ground shadow-catcher
-- **WGSL scene effects** — a user shader (shadertoy-style) with two mounts, declared by which entry points the code defines: `background` composites between the background and the scene, `foreground` over the finished frame and is handed the scene's depth, so rain and petals are occluded by the character they pass behind and fog thickens with distance. Compile diagnostics and live-tweakable uniform params on both
+- **WGSL scene effects** — a user shader (shadertoy-style) with FIVE mounts, declared by which entry points the code defines: `background` composites between the background and the scene, `foreground` over the finished frame and is handed the scene's depth, so rain and petals are occluded by the character they pass behind and fog thickens with distance. Compile diagnostics and live-tweakable uniform params on both
+- **GPU particles in an effect** — declare `// @particles 4096` and write `particleInit`/`particleStep`/`particleShade`, and the pool lives entirely on the GPU: one compute dispatch steps every particle, one instanced draw puts them on screen, positions never touching the CPU. Drawn inside the scene pass, so they are depth-tested against the cast for free — a spark behind a shoulder is simply hidden. `// @blend additive` and `// @bloom` per effect; `stretch` on the particle struct is aspect along the direction of travel, which is what makes a raindrop a streak and a snowflake a square
+- **Ribbon trails in an effect** — `trailWidth`/`trailShade` over the recorded path of any bone declared with `trail`. Catmull-Rom through the samples, extruded in SCREEN space so a ribbon holds its width at any camera distance, with mitre joints, composited in its own layer with MAX blending after tone mapping — which is what stops a bright ribbon crossing itself from stacking into a white blob
+- **Audio-reactive effects** — `rzAudioLevel()`, `rzAudioOnset()` (a precomputed kick detector) and a 32-band log-spaced spectrum, plus `…At(offset)` forms that read SECONDS into the past or the future, so a bar can lean into a beat before it lands. The track is analysed once ahead of time rather than sampled live, which is what makes an export identical to the editor: offline rendering steps frame by frame, and a live analyser would hear silence
+- **Half-resolution field pass** — `background`/`foreground` run at half resolution and upsample, which is free for anything soft; an effect drawing sub-pixel detail declares `// @fullres` and pays double
 - **Effects that read the cast** — an effect declares the BONES it wants (`// @anchor 左手首 trail`) and gets their world position, velocity and facing, plus each character's floor point, hip and bounding sphere. `trail` additionally keeps that bone's recent PATH, sampled on the scene clock so a ribbon is identical in the editor, in an export and in a re-export. This is what a hand trail, a halo parented to a head, or a mark under a planted foot is made of
 
 See [Physics](#physics) and [Rendering](#rendering) for the internals.
@@ -158,15 +162,39 @@ rzSubject(i) -> RzSubject                    // { root, center, bounds, valid } 
 rzAnchor(subject, slot) -> RzAnchor          // { pos, vel, fwd, valid } for the slot-th bone this effect DECLARED. Slots are declaration order; valid is false on a rig that spells the bone differently, which is the normal case
 rzTrailCount(subject, slot) -> i32           // path samples available — loop to THIS, never to a constant
 rzTrail(subject, slot, i) -> vec4f           // sample i of that bone's path: xyz where it was, w how many seconds ago. i = 0 is now, running backwards in time
+rzCameraRight() / rzCameraUp() / rzCameraForward() -> vec3f   // the camera's axes. Screen up is only world up when the camera is level — an effect with a direction of its own (flames climbing, a column standing) should project a world-up vector and use ITS screen direction, or it tilts with the camera
+rzAudioLevel() -> f32                        // loudness now, 0..1. Zero when the scene has no music
+rzAudioOnset() -> f32                        // how hard the bass is RISING — the kick, computed once for the whole song rather than once per pixel in every effect that wants a beat
+rzAudioBandCount() -> i32                    // bands in the spectrum (32), log-spaced between 40Hz and 14kHz
+rzAudioBand(i) -> f32                        // band i now, 0..1, normalised per band against its own p95 so the treble is not a flat zero beside the bass
+rzAudioLevelAt(o) / rzAudioOnsetAt(o) / rzAudioBandAt(i, o) -> f32   // the same, o SECONDS away: negative is the past, positive the FUTURE. The whole track is already analysed, so an effect can anticipate a beat — which no live analyser can do
+rzAudioTime() -> f32 / rzAudioPlaying() -> f32   // where the song is, and whether it is running
+
+// ── The particle mounts (WGSL) ──
+// struct Particle { pos: vec3f, age: f32, vel: vec3f, life: f32, size: f32, rot: f32, seed: f32, stretch: f32 }
+particleInit(i: u32, seed: f32) -> Particle              // a fresh particle; called again whenever one retires
+particleStep(p: Particle, dt: f32) -> Particle           // one frame of motion. Set life to 0 to retire it
+particleShade(p: Particle, uv: vec2f) -> vec4f           // its billboard, uv 0..1 across the quad
+
+// ── The trail mounts (WGSL) ──
+trailWidth(u: f32, age: f32) -> f32                                     // ribbon half-width in PIXELS, along the path
+trailShade(u: f32, v: f32, age: f32, weight: f32, slot: i32) -> vec4f   // u along the ribbon, v across it
 
 // Declared at the top of the effect's own source, like the mounts:
 //   // @anchor 頭            → slot 0, position only
 //   // @anchor 左手首 trail  → slot 1, position AND its recent path
+//   // @particles 4096       → pool size, with the particle mounts
+//   // @blend additive       → particles add light instead of covering it
+//   // @bloom                → particles reach the bloom pyramid
+//   // @fullres              → field mounts run at full resolution
+// A file declares FIELD mounts (background/foreground) or PARTICLES, not both.
 // Only what a file names is resolved and uploaded, so naming none costs nothing
 // and nobody pays for a rig's other five hundred bones. Up to 8 anchors, 4
 // subjects, 128 samples (~2.1s at 60Hz) — all MINIMUMS: they can grow without
 // breaking a published effect, because effects read through these accessors and
 // loop to the count functions rather than indexing the buffer.
+engine.setAudioData(analysis | null)         // the precomputed per-frame analysis the rzAudio* functions read: level, onset and the band magnitudes for the whole track
+engine.setAudioTime(seconds, playing)        // where the song is. The export loop drives this per FRAME rather than letting an element play, which is what makes an exported video's reactivity identical to the editor's
 engine.getEffectMounts()                     // { background, foreground } — what the installed effect declared; both false with none set
 engine.setColorGrading({ shadows?, midtones?, highlights?, contrast?, saturation? })   // ASC CDL grade on the TONEMAPPED scene: the three tonal colours are display-space sRGB with mid-grey (0.5,0.5,0.5) neutral — direction from neutral is the hue that range is pushed toward, distance is the amount, and going darker/lighter than 0.5 crushes or lifts it (shadows→CDL offset, midtones→power, highlights→slope). contrast pivots on 0.5; saturation is Rec.709. Uniforms-only, no pipeline rebuild — safe to call per frame from a slider. A neutral grade is flagged off and costs nothing per pixel
 engine.getColorGrading()                     // current grade, for serialising into a scene descriptor

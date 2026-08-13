@@ -2340,6 +2340,34 @@ export class Model {
     // morph-touched bone at its first posed frame.
     this.undoBoneMorphs()
 
+    // Clear last frame's IK result off the chain links, so a solve starts from
+    // the animation instead of from itself.
+    //
+    // solveIK bakes its output into localRotations, and applyPoseFromClip only
+    // writes bones the clip actually KEYS. A motion that keys 足ＩＫ but not the
+    // knees — which is most of them — therefore fed each frame's solve the
+    // previous frame's solved knee: θₙ = g(θₙ₋₁), where MMD computes
+    // θₙ = g(rest) afresh every frame. Near the two-bone chain's collinear
+    // singularity that map is expansive, and the knee falls into a period-2
+    // limit cycle: the foot stays pinned by IK while the thigh and calf whip
+    // around it, frame after frame. Rigs with a generous knee pre-bend and a
+    // tight extension limit never reach the singular zone, which is why this
+    // read as a model-specific bug rather than an engine one.
+    //
+    // Links only, and only when a pose source is about to run: a blanket reset
+    // would wipe bones the host posed by hand through localRotations, and a
+    // suspended clip means the current pose IS the authority.
+    if (!this.clipApplySuspended) {
+      const solvers = this.runtimeSkeleton.ikSolvers
+      if (solvers) {
+        const rots = this.runtimeSkeleton.localRotations
+        for (const solver of solvers) {
+          if (this.ikDisabled.has(solver.ikBoneIndex)) continue
+          for (const link of solver.links) rots[link.boneIndex].setIdentity()
+        }
+      }
+    }
+
     if (!this.clipApplySuspended) {
       if (this.oneShot !== null) {
         this.applyOneShot(deltaTime)

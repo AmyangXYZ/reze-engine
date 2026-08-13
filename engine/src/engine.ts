@@ -36,12 +36,23 @@ import {
 import { AGX_LUT_GZ, AGX_LUT_SIZE } from "./shaders/agx-lut"
 import {
   buildCompositeShader,
+  buildFieldShader,
   parseEffectAnchors,
   EFFECT_ANCHORS,
   EFFECT_SUBJECTS,
   EFFECT_TRAIL_BASE,
   EFFECT_TRAIL_SAMPLES,
 } from "./shaders/passes/composite"
+import {
+  buildParticleComputeShader,
+  buildParticleRenderShader,
+  parseParticleBlend,
+  parseParticleBloom,
+  parseParticleCount,
+  particleEntryPoints,
+  PARTICLE_STRIDE,
+} from "./shaders/passes/particles"
+import { buildTrailShader, trailEntryPoints, TRAIL_SUBDIVISIONS } from "./shaders/passes/trails"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
@@ -831,6 +842,75 @@ export class Engine {
   private multisampleMaskTexture!: GPUTexture
   private maskResolveTexture!: GPUTexture
   private maskResolveView!: GPUTextureView
+  /**
+   * The installed effect's particle system, or null when it declared none.
+   *
+   * A fixed pool: the count is chosen at install and the slots recycle, so there
+   * is no allocation and no spawn-rate bookkeeping in the hot path. Dead slots
+   * cost a degenerate quad the rasteriser rejects, which is cheaper than the
+   * prefix sum and readback a compacted draw list would need every frame.
+   */
+  private particles: {
+    count: number
+    buffer: GPUBuffer
+    uniform: GPUBuffer
+    data: Float32Array
+    counts: Uint32Array
+    compute: GPUComputePipeline
+    computeLayout: GPUBindGroupLayout
+    computeBind: GPUBindGroup
+    render: GPURenderPipeline
+    renderLayout: GPUBindGroupLayout
+    renderBind: GPUBindGroup
+    rebind: () => { computeBind: GPUBindGroup; renderBind: GPUBindGroup }
+  } | null = null
+  /** Ceiling for `// @particles`. Past this an author is asking for a stall. */
+  private static readonly MAX_PARTICLES = 65536
+  private particleFrame = 0
+  /**
+   * The installed effect's ribbons, or null when it declared none.
+   *
+   * No buffer of its own: it reads the very same path history the field-based
+   * ribbon read through rzTrail, so a trail costs one draw and nothing recorded.
+   */
+  private trails: {
+    instances: number
+    uniform: GPUBuffer
+    data: Float32Array
+    pipeline: GPURenderPipeline
+    layout: GPUBindGroupLayout
+    bind: GPUBindGroup
+  } | null = null
+  /** The ribbons' own offscreen target — max-blended, composited after tone map. */
+  private trailLayerTexture: GPUTexture | null = null
+  private trailLayerView: GPUTextureView | null = null
+  /** 1×1 transparent stand-in so the composite layout binds with no trails installed. */
+  private trailFallbackView!: GPUTextureView
+  /** The field layer: user background/foreground mounts at half resolution. */
+  private fieldBgTexture: GPUTexture | null = null
+  private fieldBgView: GPUTextureView | null = null
+  private fieldFgTexture: GPUTexture | null = null
+  private fieldFgView: GPUTextureView | null = null
+  private fieldUniformBuffer!: GPUBuffer
+  /** 2 = half resolution (the default); 1 = full, for effects that declare
+   *  `// @fullres` because they draw sub-pixel detail no upsample can carry. */
+  private fieldScale = 2
+  private fieldFullW = 0
+  private fieldFullH = 0
+  private fieldPipeline: GPURenderPipeline | null = null
+  private fieldBindGroupLayout!: GPUBindGroupLayout
+  private fieldPipelineLayout!: GPUPipelineLayout
+  private fieldBindGroup: GPUBindGroup | null = null
+  /**
+   * The audio analysis buffer every effect module binds: header
+   * [frames, bands, secondsPerFrame, audioTime], then [level, band0..bandN-1]
+   * per frame. Precomputed by the host for the whole track — never a live
+   * analyser, which would render silence during an export. Falls back to four
+   * zeroes (frames = 0) so layouts always bind.
+   */
+  private audioBuffer!: GPUBuffer
+  private audioFallbackBuffer!: GPUBuffer
+  private audioTimeScratch = new Float32Array(2)
   private renderPassDescriptor!: GPURenderPassDescriptor
   private compositePassDescriptor!: GPURenderPassDescriptor
   // Two specialized composite pipelines via WGSL pipeline-override constants.
@@ -1268,6 +1348,51 @@ export class Engine {
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
         { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
+        { binding: 12, resource: this.trails && this.trailLayerView ? this.trailLayerView : this.trailFallbackView },
+        { binding: 13, resource: { buffer: this.audioBuffer } },
+        { binding: 15, resource: this.fieldBgView ?? this.trailFallbackView },
+        { binding: 16, resource: this.fieldFgView ?? this.trailFallbackView },
+      ],
+    })
+    this.rebuildFieldBindGroup()
+  }
+
+  private createFieldTargets(): void {
+    if (!this.device || this.fieldFullW === 0) return
+    const w = Math.max(1, Math.ceil(this.fieldFullW / this.fieldScale))
+    const h = Math.max(1, Math.ceil(this.fieldFullH / this.fieldScale))
+    this.fieldBgTexture?.destroy()
+    this.fieldFgTexture?.destroy()
+    this.fieldBgTexture = this.device.createTexture({
+      label: "field layer (background)",
+      size: [w, h],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.fieldFgTexture = this.device.createTexture({
+      label: "field layer (foreground)",
+      size: [w, h],
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.fieldBgView = this.fieldBgTexture.createView()
+    this.fieldFgView = this.fieldFgTexture.createView()
+    this.device.queue.writeBuffer(this.fieldUniformBuffer, 0, new Float32Array([w, h, this.fieldFullW, this.fieldFullH]))
+  }
+
+  private rebuildFieldBindGroup(): void {
+    if (!this.device || !this.depthReadView || !this.fieldUniformBuffer) return
+    this.fieldBindGroup = this.device.createBindGroup({
+      label: "field layer bind group",
+      layout: this.fieldBindGroupLayout,
+      entries: [
+        { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
+        { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
+        { binding: 8, resource: this.depthReadView },
+        { binding: 9, resource: { buffer: this.dofUniformBuffer } },
+        { binding: 11, resource: { buffer: this.castBuffer } },
+        { binding: 13, resource: { buffer: this.audioBuffer } },
+        { binding: 14, resource: { buffer: this.fieldUniformBuffer } },
       ],
     })
   }
@@ -1373,6 +1498,9 @@ export class Engine {
     if (wgsl === null) {
       this.effect?.paramsBuffer?.destroy()
       this.effect = null
+      this.releaseParticles()
+      this.releaseTrails()
+      this.fieldPipeline = null
       const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
       this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
       this.compositePipelineGamma = this.makeCompositePipeline(module, true, "composite pipeline (gamma!=1)")
@@ -1387,12 +1515,62 @@ export class Engine {
     // to one — those never follow `fn`.
     const hasBackground = /\bfn\s+background\s*\(/.test(wgsl)
     const hasForeground = /\bfn\s+foreground\s*\(/.test(wgsl)
-    if (!hasBackground && !hasForeground) {
+    // Particles are a THIRD mount, declared the same way — by the functions the
+    // source defines. All three are required together: a pool with no shader to
+    // draw it, or a draw with nothing spawning into it, is a silent blank rather
+    // than an error, which is the worst way for an effect to fail.
+    const pe = particleEntryPoints(wgsl)
+    const wantsParticles = pe.init || pe.step || pe.shade
+    const te = trailEntryPoints(wgsl)
+    const wantsTrails = te.width || te.shade
+    if (wantsTrails && !(te.width && te.shade)) {
       return {
         ok: false,
         diagnostics: [
-          "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f " +
-            "or fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f (or both)",
+          `a ribbon effect needs both fn trailWidth(u: f32, age: f32) -> f32 and ` +
+            `fn trailShade(u: f32, v: f32, age: f32, weight: f32, slot: i32) -> vec4f`,
+        ],
+        mounts: noMounts,
+      }
+    }
+    if (wantsParticles && !(pe.init && pe.step && pe.shade)) {
+      const missing = [
+        pe.init ? null : "fn particleInit(id: u32, seed: f32) -> Particle",
+        pe.step ? null : "fn particleStep(p: Particle, dt: f32) -> Particle",
+        pe.shade ? null : "fn particleShade(p: Particle, uv: vec2f) -> vec4f",
+      ].filter(Boolean)
+      return { ok: false, diagnostics: [`a particle effect also needs ${missing.join(" and ")}`], mounts: noMounts }
+    }
+    // One file, one kind — for now.
+    //
+    // The two kinds compile into different modules: field functions belong to the
+    // composite pass, particle functions to the particle pair. A file holding both
+    // would have to be spliced into both, and each module would then need the
+    // OTHER's scaffolding (the Particle struct in the composite; the composite's
+    // uniforms in the particle stages) for the dead half to compile — several
+    // declarations that exist only so unused code type-checks, and a handful of
+    // accessors that would silently return zero on the wrong side. Splitting into
+    // two effects costs the author nothing once a scene can hold a list, and this
+    // says so plainly instead of failing with "unresolved type Particle" from a
+    // pass they did not know they were compiling into.
+    if ((wantsParticles || wantsTrails) && (hasBackground || hasForeground)) {
+      return {
+        ok: false,
+        diagnostics: [
+          "an effect declares field mounts (background/foreground) or particles, not both — " +
+            "split them into two effects",
+        ],
+        mounts: noMounts,
+      }
+    }
+    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails) {
+      return {
+        ok: false,
+        diagnostics: [
+          "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f, " +
+            "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f, " +
+            "the particle trio (particleInit/particleStep/particleShade), " +
+            "or the ribbon pair (trailWidth/trailShade)",
         ],
         mounts: noMounts,
       }
@@ -1442,17 +1620,47 @@ export class Engine {
 
     // ── Compile with validation captured, not thrown at the console. Line
     // numbers in diagnostics are rebased to the USER's source.
-    const source = buildCompositeShader({ wgsl, paramsDecl, hasBackground, hasForeground })
-    const userLineOffset = source.slice(0, source.indexOf(wgsl)).split("\n").length - 1
+    // The composite is STATIC: user field code compiles in its own half-res
+    // module (buildFieldShader), so a bad effect can no longer produce errors at
+    // line numbers in a shader the author never wrote — and installing one no
+    // longer recompiles the composite's tone-mapping half at all.
+    const fieldEffect = hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground } : null
+    const source = buildCompositeShader(fieldEffect)
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
-    const info = await module.getCompilationInfo()
     const scopeErr = await this.device.popErrorScope()
-    const diagnostics = info.messages
-      .filter((m) => m.type === "error")
-      .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
-    if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
-    if (diagnostics.length > 0) return { ok: false, diagnostics, mounts }
+    if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts }
+
+    let fieldPipeline: GPURenderPipeline | null = null
+    if (fieldEffect) {
+      const fieldSource = buildFieldShader(fieldEffect)
+      const userLineOffset = fieldSource.slice(0, fieldSource.indexOf(wgsl)).split("\n").length - 1
+      this.device.pushErrorScope("validation")
+      const fieldModule = this.device.createShaderModule({ label: "field shader (effect)", code: fieldSource })
+      const info = await fieldModule.getCompilationInfo()
+      const fieldScopeErr = await this.device.popErrorScope()
+      const diagnostics = info.messages
+        .filter((m) => m.type === "error")
+        .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
+      if (diagnostics.length === 0 && fieldScopeErr) diagnostics.push(fieldScopeErr.message)
+      if (diagnostics.length > 0) return { ok: false, diagnostics, mounts }
+      try {
+        fieldPipeline = await this.device.createRenderPipelineAsync({
+          label: "field layer pipeline",
+          layout: this.fieldPipelineLayout,
+          vertex: { module: fieldModule, entryPoint: "fieldVs" },
+          fragment: {
+            module: fieldModule,
+            entryPoint: "fieldFs",
+            targets: [{ format: "rgba16float" }, { format: "rgba16float" }],
+          },
+          primitive: { topology: "triangle-list" },
+          multisample: { count: 1 },
+        })
+      } catch (e) {
+        return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts }
+      }
+    }
     let identity: GPURenderPipeline
     let gamma: GPURenderPipeline
     try {
@@ -1477,8 +1685,46 @@ export class Engine {
       return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts }
     }
 
+    // Built BEFORE the swap: a particle stage that fails to compile has to leave
+    // the previously installed effect running, exactly as a bad composite does.
+    let particles: NonNullable<Engine["particles"]> | null = null
+    if (wantsParticles) {
+      const built = await this.buildParticles(wgsl, anchors.filter((a) => a.trail).length)
+      if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
+      particles = built.state
+    }
+    let trails: NonNullable<Engine["trails"]> | null = null
+    if (wantsTrails) {
+      // Only anchors that asked for `trail` have a path to draw; a ribbon on a
+      // bone recorded without one would read zeroes and paint a line to the origin.
+      const trailSlots = anchors.filter((a) => a.trail).length
+      if (trailSlots === 0) {
+        return {
+          ok: false,
+          diagnostics: ["a ribbon effect needs at least one // @anchor <bone> trail"],
+          mounts,
+        }
+      }
+      const built = await this.buildTrails(wgsl, trailSlots)
+      if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
+      trails = built.state
+    }
+
     // ── Swap — only now does the old effect (and its params buffer) go away.
     this.effect?.paramsBuffer?.destroy()
+    this.releaseParticles()
+    this.releaseTrails()
+    this.particles = particles
+    this.trails = trails
+    this.fieldPipeline = fieldPipeline
+    // `// @fullres`: an effect that draws SUB-PIXEL detail — hairline curves,
+    // scanlines — declares it and pays full price; everything soft stays at
+    // half. The field shader reads its size from fieldU, so nothing else moves.
+    const wantScale = /^\s*\/\/\s*@fullres\s*$/m.test(wgsl) ? 1 : 2
+    if (wantScale !== this.fieldScale) {
+      this.fieldScale = wantScale
+      this.createFieldTargets()
+    }
     let paramsBuffer: GPUBuffer | null = null
     if (entries.length) {
       paramsBuffer = this.device.createBuffer({
@@ -1501,6 +1747,381 @@ export class Engine {
     this.rebuildCompositeBindGroup()
     this.writeCompositeViewUniforms()
     return { ok: true, diagnostics: [], mounts }
+  }
+
+  /**
+   * Compile an effect's particle stages and allocate its pool.
+   *
+   * Two modules, not one: the compute and render stages bind the same buffer
+   * with different access (read_write vs read), and a single module would have
+   * to pick one. Compiling them separately also means an author's helper names
+   * live in their own compilation unit, which is what lets two effects both
+   * define `hash21` without meeting.
+   */
+  private async buildParticles(
+    wgsl: string,
+    trailSlots: number,
+  ): Promise<{ ok: true; state: NonNullable<Engine["particles"]> } | { ok: false; diagnostics: string[] }> {
+    // No pragma means "some": an author who wrote the trio clearly wants
+    // particles, and failing over a missing comment would be pedantry.
+    const count = parseParticleCount(wgsl, Engine.MAX_PARTICLES) || 1024
+    const src = { wgsl, count, blend: parseParticleBlend(wgsl), bloom: parseParticleBloom(wgsl) }
+    // Sparks want to spawn where a trail is, so the particle stages see the same
+    // cast buffer the trail draw reads.
+    const cast = {
+      subjects: MAX_EFFECT_SUBJECTS,
+      samples: TRAIL_SAMPLES,
+      base: MAX_EFFECT_SUBJECTS * 3,
+      trailBase: CAST_TRAIL_BASE,
+      slots: trailSlots,
+    }
+
+    const compile = async (code: string, label: string): Promise<GPUShaderModule | string[]> => {
+      const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
+      this.device.pushErrorScope("validation")
+      const module = this.device.createShaderModule({ label, code })
+      const info = await module.getCompilationInfo()
+      const scopeErr = await this.device.popErrorScope()
+      const diagnostics = info.messages
+        .filter((m) => m.type === "error")
+        .map((m) => `${Math.max(0, m.lineNum - offset)}:${m.linePos} ${m.message}`)
+      if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
+      return diagnostics.length ? diagnostics : module
+    }
+
+    const computeModule = await compile(buildParticleComputeShader(src, cast), "particle compute")
+    if (Array.isArray(computeModule)) return { ok: false, diagnostics: computeModule }
+    const renderModule = await compile(buildParticleRenderShader(src, cast), "particle render")
+    if (Array.isArray(renderModule)) return { ok: false, diagnostics: renderModule }
+
+    const buffer = this.device.createBuffer({
+      label: "particle pool",
+      size: count * PARTICLE_STRIDE,
+      usage: GPUBufferUsage.STORAGE,
+    })
+    const uniform = this.device.createBuffer({
+      label: "particle uniforms",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const uniformBytes = new ArrayBuffer(16)
+    const uniformView = { floats: new Float32Array(uniformBytes), uints: new Uint32Array(uniformBytes) }
+
+    // Visibility is per LAYOUT, not shared: a read_write storage buffer may not be
+    // visible to the vertex stage at all (WebGPU forbids it — a vertex shader
+    // that could write memory has no defined ordering against the rasteriser).
+    // Declaring one set of flags for both layouts is what made the pipeline
+    // layout invalid, and the error surfaces later and unhelpfully as "invalid
+    // due to a previous error".
+    const layoutFor = (storage: GPUBufferBindingType, visibility: number) =>
+      this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility, buffer: { type: storage } },
+          { binding: 1, visibility, buffer: { type: "uniform" } },
+          { binding: 2, visibility, buffer: { type: "uniform" } },
+          { binding: 3, visibility, buffer: { type: "read-only-storage" } },
+          { binding: 4, visibility, buffer: { type: "read-only-storage" } },
+        ],
+      })
+    const bindFor = (layout: GPUBindGroupLayout) =>
+      this.device.createBindGroup({
+        layout,
+        entries: [
+          { binding: 0, resource: { buffer } },
+          { binding: 1, resource: { buffer: uniform } },
+          { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
+          { binding: 3, resource: { buffer: this.castBuffer } },
+          { binding: 4, resource: { buffer: this.audioBuffer } },
+        ],
+      })
+
+    const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE)
+    const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT)
+
+    // Additive keeps the destination and adds to it; the alpha channel is left
+    // alone (dst factor one, src zero) so a glow does not also claim coverage
+    // it never occluded.
+    // Additive effects need the MASK to sum like the colour does — see the
+    // fragment shaders' mask comment. rg8unorm clamps the sum at 1, which is the
+    // saturation alpha-over would reach anyway.
+    const maskTarget: GPUColorTargetState =
+      src.blend === "additive"
+        ? {
+            format: Engine.BLOOM_MASK_FORMAT,
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+            },
+          }
+        : this.sceneTargets[1]
+    const colorTarget: GPUColorTargetState =
+      src.blend === "additive"
+        ? {
+            format: this.hdrFormat,
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+              alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+            },
+          }
+        : this.sceneTargets[0]
+
+    this.device.pushErrorScope("validation")
+    try {
+      const compute = await this.device.createComputePipelineAsync({
+        label: "particle compute pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
+        compute: { module: computeModule, entryPoint: "main" },
+      })
+      const render = await this.device.createRenderPipelineAsync({
+        label: "particle render pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
+        vertex: { module: renderModule, entryPoint: "vs" },
+        fragment: { module: renderModule, entryPoint: "fs", targets: [colorTarget, maskTarget] },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+        // Tested but not WRITTEN: particles are transparent, so writing depth
+        // would make whichever quad drew first occlude the ones behind it.
+        depthStencil: { format: "depth24plus-stencil8", depthWriteEnabled: false, depthCompare: "less-equal" },
+        multisample: { count: Engine.MULTISAMPLE_COUNT },
+      })
+      const scoped = await this.device.popErrorScope()
+      if (scoped) {
+        buffer.destroy()
+        uniform.destroy()
+        return { ok: false, diagnostics: [scoped.message] }
+      }
+      return {
+        ok: true,
+        state: {
+          count,
+          buffer,
+          uniform,
+          // One 16-byte block, two views: time/dt are floats and count/frame are
+          // integers, and writing them through separate arrays would upload two
+          // different buffers with the same name.
+          data: uniformView.floats,
+          counts: uniformView.uints,
+          compute,
+          computeLayout,
+          computeBind: bindFor(computeLayout),
+          render,
+          renderLayout,
+          renderBind: bindFor(renderLayout),
+          rebind: () => ({ computeBind: bindFor(computeLayout), renderBind: bindFor(renderLayout) }),
+        },
+      }
+    } catch (e) {
+      await this.device.popErrorScope()
+      buffer.destroy()
+      uniform.destroy()
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
+    }
+  }
+
+  /**
+   * Step the pool, before the scene pass.
+   *
+   * Outside the render pass because a compute dispatch cannot be encoded inside
+   * one — and it has to precede the draw that reads the same buffer, or the
+   * quads render last frame's positions.
+   */
+  private stepParticles(encoder: GPUCommandEncoder, deltaTime: number): void {
+    const p = this.particles
+    if (!p) return
+    p.data[0] = this.sceneClock - this.effectEpochScene
+    // Clamped: a backgrounded tab returns with a delta of whole seconds, and an
+    // unclamped step flings every particle out of the scene in one frame.
+    p.data[1] = Math.min(0.1, Math.max(0, deltaTime))
+    p.counts[2] = p.count
+    p.counts[3] = this.particleFrame++
+    this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
+    const cp = encoder.beginComputePass({ label: "particles" })
+    cp.setPipeline(p.compute)
+    cp.setBindGroup(0, p.computeBind)
+    cp.dispatchWorkgroups(Math.ceil(p.count / 64))
+    cp.end()
+  }
+
+  /** Draw the pool. Inside the scene pass, so it is depth-tested and pre-bloom. */
+  private renderParticles(pass: GPURenderPassEncoder): void {
+    const p = this.particles
+    if (!p) return
+    pass.setPipeline(p.render)
+    pass.setBindGroup(0, p.renderBind)
+    pass.draw(6, p.count)
+  }
+
+  /**
+   * Compile an effect's ribbon stage.
+   *
+   * One instance per (slot, subject, segment), so a scene with several dancers
+   * and several declared bones is still one draw and nothing is computed per
+   * frame on the CPU.
+   */
+  private async buildTrails(
+    wgsl: string,
+    slots: number,
+  ): Promise<{ ok: true; state: NonNullable<Engine["trails"]> } | { ok: false; diagnostics: string[] }> {
+    const src = { wgsl, slots, blend: parseParticleBlend(wgsl), bloom: parseParticleBloom(wgsl) }
+    const code = buildTrailShader(src, {
+      subjects: MAX_EFFECT_SUBJECTS,
+      samples: TRAIL_SAMPLES,
+      base: MAX_EFFECT_SUBJECTS * 3,
+      trailBase: CAST_TRAIL_BASE,
+    })
+    const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
+    this.device.pushErrorScope("validation")
+    const module = this.device.createShaderModule({ label: "trail shader", code })
+    const info = await module.getCompilationInfo()
+    const scopeErr = await this.device.popErrorScope()
+    const diagnostics = info.messages
+      .filter((m) => m.type === "error")
+      .map((m) => `${Math.max(0, m.lineNum - offset)}:${m.linePos} ${m.message}`)
+    if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
+    if (diagnostics.length) return { ok: false, diagnostics }
+
+    const uniform = this.device.createBuffer({
+      label: "trail uniforms",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const layout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" },
+        },
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The scene's depth, for the fragment's manual occlusion test.
+        {
+          binding: 3,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "depth", viewDimension: "2d", multisampled: true },
+        },
+        // The audio analysis, for rzAudio* in width and shade alike.
+        { binding: 4, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+      ],
+    })
+    // ONE target: the ribbons' own layer, blended with MAX in both channels.
+    // Max is the original's core-takes-the-max rule as a blend mode — parallel
+    // strands of a circling hand meet as max and cannot double into bright
+    // dashes, which every additive variant of this pipeline drew. The layer is
+    // composited over the frame after tone mapping (see composite.ts), which is
+    // where the fullscreen ribbon always ran.
+    const layerTarget: GPUColorTargetState = {
+      format: "rgba16float",
+      blend: {
+        color: { srcFactor: "one", dstFactor: "one", operation: "max" },
+        alpha: { srcFactor: "one", dstFactor: "one", operation: "max" },
+      },
+    }
+    this.device.pushErrorScope("validation")
+    try {
+      const pipeline = await this.device.createRenderPipelineAsync({
+        label: "trail pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+        vertex: { module, entryPoint: "vs" },
+        fragment: { module, entryPoint: "fs", targets: [layerTarget] },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+        // No depth attachment and no MSAA: the layer is a lone colour target,
+        // and occlusion happens in the fragment against the scene's own depth.
+        multisample: { count: 1 },
+      })
+      const scoped = await this.device.popErrorScope()
+      if (scoped) {
+        uniform.destroy()
+        return { ok: false, diagnostics: [scoped.message] }
+      }
+      return {
+        ok: true,
+        state: {
+          instances: slots * MAX_EFFECT_SUBJECTS * (TRAIL_SAMPLES - 1) * TRAIL_SUBDIVISIONS,
+          uniform,
+          data: new Float32Array(4),
+          pipeline,
+          layout,
+          bind: this.device.createBindGroup({
+            layout,
+            entries: [
+              { binding: 0, resource: { buffer: this.castBuffer } },
+              { binding: 1, resource: { buffer: uniform } },
+              { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
+              { binding: 3, resource: this.depthReadView! },
+              { binding: 4, resource: { buffer: this.audioBuffer } },
+            ],
+          }),
+        },
+      }
+    } catch (e) {
+      await this.device.popErrorScope()
+      uniform.destroy()
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
+    }
+  }
+
+  private releaseTrails(): void {
+    this.trails?.uniform.destroy()
+    this.trails = null
+  }
+
+  /** Draw the ribbons into their own layer — cleared, max-blended, and
+   *  composited over the frame after tone mapping. */
+  private renderTrailLayer(encoder: GPUCommandEncoder): void {
+    const t = this.trails
+    if (!t || !this.trailLayerView) return
+    t.data[0] = this.sceneClock - this.effectEpochScene
+    this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
+    const pass = encoder.beginRenderPass({
+      label: "trail layer",
+      colorAttachments: [
+        { view: this.trailLayerView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+      ],
+    })
+    pass.setPipeline(t.pipeline)
+    pass.setBindGroup(0, t.bind)
+    pass.draw(6, t.instances)
+    pass.end()
+  }
+
+  /** The user's field mounts, drawn at half resolution for the composite to
+   *  upsample. Runs the whole quad — uniform control flow, so effects may use
+   *  derivatives freely, which the old inline path had to forbid. */
+  private renderFieldPass(encoder: GPUCommandEncoder): void {
+    if (!this.fieldPipeline || !this.fieldBgView || !this.fieldFgView || !this.fieldBindGroup) return
+    const pass = encoder.beginRenderPass({
+      label: "field layer",
+      colorAttachments: [
+        { view: this.fieldBgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+        { view: this.fieldFgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+      ],
+    })
+    pass.setPipeline(this.fieldPipeline)
+    pass.setBindGroup(0, this.fieldBindGroup)
+    pass.draw(3)
+    pass.end()
+  }
+
+  /** The trail bind group holds the depth view, which a resize recreates. */
+  private rebindTrails(): void {
+    const t = this.trails
+    if (!t || !this.depthReadView) return
+    t.bind = this.device.createBindGroup({
+      layout: t.layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.castBuffer } },
+        { binding: 1, resource: { buffer: t.uniform } },
+        { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 3, resource: this.depthReadView },
+        { binding: 4, resource: { buffer: this.audioBuffer } },
+      ],
+    })
+  }
+
+  private releaseParticles(): void {
+    this.particles?.buffer.destroy()
+    this.particles?.uniform.destroy()
+    this.particles = null
   }
 
   /** Which mounts the installed effect declared. Both false when none is set. */
@@ -1922,6 +2543,51 @@ export class Engine {
       mipmapFilter: "linear",
       addressModeU: "repeat",
       addressModeV: "repeat",
+    })
+
+    this.trailFallbackView = this.device
+      .createTexture({
+        label: "trail layer fallback (1x1 transparent)",
+        size: [1, 1],
+        format: "rgba16float",
+        usage: GPUTextureUsage.TEXTURE_BINDING,
+      })
+      .createView()
+
+    this.audioFallbackBuffer = this.device.createBuffer({
+      label: "audio analysis fallback (silence)",
+      size: 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.audioBuffer = this.audioFallbackBuffer
+
+    this.fieldUniformBuffer = this.device.createBuffer({
+      label: "field layer uniforms (half size, full size)",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    // The field pass's own layout: the subset of the composite's bindings the
+    // user's code can statically reach, WITHOUT the field textures themselves —
+    // a pass may not sample its own attachments, and WebGPU counts every
+    // resource in a bound group whether the shader reads it or not.
+    this.fieldBindGroupLayout = this.device.createBindGroupLayout({
+      label: "field layer bind layout",
+      entries: [
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        {
+          binding: 8,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "depth", viewDimension: "2d", multisampled: true },
+        },
+        { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      ],
+    })
+    this.fieldPipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [this.fieldBindGroupLayout],
     })
 
     this.fallbackMaterialTexture = this.device.createTexture({
@@ -2574,6 +3240,15 @@ export class Engine {
         // The cast, for rzSubject/rzAnchor. Always bound so the base shader's
         // layout matches; the base shader simply never reads it.
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The trail layer. Bound to a transparent 1×1 when no ribbon effect is
+        // installed, so the base shader's layout always matches.
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        // The audio analysis, for rzAudio*. Silence fallback when the scene has
+        // no track.
+        { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The field layer's two halves. Fallback-bound when no field effect runs.
+        { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 16, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({
@@ -2767,6 +3442,23 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
 
+      // rgba16float explicitly, NOT hdrFormat: the composite reads this layer's
+      // ALPHA to composite it over the frame, and an rg11b10 hdr fallback has no
+      // alpha channel to read.
+      this.trailLayerTexture?.destroy()
+      this.trailLayerTexture = this.device.createTexture({
+        label: "trail layer",
+        size: [width, height],
+        format: "rgba16float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.trailLayerView = this.trailLayerTexture.createView()
+
+      // The field layer — half resolution by default, full for @fullres effects.
+      this.fieldFullW = width
+      this.fieldFullH = height
+      this.createFieldTargets()
+
       // Bloom-mask MRT attachments — same dims + MSAA as HDR so they share the render pass.
       // MS buffer gets resolved into maskResolveTexture, which the bloom blit pass samples.
       this.multisampleMaskTexture = this.device.createTexture({
@@ -2826,6 +3518,7 @@ export class Engine {
 
       const depthTextureView = this.depthTexture.createView()
       this.depthReadView = this.depthTexture.createView({ aspect: "depth-only" })
+      this.rebindTrails()
 
       // storeOp="discard" on MSAA views keeps per-sample data in Apple TBDR tile memory —
       // only the resolveTarget (hdrResolveTexture / maskResolveView) gets written to RAM.
@@ -3253,6 +3946,57 @@ export class Engine {
    *  length is its own: it does not have to match any model's clip. */
   getCameraVmdDuration(): number {
     return this.cameraAnimation?.duration ?? 0
+  }
+
+  /**
+   * Install a track's precomputed analysis for the rzAudio* effect functions:
+   * `data` is frames × (2 + bands) floats — loudness, bass onset, then the band
+   * magnitudes, all 0..1 — sampled by the clock given to setAudioTime. Null
+   * clears back to silence.
+   *
+   * Precomputed for the WHOLE track, never fed live from an analyser: an export
+   * steps the engine frame by frame rather than playing in real time, so live
+   * analysis would render silence into the exported video.
+   */
+  setAudioData(data: Float32Array | null, bandsPerFrame: number, secondsPerFrame: number): void {
+    if (this.audioBuffer !== this.audioFallbackBuffer) this.audioBuffer.destroy()
+    if (!data || data.length === 0) {
+      this.audioBuffer = this.audioFallbackBuffer
+    } else {
+      const frames = Math.floor(data.length / (bandsPerFrame + 2))
+      const payload = new Float32Array(8 + data.length)
+      payload[0] = frames
+      payload[1] = bandsPerFrame
+      payload[2] = secondsPerFrame
+      payload.set(data, 8)
+      this.audioBuffer = this.device.createBuffer({
+        label: "audio analysis",
+        size: payload.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(this.audioBuffer, 0, payload)
+    }
+    // Every consumer holds the buffer by reference in a bind group; all of them
+    // re-bind so audio arriving after an effect (or before one) both work.
+    this.rebuildCompositeBindGroup()
+    this.rebindTrails()
+    if (this.particles) {
+      const b = this.particles.rebind()
+      this.particles.computeBind = b.computeBind
+      this.particles.renderBind = b.renderBind
+    }
+  }
+
+  /**
+   * Where the track is NOW, in seconds — written by whoever owns playback: the
+   * editor's audio clock, the viewer's, or the export loop with its exact
+   * per-frame time. A 4-byte header write, cheap enough for every frame.
+   */
+  setAudioTime(seconds: number, playing = true): void {
+    if (this.audioBuffer === this.audioFallbackBuffer) return
+    this.audioTimeScratch[0] = seconds
+    this.audioTimeScratch[1] = playing ? 1 : 0
+    this.device.queue.writeBuffer(this.audioBuffer, 12, this.audioTimeScratch)
   }
 
   /** Every camera keyframe's frame index — what a timeline draws as its cuts.
@@ -5570,7 +6314,7 @@ export class Engine {
     // write leaves dofU[0].x at 0 while DoF is off, so refreshing it does not
     // switch the gather on.
     const dofOn = this.depthOfField.enabled
-    const depthRead = dofOn || (this.effect?.hasForeground ?? false)
+    const depthRead = dofOn || (this.effect?.hasForeground ?? false) || this.trails !== null
     this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
     if (depthRead) this.writeDepthOfFieldUniforms()
 
@@ -5603,6 +6347,8 @@ export class Engine {
       this.shadowMapPopulated = hasModels
     }
 
+    this.stepParticles(encoder, deltaTime)
+
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     // Phase order: opaque models → ground → transparent fabric.
     // The ground shader is the most expensive full-coverage draw in the frame
@@ -5620,7 +6366,18 @@ export class Engine {
       this.forEachInstance((inst) => {
         if (inst.model.visible) this.renderModelTransparentPhase(pass, inst)
       })
+    // Last in the pass: depth-tested against everything drawn above, so a
+    // particle behind the character is simply hidden, and still inside the HDR
+    // target so an `@bloom` effect reaches the pyramid below.
+    this.renderParticles(pass)
     pass.end()
+
+    // Ribbons draw AFTER the scene pass ends, so its depth is resolved for
+    // their manual occlusion test — and before the composite that reads them.
+    this.renderTrailLayer(encoder)
+    // The field mounts, likewise: after the scene so foregrounds can read its
+    // depth, before the composite that samples both layers.
+    this.renderFieldPass(encoder)
 
     // Bloom pyramid (EEVEE 3.6):
     //   1. Blit: HDR → bloomDown[0] (Karis prefilter, half-res)
@@ -6471,15 +7228,38 @@ export class Engine {
       ring = { pos: [], t: [] }
       this.anchorTrail.set(key, ring)
     }
+    // A TELEPORT is not motion. A model popping from the origin to its place at
+    // load, a scrub, a scene swap — the bone genuinely moves many units in one
+    // frame, and a recorder that faithfully keeps both ends hands every reader a
+    // path across the world: the ribbon drew it as a streak and the sparks
+    // seeded a burst along it. Fifty units per second is far beyond any dance
+    // (a hard flick peaks around twenty); past it, the history restarts here.
+    if (ring.pos.length > 0) {
+      const dx = pos.x - ring.pos[0]
+      const dy = pos.y - ring.pos[1]
+      const dz = pos.z - ring.pos[2]
+      const dt = Math.max(1 / 120, this.sceneClock - ring.t[0])
+      if (Math.hypot(dx, dy, dz) / dt > 50) {
+        ring.pos.length = 0
+        ring.t.length = 0
+      }
+    }
     if (this.trailDue > 0 || ring.pos.length === 0) {
-      const steps = Math.min(this.trailDue, 4)
-      for (let k = 0; k < Math.max(1, steps); k++) {
-        ring.pos.unshift(pos.x, pos.y, pos.z)
-        ring.t.unshift(this.sceneClock)
-        if (ring.t.length > TRAIL_SAMPLES) {
-          ring.t.length = TRAIL_SAMPLES
-          ring.pos.length = TRAIL_SAMPLES * 3
-        }
+      // ONE sample per frame, never one per due tick. A frame that spanned
+      // several 60Hz ticks only knows where the bone is NOW, and unshifting that
+      // position once per tick fabricated duplicate samples — same point, same
+      // timestamp, up to four copies — precisely when the scene ran heavy. Every
+      // duplicate pair kinked the spline, and each kink drew as a bright bar
+      // across the ribbon: banding that appeared under load, was spaced once per
+      // frame, and survived every renderer fix because the renderer was
+      // faithfully drawing corrupted history. Coarser spacing under load is
+      // honest — each sample carries its true timestamp, and the spline and the
+      // central-difference weight exist to handle uneven spacing.
+      ring.pos.unshift(pos.x, pos.y, pos.z)
+      ring.t.unshift(this.sceneClock)
+      if (ring.t.length > TRAIL_SAMPLES) {
+        ring.t.length = TRAIL_SAMPLES
+        ring.pos.length = TRAIL_SAMPLES * 3
       }
     }
     const count = ring.t.length
