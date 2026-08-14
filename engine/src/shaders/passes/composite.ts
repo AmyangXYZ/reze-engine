@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { scoreApi } from "../score-api"
 import { simClockApi, simReadApi } from "./sim"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
@@ -679,7 +680,7 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
   // The composite is STATIC either way now: the user's code compiles in the
   // field module alone, and the composite only decides whether to sample it.
   return COMPOSITE_HEAD +
-    EFFECT_SCENE_API + audioApi(0, 13) + body
+    EFFECT_SCENE_API + audioApi(0, 13) + scoreApi(0, 19) + body
 }
 
 /**
@@ -702,6 +703,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     COMPOSITE_HEAD +
     EFFECT_SCENE_API +
     audioApi(0, 13) +
+    scoreApi(0, 19) +
     // The persistent grid, always bound — a 1×1 of zeroes when the effect has
     // none, so rzSim() is a function that always exists rather than one an
     // author has to know whether they are allowed to call.

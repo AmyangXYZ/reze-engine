@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { scoreApi } from "../score-api"
 // Ribbons along a bone's recorded path, drawn as geometry.
 //
 // This is the effect the whole geometry path was built for. As a fullscreen
@@ -252,6 +253,7 @@ fn rzHash11(x: f32) -> f32 {
 }
 ` +
     audioApi(0, 4) +
+    scoreApi(0, 5) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `

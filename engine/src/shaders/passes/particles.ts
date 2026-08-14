@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { scoreApi } from "../score-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
 // Its own shader MODULE rather than more source spliced into composite.ts, for
@@ -248,6 +249,7 @@ export function buildParticleComputeShader(src: ParticleSource, cast: CastLayout
 ` +
     castApi(cast) +
     audioApi(0, 4) +
+    scoreApi(0, 5) +
     PRELUDE +
     "\n// ── user effect ──\n" +
     src.wgsl +
@@ -305,6 +307,7 @@ override ADDITIVE: bool = ${src.blend === "additive" ? "true" : "false"};\n` +
 ` +
     castApi(cast) +
     audioApi(0, 4) +
+    scoreApi(0, 5) +
     PRELUDE +
     "\n// ── user effect ──\n" +
     src.wgsl +

@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { scoreApi } from "../score-api"
 import { EFFECT_SCENE_API } from "./composite"
 import { type CastLayout } from "./particles"
 
@@ -152,6 +153,7 @@ fn rzSimPrev(uv: vec2f) -> vec4f {
 ` +
     EFFECT_SCENE_API +
     audioApi(0, 5) +
+    scoreApi(0, 7) +
     // rzSim itself, so a kernel may read the grid it is writing — through the
     // PREVIOUS frame's texture, which is the only version of it that exists
     // while the current one is still being written.

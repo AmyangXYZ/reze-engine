@@ -5,6 +5,7 @@ import { decodePsd, isPsd } from "./psd-loader"
 import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
+import { SCORE_HEADER, SCORE_KEYS, SCORE_NOTES, SCORE_STRIDE } from "./shaders/score-api"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
@@ -256,6 +257,24 @@ export type WorldOptions = {
   color?: Vec3
   /** Multiplier on world color (Blender: World > Surface > Strength). */
   strength?: number
+}
+
+/**
+ * One note in a score: when it sounds, for how long, at what pitch, how hard.
+ *
+ * Seconds and MIDI pitch (60 = middle C) rather than ticks and a tempo map — a
+ * score is consumed against the scene clock, so anything the engine stores in
+ * musical time would have to be resolved to seconds before every read.
+ */
+export interface ScoreNote {
+  /** Seconds from the start of the piece. */
+  start: number
+  /** Seconds the note sounds for. */
+  duration: number
+  /** MIDI pitch, 0–127. */
+  pitch: number
+  /** How hard it was struck, 0–1. Defaults to 1. */
+  velocity?: number
 }
 
 /** A model's scene placement — root offset baked into skinning + visibility. Serializable
@@ -1294,6 +1313,15 @@ export class Engine {
    */
   private audioBuffer!: GPUBuffer
   private audioFallbackBuffer!: GPUBuffer
+  // ── Score (note events) ──
+  private scoreBuffer!: GPUBuffer
+  private scoreFallbackBuffer!: GPUBuffer
+  /** The notes as installed, kept CPU-side because the per-pitch key map is
+   *  rebuilt from them every time the clock moves. */
+  private scoreNotes: ScoreNote[] = []
+  /** Header + key map, re-uploaded per clock write. */
+  private scoreLiveScratch = new Float32Array(SCORE_KEYS + 2)
+  private scoreRelease = 0.35
   private audioTimeScratch = new Float32Array(2)
   private renderPassDescriptor!: GPURenderPassDescriptor
   private compositePassDescriptor!: GPURenderPassDescriptor
@@ -1813,6 +1841,7 @@ export class Engine {
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 12, resource: this.trails && this.trailLayerView ? this.trailLayerView : this.trailFallbackView },
         { binding: 13, resource: { buffer: this.audioBuffer } },
+        { binding: 19, resource: { buffer: this.scoreBuffer } },
         { binding: 15, resource: this.fieldBgView ?? this.trailFallbackView },
         { binding: 16, resource: this.fieldFgView ?? this.trailFallbackView },
       ],
@@ -1866,6 +1895,7 @@ export class Engine {
           { binding: 9, resource: { buffer: this.dofUniformBuffer } },
           { binding: 11, resource: { buffer: this.castBuffer } },
           { binding: 13, resource: { buffer: this.audioBuffer } },
+          { binding: 19, resource: { buffer: this.scoreBuffer } },
           { binding: 14, resource: { buffer: this.fieldUniformBuffer } },
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
@@ -2312,6 +2342,9 @@ export class Engine {
           { binding: 2, visibility, buffer: { type: "uniform" } },
           { binding: 3, visibility, buffer: { type: "read-only-storage" } },
           { binding: 4, visibility, buffer: { type: "read-only-storage" } },
+          // The score, for rzNote*/rzKey* — bound wherever audio is, so a spawn
+          // rule and a background read the same instant.
+          { binding: 5, visibility, buffer: { type: "read-only-storage" } },
         ],
       })
     const bindFor = (layout: GPUBindGroupLayout) =>
@@ -2323,6 +2356,7 @@ export class Engine {
           { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
           { binding: 3, resource: { buffer: this.castBuffer } },
           { binding: 4, resource: { buffer: this.audioBuffer } },
+          { binding: 5, resource: { buffer: this.scoreBuffer } },
         ],
       })
 
@@ -2492,6 +2526,8 @@ export class Engine {
         },
         // The audio analysis, for rzAudio* in width and shade alike.
         { binding: 4, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The score, for rzNote*/rzKey*.
+        { binding: 5, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     })
     // ONE target: the ribbons' own layer, blended with MAX in both channels.
@@ -2540,6 +2576,7 @@ export class Engine {
               { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
               { binding: 3, resource: this.depthReadView! },
               { binding: 4, resource: { buffer: this.audioBuffer } },
+              { binding: 5, resource: { buffer: this.scoreBuffer } },
             ],
           }),
         },
@@ -2607,6 +2644,7 @@ export class Engine {
         { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 3, resource: this.depthReadView },
         { binding: 4, resource: { buffer: this.audioBuffer } },
+        { binding: 5, resource: { buffer: this.scoreBuffer } },
       ],
     })
   }
@@ -2662,6 +2700,7 @@ export class Engine {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     })
 
@@ -2706,6 +2745,7 @@ export class Engine {
             { binding: 4, resource: { buffer: this.castBuffer } },
             { binding: 5, resource: { buffer: this.audioBuffer } },
             { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
+            { binding: 7, resource: { buffer: this.scoreBuffer } },
           ],
         })
       return {
@@ -3266,6 +3306,16 @@ export class Engine {
     })
     this.audioBuffer = this.audioFallbackBuffer
 
+    // Header + key map even when empty: every rzNote*/rzKey* accessor reads the
+    // header first, so an effect written against a score still compiles and runs
+    // in a scene that has none — it simply sees no notes.
+    this.scoreFallbackBuffer = this.device.createBuffer({
+      label: "score fallback (no notes)",
+      size: (SCORE_HEADER + SCORE_KEYS) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.scoreBuffer = this.scoreFallbackBuffer
+
     this.fieldUniformBuffer = this.device.createBuffer({
       label: "field layer uniforms (half size, full size)",
       size: 16,
@@ -3288,6 +3338,9 @@ export class Engine {
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The score. 19 rather than a low number because both this layout and
+        // the field layer's already speak for everything below it.
+        { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 17, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
         { binding: 18, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
@@ -3953,6 +4006,9 @@ export class Engine {
         // The audio analysis, for rzAudio*. Silence fallback when the scene has
         // no track.
         { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The score. 19 rather than a low number because both this layout and
+        // the field layer's already speak for everything below it.
+        { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         // The field layer's two halves. Fallback-bound when no field effect runs.
         { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 16, visibility: GPUShaderStage.FRAGMENT, texture: {} },
@@ -4727,6 +4783,107 @@ export class Engine {
       this.particles.computeBind = b.computeBind
       this.particles.renderBind = b.renderBind
     }
+  }
+
+  /**
+   * Install a score — note events — for the rzNote* and rzKey* effect functions.
+   * Null clears it.
+   *
+   * The sibling of setAudioData, and deliberately a SEPARATE interface rather
+   * than something derived from it: a spectrum cannot give back a discrete pitch
+   * and onset, and that discreteness is the whole substance of a falling note.
+   * A scene can hold both and read them together.
+   *
+   * `release` is how long a key keeps glowing after its note ends, in seconds.
+   * It belongs here rather than in the effect because the key map it feeds is
+   * computed on the CPU — see writeScoreClock.
+   */
+  setScore(notes: ScoreNote[] | null, release = 0.35): void {
+    if (this.scoreBuffer !== this.scoreFallbackBuffer) this.scoreBuffer.destroy()
+    this.scoreRelease = Math.max(0, release)
+    // Sorted by onset. Nothing in the accessors requires it, but a caller
+    // walking the list to spawn in time order is the obvious use and a score
+    // arriving unsorted would make that silently wrong.
+    this.scoreNotes = notes ? [...notes].sort((a, b) => a.start - b.start) : []
+    if (this.scoreNotes.length === 0) {
+      this.scoreBuffer = this.scoreFallbackBuffer
+    } else {
+      let lo = 127
+      let hi = 0
+      let end = 0
+      for (const n of this.scoreNotes) {
+        if (n.pitch < lo) lo = n.pitch
+        if (n.pitch > hi) hi = n.pitch
+        end = Math.max(end, n.start + n.duration)
+      }
+      const payload = new Float32Array(SCORE_NOTES + this.scoreNotes.length * SCORE_STRIDE)
+      payload[0] = this.scoreNotes.length
+      payload[1] = lo
+      payload[2] = hi
+      payload[5] = end
+      payload[6] = this.scoreRelease
+      for (let i = 0; i < this.scoreNotes.length; i++) {
+        const n = this.scoreNotes[i]
+        const o = SCORE_NOTES + i * SCORE_STRIDE
+        payload[o] = n.start
+        payload[o + 1] = n.duration
+        payload[o + 2] = n.pitch
+        payload[o + 3] = n.velocity ?? 1
+      }
+      this.scoreBuffer = this.device.createBuffer({
+        label: "score",
+        size: payload.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(this.scoreBuffer, 0, payload)
+    }
+    // Same reason as setAudioData: every consumer holds the buffer by reference,
+    // so all of them re-bind and a score arriving before or after an effect both
+    // work.
+    this.rebuildCompositeBindGroup()
+    this.rebindTrails()
+    if (this.particles) {
+      const b = this.particles.rebind()
+      this.particles.computeBind = b.computeBind
+      this.particles.renderBind = b.renderBind
+    }
+  }
+
+  /**
+   * Move the score's clock, and rebuild the per-pitch key map from it.
+   *
+   * The map is why this is more than a header write. Falling notes index the
+   * note list directly, but a keyboard glow asks the opposite question per
+   * pixel — is anything sounding at THIS pitch — and answering that in the
+   * shader would be a scan of the whole score per fragment. One O(notes) pass
+   * here, once a frame, turns it into a single lookup.
+   *
+   * The pass is a full scan rather than a cursor because scrubbing exists: a
+   * cursor is only correct while time moves forward, and a timeline drag is
+   * exactly when a wrong answer is most visible. Ten thousand notes is ten
+   * thousand comparisons, which is nothing beside the pose pass.
+   */
+  setScoreTime(seconds: number, playing = true): void {
+    if (this.scoreBuffer === this.scoreFallbackBuffer) return
+    const keys = this.scoreLiveScratch
+    keys.fill(0)
+    keys[0] = seconds
+    keys[1] = playing ? 1 : 0
+    const release = Math.max(this.scoreRelease, 1e-4)
+    for (const n of this.scoreNotes) {
+      if (n.start > seconds) continue // sorted, but a later note may still be shorter
+      const k = Math.round(n.pitch)
+      if (k < 0 || k >= SCORE_KEYS) continue
+      const since = seconds - (n.start + n.duration)
+      // Held reads 1; released decays linearly over the release window. Max,
+      // not sum: two notes on one key is still one key, lit once.
+      const e = since <= 0 ? 1 : since >= release ? 0 : 1 - since / release
+      if (e > keys[2 + k]) keys[2 + k] = e
+    }
+    // One write covering the clock (floats 3–4) and the key map (8 onward);
+    // scratch holds them adjacently so it stays a single upload.
+    this.device.queue.writeBuffer(this.scoreBuffer, 3 * 4, keys.buffer as ArrayBuffer, 0, 2 * 4)
+    this.device.queue.writeBuffer(this.scoreBuffer, SCORE_HEADER * 4, keys.buffer as ArrayBuffer, 2 * 4, SCORE_KEYS * 4)
   }
 
   /**

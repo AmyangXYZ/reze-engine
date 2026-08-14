@@ -20,6 +20,7 @@ export {
   type EffectParamValue,
   type EffectResult,
   type CullDiagnostics,
+  type ScoreNote,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export {
