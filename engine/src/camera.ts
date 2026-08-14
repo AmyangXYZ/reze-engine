@@ -4,11 +4,25 @@ import type { CameraPose } from "./camera-animation"
 /** Far cap / zoom limit; large enough for wide shots without clipping distant ground */
 const FAR_CAP = 8000
 const FAR_MIN = 200
-/** The character-framing value the cloth z-fighting fix settled on — never go below it. */
-const NEAR_MIN = 0.5
-/** ~40cm in MMD units. Past this the near plane would start clipping geometry a
- *  user has deliberately pushed the camera up against. */
-const NEAR_MAX = 5
+/**
+ * Near-plane floor and cap, in two sets, because what a near plane costs depends
+ * entirely on the depth buffer underneath it.
+ *
+ * The single set that used to live here was written against a projection that
+ * silently doubled it (see Mat4.perspectiveInto), so the real clip was at 1.0 and
+ * 10 rather than the 0.5 and 5 stated. UNORM keeps exactly that behaviour, now
+ * said out loud: identical precision, identical z-fighting margin on coplanar
+ * cloth, no change to any scene that renders correctly today.
+ *
+ * REVERSED gets the floor the content actually wants. Float depth read backwards
+ * holds roughly constant RELATIVE precision across the range, so pulling the near
+ * plane in by twenty times costs almost nothing — and a 4 mm near plane is closer
+ * than any camera VMD will ever push.
+ */
+const NEAR_MIN_UNORM = 1.0
+const NEAR_MAX_UNORM = 10
+const NEAR_MIN_REVERSED = 0.05
+const NEAR_MAX_REVERSED = 5
 
 export class Camera {
   alpha: number
@@ -21,8 +35,11 @@ export class Camera {
    *  nearly all of it within a hand's reach and coplanar cloth/body layers z-fought
    *  (white crack flashes, worse the further the camera). 0.5 MMD units ≈ 4 cm —
    *  closer than any real framing — and buys 10× precision at character range. */
-  near: number = 0.5
+  near: number = NEAR_MIN_UNORM
   far: number = FAR_CAP
+  /** Set once by the engine, from whether it got a float depth format. Decides
+   *  both the near-plane floor and which way round the projection maps z. */
+  reversedZ = false
 
   // Input state
   private canvas: HTMLCanvasElement | null = null
@@ -248,13 +265,19 @@ export class Camera {
    * user is deliberately close to.
    */
   private updateNearFromRadius(): void {
-    this.near = Math.min(NEAR_MAX, Math.max(NEAR_MIN, this.radius / 50))
+    const lo = this.reversedZ ? NEAR_MIN_REVERSED : NEAR_MIN_UNORM
+    const hi = this.reversedZ ? NEAR_MAX_REVERSED : NEAR_MAX_UNORM
+    this.near = Math.min(hi, Math.max(lo, this.radius / 50))
   }
 
   getProjectionMatrix(): Mat4 {
     this.updateFarFromRadius()
     this.updateNearFromRadius()
-    Mat4.perspectiveInto(this._projMat.values, this.fov, this.aspect, this.near, this.far)
+    // Reversed-Z is the same matrix with near and far handed over the other way
+    // round — near → 1, far → 0. One projection function, and the reversal is a
+    // property of the depth buffer rather than a second matrix to keep in step.
+    if (this.reversedZ) Mat4.perspectiveInto(this._projMat.values, this.fov, this.aspect, this.far, this.near)
+    else Mat4.perspectiveInto(this._projMat.values, this.fov, this.aspect, this.near, this.far)
     return this._projMat
   }
 

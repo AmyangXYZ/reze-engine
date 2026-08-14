@@ -684,16 +684,33 @@ export class Mat4 {
     return new Mat4(new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]))
   }
 
-  // Perspective matrix for LEFT-HANDED coordinate system (Z+ forward)
-  // For left-handed: Z goes from 0 (near) to 1 (far), +Z is forward
-  // Zero-alloc perspective into an existing column-major array (same values as perspective).
+  /**
+   * Perspective for a LEFT-HANDED system (+Z forward), mapping z ∈ [near, far]
+   * onto clip z ∈ [0, w] — WebGPU's range, and D3D's.
+   *
+   * It used to write the OpenGL matrix, which maps onto [-w, w]. That is not a
+   * style difference: WebGPU clips everything with z < 0, so half the mapping was
+   * being thrown away and the near plane silently sat at TWICE the requested
+   * near. With the camera's own floor of 0.5 that put the real clip at 1.0 units
+   * — and since most materials draw with no face culling, a close-up did not fade
+   * the front of a head, it cut it open and showed the inside of the skull.
+   * Reported from the wild as 穿模 on imported camera work, which is exactly
+   * where it would show: a wide-angle shot is composed by moving the camera in.
+   *
+   * REVERSED-Z is this same function with near and far passed the other way
+   * round: it maps near → 1 and far → 0, which is worth doing on a float depth
+   * buffer because 1/z crowds precision at the near plane and float crowds it at
+   * zero, and the two cancel. On a UNORM buffer it is pointless — the precision
+   * curve is identical, only mirrored — so the caller decides, and decides on
+   * whether it got a float depth format.
+   */
   static perspectiveInto(out: Float32Array, fov: number, aspect: number, near: number, far: number): void {
     const f = 1.0 / Math.tan(fov / 2)
-    const rangeInv = 1.0 / (far - near) // Positive for left-handed
+    const rangeInv = 1.0 / (far - near)
     out[0] = f / aspect; out[1] = 0; out[2] = 0; out[3] = 0
     out[4] = 0; out[5] = f; out[6] = 0; out[7] = 0
-    out[8] = 0; out[9] = 0; out[10] = (far + near) * rangeInv; out[11] = 1 // Z+ forward (LH)
-    out[12] = 0; out[13] = 0; out[14] = -near * far * rangeInv * 2; out[15] = 0
+    out[8] = 0; out[9] = 0; out[10] = far * rangeInv; out[11] = 1 // Z+ forward (LH)
+    out[12] = 0; out[13] = 0; out[14] = -near * far * rangeInv; out[15] = 0
   }
 
   static perspective(fov: number, aspect: number, near: number, far: number): Mat4 {

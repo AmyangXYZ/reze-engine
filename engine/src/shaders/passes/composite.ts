@@ -182,7 +182,10 @@ const FILMIC_LUT_W: f32 = 256.0;
 
 fn linearDepth(coord: vec2<i32>) -> f32 {
   let z = textureLoad(depthTex, coord, 0);
-  // projA > 1 for every valid z in [0,1], so the divisor never crosses zero.
+  // projA and projB are m[10] and m[14] of whatever projection the camera built,
+  // so this one line inverts both conventions. Non-reversed puts projA just above
+  // 1; reversed puts it slightly below 0. Either way (z - projA) keeps its sign
+  // across the whole of z in [0,1], so the divisor never crosses zero.
   return clamp(dofU[2].y / (z - dofU[2].x), 0.05, 100000.0);
 }
 

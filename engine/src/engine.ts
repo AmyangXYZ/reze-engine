@@ -601,6 +601,10 @@ export interface CullDiagnostics {
    *  animation is moving means something is dirtying the list every frame, which
    *  is the failure mode that makes render bundles cost more than they save. */
   rebuilds: number
+  /** Times the render bundles have been re-recorded. Held to the same standard
+   *  as `rebuilds`, and for the sharper reason: a bundle exists to be replayed,
+   *  so one re-recorded every frame is strictly worse than not having it. */
+  bundleRecords: number
 }
 
 interface PickDrawCall {
@@ -1169,6 +1173,20 @@ export class Engine {
   // the fragment shader and treats missing dst.a as 1, so the blend math is
   // unchanged).
   private hdrFormat: GPUTextureFormat = "rgba16float"
+  /** Main-pass depth. Float when the adapter offers depth32float-stencil8, which
+   *  is also what makes reversed-Z worth switching on. */
+  private depthFormat: GPUTextureFormat = "depth24plus-stencil8"
+  /** Near maps to 1 and far to 0. Set once at init and never toggled — every
+   *  pipeline's compare function and both depth clears are chosen from it. */
+  private reversedZ = false
+  /** The compare a "draw what is in front" pipeline wants, either way round. */
+  private get depthAhead(): GPUCompareFunction {
+    return this.reversedZ ? "greater-equal" : "less-equal"
+  }
+  /** The value a cleared depth buffer holds: the FAR plane, whichever end that is. */
+  private get depthClear(): number {
+    return this.reversedZ ? 0 : 1
+  }
   /** Stencil value stamped by eye draws so hair can stencil-test against it and
    *  alpha-blend a second pass over eye silhouette pixels (see-through-hair effect). */
   private static readonly STENCIL_EYE_VALUE = 1
@@ -1316,6 +1334,28 @@ export class Engine {
   /** How many times the draw list has been rebuilt — a bundle-era regression
    *  guard, reported by getCullDiagnostics. Steady-state it must not climb. */
   private cullRebuilds = 0
+  // ── Render bundles ──
+  private opaqueBundle: GPURenderBundle | null = null
+  private transparentBundle: GPURenderBundle | null = null
+  private shadowBundle: GPURenderBundle | null = null
+  /** Set by scene STRUCTURE only. Every frame of animation, every physics step
+   *  and every camera move must leave this alone — re-recording constantly is
+   *  worse than having no bundles at all. */
+  private bundlesDirty = true
+  /** Companion to cullRebuilds: how many times the bundles have been recorded.
+   *  Steady-state it must not climb. */
+  private bundleRecords = 0
+  // ── GPU pass timings ──
+  // The passes worth a number, in the order their queries are laid out. Kept
+  // short on purpose: the point is to notice a restructure making a pass more
+  // expensive, and a list long enough to need reading is one nobody reads.
+  private static readonly TIMED_PASSES = ["cull", "shadow", "scene", "composite"] as const
+  private timestampQuerySet: GPUQuerySet | null = null
+  private timestampResolve: GPUBuffer | null = null
+  private timestampRead: GPUBuffer | null = null
+  /** A map is in flight; the readback buffer cannot be written while it is. */
+  private timestampBusy = false
+  private gpuPassMs: Record<string, number> | null = null
   private cullCameraArgs: GPUBuffer | null = null
   private cullShadowArgs: GPUBuffer | null = null
   private cullFrustaBuffer: GPUBuffer | null = null
@@ -1744,7 +1784,12 @@ export class Engine {
   // texture-alpha-modulated rims) stays in place behind setOutlineEnabled(true).
   private outlineEnabled = false
   setOutlineEnabled(on: boolean): void {
+    if (this.outlineEnabled === on) return
     this.outlineEnabled = on
+    // Whether a hull is drawn is decided at record time, so this is one of the
+    // few switches that genuinely has to re-record. It is a user toggle, not a
+    // per-frame state, which is what makes that affordable.
+    this.bundlesDirty = true
   }
 
   private rebuildCompositeBindGroup(): void {
@@ -2326,7 +2371,7 @@ export class Engine {
         primitive: { topology: "triangle-list", cullMode: "none" },
         // Tested but not WRITTEN: particles are transparent, so writing depth
         // would make whichever quad drew first occlude the ones behind it.
-        depthStencil: { format: "depth24plus-stencil8", depthWriteEnabled: false, depthCompare: "less-equal" },
+        depthStencil: { format: this.depthFormat, depthWriteEnabled: false, depthCompare: this.depthAhead },
         multisample: { count: Engine.MULTISAMPLE_COUNT },
       })
       const scoped = await this.device.popErrorScope()
@@ -2817,12 +2862,15 @@ export class Engine {
     u[5] = Math.min(12, Math.max(3, Math.round(d.bladeCount)))
     u[6] = d.quality === "performance" ? 8 : d.quality === "cinematic" ? 24 : 16
     u[7] = 1 // anamorphic ratio, reserved (the shader clamps ≥ 0.25)
-    // viewZ = projB / (z − projA), the inverse of perspectiveInto's z mapping.
-    // near/far track the camera radius, so these refresh every enabled frame.
-    const near = this.camera.near
-    const far = this.camera.far
-    u[8] = (far + near) / (far - near)
-    u[9] = (-2 * near * far) / (far - near)
+    // viewZ = projB / (z − projA), the inverse of the projection's z mapping —
+    // and projA/projB ARE m[10] and m[14], so read them off the matrix rather
+    // than re-deriving them from near/far. Re-derivation is what would silently
+    // rot the day the projection changed convention, which is exactly what just
+    // happened: the old pair encoded the OpenGL mapping and would have inverted
+    // a reversed-Z buffer into nonsense.
+    const proj = this.camera.getProjectionMatrix().values
+    u[8] = proj[10]
+    u[9] = proj[14]
     this.device.queue.writeBuffer(this.dofUniformBuffer, 0, u)
   }
 
@@ -2873,14 +2921,55 @@ export class Engine {
     if (!adapter) throw new Error("WebGPU is not supported in this browser.")
     const wantFeature: GPUFeatureName = "rg11b10ufloat-renderable"
     const hasRg11b10 = adapter.features.has(wantFeature)
+    // Float depth WITH stencil, which the eye/hair stencil interplay needs. It is
+    // an optional WebGPU feature, so this is a request, not an assumption — and
+    // it is the whole reason reversed-Z is worth doing: reversing a UNORM buffer
+    // mirrors the precision curve without improving it, while reversing a float
+    // one cancels 1/z crowding against float's own crowding near zero and buys
+    // back the near plane a close-up camera needs.
+    const wantDepth32: GPUFeatureName = "depth32float-stencil8"
+    const hasDepth32 = adapter.features.has(wantDepth32)
+    // GPU pass timings. Optional, and asked for on every device rather than
+    // behind a debug flag: this is the regression guard for a restructure whose
+    // whole claim is that it does not cost anything, and a guard nobody runs
+    // guards nothing.
+    const wantTimestamp: GPUFeatureName = "timestamp-query"
+    const hasTimestamp = adapter.features.has(wantTimestamp)
     const device = await adapter.requestDevice({
-      requiredFeatures: hasRg11b10 ? [wantFeature] : [],
+      requiredFeatures: [
+        ...(hasRg11b10 ? [wantFeature] : []),
+        ...(hasDepth32 ? [wantDepth32] : []),
+        ...(hasTimestamp ? [wantTimestamp] : []),
+      ],
     })
     if (!device) {
       throw new Error("WebGPU is not supported in this browser.")
     }
     this.device = device
     if (hasRg11b10) this.hdrFormat = "rg11b10ufloat"
+    if (hasTimestamp) {
+      this.timestampQuerySet = device.createQuerySet({
+        label: "pass timings",
+        type: "timestamp",
+        count: Engine.TIMED_PASSES.length * 2,
+      })
+      const bytes = Engine.TIMED_PASSES.length * 2 * 8 // one u64 per query
+      this.timestampResolve = device.createBuffer({
+        label: "pass timings (resolve)",
+        size: bytes,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      })
+      this.timestampRead = device.createBuffer({
+        label: "pass timings (readback)",
+        size: bytes,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      })
+    }
+    if (hasDepth32) {
+      this.depthFormat = "depth32float-stencil8"
+      this.reversedZ = true
+    }
+    this.camera.reversedZ = this.reversedZ
 
     const context = this.canvas.getContext("webgpu")
     if (!context) {
@@ -3405,9 +3494,9 @@ export class Engine {
       fragmentTargets: sceneTargets,
       cullMode: "none",
       depthStencil: {
-        format: "depth24plus-stencil8",
+        format: this.depthFormat,
         depthWriteEnabled: true,
-        depthCompare: "less-equal",
+        depthCompare: this.depthAhead,
       },
     })
     // Depth-write-off twin for transparent-bucket draws (see pipelineForDrawCall).
@@ -3419,9 +3508,9 @@ export class Engine {
       fragmentTargets: sceneTargets,
       cullMode: "none",
       depthStencil: {
-        format: "depth24plus-stencil8",
+        format: this.depthFormat,
         depthWriteEnabled: false,
-        depthCompare: "less-equal",
+        depthCompare: this.depthAhead,
       },
     })
     // Depth-only prepass for transparent draws (see depth-prepass.ts): writes the
@@ -3443,9 +3532,9 @@ export class Engine {
       primitive: { cullMode: "none" },
       multisample: { count: Engine.MULTISAMPLE_COUNT },
       depthStencil: {
-        format: "depth24plus-stencil8",
+        format: this.depthFormat,
         depthWriteEnabled: true,
-        depthCompare: "less-equal",
+        depthCompare: this.depthAhead,
       },
     })
 
@@ -3549,7 +3638,7 @@ export class Engine {
       vertexBuffers: [fullVertexBuffers[0]],
       fragmentTargets: sceneTargets,
       cullMode: "back",
-      depthStencil: { format: "depth24plus-stencil8", depthWriteEnabled: true, depthCompare: "less-equal" },
+      depthStencil: { format: this.depthFormat, depthWriteEnabled: true, depthCompare: this.depthAhead },
     })
 
     // Outline: group 0 = per-frame (camera), group 1 = per-instance (skinMats), group 2 = per-material (edge uniforms)
@@ -3600,12 +3689,12 @@ export class Engine {
       fragmentTargets: sceneTargets,
       cullMode: "back",
       depthStencil: {
-        format: "depth24plus-stencil8",
+        format: this.depthFormat,
         // babylon-mmd draws outlines WITH depth write (its _afterRenderingMesh
         // forces setDepthWrite(true)); the constant bias below still makes
         // hulls lose depth ties against their own near-coplanar geometry.
         depthWriteEnabled: true,
-        depthCompare: "less-equal",
+        depthCompare: this.depthAhead,
         // CONFIRMED fix (bisected live via setOutlineEnabled): hull fragments
         // carry their surface's exact depth, so against this model's paired
         // near-coplanar skirt layers the hulls WON depth ties in patches —
@@ -4002,7 +4091,7 @@ export class Engine {
       depthStencil: {
         format: "depth24plus",
         depthWriteEnabled: true,
-        depthCompare: "less-equal",
+        depthCompare: this.depthAhead,
       },
     })
 
@@ -4161,7 +4250,7 @@ export class Engine {
         label: "depth texture",
         size: [width, height],
         sampleCount: Engine.MULTISAMPLE_COUNT,
-        format: "depth24plus-stencil8",
+        format: this.depthFormat,
         // TEXTURE_BINDING for the DoF gather — a usage flag, not a copy; the
         // zero-cost-when-off story lives in depthStoreOp, not here.
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
@@ -4193,10 +4282,11 @@ export class Engine {
 
       this.renderPassDescriptor = {
         label: "renderPass",
+        timestampWrites: this.stamps("scene"),
         colorAttachments: [colorAttachment, maskAttachment],
         depthStencilAttachment: {
           view: depthTextureView,
-          depthClearValue: 1.0,
+          depthClearValue: this.depthClear,
           depthLoadOp: "clear",
           // Main-pass depth is not sampled later (shadow uses its own map, composite is depthless).
           depthStoreOp: "discard",
@@ -4209,6 +4299,7 @@ export class Engine {
       // Composite pass descriptor (color attachment view patched per-frame to current swapchain).
       this.compositePassDescriptor = {
         label: "composite pass",
+        timestampWrites: this.stamps("composite"),
         colorAttachments: [
           {
             view: undefined as unknown as GPUTextureView,
@@ -5052,6 +5143,7 @@ export class Engine {
     for (const install of inst.styleGroups.values()) this.destroyInstall(install)
     this.modelInstances.delete(name)
     this.cullListDirty = true
+    this.bundlesDirty = true
   }
 
   getModelNames(): string[] {
@@ -5417,6 +5509,9 @@ export class Engine {
    */
   private rebuildCullList(): void {
     this.cullListDirty = false
+    // A grow reallocates the argument buffers, and a bundle holds the buffer it
+    // recorded against by reference — a stale one would draw from freed memory.
+    this.bundlesDirty = true
     this.cullDraws = []
     this.cullModels = []
     for (const inst of this.modelInstances.values()) {
@@ -5719,6 +5814,119 @@ export class Engine {
    * be checked against a scene that is definitely rendering correctly — see
    * getCullDiagnostics and setCullApply.
    */
+  /**
+   * Record the three bundles: the shadow pass, the opaque phase and the
+   * transparent phase.
+   *
+   * The insight this rests on is that a character's DRAW COMMANDS are stable
+   * frame to frame — same pipeline, same bind groups, same index ranges, with
+   * only the contents of the skin-matrix buffer changing. So bundles apply to
+   * the cast, not merely to scenery, and what invalidates one is scene
+   * STRUCTURE. Animation, physics, camera movement, material morphs, a hidden
+   * material and a hidden model all leave a bundle valid — the first three
+   * because they touch buffers and not commands, the last two because their
+   * switches live in the cull compute rather than in this encode loop.
+   *
+   * The ground and the particles are deliberately not in a bundle: the ground is
+   * one draw that sits BETWEEN the two phases, and the particle count comes from
+   * the CPU. Both are cheaper to leave direct than to invalidate around.
+   */
+  private recordBundles(): void {
+    this.bundlesDirty = false
+    const scene = {
+      colorFormats: [this.hdrFormat, Engine.BLOOM_MASK_FORMAT],
+      depthStencilFormat: this.depthFormat,
+      sampleCount: Engine.MULTISAMPLE_COUNT,
+    }
+    if (this.modelInstances.size === 0) {
+      this.opaqueBundle = null
+      this.transparentBundle = null
+      this.shadowBundle = null
+      return
+    }
+
+    const opaque = this.device.createRenderBundleEncoder({ label: "opaque phase", ...scene })
+    this.forEachInstance((inst) => this.renderModelOpaquePhase(opaque, inst))
+    this.opaqueBundle = opaque.finish({ label: "opaque phase" })
+
+    const transparent = this.device.createRenderBundleEncoder({ label: "transparent phase", ...scene })
+    this.forEachInstance((inst) => this.renderModelTransparentPhase(transparent, inst))
+    this.transparentBundle = transparent.finish({ label: "transparent phase" })
+
+    const shadow = this.device.createRenderBundleEncoder({
+      label: "shadow pass",
+      colorFormats: [],
+      depthStencilFormat: "depth32float",
+    })
+    shadow.setPipeline(this.shadowDepthPipeline)
+    this.forEachInstance((inst) => this.drawInstanceShadow(shadow, inst))
+    this.shadowBundle = shadow.finish({ label: "shadow pass" })
+    this.bundleRecords++
+  }
+
+  /** The two query slots for a pass, or undefined where the device has no
+   *  timestamps — which every pass descriptor accepts as "do not measure". */
+  private stamps(pass: (typeof Engine.TIMED_PASSES)[number]): GPURenderPassTimestampWrites | undefined {
+    if (!this.timestampQuerySet) return undefined
+    const i = Engine.TIMED_PASSES.indexOf(pass)
+    return { querySet: this.timestampQuerySet, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 }
+  }
+
+  /**
+   * Resolve this frame's timings and start a readback, at most one in flight.
+   *
+   * Deliberately not awaited anywhere in the frame: a timing that costs a stall
+   * to collect would change the thing it is measuring. The numbers are therefore
+   * a frame or two old, which is exactly right for what they are for — watching
+   * a pass get more expensive across a refactor, not attributing one frame.
+   */
+  private resolveTimestamps(encoder: GPUCommandEncoder): void {
+    const qs = this.timestampQuerySet
+    if (!qs || !this.timestampResolve || !this.timestampRead) return
+    const count = Engine.TIMED_PASSES.length * 2
+    encoder.resolveQuerySet(qs, 0, count, this.timestampResolve, 0)
+    if (this.timestampBusy) return
+    encoder.copyBufferToBuffer(this.timestampResolve, 0, this.timestampRead, 0, count * 8)
+    this.timestampBusy = true
+    // After the submit this encoder belongs to, which is why the map is started
+    // from a microtask rather than here.
+    queueMicrotask(() => {
+      const buf = this.timestampRead
+      if (!buf) return
+      buf
+        .mapAsync(GPUMapMode.READ)
+        .then(() => {
+          const t = new BigInt64Array(buf.getMappedRange().slice(0))
+          buf.unmap()
+          const out: Record<string, number> = {}
+          for (let i = 0; i < Engine.TIMED_PASSES.length; i++) {
+            // Nanoseconds, and a pass that did not run leaves its pair equal —
+            // report 0 rather than a negative from an unwritten query.
+            const ns = Number(t[i * 2 + 1] - t[i * 2])
+            out[Engine.TIMED_PASSES[i]] = ns > 0 ? ns / 1e6 : 0
+          }
+          this.gpuPassMs = out
+          this.timestampBusy = false
+        })
+        .catch(() => {
+          // Device lost, or the buffer was destroyed under us. Stop reporting
+          // rather than wedging the flag and never reading again.
+          this.timestampBusy = false
+        })
+    })
+  }
+
+  /**
+   * Milliseconds on the GPU per pass, or null where the device cannot measure.
+   *
+   * The regression guard for the draw-path work: these are the numbers that say
+   * whether restructuring cost anything, which is the claim being made — not
+   * whether it made the scene faster, which was never the goal.
+   */
+  getGpuTimings(): Record<string, number> | null {
+    return this.gpuPassMs
+  }
+
   private dispatchCull(encoder: GPUCommandEncoder): void {
     if (this.cullListDirty) this.rebuildCullList()
     if (!this.cullBindGroup || this.cullDraws.length === 0) return
@@ -5729,7 +5937,7 @@ export class Engine {
     this.writeCullHidden()
     this.cullFrame++
     if (!this.cullPipeline) return
-    const pass = encoder.beginComputePass({ label: "cull" })
+    const pass = encoder.beginComputePass({ label: "cull", timestampWrites: this.stamps("cull") })
     pass.setPipeline(this.cullPipeline)
     pass.setBindGroup(0, this.cullBindGroup)
     pass.dispatchWorkgroups(Math.ceil(this.cullDraws.length / 64))
@@ -5861,6 +6069,7 @@ export class Engine {
       mismatches: [],
       models: [],
       rebuilds: this.cullRebuilds,
+      bundleRecords: this.bundleRecords,
       camera: {
         eye: [this.camera.getEyePosition().x, this.camera.getEyePosition().y, this.camera.getEyePosition().z],
         target: [this.camera.target.x, this.camera.target.y, this.camera.target.z],
@@ -6129,6 +6338,7 @@ export class Engine {
     await this.setupMaterialsForInstance(inst)
     this.modelInstances.set(name, inst)
     this.cullListDirty = true
+    this.bundlesDirty = true
   }
 
   // Build the per-model GPU vertex-morph state. Returns null (and leaves the model on the
@@ -7410,7 +7620,7 @@ export class Engine {
       ],
       depthStencilAttachment: {
         view: this.pickDepthTexture.createView(),
-        depthClearValue: 1.0,
+        depthClearValue: this.depthClear,
         depthLoadOp: "clear",
         depthStoreOp: "store",
       },
@@ -7612,8 +7822,12 @@ export class Engine {
     if (hasModels) this.dispatchMorphCompute(encoder)
 
     // Frustum cull into indirect arguments. After the camera and shadow matrices
-    // are settled, before the passes that will eventually draw from them.
+    // are settled, before the passes that draw from them.
     if (hasModels) this.dispatchCull(encoder)
+
+    // After the cull, because a rebuild there can reallocate the argument
+    // buffers and a bundle captures the buffer it recorded against.
+    if (this.bundlesDirty) this.recordBundles()
 
     // Runs one more time after the last model goes: this pass owns the shadow map's
     // only `depthLoadOp: "clear"`, so skipping it outright leaves the texture holding
@@ -7622,6 +7836,7 @@ export class Engine {
     // pass on the transition to empty, then it stops.
     if (hasModels || this.shadowMapPopulated) {
       const sp = encoder.beginRenderPass({
+        timestampWrites: this.stamps("shadow"),
         colorAttachments: [],
         depthStencilAttachment: {
           view: this.shadowMapDepthView,
@@ -7630,10 +7845,11 @@ export class Engine {
           depthStoreOp: "store",
         },
       })
-      sp.setPipeline(this.shadowDepthPipeline)
-      this.forEachInstance((inst) => {
-        if (inst.model.visible) this.drawInstanceShadow(sp, inst)
-      })
+      // The per-model `visible` test that used to guard this is gone: it is a
+      // per-frame boolean, and baking it into a bundle would make toggling a
+      // model re-record. It lives in the cull compute now, which zeroes the
+      // instance count of an invisible model's draws.
+      if (this.shadowBundle) sp.executeBundles([this.shadowBundle])
       sp.end()
       this.shadowMapPopulated = hasModels
     }
@@ -7651,15 +7867,14 @@ export class Engine {
     // shaded every covered pixel and measurably dropped Safari fps. It still
     // draws BEFORE the transparent phase so sheer fabric blends over the floor
     // instead of over the background with the floor depth-rejected behind it.
-    if (hasModels)
-      this.forEachInstance((inst) => {
-        if (inst.model.visible) this.renderModelOpaquePhase(pass, inst)
-      })
+    //
+    // Pass state the bundles cannot carry, set once for both of them:
+    // GPURenderBundleEncoder has no setStencilReference, and this is a constant
+    // anyway — eye writes it, hair tests not-equal, hairOverEyes tests equal.
+    pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    if (this.opaqueBundle) pass.executeBundles([this.opaqueBundle])
     if (this.hasGround) this.renderGround(pass)
-    if (hasModels)
-      this.forEachInstance((inst) => {
-        if (inst.model.visible) this.renderModelTransparentPhase(pass, inst)
-      })
+    if (this.transparentBundle) pass.executeBundles([this.transparentBundle])
     // Last in the pass: depth-tested against everything drawn above, so a
     // particle behind the character is simply hidden, and still inside the HDR
     // target so an `@bloom` effect reaches the pyramid below.
@@ -7732,6 +7947,9 @@ export class Engine {
     const pick = this.pendingPick
     if (pick && hasModels) this.renderPickPass(encoder)
 
+    // Last thing encoded: every timed pass has run by here.
+    this.resolveTimestamps(encoder)
+
     this.device.queue.submit([encoder.finish()])
 
     // Everything this frame that wasn't animation or physics: uniforms, encoding, submit.
@@ -7749,7 +7967,7 @@ export class Engine {
     this.updateStats(deltaTime * 1000)
   }
 
-  private drawInstanceShadow(sp: GPURenderPassEncoder, inst: ModelInstance): void {
+  private drawInstanceShadow(sp: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
     sp.setBindGroup(0, inst.shadowBindGroup)
     sp.setVertexBuffer(0, inst.vertexBuffer)
     sp.setVertexBuffer(1, inst.jointsBuffer)
@@ -8024,6 +8242,12 @@ export class Engine {
         install?.images,
       )
     }
+    // Swapping bind groups without re-sorting is the one structural change that
+    // does not pass through sortDrawCalls, so it has to say so itself. A bundle
+    // holds the bind group it recorded, and the textures behind the outgoing one
+    // are destroyed on the next line — the same failure the comment above
+    // describes, one level further out.
+    this.bundlesDirty = true
     for (const tex of previousImages ?? []) tex?.destroy()
     this.writeGroupDefaults(uniformBuffer, group, result.slotMap)
     return { ok: true, diagnostics, slotMap: result.slotMap }
@@ -8090,6 +8314,7 @@ export class Engine {
     // The sort reorders drawCalls, and a draw's position in that array is its
     // slot in every cull buffer.
     this.cullListDirty = true
+    this.bundlesDirty = true
   }
 
   /**
@@ -8111,9 +8336,9 @@ export class Engine {
       multisample: { count: Engine.MULTISAMPLE_COUNT },
     }
     const plainDepth: GPUDepthStencilState = {
-      format: "depth24plus-stencil8",
+      format: this.depthFormat,
       depthWriteEnabled: depthWrite,
-      depthCompare: "less-equal",
+      depthCompare: this.depthAhead,
     }
     let depthStencil: GPUDepthStencilState = plainDepth
     let constants: Record<string, number> | undefined
@@ -8128,9 +8353,9 @@ export class Engine {
     } else if (renderClass === "hair" && overEyes) {
       constants = { IS_OVER_EYES: 1 }
       depthStencil = {
-        format: "depth24plus-stencil8",
+        format: this.depthFormat,
         depthWriteEnabled: false,
-        depthCompare: "less-equal",
+        depthCompare: this.depthAhead,
         stencilFront: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
         stencilBack: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
         stencilReadMask: 0xff,
@@ -8174,7 +8399,11 @@ export class Engine {
    * makes outlines compose like MMD: every material drawn later in the author's
    * order covers earlier hulls, and each hull sits over everything drawn before it.
    */
-  private drawMaterials(pass: GPURenderPassEncoder, inst: ModelInstance, type: "opaque" | "transparent"): void {
+  private drawMaterials(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    type: "opaque" | "transparent",
+  ): void {
     let currentPipeline: GPURenderPipeline | null = null
     let bound = false
     for (const draw of inst.drawCalls) {
@@ -8212,23 +8441,28 @@ export class Engine {
    * a separate phase: drawMaterials draws each edge-flagged material's hull
    * right after the material itself, like MMD's per-mesh outline stage.
    */
-  private setModelDrawState(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+  private setModelDrawState(pass: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
     pass.setVertexBuffer(0, inst.vertexBuffer)
     pass.setVertexBuffer(1, inst.jointsBuffer)
     pass.setVertexBuffer(2, inst.weightsBuffer)
     pass.setIndexBuffer(inst.indexBuffer, "uint32")
-    // Single stencil-reference set covers eye (write), hair (read not-equal),
-    // and hairOverEyes (read equal). Non-stencil pipelines ignore the value.
-    pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    // The stencil reference used to be set here. It is pass state, not bundle
+    // state — GPURenderBundleEncoder has no setStencilReference at all — so it
+    // moved to the pass, which is where it always belonged: one constant covering
+    // eye (write), hair (read not-equal) and hairOverEyes (read equal), set once
+    // instead of once per model. Non-stencil pipelines ignore the value.
   }
 
-  private renderModelOpaquePhase(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+  private renderModelOpaquePhase(pass: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
     this.setModelDrawState(pass, inst)
     this.drawMaterials(pass, inst, "opaque")
     this.drawHairOverEyes(pass, inst)
   }
 
-  private renderModelTransparentPhase(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+  private renderModelTransparentPhase(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+  ): void {
     this.setModelDrawState(pass, inst)
     // Transparent: babylon-mmd's forceDepthWrite blending — PMX author order
     // with depth write ON. The accepted trade-off after trying every variant:
@@ -8265,7 +8499,7 @@ export class Engine {
    * `IS_OVER_EYES=true` (25% alpha), depth-write off. Ungrouped materials are neutral and
    * never participate.
    */
-  private drawHairOverEyes(pass: GPURenderPassEncoder, inst: ModelInstance): void {
+  private drawHairOverEyes(pass: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
     let bound = false
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
