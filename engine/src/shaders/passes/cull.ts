@@ -39,7 +39,8 @@ struct ModelRec {
   pad2: u32,
 };
 
-// Camera planes at 0..5, light planes at 6..11. counts.x = draw count.
+// Camera planes at 0..5, light planes at 6..11.
+// counts.x = draw count, counts.y = 0 to pass everything (setCullEnabled).
 struct Frusta {
   planes: array<vec4f, 12>,
   counts: vec4u,
@@ -105,8 +106,12 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
+  // Culling off (setCullEnabled) passes everything, so a scene can be A/B'd
+  // against its own unculled self without rebuilding anything. The pass still
+  // runs, so the diagnostics keep reporting.
+  let off = frusta.counts.y == 0u;
   let castsShadow = (dm.flags & DRAW_CASTS_SHADOW) != 0u;
-  cameraArgs[i * 5u + 1u] = select(0u, 1u, inCamera);
-  shadowArgs[i * 5u + 1u] = select(0u, 1u, inLight && castsShadow);
+  cameraArgs[i * 5u + 1u] = select(0u, 1u, inCamera || off);
+  shadowArgs[i * 5u + 1u] = select(0u, 1u, (inLight && castsShadow) || off);
 }
 `

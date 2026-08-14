@@ -1317,7 +1317,7 @@ export class Engine {
    *  and casts. Filled by the CPU reference; only computed when something asks. */
   private cullReference = new Uint8Array(0)
   private cullReferenceFrame = -1
-  private cullApply = false
+  private cullEnabled = true
   private cullFrame = 0
   private cullScratchVp = new Float32Array(16)
   private cullReadback: { camera: GPUBuffer; shadow: GPUBuffer; bytes: number } | null = null
@@ -5435,9 +5435,15 @@ export class Engine {
       // Everything but instanceCount is structural, so the compute never writes
       // it — one fewer store per draw per frame, and the args stay readable in a
       // capture as "this is the draw, that is whether it survived".
+      //
+      // instanceCount seeds to 1, not 0: the passes draw from this buffer, so
+      // the value it holds when the compute has NOT run is what renders. One is
+      // the whole scene unculled; zero would be an empty screen, and every way
+      // the compute can fail to run — a shader that would not compile, a frame
+      // encoded before the first dispatch — would present as everything gone.
       const a = i * Engine.CULL_ARG_WORDS
       args[a] = draw.count
-      args[a + 1] = 0
+      args[a + 1] = 1
       args[a + 2] = draw.firstIndex
       args[a + 3] = 0
       args[a + 4] = 0
@@ -5623,6 +5629,7 @@ export class Engine {
     writeFrustumPlanes(this.cullScratchVp, this.cullFrustaF32, 0)
     writeFrustumPlanes(this.shadowLightVPMatrix, this.cullFrustaF32, 24)
     this.cullFrustaU32[48] = this.cullDraws.length
+    this.cullFrustaU32[49] = this.cullEnabled ? 1 : 0
     this.device.queue.writeBuffer(this.cullFrustaBuffer, 0, this.cullFrustaBytes)
   }
 
@@ -5671,6 +5678,12 @@ export class Engine {
       const o = mi * Engine.CULL_MODEL_FLOATS
       const mf = this.cullModelFlags[o + 20]
       let bits = 0
+      if (!this.cullEnabled) {
+        // Mirror the compute's own bypass, or every draw would read as a
+        // disagreement the moment culling is switched off for an A/B.
+        out[i] = 3
+        continue
+      }
       if ((mf & Engine.CULL_MODEL_VISIBLE) !== 0) {
         let inCamera: boolean
         let inLight: boolean
@@ -5707,27 +5720,40 @@ export class Engine {
     return out
   }
 
-  /** The debug gate on the direct draws. Off (the default) it is one boolean
-   *  read per draw and the scene renders exactly as it did before this pass
-   *  existed. */
-  private cullPasses(draw: DrawCall, shadowPass: boolean): boolean {
-    if (!this.cullApply) return true
-    if (draw.cullIndex < 0 || draw.cullIndex >= this.cullReference.length) return true
-    return (this.cullReferencePass()[draw.cullIndex] & (shadowPass ? 2 : 1)) !== 0
+  /**
+   * Issue one material draw, indirect when the cull owns it.
+   *
+   * The outline and the over-eyes pass share their material's slot rather than
+   * getting their own: same index range, same bounds, so the same decision. That
+   * also means an outline can never survive a material that was culled, which is
+   * the only relationship between them that is ever correct.
+   *
+   * Falls back to a direct draw for anything outside the cull list — the ground,
+   * and any draw whose slot has not been assigned yet.
+   */
+  private issueDraw(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    draw: DrawCall,
+    shadowPass: boolean,
+  ): void {
+    const args = shadowPass ? this.cullShadowArgs : this.cullCameraArgs
+    if (args && draw.cullIndex >= 0) {
+      pass.drawIndexedIndirect(args, draw.cullIndex * Engine.CULL_ARG_WORDS * 4)
+    } else {
+      pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+    }
   }
 
   /**
-   * Skip draws the cull rejected, using the CPU mirror of the test.
+   * Turn frustum culling off without turning the pass off.
    *
-   * The CPU mirror rather than the GPU result on purpose: reading the compute's
-   * output back would land one or two frames late and every camera move would
-   * pop, which looks exactly like a culling bug and would waste the check. This
-   * way anything that vanishes wrongly is a wrong BOUND, which is the thing
-   * being validated. Development aid — it costs a per-frame pass over the draw
-   * list, and the real path is the indirect draws.
+   * The compute keeps running and keeps reporting; it just writes "visible" for
+   * every draw. That is the A/B a missing-geometry report needs — if it is still
+   * missing with culling off, the cull was not what removed it — and it costs
+   * one uniform word rather than a rebuild.
    */
-  setCullApply(on: boolean): void {
-    this.cullApply = on
+  setCullEnabled(on: boolean): void {
+    this.cullEnabled = on
   }
 
   /**
@@ -7640,9 +7666,8 @@ export class Engine {
     sp.setIndexBuffer(inst.indexBuffer, "uint32")
     for (const draw of inst.shadowDrawCalls) {
       if (!this.shouldRenderDrawCall(inst, draw)) continue
-      if (!this.cullPasses(draw, true)) continue
       sp.setBindGroup(1, draw.bindGroup)
-      sp.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      this.issueDraw(sp, draw, true)
     }
   }
 
@@ -8064,7 +8089,6 @@ export class Engine {
     let bound = false
     for (const draw of inst.drawCalls) {
       if (draw.type !== type || !this.shouldRenderDrawCall(inst, draw)) continue
-      if (!this.cullPasses(draw, false)) continue
       if (!bound) {
         pass.setBindGroup(0, this.perFrameBindGroup)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
@@ -8076,7 +8100,7 @@ export class Engine {
         currentPipeline = pipeline
       }
       pass.setBindGroup(2, draw.bindGroup)
-      pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      this.issueDraw(pass, draw, false)
       if (draw.outline && this.outlineEnabled) {
         // Same index range; own pipeline + groups 0/2. Group 1 (skinMats) is
         // layout-identical between the main and outline pipelines and stays
@@ -8084,7 +8108,7 @@ export class Engine {
         pass.setPipeline(this.outlinePipeline)
         pass.setBindGroup(0, this.outlinePerFrameBindGroup)
         pass.setBindGroup(2, draw.outline.bindGroup)
-        pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+        this.issueDraw(pass, draw, false)
         pass.setBindGroup(0, this.perFrameBindGroup)
         currentPipeline = null
       }
@@ -8141,7 +8165,7 @@ export class Engine {
         bound = true
       }
       pass.setBindGroup(2, draw.bindGroup)
-      pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      this.issueDraw(pass, draw, false)
     }
   }
 
@@ -8156,7 +8180,6 @@ export class Engine {
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
       if (draw.type !== "opaque" || !this.shouldRenderDrawCall(inst, draw)) continue
-      if (!this.cullPasses(draw, false)) continue
       const overEyes = this.overEyesPipelineFor(inst, draw)
       if (!overEyes) continue
       if (!bound) {
@@ -8169,7 +8192,7 @@ export class Engine {
         currentPipeline = overEyes
       }
       pass.setBindGroup(2, draw.bindGroup)
-      pass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+      this.issueDraw(pass, draw, false)
     }
   }
 
