@@ -4,6 +4,7 @@ import { Mat4, Quat, Vec3 } from "./math"
 import { decodePsd, isPsd } from "./psd-loader"
 import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
+import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
@@ -531,6 +532,69 @@ interface DrawCall {
    *  this material with the outline pipeline. Shares this call's index range;
    *  own bind group (edge uniforms + diffuse texture for the alpha test). */
   outline?: { bindGroup: GPUBindGroup }
+  /** MODEL-SPACE AABB over this material's index range, computed at load:
+   *  [minX, minY, minZ, maxX, maxY, maxZ]. Usable for culling only while the
+   *  owning model is rigid (see ModelInstance.rigid) — animation moves vertices
+   *  out of it, which is why a skinned model culls per model instead. */
+  bounds: Float32Array
+  /** Slot in the cull metadata and indirect-argument buffers. Reassigned every
+   *  time the flat draw list is rebuilt (model added/removed, draws re-sorted).
+   *  -1 until the list is built. */
+  cullIndex: number
+}
+
+/** One draw's place in the flat, scene-wide cull list. */
+interface CullEntry {
+  inst: ModelInstance
+  draw: DrawCall
+}
+
+/** What getCullDiagnostics() reports: the GPU's answer, an independent CPU
+ *  answer over the same source data, and every draw where they disagree. */
+export interface CullDiagnostics {
+  drawCount: number
+  modelCount: number
+  /** Draws the GPU compute left with instanceCount = 1. */
+  cameraVisibleGpu: number
+  shadowVisibleGpu: number
+  /** The same test run on the CPU from the same bounds and frusta. */
+  cameraVisibleCpu: number
+  shadowVisibleCpu: number
+  /** How each model was bounded this frame — the split that decides whether a
+   *  stage culls per material or per model. */
+  rigidModels: number
+  skinnedModels: number
+  mismatches: {
+    model: string
+    material: string
+    pass: "camera" | "shadow"
+    gpu: boolean
+    cpu: boolean
+  }[]
+  /** What each model was actually tested against. Without this a report saying
+   *  "everything visible" is unreadable — you cannot tell a working cull looking
+   *  at geometry that genuinely fills the screen from a cull that never rejects
+   *  anything. The radius against the camera distance answers it directly. */
+  models: {
+    name: string
+    rigid: boolean
+    visible: boolean
+    draws: number
+    /** How many of this model's draws survived the camera frustum. */
+    cameraVisible: number
+    /** How many survived the light frustum AND carry the PMX cast-shadow flag.
+     *  Split from `casters` so a zero here is readable: no casters at all means
+     *  the author turned shadows off, while casters with zero survivors means
+     *  the light-frustum test rejected them. */
+    shadowVisible: number
+    /** Draws with the PMX cast-shadow flag set (bit 0x04), before any culling. */
+    casters: number
+    /** Sphere path only: the world centre and radius tested against. Null for a
+     *  rigid model, whose draws each carry their own box instead. */
+    sphere: [number, number, number, number] | null
+  }[]
+  /** Where the camera was, so the numbers above can be read against it. */
+  camera: { eye: [number, number, number]; target: [number, number, number] }
 }
 
 interface PickDrawCall {
@@ -582,6 +646,25 @@ interface ModelInstance {
   // Per-group compile generation — an async compile finishing after a newer edit/remove
   // on the same id is discarded (stale-write guard).
   styleGroupGen: Map<string, number>
+  // ── Cull bounds ──
+  /** Slot in the per-model cull buffer, assigned when the draw list is rebuilt. */
+  cullModelIndex: number
+  /** Every bone shares one skin matrix (within tolerance) and no vertex morph can
+   *  move a vertex out of its material's box — so the model is a rigid transform
+   *  of its bind pose and its per-material AABBs are live. True for a stage, and
+   *  for any character still in bind pose. Re-evaluated only on the frames the
+   *  skin matrices are re-uploaded, which is never for an idle stage. */
+  rigid: boolean
+  /** The shared skin matrix, when rigid: model space → world, INCLUDING the
+   *  scene placement (setModelTransform bakes the root into skinning). */
+  rigidXform: Float32Array
+  /** Bound on how far skinning can carry a vertex from the bone that drives it:
+   *  max over vertices of max over influencing joints of |v − bindPos(joint)|,
+   *  plus the largest single vertex-morph displacement. An AABB over the model's
+   *  POSED bone positions grown by this contains every skinned vertex, because a
+   *  skinned position is a convex combination of rigid images of v, each within
+   *  that distance of its bone's posed position. */
+  skinMargin: number
 }
 
 /**
@@ -700,6 +783,252 @@ function materialAlphaStats(
   }
   if (n === 0) return { avg: 1, translucentFrac: 0 }
   return { avg: sum / n / 255, translucentFrac: translucent / n }
+}
+
+// ── Cull bounds ───────────────────────────────────────────────────────────────
+
+/** World units added to every side of a material's model-space AABB.
+ *
+ *  Three things reach past the vertices the box was measured from, and one
+ *  number covers all of them because all three are small next to an MMD model's
+ *  ~20-unit height:
+ *   · the inverted-hull outline, which shares the material's index range and
+ *     extrudes along the normal;
+ *   · the tolerance RIGID_BONE_EPS allows on "every bone shares one matrix",
+ *     which lets a vertex sit up to about a hundredth of a unit off where the
+ *     box says it is;
+ *   · fp32 rounding through the skinning multiply.
+ *  A tenth of a unit is roughly a fingernail on a character and invisible on a
+ *  stage, so nothing is lost by being generous here — a box too small drops
+ *  geometry that should have drawn, which is the only failure that shows. */
+const CULL_BOUNDS_SLACK = 0.1
+
+/** How far two bones' skin matrices may differ and still count as "the same
+ *  transform". A stage at bind pose computes world × inverseBind per bone
+ *  numerically, so the products are identity only to fp32 — bit equality would
+ *  reject every stage there is. Linear terms are unitless; the translation term
+ *  is in world units and carries the looser bound because it accumulates the
+ *  bind position's own magnitude. */
+const RIGID_LINEAR_EPS = 1e-4
+const RIGID_TRANSLATION_EPS = 1e-2
+
+/** Model-space AABB over one material's index range, as
+ *  [minX, minY, minZ, maxX, maxY, maxZ]. Walks the material's own indices, so a
+ *  200-material stage costs one pass over its index buffer in total.
+ *
+ *  Empty ranges collapse to a zero box, which the frustum test then rejects from
+ *  every direction — correct, because there is nothing to draw. */
+function materialBounds(verts: Float32Array, indices: Uint32Array, firstIndex: number, count: number): Float32Array {
+  const b = new Float32Array([Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity])
+  for (let i = 0; i < count; i++) {
+    const v = indices[firstIndex + i] * 8 // VERTEX_STRIDE — position at +0
+    const x = verts[v]
+    const y = verts[v + 1]
+    const z = verts[v + 2]
+    if (x < b[0]) b[0] = x
+    if (y < b[1]) b[1] = y
+    if (z < b[2]) b[2] = z
+    if (x > b[3]) b[3] = x
+    if (y > b[4]) b[4] = y
+    if (z > b[5]) b[5] = z
+  }
+  if (b[0] > b[3]) b.fill(0)
+  return b
+}
+
+/** Bind-pose world position of every bone, from the inverse-bind matrices:
+ *  for invBind = [R | t] (column-major), the bind position is −Rᵀt. Read from
+ *  the matrices rather than from Bone.bindTranslation because that field is
+ *  parent-relative, and this needs model space. */
+function boneBindPositions(invBind: Float32Array, boneCount: number): Float32Array {
+  const out = new Float32Array(boneCount * 3)
+  for (let i = 0; i < boneCount; i++) {
+    const o = i * 16
+    const tx = invBind[o + 12]
+    const ty = invBind[o + 13]
+    const tz = invBind[o + 14]
+    out[i * 3] = -(invBind[o] * tx + invBind[o + 1] * ty + invBind[o + 2] * tz)
+    out[i * 3 + 1] = -(invBind[o + 4] * tx + invBind[o + 5] * ty + invBind[o + 6] * tz)
+    out[i * 3 + 2] = -(invBind[o + 8] * tx + invBind[o + 9] * ty + invBind[o + 10] * tz)
+  }
+  return out
+}
+
+/**
+ * How far skinning can carry a vertex away from the bones that drive it.
+ *
+ * A skinned position is p = Σ wᵢ·(Mᵢv), and each Mᵢ is rigid (MMD bones do not
+ * scale), so Mᵢv = pᵢ + Rᵢ(v − bᵢ) where pᵢ is bone i's posed position and bᵢ
+ * its bind position. That splits p into a convex combination of the pᵢ — which
+ * is inside their AABB — plus Σ wᵢ·Rᵢ(v − bᵢ), whose length is at most
+ * Σ wᵢ·|v − bᵢ|. So an AABB over the posed bone positions, grown by the largest
+ * such WEIGHTED SUM over all vertices, contains the whole mesh in any pose. The
+ * per-model sphere is therefore derived, not guessed.
+ *
+ * The weighting is what makes it usable, and it took measuring real models to
+ * see why. Bounding by max|v − bᵢ| over the influencing bones is also valid, and
+ * on five MMD models it produced spheres 1.5–2.3× the model's own radius —
+ * mostly air, and a character that never culls. The cause is always the same: a
+ * stray 1/255 weight tying some vertex to a control bone parked at the origin
+ * (全ての親, 操作中心, a glasses bone). Such a weight moves the vertex by
+ * millimetres and must be charged for millimetres, which the weighted form does
+ * and the max form does not. Weighted, the same models land at 1.35–1.45×.
+ *
+ * Weights are renormalized here exactly as the vertex shader renormalizes them,
+ * including its fallback to joint 0 at full weight when they sum to zero — a
+ * bound has to describe the vertex the shader will actually place.
+ */
+function computeSkinMargin(
+  verts: Float32Array,
+  joints: Uint16Array,
+  weights: Uint8Array,
+  bindPos: Float32Array,
+  boneCount: number,
+): number {
+  const vertexCount = Math.floor(verts.length / 8)
+  let worst = 0
+  for (let v = 0; v < vertexCount; v++) {
+    const p = v * 8
+    const x = verts[p]
+    const y = verts[p + 1]
+    const z = verts[p + 2]
+    const j = v * 4
+    const sum = weights[j] + weights[j + 1] + weights[j + 2] + weights[j + 3]
+    let reach = 0
+    for (let k = 0; k < 4; k++) {
+      const w = sum > 0 ? weights[j + k] / sum : k === 0 ? 1 : 0
+      if (w === 0) continue
+      const b = joints[j + k]
+      if (b >= boneCount) continue
+      const dx = x - bindPos[b * 3]
+      const dy = y - bindPos[b * 3 + 1]
+      const dz = z - bindPos[b * 3 + 2]
+      reach += w * Math.sqrt(dx * dx + dy * dy + dz * dz)
+    }
+    if (reach > worst) worst = reach
+  }
+  return worst
+}
+
+/** Reused by writeCullSphere — one sphere centre per model per frame is not
+ *  worth an allocation. */
+const cullScratchVec = new Vec3(0, 0, 0)
+
+/**
+ * Does every bone share one skin matrix, within tolerance?
+ *
+ * That is exactly the condition under which per-material model-space AABBs are
+ * live: the whole mesh is one rigid transform of its bind pose, and the shared
+ * matrix IS the transform to apply. Stated this way it needs no bind-pose
+ * reasoning and no "is this a stage" flag — a stage passes, and so does a
+ * character that has not been given a motion yet, which then culls per material
+ * for free.
+ *
+ * Bone 0 is the reference. The early exit is what makes this cheap on a
+ * character: the first animated bone disagrees, so the common case reads about
+ * sixteen floats and stops.
+ */
+function skinMatricesAgree(m: Float32Array, boneCount: number): boolean {
+  for (let i = 1; i < boneCount; i++) {
+    const o = i * 16
+    for (let k = 0; k < 16; k++) {
+      // Indices 12–15 are the translation column, in world units; the rest are
+      // the unitless linear part.
+      const eps = k >= 12 ? RIGID_TRANSLATION_EPS : RIGID_LINEAR_EPS
+      if (Math.abs(m[o + k] - m[k]) > eps) return false
+    }
+  }
+  return true
+}
+
+/**
+ * Six inward frustum planes from a column-major view-projection, normalized,
+ * written as vec4(nx, ny, nz, d) at `at`. Inside is `dot(n, p) + d >= 0`.
+ *
+ * Gribb–Hartmann. The near plane is row 2 ALONE, not row3 + row2 as the OpenGL
+ * form in most references has it, and that is the one line to be careful about
+ * here — Mat4.perspectiveInto writes the OpenGL matrix, whose z lands in
+ * [-1, 1], while WebGPU clips at z >= 0. The two together put the real near
+ * plane at twice the camera's nominal near (verify: with near 0.1, ndc z crosses
+ * zero at 0.2), and row 2 is the plane that sits there. So this extracts the
+ * boundary the RASTERIZER enforces rather than the one the matrix was written
+ * for, which is the only one culling may agree with.
+ */
+function writeFrustumPlanes(vp: Float32Array, out: Float32Array, at: number): void {
+  // row_i of the matrix, from column-major storage.
+  const r = (i: number, c: number) => vp[c * 4 + i]
+  const set = (slot: number, x: number, y: number, z: number, w: number) => {
+    const len = Math.hypot(x, y, z) || 1
+    const o = at + slot * 4
+    out[o] = x / len
+    out[o + 1] = y / len
+    out[o + 2] = z / len
+    out[o + 3] = w / len
+  }
+  set(0, r(3, 0) + r(0, 0), r(3, 1) + r(0, 1), r(3, 2) + r(0, 2), r(3, 3) + r(0, 3)) // left
+  set(1, r(3, 0) - r(0, 0), r(3, 1) - r(0, 1), r(3, 2) - r(0, 2), r(3, 3) - r(0, 3)) // right
+  set(2, r(3, 0) + r(1, 0), r(3, 1) + r(1, 1), r(3, 2) + r(1, 2), r(3, 3) + r(1, 3)) // bottom
+  set(3, r(3, 0) - r(1, 0), r(3, 1) - r(1, 1), r(3, 2) - r(1, 2), r(3, 3) - r(1, 3)) // top
+  set(4, r(2, 0), r(2, 1), r(2, 2), r(2, 3)) // near — z >= 0, not z >= -w
+  set(5, r(3, 0) - r(2, 0), r(3, 1) - r(2, 1), r(3, 2) - r(2, 2), r(3, 3) - r(2, 3)) // far
+}
+
+/** CPU mirror of the compute's AABB test — the projected-extent form, so a box
+ *  is rejected only when every corner is behind one plane. */
+function aabbInsideFrustum(
+  planes: Float32Array,
+  base: number,
+  cx: number,
+  cy: number,
+  cz: number,
+  ex: number,
+  ey: number,
+  ez: number,
+): boolean {
+  for (let i = 0; i < 6; i++) {
+    const o = base + i * 4
+    const nx = planes[o]
+    const ny = planes[o + 1]
+    const nz = planes[o + 2]
+    const d = nx * cx + ny * cy + nz * cz + planes[o + 3]
+    const reach = Math.abs(nx) * ex + Math.abs(ny) * ey + Math.abs(nz) * ez
+    if (d + reach < 0) return false
+  }
+  return true
+}
+
+/** CPU mirror of the compute's sphere test. */
+function sphereInsideFrustum(
+  planes: Float32Array,
+  base: number,
+  x: number,
+  y: number,
+  z: number,
+  r: number,
+): boolean {
+  for (let i = 0; i < 6; i++) {
+    const o = base + i * 4
+    if (planes[o] * x + planes[o + 1] * y + planes[o + 2] * z + planes[o + 3] + r < 0) return false
+  }
+  return true
+}
+
+/** The largest single vertex-morph displacement in a model. Charged to both
+ *  bound kinds as slack. One morph, not the sum of all of them: several at full
+ *  weight could in principle stack past it, but face morphs are millimetres on a
+ *  twenty-unit model and summing fifty of them would inflate every box in the
+ *  scene to pay for a case that does not occur. */
+function vertexMorphReach(model: Model): number {
+  let worstSq = 0
+  for (const morph of model.getMorphing().morphs) {
+    if (morph.type !== 1) continue
+    for (const off of morph.vertexOffsets) {
+      const [ox, oy, oz] = off.positionOffset
+      const d = ox * ox + oy * oy + oz * oz
+      if (d > worstSq) worstSq = d
+    }
+  }
+  return Math.sqrt(worstSq)
 }
 
 /** Tried in order when a PMX names a texture without an extension. */
@@ -951,6 +1280,48 @@ export class Engine {
   private compositePipelineGamma!: GPURenderPipeline
   private morphComputePipeline!: GPUComputePipeline
   private morphComputeBindGroupLayout!: GPUBindGroupLayout
+  // ── GPU frustum cull (see shaders/passes/cull.ts) ──
+  // The compute runs every frame and writes indirect draw arguments. Nothing
+  // consumes them yet: the draw path still issues direct draws, and this
+  // increment exists so the culling DATA can be validated against a working app
+  // before the draw path changes. setCullApply(true) gates the direct draws on
+  // the CPU mirror of the same test, which is how a wrong bound is made visible.
+  /** Null once the pipeline has failed to compile — the pass then does nothing
+   *  rather than invalidating every command buffer it touches. */
+  private cullPipeline: GPUComputePipeline | null = null
+  private cullBindGroupLayout!: GPUBindGroupLayout
+  private cullBindGroup: GPUBindGroup | null = null
+  /** Every material draw in the scene, flat, in the order the passes walk them.
+   *  A draw's position here IS its slot in every cull buffer. */
+  private cullDraws: CullEntry[] = []
+  private cullModels: ModelInstance[] = []
+  /** Structure changed — model added or removed, draws re-sorted. NOT set by
+   *  animation, physics or camera movement, which is the whole point. */
+  private cullListDirty = true
+  private cullMetaBuffer: GPUBuffer | null = null
+  private cullModelBuffer: GPUBuffer | null = null
+  private cullCameraArgs: GPUBuffer | null = null
+  private cullShadowArgs: GPUBuffer | null = null
+  private cullFrustaBuffer: GPUBuffer | null = null
+  private cullFrustaBytes = new ArrayBuffer(208)
+  private cullFrustaF32 = new Float32Array(this.cullFrustaBytes)
+  private cullFrustaU32 = new Uint32Array(this.cullFrustaBytes)
+  /** CPU-side mirrors of what was uploaded, so the reference test reads exactly
+   *  the same numbers the compute did. */
+  private cullMetaBytes = new ArrayBuffer(0)
+  private cullMetaF32 = new Float32Array(0)
+  private cullMetaU32 = new Uint32Array(0)
+  private cullModelData = new Float32Array(0)
+  private cullModelFlags = new Uint32Array(0)
+  /** Per draw: bit0 = passes the camera frustum, bit1 = passes the light frustum
+   *  and casts. Filled by the CPU reference; only computed when something asks. */
+  private cullReference = new Uint8Array(0)
+  private cullReferenceFrame = -1
+  private cullApply = false
+  private cullFrame = 0
+  private cullScratchVp = new Float32Array(16)
+  private cullReadback: { camera: GPUBuffer; shadow: GPUBuffer; bytes: number } | null = null
+  private cullReadbackInFlight = false
   private compositeBindGroupLayout!: GPUBindGroupLayout
   private compositeBindGroup!: GPUBindGroup
   private depthOfField: DepthOfFieldOptions = { ...DEFAULT_DEPTH_OF_FIELD_OPTIONS }
@@ -3525,6 +3896,38 @@ export class Engine {
       },
     })
 
+    // GPU frustum cull. One pipeline for the whole scene; the bind group is rebuilt
+    // with the buffers whenever the draw list changes. See shaders/passes/cull.ts.
+    this.cullBindGroupLayout = this.device.createBindGroupLayout({
+      label: "cull bind group layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      ],
+    })
+    // Scoped, unlike the morph pipeline beside it, because this one is OPTIONAL:
+    // nothing renders from it. An invalid compute pipeline poisons the command
+    // encoder it is set on, so a WGSL slip here would take the whole frame down —
+    // every pass, every model, an unrelated-looking cascade of style-group and
+    // effect failures. Catching it turns that into "culling is off".
+    this.device.pushErrorScope("validation")
+    this.cullPipeline = this.device.createComputePipeline({
+      label: "cull pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.cullBindGroupLayout] }),
+      compute: {
+        module: this.device.createShaderModule({ label: "cull compute shader", code: CULL_COMPUTE_WGSL }),
+        entryPoint: "cs",
+      },
+    })
+    void this.device.popErrorScope().then((err) => {
+      if (!err) return
+      console.error(`[cull] pipeline failed to compile — frustum culling disabled:\n${err.message}`)
+      this.cullPipeline = null
+    })
+
     this.bloomPassDescriptor = {
       label: "bloom pass",
       colorAttachments: [
@@ -4405,6 +4808,11 @@ export class Engine {
       bindGroup: this.groundShadowBindGroup!,
       materialName: "Ground",
       groupId: null,
+      // The ground belongs to no model instance, so it is not in the cull list —
+      // cullIndex -1 leaves renderGround unconditional. Its box is filled in
+      // anyway rather than left a lie for whoever reads this next.
+      bounds: new Float32Array([-opts.width / 2, 0, -opts.height / 2, opts.width / 2, 0, opts.height / 2]),
+      cullIndex: -1,
     }
   }
 
@@ -4476,6 +4884,9 @@ export class Engine {
       inst.styleGroups.clear()
     })
     this.zeroStyleBuffer?.destroy()
+    this.releaseCullBuffers()
+    this.cullFrustaBuffer?.destroy()
+    this.cullFrustaBuffer = null
   }
 
   async loadModel(path: string): Promise<Model>
@@ -4623,6 +5034,7 @@ export class Engine {
     // Per-group StyleUniforms buffers aren't in gpuBuffers (allocated post-load).
     for (const install of inst.styleGroups.values()) this.destroyInstall(install)
     this.modelInstances.delete(name)
+    this.cullListDirty = true
   }
 
   getModelNames(): string[] {
@@ -4964,6 +5376,500 @@ export class Engine {
     if (pass) pass.end()
   }
 
+  // ── GPU frustum cull ────────────────────────────────────────────────────────
+  //
+  // Sizes, once, so the arithmetic below is readable: a DrawMeta is 32 bytes
+  // (vec3 lo + u32 model + vec3 hi + u32 flags), a ModelRec is 96 (mat4 + vec4
+  // sphere + u32 flags + padding), and an indirect drawIndexed record is 5 u32.
+  private static readonly CULL_META_BYTES = 32
+  private static readonly CULL_MODEL_FLOATS = 24
+  private static readonly CULL_ARG_WORDS = 5
+  private static readonly CULL_DRAW_CASTS_SHADOW = 1
+  private static readonly CULL_MODEL_VISIBLE = 1
+  private static readonly CULL_MODEL_RIGID = 2
+
+  /**
+   * Flatten the scene's material draws into the order every cull buffer is
+   * indexed by, and upload everything that only changes with STRUCTURE: the
+   * per-draw metadata and the constant words of the indirect arguments.
+   *
+   * Runs on model add/remove and on any re-sort of a model's draws (a style
+   * group assignment re-ranks them). Animation, physics and camera movement all
+   * leave it alone — that is the same invalidation set the render bundles will
+   * want, tested here first where being wrong is cheap.
+   */
+  private rebuildCullList(): void {
+    this.cullListDirty = false
+    this.cullDraws = []
+    this.cullModels = []
+    for (const inst of this.modelInstances.values()) {
+      inst.cullModelIndex = this.cullModels.length
+      this.cullModels.push(inst)
+      for (const draw of inst.drawCalls) {
+        draw.cullIndex = this.cullDraws.length
+        this.cullDraws.push({ inst, draw })
+      }
+    }
+
+    const drawCount = this.cullDraws.length
+    const modelCount = this.cullModels.length
+    this.releaseCullBuffers()
+    if (drawCount === 0 || modelCount === 0) return
+
+    this.cullMetaBytes = new ArrayBuffer(drawCount * Engine.CULL_META_BYTES)
+    this.cullMetaF32 = new Float32Array(this.cullMetaBytes)
+    this.cullMetaU32 = new Uint32Array(this.cullMetaBytes)
+    const args = new Uint32Array(drawCount * Engine.CULL_ARG_WORDS)
+    for (let i = 0; i < drawCount; i++) {
+      const { inst, draw } = this.cullDraws[i]
+      const f = i * 8
+      const b = draw.bounds
+      this.cullMetaF32[f] = b[0]
+      this.cullMetaF32[f + 1] = b[1]
+      this.cullMetaF32[f + 2] = b[2]
+      this.cullMetaU32[f + 3] = inst.cullModelIndex
+      this.cullMetaF32[f + 4] = b[3]
+      this.cullMetaF32[f + 5] = b[4]
+      this.cullMetaF32[f + 6] = b[5]
+      this.cullMetaU32[f + 7] = draw.castsShadow === true ? Engine.CULL_DRAW_CASTS_SHADOW : 0
+      // Everything but instanceCount is structural, so the compute never writes
+      // it — one fewer store per draw per frame, and the args stay readable in a
+      // capture as "this is the draw, that is whether it survived".
+      const a = i * Engine.CULL_ARG_WORDS
+      args[a] = draw.count
+      args[a + 1] = 0
+      args[a + 2] = draw.firstIndex
+      args[a + 3] = 0
+      args[a + 4] = 0
+    }
+
+    const modelBytes = modelCount * Engine.CULL_MODEL_FLOATS * 4
+    const modelBuffer = new ArrayBuffer(modelBytes)
+    this.cullModelData = new Float32Array(modelBuffer)
+    this.cullModelFlags = new Uint32Array(modelBuffer)
+    this.cullReference = new Uint8Array(drawCount)
+    this.cullReferenceFrame = -1
+
+    this.cullMetaBuffer = this.device.createBuffer({
+      label: "cull draw metadata",
+      size: this.cullMetaBytes.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.cullMetaBuffer, 0, this.cullMetaBytes)
+
+    this.cullModelBuffer = this.device.createBuffer({
+      label: "cull model records",
+      size: modelBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+
+    const argUsage =
+      GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    this.cullCameraArgs = this.device.createBuffer({
+      label: "cull camera indirect args",
+      size: args.byteLength,
+      usage: argUsage,
+    })
+    this.cullShadowArgs = this.device.createBuffer({
+      label: "cull shadow indirect args",
+      size: args.byteLength,
+      usage: argUsage,
+    })
+    this.device.queue.writeBuffer(this.cullCameraArgs, 0, args)
+    this.device.queue.writeBuffer(this.cullShadowArgs, 0, args)
+
+    if (!this.cullFrustaBuffer) {
+      this.cullFrustaBuffer = this.device.createBuffer({
+        label: "cull frusta",
+        size: this.cullFrustaBytes.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+    }
+
+    this.cullBindGroup = this.device.createBindGroup({
+      label: "cull bind group",
+      layout: this.cullBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.cullMetaBuffer } },
+        { binding: 1, resource: { buffer: this.cullModelBuffer } },
+        { binding: 2, resource: { buffer: this.cullFrustaBuffer } },
+        { binding: 3, resource: { buffer: this.cullCameraArgs } },
+        { binding: 4, resource: { buffer: this.cullShadowArgs } },
+      ],
+    })
+  }
+
+  private releaseCullBuffers(): void {
+    this.cullMetaBuffer?.destroy()
+    this.cullModelBuffer?.destroy()
+    this.cullCameraArgs?.destroy()
+    this.cullShadowArgs?.destroy()
+    this.cullMetaBuffer = null
+    this.cullModelBuffer = null
+    this.cullCameraArgs = null
+    this.cullShadowArgs = null
+    this.cullBindGroup = null
+    this.cullReadback?.camera.destroy()
+    this.cullReadback?.shadow.destroy()
+    this.cullReadback = null
+  }
+
+  /**
+   * One record per model: the rigid transform its per-material boxes live under,
+   * or the world sphere that bounds it in any pose. Written every frame, because
+   * this is the part animation moves — a few hundred bytes per model.
+   */
+  private writeCullModels(): void {
+    const data = this.cullModelData
+    const flags = this.cullModelFlags
+    for (let i = 0; i < this.cullModels.length; i++) {
+      const inst = this.cullModels[i]
+      const o = i * Engine.CULL_MODEL_FLOATS
+      let f = inst.model.visible ? Engine.CULL_MODEL_VISIBLE : 0
+      if (inst.rigid) {
+        data.set(inst.rigidXform, o)
+        f |= Engine.CULL_MODEL_RIGID
+        // The sphere is not read for a rigid model; leave it zeroed rather than
+        // walking a stage's bones every frame to fill a field nothing consumes.
+        data[o + 16] = 0
+        data[o + 17] = 0
+        data[o + 18] = 0
+        data[o + 19] = 0
+      } else {
+        this.writeCullSphere(inst, data, o + 16)
+      }
+      flags[o + 20] = f
+    }
+    if (this.cullModelBuffer) this.device.queue.writeBuffer(this.cullModelBuffer, 0, data.buffer as ArrayBuffer)
+  }
+
+  /**
+   * The world sphere for a skinned model: an AABB over its POSED bone positions,
+   * grown by the model's skin margin, then carried through the scene placement.
+   *
+   * Bone positions come from the pose that already ran this frame, so a jump, a
+   * run across the stage or a physics-driven skirt are all inside it by
+   * construction — none of which a bind-pose box would have contained. See
+   * ModelInstance.skinMargin for why growing by that one number is a bound and
+   * not an estimate.
+   */
+  private writeCullSphere(inst: ModelInstance, out: Float32Array, at: number): void {
+    const m = inst.model
+    const bones = m.getWorldMatrices()
+    if (bones.length === 0) {
+      // Nothing to bound it with. A radius nothing can cull is the honest answer:
+      // a model that never culls costs vertex work, one wrongly culled vanishes.
+      out[at] = m.position.x
+      out[at + 1] = m.position.y
+      out[at + 2] = m.position.z
+      out[at + 3] = 1e9
+      return
+    }
+    let minX = Infinity
+    let minY = Infinity
+    let minZ = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+    let maxZ = -Infinity
+    for (let i = 0; i < bones.length; i++) {
+      const v = bones[i].values
+      const x = v[12]
+      const y = v[13]
+      const z = v[14]
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (z < minZ) minZ = z
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+      if (z > maxZ) maxZ = z
+    }
+    const hx = (maxX - minX) * 0.5
+    const hy = (maxY - minY) * 0.5
+    const hz = (maxZ - minZ) * 0.5
+    const centre = cullScratchVec
+    centre.setXYZ(minX + hx, minY + hy, minZ + hz)
+    const radius = Math.sqrt(hx * hx + hy * hy + hz * hz) + inst.skinMargin + CULL_BOUNDS_SLACK
+    // Model space → world: the same composition setModelTransform bakes into the
+    // skin matrices, applied to one point instead of every bone.
+    centre.setXYZ(centre.x * m.scale, centre.y * m.scale, centre.z * m.scale)
+    Quat.rotateVecInto(m.rotation, centre, centre)
+    out[at] = centre.x + m.position.x
+    out[at + 1] = centre.y + m.position.y
+    out[at + 2] = centre.z + m.position.z
+    out[at + 3] = radius * m.scale
+  }
+
+  /**
+   * The camera's six frustum planes then the sun's, normalized, as inward
+   * half-spaces (`dot(n, p) + d >= 0` is inside).
+   *
+   * Extracted from the combined view-projection rather than rebuilt from the
+   * camera's own parameters, so a VMD-driven shot, an orbit and the shadow
+   * volume's ortho box all go through one code path and none of them can
+   * disagree with what the vertex shader actually projects.
+   *
+   * Culling shadow casters to the light's frustum looks like it should lose
+   * casters that stand outside the volume and throw shade into it. It cannot,
+   * because the shadow map is a single fixed 64×64 ortho box and the rasterizer
+   * already clips to exactly these six planes — anything this rejects was
+   * contributing nothing. That equivalence is a property of the one-cascade
+   * setup and stops holding the day a second cascade arrives.
+   */
+  private writeCullFrusta(): void {
+    if (!this.cullFrustaBuffer) return
+    // cameraMatrixData holds view at 0 and projection at 16 — already written
+    // this frame by updateCameraUniforms.
+    Mat4.multiplyArrays(this.cameraMatrixData, 16, this.cameraMatrixData, 0, this.cullScratchVp, 0)
+    writeFrustumPlanes(this.cullScratchVp, this.cullFrustaF32, 0)
+    writeFrustumPlanes(this.shadowLightVPMatrix, this.cullFrustaF32, 24)
+    this.cullFrustaU32[48] = this.cullDraws.length
+    this.device.queue.writeBuffer(this.cullFrustaBuffer, 0, this.cullFrustaBytes)
+  }
+
+  /**
+   * Cull every material draw against the camera and the sun, writing
+   * `instanceCount` into two indirect-argument buffers.
+   *
+   * Nothing draws from those buffers yet. This increment stands the pass up and
+   * leaves the draw path issuing direct draws, so the bounds and the frusta can
+   * be checked against a scene that is definitely rendering correctly — see
+   * getCullDiagnostics and setCullApply.
+   */
+  private dispatchCull(encoder: GPUCommandEncoder): void {
+    if (this.cullListDirty) this.rebuildCullList()
+    if (!this.cullBindGroup || this.cullDraws.length === 0) return
+    // The CPU half runs even with a dead pipeline: it is what setCullApply gates
+    // on, and a stale mirror would gate draws against last-known frusta.
+    this.writeCullModels()
+    this.writeCullFrusta()
+    this.cullFrame++
+    if (!this.cullPipeline) return
+    const pass = encoder.beginComputePass({ label: "cull" })
+    pass.setPipeline(this.cullPipeline)
+    pass.setBindGroup(0, this.cullBindGroup)
+    pass.dispatchWorkgroups(Math.ceil(this.cullDraws.length / 64))
+    pass.end()
+  }
+
+  /**
+   * The same test the compute runs, on the CPU, from the same uploaded numbers.
+   *
+   * Deliberately a second implementation rather than a shared one: two
+   * independent readings of the same data is what makes agreement evidence. It
+   * reads the mirrors written by writeCullModels/writeCullFrusta, so it answers
+   * for the frame that was last dispatched, and caches per frame because both
+   * the debug draw gate and the diagnostics want it.
+   */
+  private cullReferencePass(): Uint8Array {
+    if (this.cullReferenceFrame === this.cullFrame) return this.cullReference
+    this.cullReferenceFrame = this.cullFrame
+    const out = this.cullReference
+    const planes = this.cullFrustaF32
+    for (let i = 0; i < this.cullDraws.length; i++) {
+      const f = i * 8
+      const mi = this.cullMetaU32[f + 3]
+      const o = mi * Engine.CULL_MODEL_FLOATS
+      const mf = this.cullModelFlags[o + 20]
+      let bits = 0
+      if ((mf & Engine.CULL_MODEL_VISIBLE) !== 0) {
+        let inCamera: boolean
+        let inLight: boolean
+        if ((mf & Engine.CULL_MODEL_RIGID) !== 0) {
+          const cx = (this.cullMetaF32[f] + this.cullMetaF32[f + 4]) * 0.5
+          const cy = (this.cullMetaF32[f + 1] + this.cullMetaF32[f + 5]) * 0.5
+          const cz = (this.cullMetaF32[f + 2] + this.cullMetaF32[f + 6]) * 0.5
+          const ex = (this.cullMetaF32[f + 4] - this.cullMetaF32[f]) * 0.5
+          const ey = (this.cullMetaF32[f + 5] - this.cullMetaF32[f + 1]) * 0.5
+          const ez = (this.cullMetaF32[f + 6] - this.cullMetaF32[f + 2]) * 0.5
+          const m = this.cullModelData
+          const wx = m[o] * cx + m[o + 4] * cy + m[o + 8] * cz + m[o + 12]
+          const wy = m[o + 1] * cx + m[o + 5] * cy + m[o + 9] * cz + m[o + 13]
+          const wz = m[o + 2] * cx + m[o + 6] * cy + m[o + 10] * cz + m[o + 14]
+          const gx = Math.abs(m[o]) * ex + Math.abs(m[o + 4]) * ey + Math.abs(m[o + 8]) * ez
+          const gy = Math.abs(m[o + 1]) * ex + Math.abs(m[o + 5]) * ey + Math.abs(m[o + 9]) * ez
+          const gz = Math.abs(m[o + 2]) * ex + Math.abs(m[o + 6]) * ey + Math.abs(m[o + 10]) * ez
+          inCamera = aabbInsideFrustum(planes, 0, wx, wy, wz, gx, gy, gz)
+          inLight = aabbInsideFrustum(planes, 24, wx, wy, wz, gx, gy, gz)
+        } else {
+          const m = this.cullModelData
+          const sx = m[o + 16]
+          const sy = m[o + 17]
+          const sz = m[o + 18]
+          const sr = m[o + 19]
+          inCamera = sphereInsideFrustum(planes, 0, sx, sy, sz, sr)
+          inLight = sphereInsideFrustum(planes, 24, sx, sy, sz, sr)
+        }
+        if (inCamera) bits |= 1
+        if (inLight && (this.cullMetaU32[f + 7] & Engine.CULL_DRAW_CASTS_SHADOW) !== 0) bits |= 2
+      }
+      out[i] = bits
+    }
+    return out
+  }
+
+  /** The debug gate on the direct draws. Off (the default) it is one boolean
+   *  read per draw and the scene renders exactly as it did before this pass
+   *  existed. */
+  private cullPasses(draw: DrawCall, shadowPass: boolean): boolean {
+    if (!this.cullApply) return true
+    if (draw.cullIndex < 0 || draw.cullIndex >= this.cullReference.length) return true
+    return (this.cullReferencePass()[draw.cullIndex] & (shadowPass ? 2 : 1)) !== 0
+  }
+
+  /**
+   * Skip draws the cull rejected, using the CPU mirror of the test.
+   *
+   * The CPU mirror rather than the GPU result on purpose: reading the compute's
+   * output back would land one or two frames late and every camera move would
+   * pop, which looks exactly like a culling bug and would waste the check. This
+   * way anything that vanishes wrongly is a wrong BOUND, which is the thing
+   * being validated. Development aid — it costs a per-frame pass over the draw
+   * list, and the real path is the indirect draws.
+   */
+  setCullApply(on: boolean): void {
+    this.cullApply = on
+  }
+
+  /**
+   * Read the GPU's culling decisions back and diff them against the CPU
+   * reference over the same frame's uploaded data.
+   *
+   * A clean report means the compute, its buffer layouts and the plane
+   * extraction all agree with a second implementation. It does NOT prove the
+   * bounds contain the geometry — that is what setCullApply(true) and looking at
+   * the scene is for.
+   */
+  async getCullDiagnostics(): Promise<CullDiagnostics> {
+    const drawCount = this.cullDraws.length
+    const report: CullDiagnostics = {
+      drawCount,
+      modelCount: this.cullModels.length,
+      cameraVisibleGpu: 0,
+      shadowVisibleGpu: 0,
+      cameraVisibleCpu: 0,
+      shadowVisibleCpu: 0,
+      rigidModels: 0,
+      skinnedModels: 0,
+      mismatches: [],
+      models: [],
+      camera: {
+        eye: [this.camera.getEyePosition().x, this.camera.getEyePosition().y, this.camera.getEyePosition().z],
+        target: [this.camera.target.x, this.camera.target.y, this.camera.target.z],
+      },
+    }
+    for (const inst of this.cullModels) {
+      if (inst.rigid) report.rigidModels++
+      else report.skinnedModels++
+      const o = inst.cullModelIndex * Engine.CULL_MODEL_FLOATS
+      report.models.push({
+        name: inst.name,
+        rigid: inst.rigid,
+        visible: inst.model.visible,
+        draws: inst.drawCalls.length,
+        cameraVisible: 0,
+        shadowVisible: 0,
+        casters: inst.shadowDrawCalls.length,
+        sphere: inst.rigid
+          ? null
+          : [
+              this.cullModelData[o + 16],
+              this.cullModelData[o + 17],
+              this.cullModelData[o + 18],
+              this.cullModelData[o + 19],
+            ],
+      })
+    }
+    if (drawCount === 0 || !this.cullCameraArgs || !this.cullShadowArgs) return report
+
+    const reference = this.cullReferencePass()
+    for (let i = 0; i < drawCount; i++) {
+      if ((reference[i] & 1) !== 0) {
+        report.cameraVisibleCpu++
+        report.models[this.cullDraws[i].inst.cullModelIndex].cameraVisible++
+      }
+      if ((reference[i] & 2) !== 0) {
+        report.shadowVisibleCpu++
+        report.models[this.cullDraws[i].inst.cullModelIndex].shadowVisible++
+      }
+    }
+
+    // Before touching the staging buffers, not after: a second call arriving
+    // mid-readback would otherwise destroy and replace the very buffers the
+    // first one is mapping. mapAsync on an already-mapped buffer throws, and
+    // this is a console API somebody will double-call — so the second caller
+    // gets the CPU half and no exception.
+    if (this.cullReadbackInFlight) return report
+    this.cullReadbackInFlight = true
+    try {
+      const bytes = drawCount * Engine.CULL_ARG_WORDS * 4
+      if (!this.cullReadback || this.cullReadback.bytes !== bytes) {
+        this.cullReadback?.camera.destroy()
+        this.cullReadback?.shadow.destroy()
+        const mk = (label: string) =>
+          this.device.createBuffer({ label, size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+        this.cullReadback = { camera: mk("cull readback (camera)"), shadow: mk("cull readback (shadow)"), bytes }
+      }
+      await this.readCullArgs(
+        this.cullReadback,
+        [this.cullCameraArgs, this.cullShadowArgs],
+        drawCount,
+        reference,
+        report,
+      )
+    } finally {
+      this.cullReadbackInFlight = false
+    }
+    return report
+  }
+
+  /** The GPU half of getCullDiagnostics: copy both argument buffers back and
+   *  diff them against the reference. */
+  private async readCullArgs(
+    rb: { camera: GPUBuffer; shadow: GPUBuffer; bytes: number },
+    src: [GPUBuffer, GPUBuffer],
+    drawCount: number,
+    reference: Uint8Array,
+    report: CullDiagnostics,
+  ): Promise<void> {
+    const bytes = rb.bytes
+    const encoder = this.device.createCommandEncoder({ label: "cull readback" })
+    encoder.copyBufferToBuffer(src[0], 0, rb.camera, 0, bytes)
+    encoder.copyBufferToBuffer(src[1], 0, rb.shadow, 0, bytes)
+    this.device.queue.submit([encoder.finish()])
+    await Promise.all([rb.camera.mapAsync(GPUMapMode.READ), rb.shadow.mapAsync(GPUMapMode.READ)])
+    const cameraArgs = new Uint32Array(rb.camera.getMappedRange().slice(0))
+    const shadowArgs = new Uint32Array(rb.shadow.getMappedRange().slice(0))
+    rb.camera.unmap()
+    rb.shadow.unmap()
+
+    for (let i = 0; i < drawCount; i++) {
+      const gpuCamera = cameraArgs[i * Engine.CULL_ARG_WORDS + 1] !== 0
+      const gpuShadow = shadowArgs[i * Engine.CULL_ARG_WORDS + 1] !== 0
+      if (gpuCamera) report.cameraVisibleGpu++
+      if (gpuShadow) report.shadowVisibleGpu++
+      const cpuCamera = (reference[i] & 1) !== 0
+      const cpuShadow = (reference[i] & 2) !== 0
+      if (gpuCamera === cpuCamera && gpuShadow === cpuShadow) continue
+      const { inst, draw } = this.cullDraws[i]
+      if (gpuCamera !== cpuCamera)
+        report.mismatches.push({
+          model: inst.name,
+          material: draw.materialName,
+          pass: "camera",
+          gpu: gpuCamera,
+          cpu: cpuCamera,
+        })
+      if (gpuShadow !== cpuShadow)
+        report.mismatches.push({
+          model: inst.name,
+          material: draw.materialName,
+          pass: "shadow",
+          gpu: gpuShadow,
+          cpu: cpuShadow,
+        })
+    }
+  }
+
   private async setupModelInstance(
     name: string,
     model: Model,
@@ -5064,6 +5970,15 @@ export class Engine {
 
     const gpuMorph = this.createGpuMorph(name, model, vertexBuffer, gpuBuffers)
 
+    // Cull bounds. The margin is the skinning reach plus the largest single
+    // vertex-morph displacement — a face morph is millimetres against a reach of
+    // whole units, so charging one morph rather than the sum of all of them keeps
+    // the bound honest without inflating it.
+    const bindPositions = boneBindPositions(skeleton.inverseBindMatrices, boneCount)
+    const skinMargin =
+      computeSkinMargin(vertices, skinning.joints, skinning.weights, bindPositions, boneCount) +
+      vertexMorphReach(model)
+
     const inst: ModelInstance = {
       name,
       model,
@@ -5095,9 +6010,16 @@ export class Engine {
       styleGroups: new Map(),
       materialToGroup: new Map(),
       styleGroupGen: new Map(),
+      cullModelIndex: 0,
+      // Seeded false: the first skin-matrix upload decides it, and until then the
+      // sphere path is the safe answer (it never culls something it should not).
+      rigid: false,
+      rigidXform: new Float32Array(16),
+      skinMargin,
     }
     await this.setupMaterialsForInstance(inst)
     this.modelInstances.set(name, inst)
+    this.cullListDirty = true
   }
 
   // Build the per-model GPU vertex-morph state. Returns null (and leaves the model on the
@@ -5392,6 +6314,8 @@ export class Engine {
       }
     }
     const morphTargets: MaterialMorphTarget[] = []
+    // Cull slack charged to every material box below.
+    const morphReach = vertexMorphReach(model)
 
     let currentIndexOffset = 0
     let materialId = 0
@@ -5515,6 +6439,19 @@ export class Engine {
         outline = { bindGroup: outlineBindGroup }
       }
 
+      // Model-space AABB for the cull compute, grown by the three things that can
+      // put geometry outside the vertices it was measured from: a vertex morph,
+      // the inverted-hull outline sharing this index range, and the tolerance the
+      // rigid test allows on the skin matrices. See CULL_BOUNDS_SLACK.
+      const bounds = materialBounds(meshVertices, meshIndices, currentIndexOffset, indexCount)
+      const grow = morphReach + CULL_BOUNDS_SLACK
+      bounds[0] -= grow
+      bounds[1] -= grow
+      bounds[2] -= grow
+      bounds[3] += grow
+      bounds[4] += grow
+      bounds[5] += grow
+
       const type: DrawCallType = isTransparent ? "transparent" : "opaque"
       inst.drawCalls.push({
         type,
@@ -5526,6 +6463,8 @@ export class Engine {
         baseBindGroupEntries,
         castsShadow,
         outline,
+        bounds,
+        cullIndex: -1,
       })
 
       if (this.onRaycast) {
@@ -6555,6 +7494,10 @@ export class Engine {
     // them. WebGPU inserts the storage→vertex barrier between this pass and the render passes.
     if (hasModels) this.dispatchMorphCompute(encoder)
 
+    // Frustum cull into indirect arguments. After the camera and shadow matrices
+    // are settled, before the passes that will eventually draw from them.
+    if (hasModels) this.dispatchCull(encoder)
+
     // Runs one more time after the last model goes: this pass owns the shadow map's
     // only `depthLoadOp: "clear"`, so skipping it outright leaves the texture holding
     // the final frame's depth — and the ground, which draws on `hasGround` alone,
@@ -6697,6 +7640,7 @@ export class Engine {
     sp.setIndexBuffer(inst.indexBuffer, "uint32")
     for (const draw of inst.shadowDrawCalls) {
       if (!this.shouldRenderDrawCall(inst, draw)) continue
+      if (!this.cullPasses(draw, true)) continue
       sp.setBindGroup(1, draw.bindGroup)
       sp.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
     }
@@ -7028,6 +7972,9 @@ export class Engine {
     inst.shadowDrawCalls = inst.drawCalls.filter(
       (d) => (d.type === "opaque" || d.type === "transparent") && d.castsShadow === true,
     )
+    // The sort reorders drawCalls, and a draw's position in that array is its
+    // slot in every cull buffer.
+    this.cullListDirty = true
   }
 
   /**
@@ -7117,6 +8064,7 @@ export class Engine {
     let bound = false
     for (const draw of inst.drawCalls) {
       if (draw.type !== type || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (!this.cullPasses(draw, false)) continue
       if (!bound) {
         pass.setBindGroup(0, this.perFrameBindGroup)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
@@ -7208,6 +8156,7 @@ export class Engine {
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
       if (draw.type !== "opaque" || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (!this.cullPasses(draw, false)) continue
       const overEyes = this.overEyesPipelineFor(inst, draw)
       if (!overEyes) continue
       if (!bound) {
@@ -7525,6 +8474,12 @@ export class Engine {
         skinMatrices.byteLength,
       )
       inst.skinMatricesDirty = false
+      // Re-decide how this model is bounded, here and only here: the skin
+      // matrices are the one thing that can change the answer, and an idle stage
+      // never reaches this line twice.
+      const boneCount = Math.floor(skinMatrices.length / 16)
+      inst.rigid = boneCount > 0 && skinMatricesAgree(skinMatrices, boneCount)
+      if (inst.rigid) inst.rigidXform.set(skinMatrices.subarray(0, 16))
     })
   }
 

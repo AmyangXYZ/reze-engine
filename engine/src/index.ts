@@ -19,6 +19,7 @@ export {
   type GizmoDragKind,
   type EffectParamValue,
   type EffectResult,
+  type CullDiagnostics,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export {
