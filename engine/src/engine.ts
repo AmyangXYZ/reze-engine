@@ -595,6 +595,12 @@ export interface CullDiagnostics {
   }[]
   /** Where the camera was, so the numbers above can be read against it. */
   camera: { eye: [number, number, number]; target: [number, number, number] }
+  /** Times the draw list has been rebuilt since the engine started. It should
+   *  climb only when scene STRUCTURE changes — a model loaded, a style group
+   *  applied — and then stop. A number that keeps rising while nothing but the
+   *  animation is moving means something is dirtying the list every frame, which
+   *  is the failure mode that makes render bundles cost more than they save. */
+  rebuilds: number
 }
 
 interface PickDrawCall {
@@ -1300,6 +1306,16 @@ export class Engine {
   private cullListDirty = true
   private cullMetaBuffer: GPUBuffer | null = null
   private cullModelBuffer: GPUBuffer | null = null
+  private cullHiddenBuffer: GPUBuffer | null = null
+  private cullHidden = new Uint32Array(0)
+  private cullArgs = new Uint32Array(0)
+  /** Draws and models the current buffers can hold. A rebuild that fits inside
+   *  these rewrites contents and allocates nothing. */
+  private cullCapacity = 0
+  private cullModelCapacity = 0
+  /** How many times the draw list has been rebuilt — a bundle-era regression
+   *  guard, reported by getCullDiagnostics. Steady-state it must not climb. */
+  private cullRebuilds = 0
   private cullCameraArgs: GPUBuffer | null = null
   private cullShadowArgs: GPUBuffer | null = null
   private cullFrustaBuffer: GPUBuffer | null = null
@@ -3906,6 +3922,7 @@ export class Engine {
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
       ],
     })
     // Scoped, unlike the morph pipeline beside it, because this one is OPTIONAL:
@@ -5413,13 +5430,41 @@ export class Engine {
 
     const drawCount = this.cullDraws.length
     const modelCount = this.cullModels.length
-    this.releaseCullBuffers()
-    if (drawCount === 0 || modelCount === 0) return
+    if (drawCount === 0 || modelCount === 0) {
+      this.releaseCullBuffers()
+      return
+    }
+    this.cullRebuilds++
 
-    this.cullMetaBytes = new ArrayBuffer(drawCount * Engine.CULL_META_BYTES)
-    this.cullMetaF32 = new Float32Array(this.cullMetaBytes)
-    this.cullMetaU32 = new Uint32Array(this.cullMetaBytes)
-    const args = new Uint32Array(drawCount * Engine.CULL_ARG_WORDS)
+    // Reuse the buffers whenever they are big enough, and rewrite their contents
+    // instead. This path is the COMMON one, not an optimisation for a rare case:
+    // every style-group compile re-sorts a model's draws, which reorders the
+    // list without changing its length, and those compiles land one after
+    // another over the first frames after a scene loads. Reallocating five GPU
+    // buffers and a bind group on each of them put the churn exactly where a
+    // scene is least able to afford it — the frames the viewer is watching
+    // appear.
+    const fits = this.cullCapacity >= drawCount && this.cullModelCapacity >= modelCount && this.cullBindGroup !== null
+    if (!fits) {
+      this.releaseCullBuffers()
+      this.cullCapacity = drawCount
+      this.cullModelCapacity = modelCount
+    }
+
+    const cap = this.cullCapacity
+    if (!fits) {
+      this.cullMetaBytes = new ArrayBuffer(cap * Engine.CULL_META_BYTES)
+      this.cullMetaF32 = new Float32Array(this.cullMetaBytes)
+      this.cullMetaU32 = new Uint32Array(this.cullMetaBytes)
+      this.cullArgs = new Uint32Array(cap * Engine.CULL_ARG_WORDS)
+      this.cullHidden = new Uint32Array(cap)
+      this.cullReference = new Uint8Array(cap)
+      const modelBytes = new ArrayBuffer(this.cullModelCapacity * Engine.CULL_MODEL_FLOATS * 4)
+      this.cullModelData = new Float32Array(modelBytes)
+      this.cullModelFlags = new Uint32Array(modelBytes)
+    }
+    this.cullReferenceFrame = -1
+    const args = this.cullArgs
     for (let i = 0; i < drawCount; i++) {
       const { inst, draw } = this.cullDraws[i]
       const f = i * 8
@@ -5449,69 +5494,101 @@ export class Engine {
       args[a + 4] = 0
     }
 
-    const modelBytes = modelCount * Engine.CULL_MODEL_FLOATS * 4
-    const modelBuffer = new ArrayBuffer(modelBytes)
-    this.cullModelData = new Float32Array(modelBuffer)
-    this.cullModelFlags = new Uint32Array(modelBuffer)
-    this.cullReference = new Uint8Array(drawCount)
-    this.cullReferenceFrame = -1
-
-    this.cullMetaBuffer = this.device.createBuffer({
-      label: "cull draw metadata",
-      size: this.cullMetaBytes.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    })
-    this.device.queue.writeBuffer(this.cullMetaBuffer, 0, this.cullMetaBytes)
-
-    this.cullModelBuffer = this.device.createBuffer({
-      label: "cull model records",
-      size: modelBytes,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    })
-
-    const argUsage =
-      GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
-    this.cullCameraArgs = this.device.createBuffer({
-      label: "cull camera indirect args",
-      size: args.byteLength,
-      usage: argUsage,
-    })
-    this.cullShadowArgs = this.device.createBuffer({
-      label: "cull shadow indirect args",
-      size: args.byteLength,
-      usage: argUsage,
-    })
-    this.device.queue.writeBuffer(this.cullCameraArgs, 0, args)
-    this.device.queue.writeBuffer(this.cullShadowArgs, 0, args)
-
-    if (!this.cullFrustaBuffer) {
-      this.cullFrustaBuffer = this.device.createBuffer({
-        label: "cull frusta",
-        size: this.cullFrustaBytes.byteLength,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    if (!fits) {
+      const store = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      this.cullMetaBuffer = this.device.createBuffer({
+        label: "cull draw metadata",
+        size: this.cullMetaBytes.byteLength,
+        usage: store,
+      })
+      this.cullModelBuffer = this.device.createBuffer({
+        label: "cull model records",
+        size: this.cullModelData.byteLength,
+        usage: store,
+      })
+      this.cullHiddenBuffer = this.device.createBuffer({
+        label: "cull per-draw hidden",
+        size: Math.max(4, this.cullHidden.byteLength),
+        usage: store,
+      })
+      const argUsage =
+        GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+      this.cullCameraArgs = this.device.createBuffer({
+        label: "cull camera indirect args",
+        size: args.byteLength,
+        usage: argUsage,
+      })
+      this.cullShadowArgs = this.device.createBuffer({
+        label: "cull shadow indirect args",
+        size: args.byteLength,
+        usage: argUsage,
+      })
+      if (!this.cullFrustaBuffer) {
+        this.cullFrustaBuffer = this.device.createBuffer({
+          label: "cull frusta",
+          size: this.cullFrustaBytes.byteLength,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+      }
+      this.cullBindGroup = this.device.createBindGroup({
+        label: "cull bind group",
+        layout: this.cullBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.cullMetaBuffer } },
+          { binding: 1, resource: { buffer: this.cullModelBuffer } },
+          { binding: 2, resource: { buffer: this.cullFrustaBuffer } },
+          { binding: 3, resource: { buffer: this.cullCameraArgs } },
+          { binding: 4, resource: { buffer: this.cullShadowArgs } },
+          { binding: 5, resource: { buffer: this.cullHiddenBuffer } },
+        ],
       })
     }
 
-    this.cullBindGroup = this.device.createBindGroup({
-      label: "cull bind group",
-      layout: this.cullBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.cullMetaBuffer } },
-        { binding: 1, resource: { buffer: this.cullModelBuffer } },
-        { binding: 2, resource: { buffer: this.cullFrustaBuffer } },
-        { binding: 3, resource: { buffer: this.cullCameraArgs } },
-        { binding: 4, resource: { buffer: this.cullShadowArgs } },
-      ],
-    })
+    // Contents, every rebuild — the reuse above is about not reallocating, not
+    // about skipping the upload: a re-sort changes which draw sits in which slot
+    // without changing how many there are.
+    this.device.queue.writeBuffer(this.cullMetaBuffer!, 0, this.cullMetaBytes)
+    this.device.queue.writeBuffer(this.cullCameraArgs!, 0, args.buffer as ArrayBuffer)
+    this.device.queue.writeBuffer(this.cullShadowArgs!, 0, args.buffer as ArrayBuffer)
+    // Seeded so the first frame is not a frame of everything hidden.
+    this.writeCullHidden(true)
+  }
+
+  /**
+   * Per-draw hidden state, uploaded only when it actually changes.
+   *
+   * The two sets behind it are cheap to read but the buffer is not worth
+   * rewriting every frame: applyMaterialMorphs rebuilds morphHiddenMaterials on
+   * every frame of any character carrying a face VMD, and almost every one of
+   * those rebuilds produces the same answer. So compare, then upload.
+   */
+  private writeCullHidden(force = false): void {
+    if (!this.cullHiddenBuffer || this.cullDraws.length === 0) return
+    const out = this.cullHidden
+    let changed = force
+    for (let i = 0; i < this.cullDraws.length; i++) {
+      const { inst, draw } = this.cullDraws[i]
+      const v =
+        inst.hiddenMaterials.has(draw.materialName) || inst.morphHiddenMaterials.has(draw.materialName) ? 1 : 0
+      if (out[i] !== v) {
+        out[i] = v
+        changed = true
+      }
+    }
+    if (changed) this.device.queue.writeBuffer(this.cullHiddenBuffer, 0, out.buffer as ArrayBuffer)
   }
 
   private releaseCullBuffers(): void {
     this.cullMetaBuffer?.destroy()
     this.cullModelBuffer?.destroy()
+    this.cullHiddenBuffer?.destroy()
     this.cullCameraArgs?.destroy()
     this.cullShadowArgs?.destroy()
     this.cullMetaBuffer = null
     this.cullModelBuffer = null
+    this.cullHiddenBuffer = null
+    this.cullCapacity = 0
+    this.cullModelCapacity = 0
     this.cullCameraArgs = null
     this.cullShadowArgs = null
     this.cullBindGroup = null
@@ -5649,6 +5726,7 @@ export class Engine {
     // on, and a stale mirror would gate draws against last-known frusta.
     this.writeCullModels()
     this.writeCullFrusta()
+    this.writeCullHidden()
     this.cullFrame++
     if (!this.cullPipeline) return
     const pass = encoder.beginComputePass({ label: "cull" })
@@ -5678,6 +5756,10 @@ export class Engine {
       const o = mi * Engine.CULL_MODEL_FLOATS
       const mf = this.cullModelFlags[o + 20]
       let bits = 0
+      if (this.cullHidden[i] !== 0) {
+        out[i] = 0
+        continue
+      }
       if (!this.cullEnabled) {
         // Mirror the compute's own bypass, or every draw would read as a
         // disagreement the moment culling is switched off for an A/B.
@@ -5778,6 +5860,7 @@ export class Engine {
       skinnedModels: 0,
       mismatches: [],
       models: [],
+      rebuilds: this.cullRebuilds,
       camera: {
         eye: [this.camera.getEyePosition().x, this.camera.getEyePosition().y, this.camera.getEyePosition().z],
         target: [this.camera.target.x, this.camera.target.y, this.camera.target.z],
@@ -6655,6 +6738,14 @@ export class Engine {
     return buffer
   }
 
+  /** Whether a material is switched on — the user's own toggle, or a material
+   *  morph having driven its alpha to zero.
+   *
+   *  The material passes no longer consult this: their draws are indirect, and
+   *  the cull compute zeroes the instance count of anything hidden, which is
+   *  what lets a render bundle survive a face VMD rewriting the morph-hidden set
+   *  sixty times a second. It remains the answer for the passes that draw
+   *  directly, where there is no argument buffer to zero. */
   private shouldRenderDrawCall(inst: ModelInstance, drawCall: DrawCall): boolean {
     return !inst.hiddenMaterials.has(drawCall.materialName) && !inst.morphHiddenMaterials.has(drawCall.materialName)
   }
@@ -7665,7 +7756,6 @@ export class Engine {
     sp.setVertexBuffer(2, inst.weightsBuffer)
     sp.setIndexBuffer(inst.indexBuffer, "uint32")
     for (const draw of inst.shadowDrawCalls) {
-      if (!this.shouldRenderDrawCall(inst, draw)) continue
       sp.setBindGroup(1, draw.bindGroup)
       this.issueDraw(sp, draw, true)
     }
@@ -8088,7 +8178,7 @@ export class Engine {
     let currentPipeline: GPURenderPipeline | null = null
     let bound = false
     for (const draw of inst.drawCalls) {
-      if (draw.type !== type || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (draw.type !== type) continue
       if (!bound) {
         pass.setBindGroup(0, this.perFrameBindGroup)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
@@ -8157,7 +8247,7 @@ export class Engine {
   protected drawTransparentDepthPrepass(pass: GPURenderPassEncoder, inst: ModelInstance): void {
     let bound = false
     for (const draw of inst.drawCalls) {
-      if (draw.type !== "transparent" || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (draw.type !== "transparent") continue
       if (!bound) {
         pass.setPipeline(this.transparentDepthPrepassPipeline)
         pass.setBindGroup(0, this.perFrameBindGroup)
@@ -8179,7 +8269,7 @@ export class Engine {
     let bound = false
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
-      if (draw.type !== "opaque" || !this.shouldRenderDrawCall(inst, draw)) continue
+      if (draw.type !== "opaque") continue
       const overEyes = this.overEyesPipelineFor(inst, draw)
       if (!overEyes) continue
       if (!bound) {

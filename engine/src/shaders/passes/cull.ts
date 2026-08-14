@@ -51,6 +51,11 @@ struct Frusta {
 @group(0) @binding(2) var<uniform> frusta: Frusta;
 @group(0) @binding(3) var<storage, read_write> cameraArgs: array<u32>;
 @group(0) @binding(4) var<storage, read_write> shadowArgs: array<u32>;
+// 1 = the user hid this material, or a material morph drove its alpha to zero.
+// Here rather than in the encode loop because a render bundle bakes its draw
+// list: a face VMD rewrites the morph-hidden set every frame, so a bundle that
+// invalidated on it would re-record every frame and cost more than it saves.
+@group(0) @binding(5) var<storage, read> hidden: array<u32>;
 
 const DRAW_CASTS_SHADOW: u32 = 1u;
 const MODEL_VISIBLE: u32 = 1u;
@@ -108,10 +113,13 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Culling off (setCullEnabled) passes everything, so a scene can be A/B'd
   // against its own unculled self without rebuilding anything. The pass still
-  // runs, so the diagnostics keep reporting.
+  // runs, so the diagnostics keep reporting. It bypasses the FRUSTUM only —
+  // a hidden material is not culled, it is switched off, and answering "is this
+  // gone because of culling?" requires the two to stay separable.
   let off = frusta.counts.y == 0u;
+  let shown = hidden[i] == 0u;
   let castsShadow = (dm.flags & DRAW_CASTS_SHADOW) != 0u;
-  cameraArgs[i * 5u + 1u] = select(0u, 1u, inCamera || off);
-  shadowArgs[i * 5u + 1u] = select(0u, 1u, (inLight && castsShadow) || off);
+  cameraArgs[i * 5u + 1u] = select(0u, 1u, (inCamera || off) && shown);
+  shadowArgs[i * 5u + 1u] = select(0u, 1u, ((inLight && castsShadow) || off) && shown);
 }
 `
