@@ -5,7 +5,7 @@ import { decodePsd, isPsd } from "./psd-loader"
 import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
-import { buildAnchorTable, anchorAliasWgsl } from "./shaders/anchor-table"
+import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
 import { SCORE_HEADER, SCORE_KEYS, SCORE_NOTES, SCORE_STRIDE } from "./shaders/score-api"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
@@ -1453,6 +1453,18 @@ export class Engine {
   private castData!: Float32Array<ArrayBuffer>
   /** Last frame's anchor world positions, for velocity. Keyed model id → slot. */
   private anchorPrev = new Map<string, Float32Array>()
+  /**
+   * The SCENE's bones: which ones are recorded into the cast buffer, and which
+   * address each one holds. Built at install from every effect's requests, so
+   * the buffer is written once per bone however many effects read it.
+   *
+   * Everything that touches the cast buffer iterates THIS rather than any one
+   * effect's declarations — that is the whole change, and it is what makes N
+   * effects a loop instead of a rewrite. With one effect installed the table is
+   * exactly that effect's anchors in declaration order, which is why this lands
+   * with no visible difference.
+   */
+  private anchorTable: AnchorTable = EMPTY_ANCHOR_TABLE
   private castLastMs = 0
   /** Recent path per trailed anchor, keyed "model\0slot". Newest first, so the
    *  shader's index 0 is now — written by unshifting rather than by tracking a
@@ -2096,6 +2108,11 @@ export class Engine {
     // everybody. Past the cap the extras are dropped rather than silently
     // shifting every slot after them.
     const anchors = parseEffectAnchors(wgsl, MAX_EFFECT_ANCHORS)
+    // The scene's table. One effect today, so this is its own anchors and the
+    // alias is the identity; the list is what becomes plural in setEffects.
+    // Built ONCE here rather than recomputed inside each builder, which is what
+    // let three copies of it exist and drift.
+    const table = buildAnchorTable([anchors], MAX_EFFECT_ANCHORS)
 
     // ── Params: codegen a WGSL struct and mirror its uniform layout on the CPU.
     // Fields are emitted in declaration order; offsets follow WGSL's natural
@@ -2203,13 +2220,13 @@ export class Engine {
     // the previously installed effect running, exactly as a bad composite does.
     let particles: NonNullable<Engine["particles"]> | null = null
     if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, anchors)
+      const built = await this.buildParticles(wgsl, anchors, table.alias[0])
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       particles = built.state
     }
     let sim: NonNullable<Engine["sim"]> | null = null
     if (simEntryPoint(wgsl)) {
-      const built = await this.buildSim(wgsl, anchors)
+      const built = await this.buildSim(wgsl, anchors, table.alias[0])
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       sim = built.state
     }
@@ -2225,7 +2242,7 @@ export class Engine {
           mounts,
         }
       }
-      const built = await this.buildTrails(wgsl, anchors)
+      const built = await this.buildTrails(wgsl, anchors, table.alias[0])
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       trails = built.state
     }
@@ -2239,6 +2256,14 @@ export class Engine {
     this.trails = trails
     this.sim = sim
     this.fieldPipeline = fieldPipeline
+    // The scene's bones change with the effect, and a slot that meant one wrist
+    // a moment ago can mean another now. Every recorded path is therefore stale
+    // by ADDRESS, not by age: zero the counts so each ring refills from live
+    // samples (~2 s at TRAIL_HZ) rather than drawing the previous effect's
+    // history under the new one's label. anchorPrev goes with them, or the first
+    // velocity after a swap is a difference between two unrelated bones.
+    this.anchorTable = table
+    this.clearTrailHistory()
     // `// @fullres`: an effect that draws SUB-PIXEL detail — hairline curves,
     // scanlines — declares it and pays full price; everything soft stays at
     // half. The field shader reads its size from fieldU, so nothing else moves.
@@ -2283,6 +2308,10 @@ export class Engine {
   private async buildParticles(
     wgsl: string,
     anchors: { bone: string; trail: boolean }[],
+    /** This effect's local→scene slot map. Passed rather than read off the
+     *  engine: the builders run BEFORE the swap, so this.anchorTable still
+     *  describes the effect that is still on screen. */
+    alias: number[],
   ): Promise<{ ok: true; state: NonNullable<Engine["particles"]> } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
@@ -2297,7 +2326,7 @@ export class Engine {
       trailBase: CAST_TRAIL_BASE,
       slots: MAX_EFFECT_ANCHORS,
       trailCount: anchors.filter((x) => x.trail).length,
-      alias: buildAnchorTable([anchors], MAX_EFFECT_ANCHORS).alias[0],
+      alias,
     }
 
     const compile = async (code: string, label: string): Promise<GPUShaderModule | string[]> => {
@@ -2488,6 +2517,10 @@ export class Engine {
   private async buildTrails(
     wgsl: string,
     anchors: { bone: string; trail: boolean }[],
+    /** This effect's local→scene slot map. Passed rather than read off the
+     *  engine: the builders run BEFORE the swap, so this.anchorTable still
+     *  describes the effect that is still on screen. */
+    alias: number[],
   ): Promise<{ ok: true; state: NonNullable<Engine["trails"]> } | { ok: false; diagnostics: string[] }> {
     // `slots` here is how many RIBBONS to draw — one per trailed anchor — which
     // is a different number from the anchor ADDRESS SPACE the accessors index
@@ -2505,7 +2538,7 @@ export class Engine {
       base: MAX_EFFECT_SUBJECTS * 3,
       trailBase: CAST_TRAIL_BASE,
       slots: MAX_EFFECT_ANCHORS,
-      alias: buildAnchorTable([anchors], MAX_EFFECT_ANCHORS).alias[0],
+      alias,
       reversedZ: this.reversedZ,
     })
     const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
@@ -2680,6 +2713,10 @@ export class Engine {
   private async buildSim(
     wgsl: string,
     anchors: { bone: string; trail: boolean }[],
+    /** This effect's local→scene slot map. Passed rather than read off the
+     *  engine: the builders run BEFORE the swap, so this.anchorTable still
+     *  describes the effect that is still on screen. */
+    alias: number[],
   ): Promise<{ ok: true; state: NonNullable<Engine["sim"]> } | { ok: false; diagnostics: string[] }> {
     const size = parseSimSize(wgsl, SIM_MAX) || 256
     const cast = {
@@ -2689,7 +2726,7 @@ export class Engine {
       trailBase: CAST_TRAIL_BASE,
       slots: MAX_EFFECT_ANCHORS,
       trailCount: anchors.filter((x) => x.trail).length,
-      alias: buildAnchorTable([anchors], MAX_EFFECT_ANCHORS).alias[0],
+      alias,
     }
     const code = buildSimShader(wgsl, size, cast)
     const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
@@ -8812,12 +8849,13 @@ export class Engine {
       if (this.effect) {
         // Up to the last trailed slot, not the whole buffer: an effect with no
         // trails never uploads the 32KB it would otherwise pay for every frame.
+        const scene = this.anchorTable.entries
         let lastTrail = -1
-        for (let i = 0; i < this.effect.anchors.length; i++) if (this.effect.anchors[i].trail) lastTrail = i
+        for (let i = 0; i < scene.length; i++) if (scene[i].trail) lastTrail = i
         const used =
           lastTrail >= 0
             ? CAST_TRAIL_BASE + (lastTrail * MAX_EFFECT_SUBJECTS + MAX_EFFECT_SUBJECTS) * TRAIL_SAMPLES
-            : CAST_SUBJECT_VEC4S + this.effect.anchors.length * MAX_EFFECT_SUBJECTS * 3
+            : CAST_SUBJECT_VEC4S + scene.length * MAX_EFFECT_SUBJECTS * 3
         this.device.queue.writeBuffer(this.castBuffer, 0, this.castData, 0, used * 4)
         this.castLastMs = performance.now()
       }
@@ -8881,7 +8919,10 @@ export class Engine {
 
     // Declared bones. Velocity is per model AND per slot, so two characters
     // wearing the same effect never inherit each other's motion.
-    const anchors = effect.anchors
+    // The SCENE's bones, deduplicated — not this effect's declarations. Two
+    // effects naming the same wrist resolve and upload it once, and the slot
+    // each reads is the one the table dealt them.
+    const anchors = this.anchorTable.entries
     if (anchors.length === 0) return
     let prev = this.anchorPrev.get(inst.name)
     const dtMs = Math.max(1, performance.now() - this.castLastMs)
@@ -8938,6 +8979,24 @@ export class Engine {
    * export record the same path at the same spacing. A frame that covers several
    * intervals emits several samples rather than one, or a fast hand would tear.
    */
+  /**
+   * Forget every recorded path, because the slots have been re-dealt.
+   *
+   * Called on every effect swap. The rings are keyed by (model, slot) and a slot
+   * is an ADDRESS, so re-allocating the table can leave a left wrist's recorded
+   * history sitting at the address a right wrist now occupies — a ribbon drawn
+   * confidently along a path that belongs to another bone. Refilling from live
+   * samples costs about two seconds of trail and cannot be wrong.
+   */
+  private clearTrailHistory(): void {
+    this.anchorTrail.clear()
+    this.anchorPrev.clear()
+    // The GPU copy too: rzTrailCount reads the recorded count out of the cast
+    // buffer, and an effect installed mid-frame would otherwise read the old
+    // effect's counts before the next upload replaces them.
+    this.castData.fill(0, CAST_SUBJECT_VEC4S * 4)
+  }
+
   private writeTrail(model: string, slot: number, n: number, pos: Vec3, cd: Float32Array, anchorBase: number): void {
     const key = `${model}\u0000${slot}`
     let ring = this.anchorTrail.get(key)

@@ -25,6 +25,9 @@ export interface AnchorRequest {
   trail: boolean
 }
 
+/** The empty table — a scene with no effect installed asks for no bones. */
+export const EMPTY_ANCHOR_TABLE: AnchorTable = { entries: [], alias: [], dropped: [] }
+
 export interface AnchorTable {
   /** The scene's bones, deduplicated, in allocation order. Storage addresses. */
   entries: AnchorRequest[]
