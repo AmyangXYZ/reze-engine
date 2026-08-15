@@ -42,7 +42,7 @@ export type CastLayout = {
  * particleInit reading the same recorded history the trail draws from. One
  * effect file, two mounts, one buffer.
  */
-/** Shared with the sim pass, which reads the same buffer for the same reason:
+/** Shared with the grid pass, which reads the same buffer for the same reason:
  *  a kernel that displaces fog has to know where the dancer's feet are. */
 export function castApi(cast: CastLayout): string {
   return `

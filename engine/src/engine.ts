@@ -57,11 +57,11 @@ import {
 } from "./shaders/passes/particles"
 import {
   SIM_FORMAT,
-  SIM_MAX,
+  GRID_MAX,
   buildSimShader,
-  parseSimSize,
-  simEntryPoint,
-} from "./shaders/passes/sim"
+  parseGridSize,
+  gridEntryPoint,
+} from "./shaders/passes/grid"
 import { buildTrailShader, trailEntryPoints, TRAIL_SUBDIVISIONS } from "./shaders/passes/trails"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
@@ -1090,7 +1090,7 @@ interface EffectParticles {
  * effect resource that does not scale: 9 MB at 768 squared, doubled for the
  * ping-pong, which is why setEffects gives the scene a budget.
  */
-interface EffectSim {
+interface EffectGrid {
   size: number
   textures: [GPUTexture, GPUTexture]
   /** Sampled views, for reading. */
@@ -1159,9 +1159,9 @@ const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
  * per effect is the change; the plural comes free once nothing reaches for
  * `this.effect` any more.
  *
- * The `epochScene` is per effect on purpose. The sim clock is measured from it,
+ * The `epochScene` is per effect on purpose. The grid clock is measured from it,
  * and an effect installed while another is already running would otherwise
- * begin mid-animation and never see `rzSimFrame() == 0` — its only chance to
+ * begin mid-animation and never see `rzGridFrame() == 0` — its only chance to
  * seed a grid.
  */
 interface EffectInstance {
@@ -1187,7 +1187,7 @@ interface EffectInstance {
    *  declaration, not the scene's — see Engine.FIELD_SCALES. */
   fieldLayer: number
   particles: EffectParticles | null
-  sim: EffectSim | null
+  grid: EffectGrid | null
   trails: EffectTrails | null
 }
 
@@ -2016,7 +2016,7 @@ export class Engine {
   /**
    * ONE PER GRID PARITY.
    *
-   * The sim alternates which texture holds the current grid, so the field pass
+   * The grid alternates which texture holds the current grid, so the field pass
    * needs a bind group for each — built once here rather than rebuilt every
    * frame, which is what a single group would force and is pure waste for a
    * change that only ever toggles between two known states.
@@ -2046,8 +2046,8 @@ export class Engine {
     // Per effect: the params buffer and the grid are both its own, so two
     // effects cannot share a bind group even when everything else matches.
     for (const e of this.effects) {
-      e.fieldBindGroups = e.sim
-        ? [build(e, e.sim.read[0]), build(e, e.sim.read[1])]
+      e.fieldBindGroups = e.grid
+        ? [build(e, e.grid.read[0]), build(e, e.grid.read[1])]
         : [build(e, this.simFallbackView), build(e, this.simFallbackView)]
     }
   }
@@ -2272,11 +2272,11 @@ export class Engine {
     // module (buildFieldShader), so a bad effect can no longer produce errors at
     // line numbers in a shader the author never wrote — and installing one no
     // longer recompiles the composite's tone-mapping half at all.
-    const simSize = simEntryPoint(wgsl) ? parseSimSize(wgsl, SIM_MAX) || 256 : 0
+    const gridSize = gridEntryPoint(wgsl) ? parseGridSize(wgsl, GRID_MAX) || 256 : 0
     // `alias` goes in: a field effect reads bones through _rzSlot exactly as a
     // particle one does, and it was the only module never handed the mapping.
     const fieldEffect =
-      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, simSize, alias } : null
+      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, gridSize, alias } : null
     const source = buildCompositeShader(fieldEffect)
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
@@ -2362,9 +2362,9 @@ export class Engine {
     const abandon = (diagnostics: string[]): EffectResult => {
       particles?.buffer.destroy()
       particles?.uniform.destroy()
-      sim?.textures[0].destroy()
-      sim?.textures[1].destroy()
-      sim?.uniform.destroy()
+      grid?.textures[0].destroy()
+      grid?.textures[1].destroy()
+      grid?.uniform.destroy()
       trails?.uniform.destroy()
       return { ok: false, diagnostics, mounts }
     }
@@ -2374,11 +2374,11 @@ export class Engine {
       if (!built.ok) return abandon(built.diagnostics)
       particles = built.state
     }
-    let sim: EffectSim | null = null
-    if (simEntryPoint(wgsl)) {
+    let grid: EffectGrid | null = null
+    if (gridEntryPoint(wgsl)) {
       const built = await this.buildSim(wgsl, anchors, alias)
       if (!built.ok) return abandon(built.diagnostics)
-      sim = built.state
+      grid = built.state
     }
     let trails: EffectTrails | null = null
     if (wantsTrails) {
@@ -2415,7 +2415,7 @@ export class Engine {
         hasForeground,
         anchors,
         // The effect's own clock starts now. Per effect so that one installed
-        // later still gets a frame where rzSimFrame() is 0 and can seed.
+        // later still gets a frame where rzGridFrame() is 0 and can seed.
         epochScene: this.sceneClock,
         // Its OWN resolution, no longer the scene's: an effect that never asked
         // for full res is not promoted because a neighbour did.
@@ -2425,7 +2425,7 @@ export class Engine {
         // exist first — it binds this effect's own params buffer and grid.
         fieldBindGroups: null,
         particles,
-        sim,
+        grid,
         trails,
     }
     return { ok: true, instance }
@@ -2466,7 +2466,7 @@ export class Engine {
       for (const e of this.effects) e.paramsBuffer?.destroy()
       this.releaseParticles()
       this.releaseTrails()
-      this.releaseSim()
+      this.releaseGrid()
       this.effects = []
       this.anchorTable = EMPTY_ANCHOR_TABLE
       this.clearTrailHistory()
@@ -2517,7 +2517,7 @@ export class Engine {
     for (const e of this.effects) e.paramsBuffer?.destroy()
     this.releaseParticles()
     this.releaseTrails()
-    this.releaseSim()
+    this.releaseGrid()
     this.effects = instances
     this.anchorTable = table
     // Slots have been re-dealt; a recorded path is stale by ADDRESS, not by age.
@@ -2532,7 +2532,7 @@ export class Engine {
       label: "composite shader (effects)",
       code: buildCompositeShader(
         hasBackground || hasForeground
-          ? { wgsl: "", paramsDecl: "", hasBackground, hasForeground, simSize: 0 }
+          ? { wgsl: "", paramsDecl: "", hasBackground, hasForeground, gridSize: 0 }
           : null,
       ),
     })
@@ -2963,7 +2963,7 @@ export class Engine {
         pass.setPipeline(e.fieldPipeline!)
         // The grid this effect just wrote — after its parity flip, the one at
         // `parity`. Per effect, so two grids never read each other's frame.
-        pass.setBindGroup(0, e.fieldBindGroups![e.sim?.parity ?? 0])
+        pass.setBindGroup(0, e.fieldBindGroups![e.grid?.parity ?? 0])
         pass.draw(3)
       }
       pass.end()
@@ -3002,7 +3002,7 @@ export class Engine {
    * Compile and allocate the effect's persistent grid.
    *
    * The textures are created ZEROED, which is the contract a kernel is written
-   * against: rzSimFrame() is 0 on the first step and every value it reads is
+   * against: rzGridFrame() is 0 on the first step and every value it reads is
    * zero, so seeding is just "if frame is 0, return the initial state".
    */
   private async buildSim(
@@ -3012,8 +3012,8 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
-  ): Promise<{ ok: true; state: EffectSim } | { ok: false; diagnostics: string[] }> {
-    const size = parseSimSize(wgsl, SIM_MAX) || 256
+  ): Promise<{ ok: true; state: EffectGrid } | { ok: false; diagnostics: string[] }> {
+    const size = parseGridSize(wgsl, GRID_MAX) || 256
     const cast = {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
@@ -3026,7 +3026,7 @@ export class Engine {
     const code = buildSimShader(wgsl, size, cast)
     const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
     this.device.pushErrorScope("validation")
-    const module = this.device.createShaderModule({ label: "sim step", code })
+    const module = this.device.createShaderModule({ label: "grid step", code })
     const info = await module.getCompilationInfo()
     const scopeErr = await this.device.popErrorScope()
     const diagnostics = info.messages
@@ -3036,7 +3036,7 @@ export class Engine {
     if (diagnostics.length) return { ok: false, diagnostics }
 
     const layout = this.device.createBindGroupLayout({
-      label: "sim bind layout",
+      label: "grid bind layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "float", viewDimension: "2d" } },
@@ -3055,7 +3055,7 @@ export class Engine {
 
     const make = (n: number) =>
       this.device.createTexture({
-        label: `sim grid ${n}`,
+        label: `grid grid ${n}`,
         size: [size, size],
         format: SIM_FORMAT,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
@@ -3063,7 +3063,7 @@ export class Engine {
     const textures: [GPUTexture, GPUTexture] = [make(0), make(1)]
     const read: [GPUTextureView, GPUTextureView] = [textures[0].createView(), textures[1].createView()]
     const uniform = this.device.createBuffer({
-      label: "sim uniforms",
+      label: "grid uniforms",
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
@@ -3071,7 +3071,7 @@ export class Engine {
     this.device.pushErrorScope("validation")
     try {
       const pipeline = await this.device.createComputePipelineAsync({
-        label: "sim step pipeline",
+        label: "grid step pipeline",
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         compute: { module, entryPoint: "main" },
       })
@@ -3121,12 +3121,12 @@ export class Engine {
     }
   }
 
-  private releaseSim(): void {
+  private releaseGrid(): void {
     for (const e of this.effects) {
-      e.sim?.textures[0].destroy()
-      e.sim?.textures[1].destroy()
-      e.sim?.uniform.destroy()
-      e.sim = null
+      e.grid?.textures[0].destroy()
+      e.grid?.textures[1].destroy()
+      e.grid?.uniform.destroy()
+      e.grid = null
     }
   }
 
@@ -3138,24 +3138,24 @@ export class Engine {
    */
   private stepSim(encoder: GPUCommandEncoder, deltaTime: number): void {
     for (const e of this.effects) {
-    const sim = e.sim
-    if (!sim) continue
-    sim.data[0] = this.sceneClock - e.epochScene
+    const grid = e.grid
+    if (!grid) continue
+    grid.data[0] = this.sceneClock - e.epochScene
     // Clamped like the particle step: a backgrounded tab returns with a delta of
     // whole seconds, and one unclamped step of an advection kernel throws the
     // whole grid off its own edge.
-    sim.data[1] = Math.min(0.1, Math.max(0, deltaTime))
-    sim.data[2] = sim.size
-    sim.data[3] = sim.frame++
-    this.device.queue.writeBuffer(sim.uniform, 0, sim.data.buffer as ArrayBuffer)
-    const cp = encoder.beginComputePass({ label: "sim" })
-    cp.setPipeline(sim.pipeline)
-    cp.setBindGroup(0, sim.binds[sim.parity])
-    const groups = Math.ceil(sim.size / 8)
+    grid.data[1] = Math.min(0.1, Math.max(0, deltaTime))
+    grid.data[2] = grid.size
+    grid.data[3] = grid.frame++
+    this.device.queue.writeBuffer(grid.uniform, 0, grid.data.buffer as ArrayBuffer)
+    const cp = encoder.beginComputePass({ label: "grid" })
+    cp.setPipeline(grid.pipeline)
+    cp.setBindGroup(0, grid.binds[grid.parity])
+    const groups = Math.ceil(grid.size / 8)
     cp.dispatchWorkgroups(groups, groups)
     cp.end()
     // The freshly written texture is now the current one.
-    sim.parity = 1 - sim.parity
+    grid.parity = 1 - grid.parity
     }
   }
 
@@ -3637,7 +3637,7 @@ export class Engine {
     // fog, a stretch of water — and a kernel that reads past its edge means to
     // ask what is just outside, not to wrap around to the far side of it.
     this.simSampler = this.device.createSampler({
-      label: "sim grid sampler",
+      label: "grid grid sampler",
       magFilter: "linear",
       minFilter: "linear",
       addressModeU: "clamp-to-edge",
@@ -3645,7 +3645,7 @@ export class Engine {
     })
     this.simFallbackView = this.device
       .createTexture({
-        label: "sim grid fallback (1x1 zero)",
+        label: "grid grid fallback (1x1 zero)",
         size: [1, 1],
         format: SIM_FORMAT,
         usage: GPUTextureUsage.TEXTURE_BINDING,
@@ -9123,7 +9123,7 @@ export class Engine {
       // not care. Fixing it properly means a per-effect field uniform, which is
       // the field-pass restructure's business, not this increment's. The SIM
       // clock is already per effect, which is the one that actually breaks
-      // things (rzSimFrame()==0 is a grid's only chance to seed).
+      // things (rzGridFrame()==0 is a grid's only chance to seed).
       u[24] = this.sceneClock - (this.effects[0]?.epochScene ?? 0)
       u[26] = this.canvas.width
       u[27] = this.canvas.height

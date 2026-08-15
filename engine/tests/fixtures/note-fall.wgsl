@@ -463,7 +463,12 @@ fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
     // Height units on both axes, so the glow is round in pixels.
     let dx = (uv.x - keyX(pitch, ord0, kw)) * aspect;
     let halfW = kw * aspect * select(BAR_FILL, BAR_FILL_B, black);
-    if (abs(dx) > halfW + PAD + SPARK_REACH * 1.6) { continue; }
+    // 2.3x SPARK_REACH, not 1.0: a glint's reach is scaled by its own hash to
+    // 1.25, by its note's energy to 1.35, and then travelled at up to 1.25
+    // speed — every one of those multiplies the spread. Raise this whenever any
+    // of them is raised: an unraised bound does not fail, it silently clips the
+    // outermost glints of exactly the biggest hits.
+    if (abs(dx) > halfW + PAD + SPARK_REACH * 2.3) { continue; }
 
     if (top > bot) {
       let len = top - bot;
@@ -491,8 +496,25 @@ fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
       // Short notes pack their glints into the time they have; long ones spread
       // over a full life and then recycle. Without the floor, a staccato note
       // emitted only the first two or three of them.
-      let step = min(SPARK_LIFE, max(dur, 0.12)) / f32(SPARK_N);
-      for (var j = 0; j < SPARK_N; j = j + 1) {
+      // THIS NOTE'S OWN CHARACTER, drawn once and shared by every glint it
+      // throws. Without it every burst was the same fan at a different place —
+      // same width, same count, same energy — so a run of notes read as one
+      // animation repeating rather than as a piece being played. The pitch is
+      // in the seed as well as the index, so the same key struck twice differs
+      // and two different keys differ more.
+      let nh = rzHash11(f32(i) * 1.37 + pitch * 0.29 + 0.11);
+      let nh2 = rzHash11(f32(i) * 2.71 + pitch * 0.73 + 7.3);
+      let nh3 = rzHash11(f32(i) * 5.11 + pitch * 1.13 + 3.7);
+      // How hard this one went: velocity, plus a draw of its own so two notes
+      // at the same velocity are still not the same burst.
+      let energy = mix(0.65, 1.35, nh2) * (0.6 + 0.4 * clamp(rzNoteVelocity(i) * 2.2, 0.0, 1.0));
+      let spread = mix(0.5, 1.0, nh);        // how wide the fan opens
+      let tilt = (nh3 - 0.5) * 0.85;         // and which way it leans
+      // Not every hit throws the same number. A light one is a few glints.
+      let live = max(i32(mix(f32(SPARK_N) * 0.4, f32(SPARK_N), nh2 * energy)), 3);
+
+      let step = min(SPARK_LIFE, max(dur, 0.12)) / f32(live);
+      for (var j = 0; j < live; j = j + 1) {
         let tj = age - f32(j) * step;
         if (tj < 0.0) { continue; }
         let cyc = floor(tj / SPARK_LIFE);
@@ -501,10 +523,13 @@ fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
         let h = rzHash11(f32(i) * 3.17 + f32(j) * 0.71 + cyc * 5.13);
         let h2 = rzHash11(f32(i) * 7.31 + f32(j) * 2.13 + cyc * 1.77 + 11.0);
         // Fanned by j and only JITTERED by the hash. Pure hash angles clump —
-        // sixteen random draws leave gaps and pairs, which reads as a handful
-        // rather than as a burst.
-        let ang = (f32(j) + 0.5) / f32(SPARK_N) * 3.14159265 + (h - 0.5) * 0.42;
-        let reach = SPARK_REACH * (0.35 + 0.9 * h2);
+        // random draws leave gaps and pairs, which reads as a handful rather
+        // than as a burst. The fan is centred on straight up and then leaned,
+        // so the SHAPE varies per note while the spacing stays even.
+        let ang = 1.5707963 + tilt
+                + ((f32(j) + 0.5) / f32(live) - 0.5) * 3.14159265 * spread
+                + (h - 0.5) * 0.42;
+        let reach = SPARK_REACH * energy * (0.35 + 0.9 * h2);
         let sp2 = sp * (0.75 + 0.5 * h);   // and not all at one speed
         let px = cos(ang) * reach * sp2;
         let py = LINE_Y + sin(ang) * reach * SPARK_RISE * sp2 - SPARK_GRAV * sp2 * sp2;

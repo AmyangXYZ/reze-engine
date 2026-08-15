@@ -1,7 +1,7 @@
 import { anchorAliasWgsl } from "../anchor-table"
 import { audioApi } from "../audio-api"
 import { scoreApi } from "../score-api"
-import { simClockApi, simReadApi } from "./sim"
+import { gridClockApi, gridReadApi } from "./grid"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
 //
@@ -99,8 +99,8 @@ export type CompositeEffectSource = {
   hasBackground: boolean
   /** Defines `fn foreground(...)` — mount over the finished frame. */
   hasForeground: boolean
-  /** Grid resolution when the effect declared `// @sim`, else 0. */
-  simSize: number
+  /** Grid resolution when the effect declared `// @grid`, else 0. */
+  gridSize: number
   /** This effect's local anchor slot → scene slot, from the shared table.
    *  Omitted or identity when it owns the table. The particle and trail modules
    *  have always taken this; the field module not taking it was the bug. */
@@ -301,7 +301,7 @@ fn viewTransform(c: vec3f) -> vec3f {
  *
  * Split out of COMPOSITE_HEAD so the SIM pass can have it too. One effect file
  * is spliced into every module it has a mount in, so a file with both a grid and
- * a foreground compiles its foreground inside the sim shader, where every
+ * a foreground compiles its foreground inside the grid shader, where every
  * rzCameraPos() in it has to resolve. Sharing the block is better than stubbing
  * it twice, and it means a kernel can legitimately ask where a bone is — which
  * is exactly what a wake wants.
@@ -430,7 +430,7 @@ fn rzSubject(i: i32) -> RzSubject {
 // exactly why it survived: it only breaks once a SECOND anchor-declaring effect
 // is installed ahead of it, and then the field effect silently reads the other
 // one's bones. Footprints composed after Hand Ribbon put its prints on the
-// hands. The particle, trail and sim modules always spliced the real alias;
+// hands. The particle, trail and grid modules always spliced the real alias;
 // only this one did not.
 
 /**
@@ -772,10 +772,10 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     audioApi(0, 13) +
     scoreApi(0, 19) +
     // The persistent grid, always bound — a 1×1 of zeroes when the effect has
-    // none, so rzSim() is a function that always exists rather than one an
+    // none, so rzGrid() is a function that always exists rather than one an
     // author has to know whether they are allowed to call.
-    simReadApi(0, 17, 18, effect.simSize) +
-    simClockApi("viewU[6].x") +
+    gridReadApi(0, 17, 18, effect.gridSize) +
+    gridClockApi("viewU[6].x") +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +

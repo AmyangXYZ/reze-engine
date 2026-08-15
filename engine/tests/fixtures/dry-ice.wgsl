@@ -1,4 +1,4 @@
-// @sim 768
+// @grid 768
 // @fullres
 // @anchor 左足首
 // @anchor 右足首
@@ -27,7 +27,7 @@
 // The original's look genuinely depends on its resolution — at 1080p the same
 // source runs a slower, finer fluid, because a velocity of "one pixel" is a
 // smaller fraction of the screen. Pinning the conversion to one resolution is
-// what makes the port resolution-INDEPENDENT: raising @sim below now buys
+// what makes the port resolution-INDEPENDENT: raising @grid below now buys
 // sharpness and changes nothing else, which is the property you want and the
 // original does not have.
 
@@ -261,26 +261,26 @@ fn dfUV(xz: vec2f) -> vec2f { return (xz - SIM_AT) / SIM_SPAN + vec2f(0.5); }
  * pressure climbs without bound, and the fluid never circulates.
  */
 fn dfMinusGrad(uv: vec2f, te: f32) -> vec3f {
-  let c = rzSimPrev(uv);
-  let l = rzSimPrev(uv - vec2f(te, 0.0)).w;
-  let r = rzSimPrev(uv + vec2f(te, 0.0)).w;
-  let d = rzSimPrev(uv - vec2f(0.0, te)).w;
-  let u = rzSimPrev(uv + vec2f(0.0, te)).w;
+  let c = rzGridPrev(uv);
+  let l = rzGridPrev(uv - vec2f(te, 0.0)).w;
+  let r = rzGridPrev(uv + vec2f(te, 0.0)).w;
+  let d = rzGridPrev(uv - vec2f(0.0, te)).w;
+  let u = rzGridPrev(uv + vec2f(0.0, te)).w;
   return vec3f(c.xy - vec2f(r - l, u - d) * 0.5, c.z);
 }
 
-fn simStep(uv: vec2f, prev: vec4f, dt: f32) -> vec4f {
+fn gridStep(uv: vec2f, prev: vec4f, dt: f32) -> vec4f {
   // Starts EMPTY. There is nothing to seed: injection fills the pool within a
   // couple of seconds and then never stops, and what you look at is the balance
   // between that and the decay, not a bank that was placed there.
-  if (rzSimFrame() == 0) { return vec4f(0.0); }
+  if (rzGridFrame() == 0) { return vec4f(0.0); }
 
-  let te = rzSimTexel();
+  let te = rzGridTexel();
   let t = rzTime();
-  let sL = rzSimPrev(uv - vec2f(te, 0.0));
-  let sR = rzSimPrev(uv + vec2f(te, 0.0));
-  let sD = rzSimPrev(uv - vec2f(0.0, te));
-  let sU = rzSimPrev(uv + vec2f(0.0, te));
+  let sL = rzGridPrev(uv - vec2f(te, 0.0));
+  let sR = rzGridPrev(uv + vec2f(te, 0.0));
+  let sD = rzGridPrev(uv - vec2f(0.0, te));
+  let sU = rzGridPrev(uv + vec2f(0.0, te));
 
   // ── Project, then advect backwards, both through dfMinusGrad ──
   let here = prev.xy - vec2f(sR.w - sL.w, sU.w - sD.w) * 0.5;
@@ -375,7 +375,7 @@ fn simStep(uv: vec2f, prev: vec4f, dt: f32) -> vec4f {
 fn dfFogTop(xz: vec2f) -> f32 {
   let g = dfUV(xz);
   if (g.x < 0.0 || g.x > 1.0 || g.y < 0.0 || g.y > 1.0) { return FLOOR_Y; }
-  return FLOOR_Y + rzSim(g).z * HEIGHT;
+  return FLOOR_Y + rzGrid(g).z * HEIGHT;
 }
 
 /**
