@@ -1,3 +1,4 @@
+// @layer additive
 // @fullres
 
 // Summoning Circle — a sigil on the ground under the cast, and the light

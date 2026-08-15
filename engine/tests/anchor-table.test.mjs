@@ -89,3 +89,26 @@ test("a ribbon out of range resolves to -1, which the trail accessors reject", (
   // The identity alias passes -1 through, and rzTrailCount guards g < 0.
   assert.match(anchorAliasWgsl([0, 1]), /return local;/)
 })
+
+test("two effects with different bones get DIFFERENT spliced aliases", () => {
+  // The multi-effect bug in one assertion. Both authors wrote slot 0; without
+  // aliasing both would read address 0 and one would silently animate on the
+  // other's bone, with nothing anywhere reporting a problem.
+  const t = buildAnchorTable([[a("左手首", true)], [a("右手首", true)]], 8)
+  const first = anchorAliasWgsl(t.alias[0])
+  const second = anchorAliasWgsl(t.alias[1])
+  assert.notEqual(first, second, "two effects on different bones must not compile the same alias")
+  assert.match(first, /return local;/, "the first effect keeps the identity")
+  assert.match(second, /case 0: \{ return 1; \}/, "the second is remapped onto its own address")
+})
+
+test("a scene of four effects sharing two bones allocates two slots", () => {
+  // The acceptance shape: several effects, overlapping anchors, one table.
+  const t = buildAnchorTable(
+    [[a("左手首", true)], [a("右手首", true)], [a("左手首", true), a("右手首", true)], []],
+    8,
+  )
+  assert.equal(t.entries.length, 2, "four effects, two distinct bones, two rings")
+  assert.deepEqual(t.alias, [[0], [1], [0, 1], []])
+  assert.equal(t.dropped.length, 0)
+})

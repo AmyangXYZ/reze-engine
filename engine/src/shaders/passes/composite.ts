@@ -641,8 +641,14 @@ const COMPOSITE_BODY = /* wgsl */ `
 // OVER onto the base layer. No `if` around it: the pipeline is rebuilt per
 // effect, so this text only exists in variants whose WGSL defines background().
 const BACKGROUND_CALL = /* wgsl */ `
+    // The field layer is PREMULTIPLIED: N effects blend into it in document
+    // order, and premultiplied is the only form in which repeated OVER composes
+    // associatively — straight alpha would need the divide back out on every
+    // draw. So rgb is already scaled by its own alpha and must not be again.
+    // With one effect drawing over a cleared target this is identical to the
+    // straight form it replaced.
     let bgFx = clamp(textureSampleLevel(fieldBgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0));
-    bgPm = bgFx.rgb * bgFx.a + bgPm * (1.0 - bgFx.a);
+    bgPm = bgFx.rgb + bgPm * (1.0 - bgFx.a);
     bgA = bgFx.a + bgA * (1.0 - bgFx.a);
 `
 
@@ -650,8 +656,9 @@ const BACKGROUND_CALL = /* wgsl */ `
 // base. Ungated by design: a foreground runs at every pixel, including the ones
 // the model covers, because covering them is the point.
 const FOREGROUND_CALL = /* wgsl */ `
+  // Premultiplied, as the background layer above — same reason.
   let fgFx = clamp(textureSampleLevel(fieldFgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0));
-  outRgb = fgFx.rgb * fgFx.a + outRgb * (1.0 - fgFx.a);
+  outRgb = fgFx.rgb + outRgb * (1.0 - fgFx.a);
   outA = fgFx.a + outA * (1.0 - fgFx.a);
 `
 

@@ -1064,6 +1064,130 @@ function vertexMorphReach(model: Model): number {
 /** Tried in order when a PMX names a texture without an extension. */
 const TEXTURE_EXTENSION_GUESSES = [".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".spa", ".sph"]
 
+/** One effect's GPU particle pool. Per effect: each declares its own count. */
+interface EffectParticles {
+  count: number
+  buffer: GPUBuffer
+  uniform: GPUBuffer
+  data: Float32Array
+  counts: Uint32Array
+  compute: GPUComputePipeline
+  computeLayout: GPUBindGroupLayout
+  computeBind: GPUBindGroup
+  render: GPURenderPipeline
+  renderLayout: GPUBindGroupLayout
+  renderBind: GPUBindGroup
+  rebind: () => { computeBind: GPUBindGroup; renderBind: GPUBindGroup }
+}
+
+/**
+ * One effect's persistent grid, or null when it declared none.
+ *
+ * Two textures, not one, and read/write alternate between them every frame: a
+ * shader cannot coherently read and write the same texture, so this is not an
+ * optimisation but the only correct shape. `parity` says which one holds the
+ * CURRENT grid — the one everything else samples. Per effect, and the only
+ * effect resource that does not scale: 9 MB at 768 squared, doubled for the
+ * ping-pong, which is why setEffects gives the scene a budget.
+ */
+interface EffectSim {
+  size: number
+  textures: [GPUTexture, GPUTexture]
+  /** Sampled views, for reading. */
+  read: [GPUTextureView, GPUTextureView]
+  pipeline: GPUComputePipeline
+  layout: GPUBindGroupLayout
+  /** Bind groups per parity: binds[i] reads textures[i], writes the other. */
+  binds: [GPUBindGroup, GPUBindGroup]
+  uniform: GPUBuffer
+  data: Float32Array
+  parity: number
+  frame: number
+}
+
+/**
+ * One effect's ribbons, or null when it declared none.
+ *
+ * No buffer of its own: it reads the very same path history the field-based
+ * ribbon read through rzTrail, so a trail costs one draw and nothing recorded.
+ */
+interface EffectTrails {
+  instances: number
+  uniform: GPUBuffer
+  data: Float32Array
+  pipeline: GPURenderPipeline
+  layout: GPUBindGroupLayout
+  bind: GPUBindGroup
+}
+
+/**
+ * How one field draw lands on the ones before it: OVER, into a premultiplied
+ * target. Shared by both field attachments so they cannot drift apart, which
+ * would show as a foreground that layers differently from its own background.
+ */
+const FIELD_LAYER_BLEND: GPUBlendState = {
+  color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+}
+
+/**
+ * `// @layer additive` — for LIGHT rather than matter.
+ *
+ * Alpha-over is right for anything with mass: smoke, fog, a backdrop. It is
+ * wrong for a glow, and visibly so the moment two of them cross — the later
+ * bolt occludes the earlier one in proportion to its own brightness, when what
+ * light does is get brighter. Unity and Unreal both ship exactly this split,
+ * and the particle path here already has it as `@blend additive`.
+ *
+ * Colour still scales by the author's alpha, so alpha keeps meaning "how much
+ * of this is here" and an effect fades out the way it always did. What changes
+ * is that the destination is never scaled down: nothing behind an emissive
+ * layer is removed by it. Alpha writes are dropped for the same reason — a glow
+ * does not COVER the base colour, so it must not claim coverage the composite
+ * would then use to hide it.
+ */
+const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
+  color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
+  alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+}
+
+/**
+ * One installed effect, whole.
+ *
+ * Everything here used to be a singleton field on the Engine, which is exactly
+ * what made "one effect per scene" structural rather than a choice. Grouping it
+ * per effect is the change; the plural comes free once nothing reaches for
+ * `this.effect` any more.
+ *
+ * The `epochScene` is per effect on purpose. The sim clock is measured from it,
+ * and an effect installed while another is already running would otherwise
+ * begin mid-animation and never see `rzSimFrame() == 0` — its only chance to
+ * seed a grid.
+ */
+interface EffectInstance {
+  wgsl: string
+  paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
+  paramsBuffer: GPUBuffer | null
+  paramsData: Float32Array<ArrayBuffer>
+  /** Mounted under the scene. */
+  hasBackground: boolean
+  /** Mounted over the finished frame — and the reason the scene pass has to
+   *  STORE its depth, which it otherwise discards into tile memory. */
+  hasForeground: boolean
+  /** Bones this source asked for, in ITS OWN declaration order. The scene table
+   *  maps these onto shared addresses; this list is what it is rebuilt from. */
+  anchors: { bone: string; trail: boolean }[]
+  /** Where this effect's own clock started, in scene seconds. */
+  epochScene: number
+  /** The field mount's pipeline and its two parity bind groups, or null when the
+   *  effect declares neither background nor foreground. */
+  fieldPipeline: GPURenderPipeline | null
+  fieldBindGroups: [GPUBindGroup, GPUBindGroup] | null
+  particles: EffectParticles | null
+  sim: EffectSim | null
+  trails: EffectTrails | null
+}
+
 export class Engine {
   private static instance: Engine | null = null
 
@@ -1230,20 +1354,6 @@ export class Engine {
    * cost a degenerate quad the rasteriser rejects, which is cheaper than the
    * prefix sum and readback a compacted draw list would need every frame.
    */
-  private particles: {
-    count: number
-    buffer: GPUBuffer
-    uniform: GPUBuffer
-    data: Float32Array
-    counts: Uint32Array
-    compute: GPUComputePipeline
-    computeLayout: GPUBindGroupLayout
-    computeBind: GPUBindGroup
-    render: GPURenderPipeline
-    renderLayout: GPUBindGroupLayout
-    renderBind: GPUBindGroup
-    rebind: () => { computeBind: GPUBindGroup; renderBind: GPUBindGroup }
-  } | null = null
   /** Ceiling for `// @particles`. Past this an author is asking for a stall. */
   private static readonly MAX_PARTICLES = 65536
   private particleFrame = 0
@@ -1255,20 +1365,6 @@ export class Engine {
    * an optimisation but the only correct shape. `parity` says which one holds
    * the CURRENT grid — the one everything else samples.
    */
-  private sim: {
-    size: number
-    textures: [GPUTexture, GPUTexture]
-    /** Sampled views, for reading. */
-    read: [GPUTextureView, GPUTextureView]
-    pipeline: GPUComputePipeline
-    layout: GPUBindGroupLayout
-    /** Bind groups per parity: binds[i] reads textures[i], writes the other. */
-    binds: [GPUBindGroup, GPUBindGroup]
-    uniform: GPUBuffer
-    data: Float32Array
-    parity: number
-    frame: number
-  } | null = null
   private simSampler!: GPUSampler
   private simFallbackView!: GPUTextureView
   /**
@@ -1277,14 +1373,6 @@ export class Engine {
    * No buffer of its own: it reads the very same path history the field-based
    * ribbon read through rzTrail, so a trail costs one draw and nothing recorded.
    */
-  private trails: {
-    instances: number
-    uniform: GPUBuffer
-    data: Float32Array
-    pipeline: GPURenderPipeline
-    layout: GPUBindGroupLayout
-    bind: GPUBindGroup
-  } | null = null
   /** The ribbons' own offscreen target — max-blended, composited after tone map. */
   private trailLayerTexture: GPUTexture | null = null
   private trailLayerView: GPUTextureView | null = null
@@ -1301,9 +1389,7 @@ export class Engine {
   private fieldScale = 2
   private fieldFullW = 0
   private fieldFullH = 0
-  private fieldPipeline: GPURenderPipeline | null = null
   private fieldBindGroupLayout!: GPUBindGroupLayout
-  private fieldBindGroups: [GPUBindGroup, GPUBindGroup] | null = null
   private fieldPipelineLayout!: GPUPipelineLayout
   /**
    * The audio analysis buffer every effect module binds: header
@@ -1433,20 +1519,19 @@ export class Engine {
   // defines. The composite pipelines are REBUILT with the user code injected;
   // params live in their own uniform buffer so setEffectParam is a write, not a
   // recompile (the same instant tier as setStyleParam).
-  private effect: {
-    wgsl: string
-    paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
-    paramsBuffer: GPUBuffer | null
-    paramsData: Float32Array<ArrayBuffer>
-    /** Mounted under the scene. */
-    hasBackground: boolean
-    /** Mounted over the finished frame — and the reason the scene pass has to
-     *  STORE its depth, which it otherwise discards into tile memory. */
-    hasForeground: boolean
-    /** Bones the source asked for, in declaration order — rzAnchor's slots. Only
-     *  these are resolved and uploaded, so a file that names none costs nothing. */
-    anchors: { bone: string; trail: boolean }[]
-  } | null = null
+  /**
+   * The scene's effects, in document order — the order they layer in.
+   *
+   * An array from here down even while setEffect installs exactly one, because
+   * the plural is the whole point of this step and a singleton that has to be
+   * "generalised later" is a singleton that shapes every call site against it.
+   */
+  private effects: EffectInstance[] = []
+  /** The first installed effect, for the many places that legitimately want
+   *  "is anything installed" or the singleton API's one effect. */
+  private get effect(): EffectInstance | null {
+    return this.effects[0] ?? null
+  }
   /** The cast, as the effect API sees it. Written per frame while an effect is
    *  installed, and only up to what that effect actually declared. */
   private castBuffer!: GPUBuffer
@@ -1486,7 +1571,6 @@ export class Engine {
   /** time=0 origin for the active effect — reset each setEffect. */
   /** Scene-clock reading when the current effect was installed. The effect's
    *  `time` is measured from here — see where it is written. */
-  private effectEpochScene = 0
   private compositeBloomView: GPUTextureView | null = null
 
   // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
@@ -1852,7 +1936,11 @@ export class Engine {
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
         { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
-        { binding: 12, resource: this.trails && this.trailLayerView ? this.trailLayerView : this.trailFallbackView },
+        {
+          binding: 12,
+          resource:
+            this.effects.some((e) => e.trails) && this.trailLayerView ? this.trailLayerView : this.trailFallbackView,
+        },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.scoreBuffer } },
         { binding: 15, resource: this.fieldBgView ?? this.trailFallbackView },
@@ -1897,13 +1985,13 @@ export class Engine {
     if (!this.device || !this.depthReadView || !this.fieldUniformBuffer) return
     // Captured, so the null guard above survives into the closure.
     const depth = this.depthReadView
-    const build = (grid: GPUTextureView) =>
+    const build = (owner: EffectInstance, grid: GPUTextureView) =>
       this.device.createBindGroup({
         label: "field layer bind group",
         layout: this.fieldBindGroupLayout,
         entries: [
           { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
-          { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
+          { binding: 7, resource: { buffer: owner.paramsBuffer ?? this.bgParamsDummyBuffer } },
           { binding: 8, resource: depth },
           { binding: 9, resource: { buffer: this.dofUniformBuffer } },
           { binding: 11, resource: { buffer: this.castBuffer } },
@@ -1914,10 +2002,13 @@ export class Engine {
           { binding: 18, resource: this.simSampler },
         ],
       })
-    const sim = this.sim
-    this.fieldBindGroups = sim
-      ? [build(sim.read[0]), build(sim.read[1])]
-      : [build(this.simFallbackView), build(this.simFallbackView)]
+    // Per effect: the params buffer and the grid are both its own, so two
+    // effects cannot share a bind group even when everything else matches.
+    for (const e of this.effects) {
+      e.fieldBindGroups = e.sim
+        ? [build(e, e.sim.read[0]), build(e, e.sim.read[1])]
+        : [build(e, this.simFallbackView), build(e, this.simFallbackView)]
+    }
   }
 
   /**
@@ -2014,24 +2105,17 @@ export class Engine {
    * is KEPT and diagnostics are returned with line numbers relative to the
    * user's WGSL. Pass null to remove the effect.
    */
-  async setEffect(wgsl: string | null, params?: Record<string, EffectParamValue>): Promise<EffectResult> {
+  private async compileEffect(
+    wgsl: string,
+    params: Record<string, EffectParamValue> | undefined,
+    /** This effect's own declarations, already parsed by the caller — which had
+     *  to read them anyway to build the scene table. */
+    anchors: { bone: string; trail: boolean }[],
+    /** Its row of that table: local slot → scene slot. */
+    alias: number[],
+  ): Promise<{ ok: true; instance: EffectInstance } | EffectResult> {
     const noMounts = { background: false, foreground: false }
     if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts }
-
-    if (wgsl === null) {
-      this.effect?.paramsBuffer?.destroy()
-      this.effect = null
-      this.releaseParticles()
-      this.releaseTrails()
-      this.releaseSim()
-      this.fieldPipeline = null
-      const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
-      this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
-      this.compositePipelineGamma = this.makeCompositePipeline(module, true, "composite pipeline (gamma!=1)")
-      this.rebuildCompositeBindGroup()
-      this.writeCompositeViewUniforms()
-      return { ok: true, diagnostics: [], mounts: noMounts }
-    }
 
     // ── Which mounts did the author ask for? A declaration, not a setting: the
     // entry points present in the source are the ones compiled in. Matching the
@@ -2107,12 +2191,6 @@ export class Engine {
     // naming eight costs eight — rather than every rig's 500 bones costing
     // everybody. Past the cap the extras are dropped rather than silently
     // shifting every slot after them.
-    const anchors = parseEffectAnchors(wgsl, MAX_EFFECT_ANCHORS)
-    // The scene's table. One effect today, so this is its own anchors and the
-    // alias is the identity; the list is what becomes plural in setEffects.
-    // Built ONCE here rather than recomputed inside each builder, which is what
-    // let three copies of it exist and drift.
-    const table = buildAnchorTable([anchors], MAX_EFFECT_ANCHORS)
 
     // ── Params: codegen a WGSL struct and mirror its uniform layout on the CPU.
     // Fields are emitted in declaration order; offsets follow WGSL's natural
@@ -2162,6 +2240,11 @@ export class Engine {
     const scopeErr = await this.device.popErrorScope()
     if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts }
 
+    // Declared like every other mount property: by what the source says, not by
+    // a setting somewhere else that an author cannot see from the file.
+    const layerBlend = /^\s*\/\/\s*@layer\s+additive\s*$/m.test(wgsl)
+      ? FIELD_LAYER_BLEND_ADDITIVE
+      : FIELD_LAYER_BLEND
     let fieldPipeline: GPURenderPipeline | null = null
     if (fieldEffect) {
       const fieldSource = buildFieldShader(fieldEffect)
@@ -2183,7 +2266,18 @@ export class Engine {
           fragment: {
             module: fieldModule,
             entryPoint: "fieldFs",
-            targets: [{ format: "rgba16float" }, { format: "rgba16float" }],
+            // OVER, accumulating PREMULTIPLIED colour: several effects draw into
+            // these two targets in document order, and each must layer onto what
+            // the earlier ones left rather than replace it. src-alpha on colour
+            // premultiplies as it writes; alpha accumulates as one-over. An
+            // author still returns STRAIGHT colour+alpha, exactly as before —
+            // the premultiplication happens here, and the composite reads it
+            // back knowing that. With one effect over a cleared target the
+            // result is identical to the replace it used to do.
+            targets: [
+              { format: "rgba16float", blend: layerBlend },
+              { format: "rgba16float", blend: layerBlend },
+            ],
           },
           primitive: { topology: "triangle-list" },
           multisample: { count: 1 },
@@ -2218,19 +2312,32 @@ export class Engine {
 
     // Built BEFORE the swap: a particle stage that fails to compile has to leave
     // the previously installed effect running, exactly as a bad composite does.
-    let particles: NonNullable<Engine["particles"]> | null = null
+    // A stage that fails after an earlier one succeeded would otherwise strand
+    // the earlier one's buffers: the candidate is never installed, so no release
+    // path ever sees them. Matters more with a list — one bad effect among
+    // thirteen should cost nothing but itself.
+    const abandon = (diagnostics: string[]): EffectResult => {
+      particles?.buffer.destroy()
+      particles?.uniform.destroy()
+      sim?.textures[0].destroy()
+      sim?.textures[1].destroy()
+      sim?.uniform.destroy()
+      trails?.uniform.destroy()
+      return { ok: false, diagnostics, mounts }
+    }
+    let particles: EffectParticles | null = null
     if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, anchors, table.alias[0])
-      if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
+      const built = await this.buildParticles(wgsl, anchors, alias)
+      if (!built.ok) return abandon(built.diagnostics)
       particles = built.state
     }
-    let sim: NonNullable<Engine["sim"]> | null = null
+    let sim: EffectSim | null = null
     if (simEntryPoint(wgsl)) {
-      const built = await this.buildSim(wgsl, anchors, table.alias[0])
-      if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
+      const built = await this.buildSim(wgsl, anchors, alias)
+      if (!built.ok) return abandon(built.diagnostics)
       sim = built.state
     }
-    let trails: NonNullable<Engine["trails"]> | null = null
+    let trails: EffectTrails | null = null
     if (wantsTrails) {
       // Only anchors that asked for `trail` have a path to draw; a ribbon on a
       // bone recorded without one would read zeroes and paint a line to the origin.
@@ -2242,36 +2349,11 @@ export class Engine {
           mounts,
         }
       }
-      const built = await this.buildTrails(wgsl, anchors, table.alias[0])
-      if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
+      const built = await this.buildTrails(wgsl, anchors, alias)
+      if (!built.ok) return abandon(built.diagnostics)
       trails = built.state
     }
 
-    // ── Swap — only now does the old effect (and its params buffer) go away.
-    this.effect?.paramsBuffer?.destroy()
-    this.releaseParticles()
-    this.releaseTrails()
-    this.releaseSim()
-    this.particles = particles
-    this.trails = trails
-    this.sim = sim
-    this.fieldPipeline = fieldPipeline
-    // The scene's bones change with the effect, and a slot that meant one wrist
-    // a moment ago can mean another now. Every recorded path is therefore stale
-    // by ADDRESS, not by age: zero the counts so each ring refills from live
-    // samples (~2 s at TRAIL_HZ) rather than drawing the previous effect's
-    // history under the new one's label. anchorPrev goes with them, or the first
-    // velocity after a swap is a difference between two unrelated bones.
-    this.anchorTable = table
-    this.clearTrailHistory()
-    // `// @fullres`: an effect that draws SUB-PIXEL detail — hairline curves,
-    // scanlines — declares it and pays full price; everything soft stays at
-    // half. The field shader reads its size from fieldU, so nothing else moves.
-    const wantScale = /^\s*\/\/\s*@fullres\s*$/m.test(wgsl) ? 1 : 2
-    if (wantScale !== this.fieldScale) {
-      this.fieldScale = wantScale
-      this.createFieldTargets()
-    }
     let paramsBuffer: GPUBuffer | null = null
     if (entries.length) {
       paramsBuffer = this.device.createBuffer({
@@ -2281,19 +2363,26 @@ export class Engine {
       })
       this.device.queue.writeBuffer(paramsBuffer, 0, paramsData)
     }
-    this.effect = { wgsl, paramLayout: layout, paramsBuffer, paramsData, hasBackground, hasForeground, anchors }
-    // Velocities and paths restart from rest rather than continuing from
-    // whatever the last effect's slot 0 happened to be — the slots mean
-    // something different now, and a trail would otherwise draw a line from the
-    // old bone to the new one across the whole scene.
-    this.anchorPrev.clear()
-    this.anchorTrail.clear()
-    this.compositePipelineIdentity = identity
-    this.compositePipelineGamma = gamma
-    this.effectEpochScene = this.sceneClock
-    this.rebuildCompositeBindGroup()
-    this.writeCompositeViewUniforms()
-    return { ok: true, diagnostics: [], mounts }
+    const instance: EffectInstance = {
+        wgsl,
+        paramLayout: layout,
+        paramsBuffer,
+        paramsData,
+        hasBackground,
+        hasForeground,
+        anchors,
+        // The effect's own clock starts now. Per effect so that one installed
+        // later still gets a frame where rzSimFrame() is 0 and can seed.
+        epochScene: this.sceneClock,
+        fieldPipeline,
+        // Filled by rebuildFieldBindGroup below, which needs the instance to
+        // exist first — it binds this effect's own params buffer and grid.
+        fieldBindGroups: null,
+        particles,
+        sim,
+        trails,
+    }
+    return { ok: true, instance }
   }
 
   /**
@@ -2305,6 +2394,135 @@ export class Engine {
    * live in their own compilation unit, which is what lets two effects both
    * define `hash21` without meeting.
    */
+  /**
+   * Install a LIST of effects, in document order — the order they layer in.
+   *
+   * Each is compiled independently and a failure is contained: it is reported in
+   * its own slot of the returned array and left out of the scene, while the rest
+   * install. That is the style-group discipline, and it matters more here — with
+   * four effects on screen, "one bad shader blanks the scene" is the first bug
+   * report anyone would file.
+   *
+   * The bones are allocated ONCE for the whole list: two effects naming the same
+   * wrist share one address and one recorded path, and the cap is eight distinct
+   * bones across the scene rather than per file.
+   *
+   * Null or empty clears everything.
+   */
+  async setEffects(
+    list: { wgsl: string; params?: Record<string, EffectParamValue> }[] | null,
+  ): Promise<EffectResult[]> {
+    const noMounts = { background: false, foreground: false }
+    if (!this.device) return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts }]
+
+    const requested = list ?? []
+    if (requested.length === 0) {
+      for (const e of this.effects) e.paramsBuffer?.destroy()
+      this.releaseParticles()
+      this.releaseTrails()
+      this.releaseSim()
+      this.effects = []
+      this.anchorTable = EMPTY_ANCHOR_TABLE
+      this.clearTrailHistory()
+      const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
+      this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
+      this.compositePipelineGamma = this.makeCompositePipeline(module, true, "composite pipeline (gamma!=1)")
+      this.rebuildCompositeBindGroup()
+      this.writeCompositeViewUniforms()
+      return []
+    }
+
+    // One table for the whole scene, built before anything compiles: an effect's
+    // alias is its row, and a bone two effects both name is allocated once.
+    const perEffectAnchors = requested.map((e) => parseEffectAnchors(e.wgsl, MAX_EFFECT_ANCHORS))
+    const table = buildAnchorTable(perEffectAnchors, MAX_EFFECT_ANCHORS)
+
+    const results: EffectResult[] = []
+    const instances: EffectInstance[] = []
+    for (let i = 0; i < requested.length; i++) {
+      const built = await this.compileEffect(
+        requested[i].wgsl,
+        requested[i].params,
+        perEffectAnchors[i],
+        table.alias[i],
+      )
+      if (!("instance" in built)) {
+        // Contained: this one is out, the others carry on.
+        results.push(built)
+        continue
+      }
+      instances.push(built.instance)
+      results.push({
+        ok: true,
+        diagnostics: [],
+        mounts: { background: built.instance.hasBackground, foreground: built.instance.hasForeground },
+      })
+    }
+    // An anchor the cap refused is worth saying out loud on the effect that
+    // asked for it — its rzAnchor will read invalid, and silence would make that
+    // look like a rig that spells the bone differently.
+    for (const d of table.dropped) {
+      const r = results[d.effect]
+      if (r) r.diagnostics.push(`anchor "${d.bone}" dropped: the scene is already using all ${MAX_EFFECT_ANCHORS} slots`)
+    }
+
+    // ── Swap. Everything above either succeeded or was excluded, so the scene
+    // that was running is only torn down now.
+    for (const e of this.effects) e.paramsBuffer?.destroy()
+    this.releaseParticles()
+    this.releaseTrails()
+    this.releaseSim()
+    this.effects = instances
+    this.anchorTable = table
+    // Slots have been re-dealt; a recorded path is stale by ADDRESS, not by age.
+    this.clearTrailHistory()
+
+    // Scene-level, from the union: the composite decides only whether to SAMPLE
+    // the field layers, so one effect with a background is enough to turn that
+    // on for the frame.
+    const hasBackground = instances.some((e) => e.hasBackground)
+    const hasForeground = instances.some((e) => e.hasForeground)
+    const compositeModule = this.device.createShaderModule({
+      label: "composite shader (effects)",
+      code: buildCompositeShader(
+        hasBackground || hasForeground
+          ? { wgsl: "", paramsDecl: "", hasBackground, hasForeground, simSize: 0 }
+          : null,
+      ),
+    })
+    this.compositePipelineIdentity = this.makeCompositePipeline(compositeModule, false, "composite pipeline (gamma=1)")
+    this.compositePipelineGamma = this.makeCompositePipeline(compositeModule, true, "composite pipeline (gamma!=1)")
+
+    // `@fullres` is a property of the TARGETS, which are shared — so any effect
+    // declaring it promotes them for all of them. Stated here rather than
+    // discovered: the alternative is a scene whose sharpness depends on install
+    // order, which is worse than one effect paying for another's detail.
+    const wantScale = requested.some((e) => /^\s*\/\/\s*@fullres\s*$/m.test(e.wgsl)) ? 1 : 2
+    if (wantScale !== this.fieldScale) {
+      this.fieldScale = wantScale
+      this.createFieldTargets()
+    }
+
+    this.rebuildFieldBindGroup()
+    this.rebuildCompositeBindGroup()
+    this.writeCompositeViewUniforms()
+    return results
+  }
+
+  /**
+   * Install ONE effect — the singleton API, kept because most scenes are one
+   * effect and every existing caller uses it. A one-element setEffects.
+   */
+  async setEffect(wgsl: string | null, params?: Record<string, EffectParamValue>): Promise<EffectResult> {
+    const noMounts = { background: false, foreground: false }
+    if (wgsl === null) {
+      await this.setEffects(null)
+      return { ok: true, diagnostics: [], mounts: noMounts }
+    }
+    const [result] = await this.setEffects([{ wgsl, params }])
+    return result ?? { ok: false, diagnostics: ["effect failed to install"], mounts: noMounts }
+  }
+
   private async buildParticles(
     wgsl: string,
     anchors: { bone: string; trail: boolean }[],
@@ -2312,7 +2530,7 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
-  ): Promise<{ ok: true; state: NonNullable<Engine["particles"]> } | { ok: false; diagnostics: string[] }> {
+  ): Promise<{ ok: true; state: EffectParticles } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
     const count = parseParticleCount(wgsl, Engine.MAX_PARTICLES) || 1024
@@ -2482,29 +2700,33 @@ export class Engine {
    * quads render last frame's positions.
    */
   private stepParticles(encoder: GPUCommandEncoder, deltaTime: number): void {
-    const p = this.particles
-    if (!p) return
-    p.data[0] = this.sceneClock - this.effectEpochScene
-    // Clamped: a backgrounded tab returns with a delta of whole seconds, and an
-    // unclamped step flings every particle out of the scene in one frame.
-    p.data[1] = Math.min(0.1, Math.max(0, deltaTime))
-    p.counts[2] = p.count
-    p.counts[3] = this.particleFrame++
-    this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
-    const cp = encoder.beginComputePass({ label: "particles" })
-    cp.setPipeline(p.compute)
-    cp.setBindGroup(0, p.computeBind)
-    cp.dispatchWorkgroups(Math.ceil(p.count / 64))
-    cp.end()
+    for (const e of this.effects) {
+      const p = e.particles
+      if (!p) continue
+      p.data[0] = this.sceneClock - e.epochScene
+      // Clamped: a backgrounded tab returns with a delta of whole seconds, and an
+      // unclamped step flings every particle out of the scene in one frame.
+      p.data[1] = Math.min(0.1, Math.max(0, deltaTime))
+      p.counts[2] = p.count
+      p.counts[3] = this.particleFrame++
+      this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
+      const cp = encoder.beginComputePass({ label: "particles" })
+      cp.setPipeline(p.compute)
+      cp.setBindGroup(0, p.computeBind)
+      cp.dispatchWorkgroups(Math.ceil(p.count / 64))
+      cp.end()
+    }
   }
 
   /** Draw the pool. Inside the scene pass, so it is depth-tested and pre-bloom. */
   private renderParticles(pass: GPURenderPassEncoder): void {
-    const p = this.particles
-    if (!p) return
-    pass.setPipeline(p.render)
-    pass.setBindGroup(0, p.renderBind)
-    pass.draw(6, p.count)
+    for (const e of this.effects) {
+      const p = e.particles
+      if (!p) continue
+      pass.setPipeline(p.render)
+      pass.setBindGroup(0, p.renderBind)
+      pass.draw(6, p.count)
+    }
   }
 
   /**
@@ -2521,7 +2743,7 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
-  ): Promise<{ ok: true; state: NonNullable<Engine["trails"]> } | { ok: false; diagnostics: string[] }> {
+  ): Promise<{ ok: true; state: EffectTrails } | { ok: false; diagnostics: string[] }> {
     // `slots` here is how many RIBBONS to draw — one per trailed anchor — which
     // is a different number from the anchor ADDRESS SPACE the accessors index
     // by. Conflating the two is what made a trail declared after a bare anchor
@@ -2637,26 +2859,34 @@ export class Engine {
   }
 
   private releaseTrails(): void {
-    this.trails?.uniform.destroy()
-    this.trails = null
+    for (const e of this.effects) {
+      e.trails?.uniform.destroy()
+      e.trails = null
+    }
   }
 
   /** Draw the ribbons into their own layer — cleared, max-blended, and
    *  composited over the frame after tone mapping. */
   private renderTrailLayer(encoder: GPUCommandEncoder): void {
-    const t = this.trails
-    if (!t || !this.trailLayerView) return
-    t.data[0] = this.sceneClock - this.effectEpochScene
-    this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
+    const drawn = this.effects.filter((e) => e.trails)
+    if (drawn.length === 0 || !this.trailLayerView) return
+    for (const e of drawn) {
+      const t = e.trails!
+      t.data[0] = this.sceneClock - e.epochScene
+      this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
+    }
     const pass = encoder.beginRenderPass({
       label: "trail layer",
       colorAttachments: [
         { view: this.trailLayerView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
       ],
     })
-    pass.setPipeline(t.pipeline)
-    pass.setBindGroup(0, t.bind)
-    pass.draw(6, t.instances)
+    for (const e of drawn) {
+      const t = e.trails!
+      pass.setPipeline(t.pipeline)
+      pass.setBindGroup(0, t.bind)
+      pass.draw(6, t.instances)
+    }
     pass.end()
   }
 
@@ -2664,7 +2894,12 @@ export class Engine {
    *  upsample. Runs the whole quad — uniform control flow, so effects may use
    *  derivatives freely, which the old inline path had to forbid. */
   private renderFieldPass(encoder: GPUCommandEncoder): void {
-    if (!this.fieldPipeline || !this.fieldBgView || !this.fieldFgView || !this.fieldBindGroups) return
+    const drawn = this.effects.filter((e) => e.fieldPipeline && e.fieldBindGroups)
+    if (drawn.length === 0 || !this.fieldBgView || !this.fieldFgView) return
+    // ONE pass, N draws, in document order — the targets are cleared once and
+    // each effect blends over what the earlier ones left. Alpha is the layer,
+    // which is the same rule the composite already states, and it keeps memory
+    // flat however many effects a scene installs.
     const pass = encoder.beginRenderPass({
       label: "field layer",
       colorAttachments: [
@@ -2672,18 +2907,22 @@ export class Engine {
         { view: this.fieldFgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
       ],
     })
-    pass.setPipeline(this.fieldPipeline)
-    // The grid the sim just WROTE, which after its parity flip is the one at
-    // `parity` — an effect reads this frame's simulation, not last frame's.
-    pass.setBindGroup(0, this.fieldBindGroups[this.sim?.parity ?? 0])
-    pass.draw(3)
+    for (const e of drawn) {
+      pass.setPipeline(e.fieldPipeline!)
+      // The grid this effect just wrote — after its parity flip, the one at
+      // `parity`. Per effect, so two grids never read each other's frame.
+      pass.setBindGroup(0, e.fieldBindGroups![e.sim?.parity ?? 0])
+      pass.draw(3)
+    }
     pass.end()
   }
 
   /** The trail bind group holds the depth view, which a resize recreates. */
   private rebindTrails(): void {
-    const t = this.trails
-    if (!t || !this.depthReadView) return
+    if (!this.depthReadView) return
+    for (const e of this.effects) {
+    const t = e.trails
+    if (!t) continue
     t.bind = this.device.createBindGroup({
       layout: t.layout,
       entries: [
@@ -2695,12 +2934,15 @@ export class Engine {
         { binding: 5, resource: { buffer: this.scoreBuffer } },
       ],
     })
+    }
   }
 
   private releaseParticles(): void {
-    this.particles?.buffer.destroy()
-    this.particles?.uniform.destroy()
-    this.particles = null
+    for (const e of this.effects) {
+      e.particles?.buffer.destroy()
+      e.particles?.uniform.destroy()
+      e.particles = null
+    }
   }
 
   /**
@@ -2717,7 +2959,7 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
-  ): Promise<{ ok: true; state: NonNullable<Engine["sim"]> } | { ok: false; diagnostics: string[] }> {
+  ): Promise<{ ok: true; state: EffectSim } | { ok: false; diagnostics: string[] }> {
     const size = parseSimSize(wgsl, SIM_MAX) || 256
     const cast = {
       subjects: MAX_EFFECT_SUBJECTS,
@@ -2827,10 +3069,12 @@ export class Engine {
   }
 
   private releaseSim(): void {
-    this.sim?.textures[0].destroy()
-    this.sim?.textures[1].destroy()
-    this.sim?.uniform.destroy()
-    this.sim = null
+    for (const e of this.effects) {
+      e.sim?.textures[0].destroy()
+      e.sim?.textures[1].destroy()
+      e.sim?.uniform.destroy()
+      e.sim = null
+    }
   }
 
   /**
@@ -2840,9 +3084,10 @@ export class Engine {
    * and before the field pass, or an effect samples a grid one frame stale.
    */
   private stepSim(encoder: GPUCommandEncoder, deltaTime: number): void {
-    const sim = this.sim
-    if (!sim) return
-    sim.data[0] = this.sceneClock - this.effectEpochScene
+    for (const e of this.effects) {
+    const sim = e.sim
+    if (!sim) continue
+    sim.data[0] = this.sceneClock - e.epochScene
     // Clamped like the particle step: a backgrounded tab returns with a delta of
     // whole seconds, and one unclamped step of an advection kernel throws the
     // whole grid off its own edge.
@@ -2858,6 +3103,7 @@ export class Engine {
     cp.end()
     // The freshly written texture is now the current one.
     sim.parity = 1 - sim.parity
+    }
   }
 
   /** Which mounts the installed effect declared. Both false when none is set. */
@@ -4840,10 +5086,13 @@ export class Engine {
     // re-bind so audio arriving after an effect (or before one) both work.
     this.rebuildCompositeBindGroup()
     this.rebindTrails()
-    if (this.particles) {
-      const b = this.particles.rebind()
-      this.particles.computeBind = b.computeBind
-      this.particles.renderBind = b.renderBind
+    // EVERY effect: a buffer arriving after install must reach all of them, or
+    // the ones installed earlier keep reading the buffer this replaced.
+    for (const e of this.effects) {
+      if (!e.particles) continue
+      const b = e.particles.rebind()
+      e.particles.computeBind = b.computeBind
+      e.particles.renderBind = b.renderBind
     }
   }
 
@@ -4904,10 +5153,13 @@ export class Engine {
     // work.
     this.rebuildCompositeBindGroup()
     this.rebindTrails()
-    if (this.particles) {
-      const b = this.particles.rebind()
-      this.particles.computeBind = b.computeBind
-      this.particles.renderBind = b.renderBind
+    // EVERY effect: a buffer arriving after install must reach all of them, or
+    // the ones installed earlier keep reading the buffer this replaced.
+    for (const e of this.effects) {
+      if (!e.particles) continue
+      const b = e.particles.rebind()
+      e.particles.computeBind = b.computeBind
+      e.particles.renderBind = b.renderBind
     }
   }
 
@@ -8030,7 +8282,10 @@ export class Engine {
     // write leaves dofU[0].x at 0 while DoF is off, so refreshing it does not
     // switch the gather on.
     const dofOn = this.depthOfField.enabled
-    const depthRead = dofOn || (this.effect?.hasForeground ?? false) || this.trails !== null
+    // ANY effect: one foreground mount anywhere in the scene, or one ribbon,
+    // is enough to make the pass store its depth instead of discarding it.
+    const depthRead =
+      dofOn || this.effects.some((e) => e.hasForeground) || this.effects.some((e) => e.trails !== null)
     this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
     if (depthRead) this.writeDepthOfFieldUniforms()
 
@@ -8799,7 +9054,17 @@ export class Engine {
       // against the accumulated frame delta, an effect animates identically in
       // the editor, in an export, and in a re-export, which is the same rule the
       // trails already followed.
-      u[24] = this.sceneClock - this.effectEpochScene
+      // The FIELD clock, and it is shared: viewU lives in one composite uniform
+      // that every field draw reads, so rzTime() is the same for all of them.
+      // Taken from the first effect, which keeps a single-effect scene exactly
+      // as it was. KNOWN GAP for multi-effect: an effect installed later starts
+      // its rzTime() mid-stream rather than at zero, so a one-shot intro
+      // animation would be skipped. Periodic effects — nearly all of them — do
+      // not care. Fixing it properly means a per-effect field uniform, which is
+      // the field-pass restructure's business, not this increment's. The SIM
+      // clock is already per effect, which is the one that actually breaks
+      // things (rzSimFrame()==0 is a grid's only chance to seed).
+      u[24] = this.sceneClock - (this.effects[0]?.epochScene ?? 0)
       u[26] = this.canvas.width
       u[27] = this.canvas.height
       // Camera world position (viewU[10]) — the other half of bgWorldPos. It
