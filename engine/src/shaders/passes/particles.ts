@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { anchorAliasWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
@@ -18,7 +19,20 @@ import { scoreApi } from "../score-api"
 // gets them subtly wrong in a way that only shows up on someone else's machine.
 
 /** Where the cast/trail history sits in the shared storage buffer. */
-export type CastLayout = { subjects: number; samples: number; base: number; trailBase: number; slots: number }
+export type CastLayout = {
+  subjects: number
+  samples: number
+  base: number
+  trailBase: number
+  /** The scene's anchor CAP — the address space, not how many asked for trails. */
+  slots: number
+  /** How many of this effect's anchors asked for a trail. AUTHOR-VISIBLE as
+   *  RZ_TRAIL_SLOTS: published effects loop over it, so its meaning is pinned
+   *  even though the address space it used to share is now a separate number. */
+  trailCount: number
+  /** This effect's local slot → scene slot. Identity while one effect exists. */
+  alias: number[]
+}
 
 /**
  * The trail accessors, in the PARTICLE module.
@@ -34,7 +48,12 @@ export function castApi(cast: CastLayout): string {
   return `
 const RZ_SUBJECTS: i32 = ${cast.subjects};
 const RZ_SAMPLES: i32 = ${cast.samples};
-const RZ_TRAIL_SLOTS: i32 = ${cast.slots};
+const RZ_MAX_ANCHORS: i32 = ${cast.slots};
+// Author-visible, and kept because published effects loop over it. It used to
+// double as the accessors' bound, which was the latent trail bug; the bound is
+// now RZ_MAX_ANCHORS and this is only ever "how many trails do I have".
+const RZ_TRAIL_SLOTS: i32 = ${cast.trailCount};
+${anchorAliasWgsl(cast.alias)}
 fn rzSubjectCount() -> i32 {
   var n = 0;
   for (var i = 0; i < RZ_SUBJECTS; i++) {
@@ -43,14 +62,21 @@ fn rzSubjectCount() -> i32 {
   return n;
 }
 fn rzTrailCount(subject: i32, slot: i32) -> i32 {
-  if (subject < 0 || subject >= RZ_SUBJECTS || slot < 0 || slot >= RZ_TRAIL_SLOTS) { return 0; }
-  return i32(_rzCast[${cast.base} + (slot * RZ_SUBJECTS + subject) * 3 + 2].w);
+  // Bounded by the scene's anchor cap, NOT by how many anchors asked for a
+  // trail. Those are different index spaces: storage is addressed by anchor
+  // slot, so an untrailed @anchor followed by a trailed one put the trail at
+  // index 1 with a bound of 1, and rzTrail returned zero — a ribbon that
+  // silently did not draw. The bound was redundant: an untrailed slot already
+  // reports a recorded count of zero.
+  let g = _rzSlot(slot);
+  if (subject < 0 || subject >= RZ_SUBJECTS || g < 0 || g >= RZ_MAX_ANCHORS) { return 0; }
+  return i32(_rzCast[${cast.base} + (g * RZ_SUBJECTS + subject) * 3 + 2].w);
 }
 /** Sample i of a path: xyz where it was, w how many seconds ago. i = 0 is now. */
 fn rzTrail(subject: i32, slot: i32, i: i32) -> vec4f {
   let n = rzTrailCount(subject, slot);
   if (i < 0 || i >= n) { return vec4f(0.0); }
-  return _rzCast[${cast.trailBase} + (slot * RZ_SUBJECTS + subject) * RZ_SAMPLES + i];
+  return _rzCast[${cast.trailBase} + (_rzSlot(slot) * RZ_SUBJECTS + subject) * RZ_SAMPLES + i];
 }
 `
 }

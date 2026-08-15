@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { anchorAliasWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
 import { EFFECT_SCENE_API } from "./composite"
 import { type CastLayout } from "./particles"

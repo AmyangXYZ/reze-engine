@@ -5,6 +5,7 @@ import { decodePsd, isPsd } from "./psd-loader"
 import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
+import { buildAnchorTable, anchorAliasWgsl } from "./shaders/anchor-table"
 import { SCORE_HEADER, SCORE_KEYS, SCORE_NOTES, SCORE_STRIDE } from "./shaders/score-api"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
@@ -2202,13 +2203,13 @@ export class Engine {
     // the previously installed effect running, exactly as a bad composite does.
     let particles: NonNullable<Engine["particles"]> | null = null
     if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, anchors.filter((a) => a.trail).length)
+      const built = await this.buildParticles(wgsl, anchors)
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       particles = built.state
     }
     let sim: NonNullable<Engine["sim"]> | null = null
     if (simEntryPoint(wgsl)) {
-      const built = await this.buildSim(wgsl, anchors.filter((a) => a.trail).length)
+      const built = await this.buildSim(wgsl, anchors)
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       sim = built.state
     }
@@ -2224,7 +2225,7 @@ export class Engine {
           mounts,
         }
       }
-      const built = await this.buildTrails(wgsl, trailSlots)
+      const built = await this.buildTrails(wgsl, anchors)
       if (!built.ok) return { ok: false, diagnostics: built.diagnostics, mounts }
       trails = built.state
     }
@@ -2281,7 +2282,7 @@ export class Engine {
    */
   private async buildParticles(
     wgsl: string,
-    trailSlots: number,
+    anchors: { bone: string; trail: boolean }[],
   ): Promise<{ ok: true; state: NonNullable<Engine["particles"]> } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
@@ -2294,7 +2295,9 @@ export class Engine {
       samples: TRAIL_SAMPLES,
       base: MAX_EFFECT_SUBJECTS * 3,
       trailBase: CAST_TRAIL_BASE,
-      slots: trailSlots,
+      slots: MAX_EFFECT_ANCHORS,
+      trailCount: anchors.filter((x) => x.trail).length,
+      alias: buildAnchorTable([anchors], MAX_EFFECT_ANCHORS).alias[0],
     }
 
     const compile = async (code: string, label: string): Promise<GPUShaderModule | string[]> => {
@@ -2484,14 +2487,26 @@ export class Engine {
    */
   private async buildTrails(
     wgsl: string,
-    slots: number,
+    anchors: { bone: string; trail: boolean }[],
   ): Promise<{ ok: true; state: NonNullable<Engine["trails"]> } | { ok: false; diagnostics: string[] }> {
-    const src = { wgsl, slots, blend: parseParticleBlend(wgsl), bloom: parseParticleBloom(wgsl) }
+    // `slots` here is how many RIBBONS to draw — one per trailed anchor — which
+    // is a different number from the anchor ADDRESS SPACE the accessors index
+    // by. Conflating the two is what made a trail declared after a bare anchor
+    // read zeroes; they are now named apart and computed apart.
+    // Which LOCAL anchor each ribbon belongs to. Identity for an all-trailed
+    // file (every library effect today), and the reason a mixed one drew
+    // nothing before: ribbon i was read as anchor slot i.
+    const ribbonSlots = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
+    const slots = ribbonSlots.length
+    const src = { wgsl, slots, ribbonSlots, blend: parseParticleBlend(wgsl), bloom: parseParticleBloom(wgsl) }
     const code = buildTrailShader(src, {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
       base: MAX_EFFECT_SUBJECTS * 3,
       trailBase: CAST_TRAIL_BASE,
+      slots: MAX_EFFECT_ANCHORS,
+      alias: buildAnchorTable([anchors], MAX_EFFECT_ANCHORS).alias[0],
+      reversedZ: this.reversedZ,
     })
     const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
     this.device.pushErrorScope("validation")
@@ -2664,7 +2679,7 @@ export class Engine {
    */
   private async buildSim(
     wgsl: string,
-    trailSlots: number,
+    anchors: { bone: string; trail: boolean }[],
   ): Promise<{ ok: true; state: NonNullable<Engine["sim"]> } | { ok: false; diagnostics: string[] }> {
     const size = parseSimSize(wgsl, SIM_MAX) || 256
     const cast = {
@@ -2672,7 +2687,9 @@ export class Engine {
       samples: TRAIL_SAMPLES,
       base: MAX_EFFECT_SUBJECTS * 3,
       trailBase: CAST_TRAIL_BASE,
-      slots: trailSlots,
+      slots: MAX_EFFECT_ANCHORS,
+      trailCount: anchors.filter((x) => x.trail).length,
+      alias: buildAnchorTable([anchors], MAX_EFFECT_ANCHORS).alias[0],
     }
     const code = buildSimShader(wgsl, size, cast)
     const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
@@ -3621,6 +3638,9 @@ export class Engine {
         format: "depth32float",
         depthWriteEnabled: true,
         depthCompare: "less-equal",
+        // The shadow map keeps the NON-reversed convention (orthographicLh maps
+        // [0,1] with far = 1, and this pass never flipped) — so this bias must
+        // NOT follow reversedZ. It is the camera-pass biases that flip.
         depthBias: 2,
         depthBiasSlopeScale: 1.5,
         depthBiasClamp: 0,
@@ -3755,7 +3775,12 @@ export class Engine {
         // every tie; silhouette rims compare against the far background and are
         // unaffected. No slope term — slope explodes at silhouettes and would
         // erase the rims themselves (previous regression).
-        depthBias: 4,
+        //
+        // SIGNED BY CONVENTION: bias adds to the depth VALUE, and reversed-Z
+        // inverts what a larger value means — +4 there makes hulls WIN the ties
+        // this exists to lose, which is the dress regression back again. The
+        // compare op flips via depthAhead; the bias has to flip by hand.
+        depthBias: this.reversedZ ? -4 : 4,
         depthBiasSlopeScale: 0,
         depthBiasClamp: 0,
         // Skip fragments where the eye stamped stencil=EYE_VALUE. Those pixels are owned by
@@ -8521,9 +8546,14 @@ export class Engine {
     } else if (renderClass === "eye") {
       depthStencil = {
         ...plainDepth,
-        depthBias: -0.00005,
-        depthBiasSlopeScale: 0.0,
-        depthBiasClamp: 0.0,
+        // No depth bias, and none was ever in effect: this carried
+        // depthBias: -0.00005 for its whole life, and GPUDepthBias is an i32 —
+        // WebIDL truncates -0.00005 to ZERO before the driver sees it. The
+        // see-through-hair effect demonstrably works without a bias (that IS
+        // the deployed look), via draw order + front-cull + the stencil stamp.
+        // Removing the dead literal is behavior-identical; introducing a REAL
+        // bias would change how eyes sit against the face on every published
+        // scene, so it is deliberately not done here.
         stencilFront: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
         stencilBack: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
         stencilReadMask: 0xff,

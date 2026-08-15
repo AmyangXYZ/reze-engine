@@ -382,6 +382,13 @@ fn rzSubject(i: i32) -> RzSubject {
   return s;
 }
 
+/** Local slot → scene slot. IDENTITY here, hardcoded rather than spliced: with
+ *  one effect installed the scene table is exactly this effect's declaration
+ *  order, so the two spaces coincide. setEffects replaces this line with the
+ *  effect's real alias (anchorAliasWgsl) when the table is shared — the
+ *  accessors below already route through it, so only this definition changes. */
+fn _rzSlot(local: i32) -> i32 { return local; }
+
 /**
  * The slot-th bone this effect declared, on character subject.
  *
@@ -397,8 +404,11 @@ fn rzSubject(i: i32) -> RzSubject {
 fn rzAnchor(subject: i32, slot: i32) -> RzAnchor {
   var a: RzAnchor;
   a.valid = false;
-  if (subject < 0 || subject >= rzSubjectCount() || slot < 0 || slot >= RZ_MAX_ANCHORS) { return a; }
-  let b = ${EFFECT_SUBJECTS * 3} + (slot * ${EFFECT_SUBJECTS} + subject) * 3;
+  // The author's slot is a NAME; _rzSlot turns it into the scene's address. With
+  // one effect installed the two coincide and this folds away.
+  let g = _rzSlot(slot);
+  if (subject < 0 || subject >= rzSubjectCount() || g < 0 || g >= RZ_MAX_ANCHORS) { return a; }
+  let b = ${EFFECT_SUBJECTS * 3} + (g * ${EFFECT_SUBJECTS} + subject) * 3;
   a.valid = _rzCast[b].w > 0.5;
   a.pos = _rzCast[b].xyz;
   a.vel = _rzCast[b + 1].xyz;
@@ -416,8 +426,9 @@ const RZ_TRAIL_SAMPLES: i32 = ${EFFECT_TRAIL_SAMPLES};
  * grow, which stays true only while nobody hardcodes it.
  */
 fn rzTrailCount(subject: i32, slot: i32) -> i32 {
-  if (subject < 0 || subject >= rzSubjectCount() || slot < 0 || slot >= RZ_MAX_ANCHORS) { return 0; }
-  return i32(_rzCast[${EFFECT_SUBJECTS * 3} + (slot * ${EFFECT_SUBJECTS} + subject) * 3 + 2].w);
+  let g = _rzSlot(slot);
+  if (subject < 0 || subject >= rzSubjectCount() || g < 0 || g >= RZ_MAX_ANCHORS) { return 0; }
+  return i32(_rzCast[${EFFECT_SUBJECTS * 3} + (g * ${EFFECT_SUBJECTS} + subject) * 3 + 2].w);
 }
 
 /**
@@ -435,7 +446,7 @@ fn rzTrailCount(subject: i32, slot: i32) -> i32 {
 fn rzTrail(subject: i32, slot: i32, i: i32) -> vec4f {
   let n = rzTrailCount(subject, slot);
   if (i < 0 || i >= n) { return vec4f(0.0); }
-  let base = ${EFFECT_TRAIL_BASE} + (slot * ${EFFECT_SUBJECTS} + subject) * RZ_TRAIL_SAMPLES;
+  let base = ${EFFECT_TRAIL_BASE} + (_rzSlot(slot) * ${EFFECT_SUBJECTS} + subject) * RZ_TRAIL_SAMPLES;
   return _rzCast[base + i];
 }
 

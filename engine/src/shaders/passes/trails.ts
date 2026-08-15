@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
 // Ribbons along a bone's recorded path, drawn as geometry.
 //
@@ -20,8 +21,11 @@ import { scoreApi } from "../score-api"
 export type TrailSource = {
   /** The author's WGSL verbatim. */
   wgsl: string
-  /** Declared anchors with `trail`, in slot order. */
+  /** How many ribbons to draw — one per trailed anchor. */
   slots: number
+  /** For each ribbon, the LOCAL anchor slot it belongs to. Identity when every
+   *  anchor is trailed; otherwise it skips the untrailed ones. */
+  ribbonSlots: number[]
   /** Additive, like most glowing ribbons, or straight alpha. */
   blend: "alpha" | "additive"
   bloom: boolean
@@ -62,12 +66,33 @@ export function trailEntryPoints(wgsl: string): { width: boolean; shade: boolean
  * ribbon that loops back on itself stays visible along its entire length instead
  * of vanishing edge-on where it turns.
  */
-export function buildTrailShader(src: TrailSource, cast: { subjects: number; samples: number; base: number; trailBase: number }): string {
+export function buildTrailShader(
+  src: TrailSource,
+  cast: {
+    subjects: number
+    samples: number
+    base: number
+    trailBase: number
+    slots: number
+    alias: number[]
+    /** Depth convention of the scene buffer this layer tests against. The
+     *  occlusion compare below is MANUAL (the layer has no depth attachment),
+     *  so it does not flip with the pipelines' depthCompare — it has to be
+     *  emitted the right way round at build time. On a reversed-Z device,
+     *  larger z is CLOSER; the unflipped test drew ribbons only when occluded. */
+    reversedZ: boolean
+  },
+): string {
   return (
     `const RZ_SUBJECTS: i32 = ${cast.subjects};
 const RZ_SAMPLES: i32 = ${cast.samples};
 const RZ_SLOTS: i32 = ${src.slots};
 const RZ_TRAIL_SLOTS: i32 = ${src.slots};
+// The anchor ADDRESS SPACE — distinct from RZ_SLOTS, which is how many ribbons
+// this effect draws. The accessors bound by this; the instance loop by that.
+const RZ_MAX_ANCHORS: i32 = ${cast.slots};
+${ribbonSlotWgsl(src.ribbonSlots)}
+${anchorAliasWgsl(cast.alias)}
 const SUB: i32 = ${TRAIL_SUBDIVISIONS};
 
 // The same struct and helpers the particle modules define. The whole effect
@@ -168,14 +193,21 @@ fn rzSubjectCount() -> i32 {
   return n;
 }
 fn rzTrailCount(subject: i32, slot: i32) -> i32 {
-  if (subject < 0 || subject >= RZ_SUBJECTS || slot < 0 || slot >= RZ_SLOTS) { return 0; }
-  return i32(_rzCast[${cast.base} + (slot * RZ_SUBJECTS + subject) * 3 + 2].w);
+  // Bounded by the scene's anchor cap, NOT by how many anchors asked for a
+  // trail. Those are different index spaces: storage is addressed by anchor
+  // slot, so an untrailed @anchor followed by a trailed one put the trail at
+  // index 1 with a bound of 1, and rzTrail returned zero — a ribbon that
+  // silently did not draw. The bound was redundant: an untrailed slot already
+  // reports a recorded count of zero.
+  let g = _rzSlot(slot);
+  if (subject < 0 || subject >= RZ_SUBJECTS || g < 0 || g >= RZ_MAX_ANCHORS) { return 0; }
+  return i32(_rzCast[${cast.base} + (g * RZ_SUBJECTS + subject) * 3 + 2].w);
 }
 /** Sample i of a path: xyz where it was, w how many seconds ago. i = 0 is now. */
 fn rzTrail(subject: i32, slot: i32, i: i32) -> vec4f {
   let n = rzTrailCount(subject, slot);
   if (i < 0 || i >= n) { return vec4f(0.0); }
-  return _rzCast[${cast.trailBase} + (slot * RZ_SUBJECTS + subject) * RZ_SAMPLES + i];
+  return _rzCast[${cast.trailBase} + (_rzSlot(slot) * RZ_SUBJECTS + subject) * RZ_SAMPLES + i];
 }
 /** Catmull-Rom through four samples — passes through p1 and p2. */
 fn rzSpline(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, t: f32) -> vec3f {
@@ -276,10 +308,14 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   let seg = k / SUB;
   let sub = k % SUB;
   let subject = i32(rest % u32(RZ_SUBJECTS));
-  let slot = i32(rest / u32(RZ_SUBJECTS));
+  // Instance index counts RIBBONS; the cast buffer is addressed by anchor slot.
+  // One ribbon per trailed anchor, so these are the same number only when every
+  // anchor is trailed — _rzRibbonSlot is what bridges them.
+  let ribbon = i32(rest / u32(RZ_SUBJECTS));
+  let slot = _rzRibbonSlot(ribbon);
 
   let n = rzTrailCount(subject, slot);
-  if (slot >= RZ_SLOTS || seg + 1 >= n) {
+  if (ribbon >= RZ_SLOTS || seg + 1 >= n) {
     out.clip = vec4f(0.0, 0.0, -2.0, 1.0);
     out.uv = vec2f(0.0);
     out.age = 0.0;
@@ -390,9 +426,11 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
 fn fs(in: VSOut) -> @location(0) vec4f {
   // Manual depth test against the scene's own buffer — the layer has no depth
   // attachment, and a per-fragment compare is exactly what the fullscreen
-  // version did (segZ <= depth). position.z IS this fragment's depth.
+  // version did. position.z IS this fragment's depth, and the DIRECTION of the
+  // compare is baked at build time to match the scene's depth convention —
+  // "behind" is larger z non-reversed and smaller z reversed.
   let sceneD = textureLoad(sceneDepth, vec2i(in.clip.xy), 0);
-  if (in.clip.z > sceneD) { discard; }
+  if (in.clip.z ${cast.reversedZ ? "<" : ">"} sceneD) { discard; }
   let c = trailShade(in.uv.x, in.uv.y, in.age, in.weight, i32(in.slot));
   if (c.a <= 0.0) { discard; }
   // STRAIGHT colour, into a layer that blends with MAX — which is the
