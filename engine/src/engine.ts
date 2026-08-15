@@ -1464,7 +1464,18 @@ export class Engine {
   // The passes worth a number, in the order their queries are laid out. Kept
   // short on purpose: the point is to notice a restructure making a pass more
   // expensive, and a list long enough to need reading is one nobody reads.
-  private static readonly TIMED_PASSES = ["cull", "shadow", "scene", "composite"] as const
+  /** Every pass worth watching across a refactor. The query set, the resolve
+   *  buffer and the readback are all sized from this, so adding one here is the
+   *  whole change.
+   *
+   *  `field` earns its place now that a scene runs SEVERAL field effects at
+   *  once: it is one pass with N draws, its resolution is a property of the
+   *  shared targets rather than of any one effect — so a single `@fullres`
+   *  effect quadruples the pixel count for all of them — and it is the pass the
+   *  field restructure moves. Restructuring it while it was the only untimed
+   *  pass in the frame would have meant reasoning about the cost instead of
+   *  reading it. */
+  private static readonly TIMED_PASSES = ["cull", "shadow", "scene", "field", "composite"] as const
   private timestampQuerySet: GPUQuerySet | null = null
   private timestampResolve: GPUBuffer | null = null
   private timestampRead: GPUBuffer | null = null
@@ -2908,6 +2919,7 @@ export class Engine {
         { view: this.fieldBgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
         { view: this.fieldFgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
       ],
+      timestampWrites: this.stamps("field"),
     })
     for (const e of drawn) {
       pass.setPipeline(e.fieldPipeline!)

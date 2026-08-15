@@ -167,6 +167,10 @@ const LINE_CAP: f32 = 4.0;     // the reciprocal is unbounded at dy = 0
 // how thin the filament is, HALO is how far the light carries.
 const LINE_HALO: f32 = 55.0;
 const LINE_HALO_W: f32 = 0.42;
+/** Past this far from the line, in screen heights, it contributes nothing worth
+ *  a twenty-four-key sample — so pixels beyond it skip lineY entirely. At the
+ *  edge the wide falloff is under 0.03, below what bloom can lift. */
+const LINE_REACH: f32 = 0.30;
 
 // The line is the surface notes land ON, so it has to read as level. It bends
 // where keys sound, but only just: the bend is per-key and SUMS across the
@@ -248,13 +252,24 @@ fn kbWhites() -> i32 {
 /** Width of one white key, in screen widths. */
 fn kbKeyW() -> f32 { return (KEYS_HI - KEYS_LO) / f32(kbWhites()); }
 
-/** x of a pitch: the centre of its white key, or the seam its black key sits
- *  on. The one mapping a falling note and its key both go through. */
-fn keyX(pitch: f32) -> f32 {
+/**
+ * x of a pitch: the centre of its white key, or the seam its black key sits on.
+ * The one mapping a falling note and its key both go through.
+ *
+ * ord0 and kw are passed IN, not looked up. They used to be read here through
+ * kbLowOrd()/kbKeyW(), which is correct and was costing the whole effect: each
+ * of those does integer division and reads the score header, and this function
+ * is called about a hundred times per pixel — twenty-four by the line and up to
+ * eighty by the note loop. Integer division is among the slowest things a GPU
+ * does, so that worked out at several hundred divides on every pixel of a
+ * full-resolution frame, and the field pass measured 23.8ms. They are loop
+ * invariants; hoisting them to the caller is the whole fix.
+ */
+fn keyX(pitch: f32, ord0: i32, kw: f32) -> f32 {
   let p = i32(round(pitch));
-  let n = f32(whiteOrd(p) - kbLowOrd());
+  let n = f32(whiteOrd(p) - ord0);
   let off = select(0.5, 0.0, isBlackClass(p % 12));
-  return KEYS_LO + (n + off) * kbKeyW();
+  return KEYS_LO + (n + off) * kw;
 }
 
 /** Signed distance to a rounded box — the bar's shape before it becomes light. */
@@ -343,8 +358,9 @@ fn keyboard(uv: vec2f, t: f32) -> vec3f {
   return mix(KEY_IVORY, KEY_PRESS, press) * mix(1.0, KEY_SHADE, v);
 }
 
-/** The line's height at x: a flowing baseline, nudged where a key sounds. */
-fn lineY(x: f32, t: f32) -> f32 {
+/** The line's height at x: a flowing baseline, nudged where a key sounds.
+ *  ord0/kw/lo/hi are hoisted for the reason keyX explains. */
+fn lineY(x: f32, t: f32, ord0: i32, kw: f32, lo: f32, hi: f32) -> f32 {
   // Idle motion, so the line is fluid rather than a rule drawn across the frame.
   let base = LINE_Y
            + sin(x * 9.0 + t * FLOW) * 0.0022
@@ -353,12 +369,10 @@ fn lineY(x: f32, t: f32) -> f32 {
   // Every sounding key pushes it up near its own x. Sampling the key map rather
   // than the note list is the whole reason that map exists: this is a per-pixel
   // question about NOW, which a list of onsets cannot answer cheaply.
-  let lo = rzPitchLow();
-  let hi = rzPitchHigh();
   var bend = 0.0;
   for (var k = 0; k < 24; k = k + 1) {
     let pitch = round(mix(lo, hi, f32(k) / 23.0));
-    let d = (x - keyX(pitch)) / RIPPLE_W;
+    let d = (x - keyX(pitch, ord0, kw)) / RIPPLE_W;
     // Distance first: past three widths the gaussian is nothing, and this is
     // the innermost loop of a full-resolution fullscreen pass.
     if (abs(d) > 3.0) { continue; }
@@ -373,13 +387,28 @@ fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
   let t = rzScoreTime();
   var col = vec3f(0.0);
 
+  // The keyboard's shape, read ONCE. Every one of these costs an integer divide
+  // or a score-header read, and everything below wants them — see keyX.
+  let ord0 = kbLowOrd();
+  let nW = kbWhites();
+  let kw = (KEYS_HI - KEYS_LO) / f32(nW);
+  let pLo = rzPitchLow();
+  let pHi = rzPitchHigh();
+
   // ── The line ──────────────────────────────────────────────────────────────
   // 1/|distance| — a hot filament inside a wide glow, which is what a soft edge
   // cannot give and what bloom needs something to catch.
-  let ly = lineY(uv.x, time);
-  let dy = uv.y - ly;
-  col += LINE_TINT * (min(abs(1.0 / (LINE_SHARP * dy)), LINE_CAP) * LINE_GAIN
-                    + LINE_HALO_W / (1.0 + LINE_HALO * abs(dy)));
+  //
+  // Skipped outright where it cannot be seen. lineY samples twenty-four keys,
+  // and it was doing that for every pixel of the frame including the empty sky
+  // — most of a full-resolution pass spent computing a line that contributes
+  // nothing that far from it. LINE_REACH is past where the wide falloff has
+  // anything left to add.
+  if (abs(uv.y - LINE_Y) < LINE_REACH) {
+    let dy = uv.y - lineY(uv.x, time, ord0, kw, pLo, pHi);
+    col += LINE_TINT * (min(abs(1.0 / (LINE_SHARP * dy)), LINE_CAP) * LINE_GAIN
+                      + LINE_HALO_W / (1.0 + LINE_HALO * abs(dy)));
+  }
 
   let count = rzNoteCount();
   if (count == 0) {
@@ -405,7 +434,6 @@ fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
   let tau = t + above / speed;
   let sTo = tau + PAD / speed;
   let sFrom = min(tau, t) - PAD / speed - DUR_MAX - SPARK_LIFE;
-  let kw = kbKeyW();
 
   let start = firstAfter(sFrom);
   for (var k = 0; k < WINDOW; k = k + 1) {
@@ -433,7 +461,7 @@ fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
     let pitch = rzNotePitch(i);
     let black = isBlackClass(i32(round(pitch)) % 12);
     // Height units on both axes, so the glow is round in pixels.
-    let dx = (uv.x - keyX(pitch)) * aspect;
+    let dx = (uv.x - keyX(pitch, ord0, kw)) * aspect;
     let halfW = kw * aspect * select(BAR_FILL, BAR_FILL_B, black);
     if (abs(dx) > halfW + PAD + SPARK_REACH * 1.6) { continue; }
 
