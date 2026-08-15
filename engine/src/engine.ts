@@ -1183,6 +1183,9 @@ interface EffectInstance {
    *  effect declares neither background nor foreground. */
   fieldPipeline: GPURenderPipeline | null
   fieldBindGroups: [GPUBindGroup, GPUBindGroup] | null
+  /** Which resolution pair this effect draws into: 0 full, 1 half. Its own
+   *  declaration, not the scene's — see Engine.FIELD_SCALES. */
+  fieldLayer: number
   particles: EffectParticles | null
   sim: EffectSim | null
   trails: EffectTrails | null
@@ -1378,15 +1381,32 @@ export class Engine {
   private trailLayerView: GPUTextureView | null = null
   /** 1×1 transparent stand-in so the composite layout binds with no trails installed. */
   private trailFallbackView!: GPUTextureView
-  /** The field layer: user background/foreground mounts at half resolution. */
-  private fieldBgTexture: GPUTexture | null = null
-  private fieldBgView: GPUTextureView | null = null
-  private fieldFgTexture: GPUTexture | null = null
-  private fieldFgView: GPUTextureView | null = null
-  private fieldUniformBuffer!: GPUBuffer
-  /** 2 = half resolution (the default); 1 = full, for effects that declare
-   *  `// @fullres` because they draw sub-pixel detail no upsample can carry. */
-  private fieldScale = 2
+  /**
+   * The field layer: user background/foreground mounts, ONE TARGET PAIR PER
+   * RESOLUTION. Index 0 is full, index 1 is half — coarsest last, so the
+   * composite reads them full-over-half.
+   *
+   * `@fullres` used to be a property of the shared targets: one effect
+   * declaring it promoted the pass for every effect installed, so a starfield
+   * that upsamples perfectly paid four times the pixels because a keyboard
+   * beside it needed crisp edges. Measured, that was the largest avoidable cost
+   * in the frame — Footprints went from about 1.2ms to 4.5ms purely by being
+   * dragged along.
+   *
+   * The price is that a resolution boundary is now a LAYER boundary. Within a
+   * pair, effects blend in document order; across pairs the full-res layer
+   * composites over the half-res one whatever the document said. Invisible for
+   * the additive glows this is nearly always used for, and stated because it is
+   * the one thing document order stopped deciding.
+   */
+  private static readonly FIELD_SCALES = [1, 2] as const
+  private fieldBgTextures: (GPUTexture | null)[] = [null, null]
+  private fieldBgViews: (GPUTextureView | null)[] = [null, null]
+  private fieldFgTextures: (GPUTexture | null)[] = [null, null]
+  private fieldFgViews: (GPUTextureView | null)[] = [null, null]
+  /** One per scale: the field shader reconstructs the full-res pixel it stands
+   *  in for, so each pass needs its own (w, h, fullW, fullH). */
+  private fieldUniformBuffers: GPUBuffer[] = []
   private fieldFullW = 0
   private fieldFullH = 0
   private fieldBindGroupLayout!: GPUBindGroupLayout
@@ -1954,8 +1974,10 @@ export class Engine {
         },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.scoreBuffer } },
-        { binding: 15, resource: this.fieldBgView ?? this.trailFallbackView },
-        { binding: 16, resource: this.fieldFgView ?? this.trailFallbackView },
+        { binding: 15, resource: this.fieldBgViews[0] ?? this.trailFallbackView },
+        { binding: 16, resource: this.fieldFgViews[0] ?? this.trailFallbackView },
+        { binding: 20, resource: this.fieldBgViews[1] ?? this.trailFallbackView },
+        { binding: 21, resource: this.fieldFgViews[1] ?? this.trailFallbackView },
       ],
     })
     this.rebuildFieldBindGroup()
@@ -1963,25 +1985,32 @@ export class Engine {
 
   private createFieldTargets(): void {
     if (!this.device || this.fieldFullW === 0) return
-    const w = Math.max(1, Math.ceil(this.fieldFullW / this.fieldScale))
-    const h = Math.max(1, Math.ceil(this.fieldFullH / this.fieldScale))
-    this.fieldBgTexture?.destroy()
-    this.fieldFgTexture?.destroy()
-    this.fieldBgTexture = this.device.createTexture({
-      label: "field layer (background)",
-      size: [w, h],
-      format: "rgba16float",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.fieldFgTexture = this.device.createTexture({
-      label: "field layer (foreground)",
-      size: [w, h],
-      format: "rgba16float",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.fieldBgView = this.fieldBgTexture.createView()
-    this.fieldFgView = this.fieldFgTexture.createView()
-    this.device.queue.writeBuffer(this.fieldUniformBuffer, 0, new Float32Array([w, h, this.fieldFullW, this.fieldFullH]))
+    for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
+      const scale = Engine.FIELD_SCALES[i]
+      const w = Math.max(1, Math.ceil(this.fieldFullW / scale))
+      const h = Math.max(1, Math.ceil(this.fieldFullH / scale))
+      this.fieldBgTextures[i]?.destroy()
+      this.fieldFgTextures[i]?.destroy()
+      this.fieldBgTextures[i] = this.device.createTexture({
+        label: `field layer ${scale === 1 ? "full" : "half"} (background)`,
+        size: [w, h],
+        format: "rgba16float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.fieldFgTextures[i] = this.device.createTexture({
+        label: `field layer ${scale === 1 ? "full" : "half"} (foreground)`,
+        size: [w, h],
+        format: "rgba16float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.fieldBgViews[i] = this.fieldBgTextures[i]!.createView()
+      this.fieldFgViews[i] = this.fieldFgTextures[i]!.createView()
+      this.device.queue.writeBuffer(
+        this.fieldUniformBuffers[i],
+        0,
+        new Float32Array([w, h, this.fieldFullW, this.fieldFullH]),
+      )
+    }
   }
 
   /**
@@ -1993,7 +2022,7 @@ export class Engine {
    * change that only ever toggles between two known states.
    */
   private rebuildFieldBindGroup(): void {
-    if (!this.device || !this.depthReadView || !this.fieldUniformBuffer) return
+    if (!this.device || !this.depthReadView || this.fieldUniformBuffers.length === 0) return
     // Captured, so the null guard above survives into the closure.
     const depth = this.depthReadView
     const build = (owner: EffectInstance, grid: GPUTextureView) =>
@@ -2008,7 +2037,8 @@ export class Engine {
           { binding: 11, resource: { buffer: this.castBuffer } },
           { binding: 13, resource: { buffer: this.audioBuffer } },
           { binding: 19, resource: { buffer: this.scoreBuffer } },
-          { binding: 14, resource: { buffer: this.fieldUniformBuffer } },
+          // The size uniform for the pair THIS effect draws into.
+          { binding: 14, resource: { buffer: this.fieldUniformBuffers[owner.fieldLayer] } },
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
         ],
@@ -2387,6 +2417,9 @@ export class Engine {
         // The effect's own clock starts now. Per effect so that one installed
         // later still gets a frame where rzSimFrame() is 0 and can seed.
         epochScene: this.sceneClock,
+        // Its OWN resolution, no longer the scene's: an effect that never asked
+        // for full res is not promoted because a neighbour did.
+        fieldLayer: /^\s*\/\/\s*@fullres\s*$/m.test(wgsl) ? 0 : 1,
         fieldPipeline,
         // Filled by rebuildFieldBindGroup below, which needs the instance to
         // exist first — it binds this effect's own params buffer and grid.
@@ -2506,16 +2539,10 @@ export class Engine {
     this.compositePipelineIdentity = this.makeCompositePipeline(compositeModule, false, "composite pipeline (gamma=1)")
     this.compositePipelineGamma = this.makeCompositePipeline(compositeModule, true, "composite pipeline (gamma!=1)")
 
-    // `@fullres` is a property of the TARGETS, which are shared — so any effect
-    // declaring it promotes them for all of them. Stated here rather than
-    // discovered: the alternative is a scene whose sharpness depends on install
-    // order, which is worse than one effect paying for another's detail.
-    const wantScale = requested.some((e) => /^\s*\/\/\s*@fullres\s*$/m.test(e.wgsl)) ? 1 : 2
-    if (wantScale !== this.fieldScale) {
-      this.fieldScale = wantScale
-      this.createFieldTargets()
-    }
-
+    // Nothing to promote any more: `@fullres` is per effect, read into
+    // fieldLayer when the instance is built, and both target pairs exist for
+    // the life of the surface. What used to be a scene-wide decision made here
+    // is now each effect's own.
     this.rebuildFieldBindGroup()
     this.rebuildCompositeBindGroup()
     this.writeCompositeViewUniforms()
@@ -2908,27 +2935,39 @@ export class Engine {
    *  derivatives freely, which the old inline path had to forbid. */
   private renderFieldPass(encoder: GPUCommandEncoder): void {
     const drawn = this.effects.filter((e) => e.fieldPipeline && e.fieldBindGroups)
-    if (drawn.length === 0 || !this.fieldBgView || !this.fieldFgView) return
-    // ONE pass, N draws, in document order — the targets are cleared once and
-    // each effect blends over what the earlier ones left. Alpha is the layer,
-    // which is the same rule the composite already states, and it keeps memory
-    // flat however many effects a scene installs.
-    const pass = encoder.beginRenderPass({
-      label: "field layer",
-      colorAttachments: [
-        { view: this.fieldBgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
-        { view: this.fieldFgView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
-      ],
-      timestampWrites: this.stamps("field"),
-    })
-    for (const e of drawn) {
-      pass.setPipeline(e.fieldPipeline!)
-      // The grid this effect just wrote — after its parity flip, the one at
-      // `parity`. Per effect, so two grids never read each other's frame.
-      pass.setBindGroup(0, e.fieldBindGroups![e.sim?.parity ?? 0])
-      pass.draw(3)
+    if (drawn.length === 0) return
+    // ONE PASS PER RESOLUTION, N draws each, in document order — a pair is
+    // cleared once and each effect blends over what the earlier ones left.
+    // Alpha is the layer, the same rule the composite already states, and it
+    // keeps memory flat however many effects a scene installs.
+    //
+    // Both pairs are cleared even when empty: the composite reads both every
+    // frame, and a pair left holding last frame's content would keep drawing an
+    // effect that has been removed.
+    for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
+      const bg = this.fieldBgViews[i]
+      const fg = this.fieldFgViews[i]
+      if (!bg || !fg) continue
+      const pass = encoder.beginRenderPass({
+        label: `field layer (${Engine.FIELD_SCALES[i] === 1 ? "full" : "half"})`,
+        colorAttachments: [
+          { view: bg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+          { view: fg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+        ],
+        // Only the full-res pass is stamped: one query pair is reserved for
+        // "field", and it is the pass whose cost is worth watching.
+        timestampWrites: i === 0 ? this.stamps("field") : undefined,
+      })
+      for (const e of drawn) {
+        if (e.fieldLayer !== i) continue
+        pass.setPipeline(e.fieldPipeline!)
+        // The grid this effect just wrote — after its parity flip, the one at
+        // `parity`. Per effect, so two grids never read each other's frame.
+        pass.setBindGroup(0, e.fieldBindGroups![e.sim?.parity ?? 0])
+        pass.draw(3)
+      }
+      pass.end()
     }
-    pass.end()
   }
 
   /** The trail bind group holds the depth view, which a resize recreates. */
@@ -3630,11 +3669,14 @@ export class Engine {
     })
     this.scoreBuffer = this.scoreFallbackBuffer
 
-    this.fieldUniformBuffer = this.device.createBuffer({
-      label: "field layer uniforms (half size, full size)",
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
+    // One per resolution — see FIELD_SCALES.
+    this.fieldUniformBuffers = Engine.FIELD_SCALES.map((scale) =>
+      this.device.createBuffer({
+        label: `field layer uniforms (${scale === 1 ? "full" : "half"})`,
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      }),
+    )
     // The field pass's own layout: the subset of the composite's bindings the
     // user's code can statically reach, WITHOUT the field textures themselves —
     // a pass may not sample its own attachments, and WebGPU counts every
@@ -4334,6 +4376,10 @@ export class Engine {
         // The field layer's two halves. Fallback-bound when no field effect runs.
         { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 16, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        // The half-resolution pair. Always bound, empty or not — see the
+        // composite's own note on why both are read every frame.
+        { binding: 20, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 21, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({

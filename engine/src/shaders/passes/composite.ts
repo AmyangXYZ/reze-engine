@@ -177,8 +177,23 @@ override APPLY_GAMMA: bool = true;
 // effects are glows, fog, shafts, gradients — low-frequency by nature — and
 // running them per quarter-pixel was the single largest per-frame cost an
 // effect could add. Bilinear upsampling is invisible at that frequency.
+// The field layer, ONE PAIR PER RESOLUTION. 15/16 are full res, 20/21 half.
+// An effect draws into the pair it declared, so a starfield that upsamples
+// perfectly no longer pays full-resolution pixels because a neighbour needed
+// crisp edges. Both pairs are read every frame — a pair with no effects in it
+// is cleared, not stale — and combined full-over-half below.
 @group(0) @binding(15) var fieldBgTex: texture_2d<f32>;
 @group(0) @binding(16) var fieldFgTex: texture_2d<f32>;
+@group(0) @binding(20) var fieldBgHalfTex: texture_2d<f32>;
+@group(0) @binding(21) var fieldFgHalfTex: texture_2d<f32>;
+
+/** Two field layers into one, premultiplied OVER, top in front. A resolution
+ *  boundary is a layer boundary: within a pair, effects blend in document
+ *  order; across pairs, full res wins. (No backticks in here — this string is
+ *  a TS template literal and one ends it mid-shader.) */
+fn rzFieldMerge(top: vec4f, bot: vec4f) -> vec4f {
+  return vec4f(top.rgb + bot.rgb * (1.0 - top.a), top.a + bot.a * (1.0 - top.a));
+}
 // Geometry ribbons, max-blended in their own layer (trails.ts). Composited in
 // display space below, where the fullscreen ribbon effects always ran.
 @group(0) @binding(12) var trailTex: texture_2d<f32>;
@@ -676,7 +691,9 @@ const BACKGROUND_CALL = /* wgsl */ `
     // draw. So rgb is already scaled by its own alpha and must not be again.
     // With one effect drawing over a cleared target this is identical to the
     // straight form it replaced.
-    let bgFx = clamp(textureSampleLevel(fieldBgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0));
+    let bgFx = rzFieldMerge(
+      clamp(textureSampleLevel(fieldBgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)),
+      clamp(textureSampleLevel(fieldBgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)));
     bgPm = bgFx.rgb + bgPm * (1.0 - bgFx.a);
     bgA = bgFx.a + bgA * (1.0 - bgFx.a);
 `
@@ -686,7 +703,9 @@ const BACKGROUND_CALL = /* wgsl */ `
 // the model covers, because covering them is the point.
 const FOREGROUND_CALL = /* wgsl */ `
   // Premultiplied, as the background layer above — same reason.
-  let fgFx = clamp(textureSampleLevel(fieldFgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0));
+  let fgFx = rzFieldMerge(
+    clamp(textureSampleLevel(fieldFgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)),
+    clamp(textureSampleLevel(fieldFgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)));
   outRgb = fgFx.rgb + outRgb * (1.0 - fgFx.a);
   outA = fgFx.a + outA * (1.0 - fgFx.a);
 `
