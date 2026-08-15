@@ -23,6 +23,7 @@ export {
   type ScoreNote,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
+export { parseMidi } from "./midi-loader"
 export {
   compileGraph,
   validateGraph,

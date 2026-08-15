@@ -49,7 +49,16 @@ const MODULES = [
 
 /** Accessors every module must expose, because one effect file reaches all of
  *  them and an author cannot know which module a helper of theirs lands in. */
-const ACCESSORS = ["rzSubjectCount", "rzTrailCount", "rzTrail"]
+const ACCESSORS = [
+  "rzSubjectCount",
+  "rzTrailCount",
+  "rzTrail",
+  // Utilities, in EVERY module. rzHash11 lived only in the particle and trail
+  // modules, so an effect that used it in a background silently failed to
+  // compile — the gap that produced this line.
+  "rzHash11",
+  "rzHash13",
+]
 
 for (const [name, code] of MODULES) {
   test(`${name}: the cast accessors an effect may call are all present`, () => {

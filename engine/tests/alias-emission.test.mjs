@@ -54,6 +54,44 @@ test("the ribbon occlusion compare follows the depth convention", () => {
   assert.match(rev, /in\.clip\.z < sceneD/)
 })
 
+test("a FIELD effect's _rzSlot carries its real alias, not the identity", () => {
+  // The half of the contract the test above cannot see. It checks that _rzSlot
+  // is defined once wherever it is called — which the field module satisfied
+  // while defining it as the IDENTITY, hardcoded, forever. That is correct for
+  // an effect that owns the anchor table and silently wrong for one sharing it:
+  // its slot 0 addressed scene slot 0, which belongs to whichever effect was
+  // installed first. Footprints composed after Hand Ribbon read the hand trails
+  // and drew its prints on her hands.
+  //
+  // Only ever visible with TWO anchor-declaring effects, which is why a year of
+  // single-effect scenes never showed it.
+  const shared = buildFieldShader({
+    wgsl: "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f { return vec4f(0.0); }",
+    paramsDecl: "",
+    hasBackground: false,
+    hasForeground: true,
+    simSize: 0,
+    alias: [2, 3, 4, 5],
+  })
+  assert.match(shared, /case 0: \{ return 2; \}/, "local slot 0 must resolve to scene slot 2")
+  assert.match(shared, /case 3: \{ return 5; \}/, "local slot 3 must resolve to scene slot 5")
+  assert.doesNotMatch(
+    shared,
+    /fn _rzSlot\(local: i32\) -> i32 \{ return local; \}/,
+    "a shared table must not compile to the identity — that is the bug this covers",
+  )
+  // And an effect that owns the table still folds away to nothing.
+  const alone = buildFieldShader({
+    wgsl: "fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f { return vec4f(0.0); }",
+    paramsDecl: "",
+    hasBackground: true,
+    hasForeground: false,
+    simSize: 0,
+    alias: [0, 1],
+  })
+  assert.match(alone, /fn _rzSlot\(local: i32\) -> i32 \{ return local; \}/, "identity must stay free")
+})
+
 test("the assembled trail module resolves ribbon -> local slot -> scene slot", () => {
   // The full chain in one string, which is the only place all three index
   // spaces meet. A mixed file: one ribbon, belonging to local anchor 1,

@@ -2232,8 +2232,10 @@ export class Engine {
     // line numbers in a shader the author never wrote — and installing one no
     // longer recompiles the composite's tone-mapping half at all.
     const simSize = simEntryPoint(wgsl) ? parseSimSize(wgsl, SIM_MAX) || 256 : 0
+    // `alias` goes in: a field effect reads bones through _rzSlot exactly as a
+    // particle one does, and it was the only module never handed the mapping.
     const fieldEffect =
-      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, simSize } : null
+      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, simSize, alias } : null
     const source = buildCompositeShader(fieldEffect)
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })

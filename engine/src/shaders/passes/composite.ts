@@ -1,3 +1,4 @@
+import { anchorAliasWgsl } from "../anchor-table"
 import { audioApi } from "../audio-api"
 import { scoreApi } from "../score-api"
 import { simClockApi, simReadApi } from "./sim"
@@ -100,6 +101,10 @@ export type CompositeEffectSource = {
   hasForeground: boolean
   /** Grid resolution when the effect declared `// @sim`, else 0. */
   simSize: number
+  /** This effect's local anchor slot → scene slot, from the shared table.
+   *  Omitted or identity when it owns the table. The particle and trail modules
+   *  have always taken this; the field module not taking it was the bug. */
+  alias?: number[]
 }
 
 const COMPOSITE_HEAD = /* wgsl */ `
@@ -371,6 +376,26 @@ const RZ_MAX_ANCHORS: i32 = ${EFFECT_ANCHORS};
  * Character i. Loop to rzSubjectCount(), never to a constant — the caps here are
  * MINIMUMS and are free to grow, which is only true while nobody hardcodes them.
  */
+/**
+ * Cheap hash, 0..1. The particle and trail modules have always had these; the
+ * field module did not, so a helper an author wrote for one mount failed to
+ * compile in another — for no reason anyone could see from the file. One noise
+ * source, everywhere.
+ */
+fn rzHash11(x: f32) -> f32 {
+  var p = fract(x * 0.1031);
+  p = p * (p + 33.33);
+  return fract(p * (p + p));
+}
+fn rzHash21(p: vec2f) -> f32 {
+  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
+  p3 = p3 + dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+fn rzHash13(x: f32) -> vec3f {
+  return vec3f(rzHash11(x), rzHash11(x + 17.13), rzHash11(x + 41.71));
+}
+
 fn rzSubject(i: i32) -> RzSubject {
   var s: RzSubject;
   s.valid = i >= 0 && i < rzSubjectCount();
@@ -382,12 +407,16 @@ fn rzSubject(i: i32) -> RzSubject {
   return s;
 }
 
-/** Local slot → scene slot. IDENTITY here, hardcoded rather than spliced: with
- *  one effect installed the scene table is exactly this effect's declaration
- *  order, so the two spaces coincide. setEffects replaces this line with the
- *  effect's real alias (anchorAliasWgsl) when the table is shared — the
- *  accessors below already route through it, so only this definition changes. */
-fn _rzSlot(local: i32) -> i32 { return local; }
+// _rzSlot — local slot → scene slot — is APPENDED by the builders below, from
+// the effect's own alias. It used to be hardcoded to the identity here, with a
+// comment promising that setEffects would replace the line; that replacement was
+// never written, so a field effect declaring anchors read the identity forever.
+// Alone that is correct (its declaration order IS the scene table), which is
+// exactly why it survived: it only breaks once a SECOND anchor-declaring effect
+// is installed ahead of it, and then the field effect silently reads the other
+// one's bones. Footprints composed after Hand Ribbon put its prints on the
+// hands. The particle, trail and sim modules always spliced the real alias;
+// only this one did not.
 
 /**
  * The slot-th bone this effect declared, on character subject.
@@ -698,7 +727,7 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
   // The composite is STATIC either way now: the user's code compiles in the
   // field module alone, and the composite only decides whether to sample it.
   return COMPOSITE_HEAD +
-    EFFECT_SCENE_API + audioApi(0, 13) + scoreApi(0, 19) + body
+    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + scoreApi(0, 19) + body
 }
 
 /**
@@ -720,6 +749,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
   return (
     COMPOSITE_HEAD +
     EFFECT_SCENE_API +
+    anchorAliasWgsl(effect.alias ?? []) +
     audioApi(0, 13) +
     scoreApi(0, 19) +
     // The persistent grid, always bound — a 1×1 of zeroes when the effect has

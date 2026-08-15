@@ -31,7 +31,7 @@ const LIFETIME = 0.80;   // seconds of path drawn behind the hand
 // PIXELS, exactly as the original measured — the ribbon is extruded in screen
 // space now, so the constant means what it meant there, and the trail holds its
 // width on screen at any camera distance.
-const WIDTH = 36.0;      // half-width of the GLOW in pixels at 1080p
+const WIDTH = 32.0;      // half-width of the GLOW in pixels at 1080p
 const CORE_FRAC = 0.21;  // the hot core inside it — the original's 7px in 34
 const TAIL_WIDTH = 0.40; // core width at the far end, as a fraction
 const TAIL_EASE = 0.22;  // last stretch of life spent fading to nothing
