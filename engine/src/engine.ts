@@ -340,7 +340,10 @@ export type SunOptions = {
 export type EffectParamValue = number | { x: number; y: number; z: number }
 export type EffectResult = {
   ok: boolean
-  /** Compile/validation errors, line:col relative to the USER's WGSL. */
+  /** Compile/validation errors, line:col relative to the USER's WGSL. Also
+   *  carries non-fatal warnings on an effect that DID install — a directive
+   *  that parsed but will never fire, an anchor the scene had no slot for. So
+   *  a non-empty list is not a failure; `ok` is. */
   diagnostics: string[]
   /** Which mounts the WGSL declared — `fn background` / `fn foreground`. Both
    *  false only on a failed compile, since defining neither IS the failure. */
@@ -2167,7 +2170,7 @@ export class Engine {
     anchors: { bone: string; trail: boolean }[],
     /** Its row of that table: local slot → scene slot. */
     alias: number[],
-  ): Promise<{ ok: true; instance: EffectInstance } | EffectResult> {
+  ): Promise<{ ok: true; instance: EffectInstance; warnings: string[] } | EffectResult> {
     const noMounts = { background: false, foreground: false }
     if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts }
 
@@ -2238,6 +2241,29 @@ export class Engine {
       }
     }
     const mounts = { background: hasBackground, foreground: hasForeground }
+
+    // ── Directives only some mounts honour ──
+    //
+    // @bloom sets the aux mask, and only the particle and ribbon modules write
+    // that mask: they draw inside the scene pass, in HDR, while the bloom
+    // pyramid can still see them. A field effect composites in DISPLAY space
+    // after tone mapping, so there is nothing left to pick it up and the
+    // directive does exactly nothing. It parsed silently either way, which is
+    // the same author-surface lie the three guards above exist to kill — Note
+    // Fall declared it for a glow that was its own falloff the whole time, and
+    // finding that out cost a round trip.
+    //
+    // A WARNING, not an error. A published link is immutable, so a scene
+    // pinning an effect that declares this has to keep installing; saying so is
+    // all that was ever missing.
+    const warnings: string[] = []
+    if (parseParticleBloom(wgsl) && !wantsParticles && !wantsTrails) {
+      warnings.push(
+        "// @bloom does nothing here. A field effect (background/foreground) composites after tone " +
+          "mapping, past the bloom pyramid — the directive applies to particles and ribbons, which draw " +
+          "in HDR inside the scene pass. Make the effect's own falloff brighter instead.",
+      )
+    }
 
     // ── Which bones did the author ask for? Same idea as the mounts above: a
     // declaration in the source, not a setting somewhere else. Only what is
@@ -2441,7 +2467,7 @@ export class Engine {
         grid,
         trails,
     }
-    return { ok: true, instance }
+    return { ok: true, instance, warnings }
   }
 
   /**
@@ -2513,7 +2539,9 @@ export class Engine {
       instances.push(built.instance)
       results.push({
         ok: true,
-        diagnostics: [],
+        // Installed, and still with something to say — a directive that parsed
+        // but will never fire. Same channel as the dropped-anchor note below.
+        diagnostics: built.warnings,
         mounts: { background: built.instance.hasBackground, foreground: built.instance.hasForeground },
       })
     }

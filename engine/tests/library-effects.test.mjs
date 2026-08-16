@@ -217,4 +217,17 @@ for (const file of FIXTURES) {
       )
     }
   })
+
+  // The engine warns about this at install, where only someone with a browser
+  // open sees it. A built-in shipping the dead directive is what taught authors
+  // to write it, so the built-ins are held to it here too.
+  test(`${file}: declares @bloom only if something can bloom`, () => {
+    if (!/^\s*\/\/\s*@bloom\s*$/m.test(wgsl)) return
+    const hdr = /\bfn\s+particleInit\s*\(/.test(wgsl) || /\bfn\s+trailWidth\s*\(/.test(wgsl)
+    assert.ok(
+      hdr,
+      `${file} declares // @bloom with neither particles nor ribbons. Field mounts composite after tone ` +
+        `mapping, past the pyramid, so the directive does nothing and its glow is its own falloff.`,
+    )
+  })
 }

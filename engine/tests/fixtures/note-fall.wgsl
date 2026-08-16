@@ -1,5 +1,4 @@
 // @layer additive
-// @bloom
 // @fullres
 
 // Note Fall — the score falling onto a keyboard, behind the cast.
