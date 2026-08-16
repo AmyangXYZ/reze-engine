@@ -9247,6 +9247,14 @@ export class Engine {
     return true
   }
 
+  /** Forget what a group's tracks last wrote, so the next frame writes it again.
+   *  Called whenever something else has written that uniform underneath them. */
+  private invalidateParamTracks(modelName: string, groupId: string): void {
+    for (const track of this.paramTracks.values()) {
+      if (track.modelName === modelName && track.groupId === groupId) track.last = null
+    }
+  }
+
   /** Every track, at the current scene clock. Called once per frame, before the
    *  pass that reads the uniforms it writes. */
   private evaluateParamTracks(): void {
@@ -9257,8 +9265,11 @@ export class Engine {
       // keeps a still scene from spending a uniform write per parameter per
       // frame for values nobody moved.
       if (v === null || !paramChanged(v, track.last)) continue
-      track.last = v
-      this.setStyleParam(track.modelName, track.groupId, track.paramId, v)
+      // Recorded only if the write LANDED. A group that is mid-recompile or
+      // gone refuses it, and remembering a value that never reached the GPU
+      // would mean never trying again — the track would go quiet permanently
+      // instead of resuming when the group comes back.
+      if (this.setStyleParam(track.modelName, track.groupId, track.paramId, v)) track.last = v
     }
   }
 
@@ -9398,6 +9409,12 @@ export class Engine {
     this.bundlesDirty = true
     for (const tex of previousImages ?? []) tex?.destroy()
     this.writeGroupDefaults(uniformBuffer, group, result.slotMap)
+    // The defaults just overwrote whatever a track had driven into this buffer.
+    // A track is only written when its value CHANGES, so a flat one would never
+    // write again and the parameter would sit at its default until the next
+    // key — silently, and only after an unrelated graph edit. Forgetting what
+    // was last written makes the next frame restate it.
+    this.invalidateParamTracks(inst.name, group.id)
     return { ok: true, diagnostics, slotMap: result.slotMap }
   }
 

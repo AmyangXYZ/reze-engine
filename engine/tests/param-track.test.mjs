@@ -95,3 +95,36 @@ test("paramChanged is what stops a still scene writing every frame", () => {
   assert.equal(paramChanged(0, null), true)
   assert.equal(paramChanged(null, null), false)
 })
+
+// ── The lifecycle half, checked against the SOURCE ──
+//
+// These two are interactions with the style-group install path, not properties
+// of the sampler, and both are invisible to the pure tests above. Neither can
+// run headlessly — writing a uniform needs a device — so what is pinned is that
+// the engine still does the two things that make a track survive an edit.
+
+import { readFileSync } from "node:fs"
+import { fileURLToPath } from "node:url"
+import { dirname, join } from "node:path"
+
+const engine = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../src/engine.ts"), "utf8")
+
+test("a group recompile makes its tracks restate themselves", () => {
+  // writeGroupDefaults runs on EVERY install, reused buffer or not, so a graph
+  // edit overwrites whatever a track had driven in. A track only writes when
+  // its value changes, so without this a flat track never writes again and the
+  // parameter sits at its default — silently, and only after an unrelated edit.
+  const at = engine.indexOf("this.writeGroupDefaults(uniformBuffer, group, result.slotMap)")
+  assert.ok(at > 0, "writeGroupDefaults call not found — this test went blind")
+  const after = engine.slice(at, at + 600)
+  assert.match(after, /this\.invalidateParamTracks\(inst\.name, group\.id\)/, "defaults must invalidate the tracks that drive this group")
+})
+
+test("a track that failed to write tries again", () => {
+  // setStyleParam refuses when the group is gone or mid-recompile. Recording
+  // that value as written would retire the track permanently instead of letting
+  // it resume when the group comes back.
+  const at = engine.indexOf("private evaluateParamTracks()")
+  const body = engine.slice(at, engine.indexOf("\n  }", at))
+  assert.match(body, /if \(this\.setStyleParam\([^)]*\)\) track\.last = v/, "last must be recorded only on a successful write")
+})
