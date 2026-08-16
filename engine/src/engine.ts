@@ -29,6 +29,7 @@ import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
+import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1586,8 +1587,36 @@ export class Engine {
   private gpuPassMs: Record<string, number> | null = null
   private cullCameraArgs: GPUBuffer | null = null
   private cullShadowArgs: GPUBuffer | null = null
+  private cullMirrorArgs: GPUBuffer | null = null
+  // ── The floor mirror (step 7C) ──
+  // Half-res scene-contract attachments a mirrored draw renders into, plus the
+  // mirror's own camera block. The plane is the ground plane: MMD floors live
+  // at y = 0 by convention and addGround builds its quad there.
+  private static readonly REFLECTION_PLANE_Y = 0
+  private mirrorCameraData = new Float32Array(40)
+  private mirrorCameraBuffer!: GPUBuffer
+  private mirrorPerFrameBindGroup!: GPUBindGroup
+  private mirrorColorMsTexture: GPUTexture | null = null
+  private mirrorColorTexture: GPUTexture | null = null
+  private mirrorColorView: GPUTextureView | null = null
+  private mirrorMaskMsTexture: GPUTexture | null = null
+  private mirrorIdMsTexture: GPUTexture | null = null
+  private mirrorDepthTexture: GPUTexture | null = null
+  private mirrorPassDescriptor: GPURenderPassDescriptor | null = null
+  private mirrorOpaqueBundle: GPURenderBundle | null = null
+  private mirrorTransparentBundle: GPURenderBundle | null = null
+  /** setGroundMirror lands in step 7D; the debug dial is what exercises C. */
+  private groundMirror = 0
+  private reflectionDebug = false
+  private reflectionDebugPipeline: GPURenderPipeline | null = null
+  private reflectionDebugBindGroupLayout: GPUBindGroupLayout | null = null
+  private reflectionDebugBindGroup: GPUBindGroup | null = null
+  private get reflectionActive(): boolean {
+    return this.reflectionDebug || this.groundMirror > 0
+  }
   private cullFrustaBuffer: GPUBuffer | null = null
-  private cullFrustaBytes = new ArrayBuffer(208)
+  // 18 planes (camera, shadow, mirror) x 16 bytes, then the counts vec4u.
+  private cullFrustaBytes = new ArrayBuffer(304)
   private cullFrustaF32 = new Float32Array(this.cullFrustaBytes)
   private cullFrustaU32 = new Uint32Array(this.cullFrustaBytes)
   /** CPU-side mirrors of what was uploaded, so the reference test reads exactly
@@ -2111,6 +2140,95 @@ export class Engine {
     pass.setPipeline(this.idDebugPipeline!)
     pass.setBindGroup(0, this.idDebugBindGroup!)
     pass.draw(3)
+    pass.end()
+  }
+
+  /**
+   * Show the floor mirror's target instead of the finished frame — the
+   * instrument that makes the reflection pass checkable before the ground
+   * consumes it. Dev surface, like setIdDebug beside it.
+   */
+  setReflectionDebug(on: boolean): void {
+    this.reflectionDebug = on
+  }
+
+  private ensureReflectionDebugPipeline(): boolean {
+    if (!this.mirrorColorView) return false
+    if (!this.reflectionDebugBindGroupLayout) {
+      this.reflectionDebugBindGroupLayout = this.device.createBindGroupLayout({
+        label: "reflection debug bind group layout",
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        ],
+      })
+    }
+    if (!this.reflectionDebugPipeline) {
+      const module = this.device.createShaderModule({ label: "reflection debug", code: REFLECTION_DEBUG_WGSL })
+      this.reflectionDebugPipeline = this.device.createRenderPipeline({
+        label: "reflection debug pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.reflectionDebugBindGroupLayout] }),
+        vertex: { module, entryPoint: "vs" },
+        fragment: { module, entryPoint: "fs", targets: [{ format: this.presentationFormat }] },
+        primitive: { topology: "triangle-list" },
+      })
+    }
+    if (!this.reflectionDebugBindGroup) {
+      this.reflectionDebugBindGroup = this.device.createBindGroup({
+        label: "reflection debug bind group",
+        layout: this.reflectionDebugBindGroupLayout,
+        entries: [
+          { binding: 0, resource: this.mirrorColorView },
+          { binding: 1, resource: this.materialSampler },
+        ],
+      })
+    }
+    return true
+  }
+
+  private renderReflectionDebugPass(encoder: GPUCommandEncoder, swapchainView: GPUTextureView): void {
+    if (!this.reflectionDebug || !this.ensureReflectionDebugPipeline()) return
+    const pass = encoder.beginRenderPass({
+      label: "reflection debug",
+      colorAttachments: [
+        { view: swapchainView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
+      ],
+    })
+    pass.setPipeline(this.reflectionDebugPipeline!)
+    pass.setBindGroup(0, this.reflectionDebugBindGroup!)
+    pass.draw(3)
+    pass.end()
+  }
+
+  /** Refold the live camera with the reflection — a copy and a handful of
+   *  sign flips; cheap enough to run every frame a mirror is on. */
+  private updateMirrorCamera(): void {
+    buildMirrorCamera(this.cameraMatrixData, Engine.REFLECTION_PLANE_Y, this.mirrorCameraData)
+    this.device.queue.writeBuffer(this.mirrorCameraBuffer, 0, this.mirrorCameraData)
+  }
+
+  /**
+   * The scene, mirrored about the floor, into the half-res reflection target.
+   *
+   * Models only: no ground (the mirror IS the ground), no particles, trails or
+   * field effects — the classic MMD stage-floor reflection is the cast, and
+   * each of those layers would need its own mirrored variant to join. Runs
+   * between emitLights (materials read the lights buffer) and the scene pass
+   * (whose ground will sample the resolve).
+   *
+   * KNOWN LIMIT, deliberate: geometry BELOW the floor plane would reflect up
+   * into the target — there is no oblique clip. MMD stages rarely have any;
+   * the clip is the follow-up if one shows.
+   */
+  private renderMirrorPass(encoder: GPUCommandEncoder): void {
+    if (!this.reflectionActive || !this.mirrorPassDescriptor) return
+    if (!this.mirrorOpaqueBundle && !this.mirrorTransparentBundle) return
+    const pass = encoder.beginRenderPass(this.mirrorPassDescriptor)
+    pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    const bundles: GPURenderBundle[] = []
+    if (this.mirrorOpaqueBundle) bundles.push(this.mirrorOpaqueBundle)
+    if (this.mirrorTransparentBundle) bundles.push(this.mirrorTransparentBundle)
+    pass.executeBundles(bundles)
     pass.end()
   }
 
@@ -4477,6 +4595,24 @@ export class Engine {
         { binding: 9, resource: this.brdfLutView },
       ],
     })
+    // The mirror's, identical but for the camera — same lights, same shadow
+    // maps, because a reflection is the same scene lit the same way, seen from
+    // a reflected eye.
+    this.mirrorPerFrameBindGroup = this.device.createBindGroup({
+      label: "mirror per-frame bind group",
+      layout: this.mainPerFrameBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.mirrorCameraBuffer } },
+        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+        { binding: 2, resource: this.materialSampler },
+        { binding: 3, resource: this.shadowMapDepthViews[0] },
+        { binding: 4, resource: this.shadowComparisonSampler },
+        { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
+        { binding: 6, resource: { buffer: this.lightsBuffer } },
+        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
+        { binding: 9, resource: this.brdfLutView },
+      ],
+    })
 
     this.groundShadowBindGroupLayout = this.device.createBindGroupLayout({
       label: "ground shadow layout",
@@ -4890,6 +5026,7 @@ export class Engine {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: roStorage },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
       ],
     })
     // Scoped, unlike the morph pipeline beside it, because this one is OPTIONAL:
@@ -5102,6 +5239,92 @@ export class Engine {
           usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
         })
         this.idView = this.idTexture.createView()
+      }
+
+      // The floor mirror's targets — HALF resolution, but the SAME attachment
+      // contract and sample count as the scene pass, which is what lets the
+      // mirror bundles reuse every scene pipeline unchanged. A reflection is
+      // low-frequency by the time a floor finishes with it; half res is the
+      // classic spend. Aux and id are along for pipeline compatibility and
+      // discarded; only the HDR colour resolves to something samplable.
+      const mw = Math.max(1, width >> 1)
+      const mh = Math.max(1, height >> 1)
+      this.mirrorColorMsTexture?.destroy()
+      this.mirrorColorTexture?.destroy()
+      this.mirrorMaskMsTexture?.destroy()
+      this.mirrorIdMsTexture?.destroy()
+      this.mirrorDepthTexture?.destroy()
+      this.reflectionDebugBindGroup = null
+      this.mirrorColorMsTexture = this.device.createTexture({
+        label: "mirror HDR (msaa)",
+        size: [mw, mh],
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.mirrorColorTexture = this.device.createTexture({
+        label: "mirror HDR resolve",
+        size: [mw, mh],
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.mirrorColorView = this.mirrorColorTexture.createView()
+      this.mirrorMaskMsTexture = this.device.createTexture({
+        label: "mirror aux (msaa, discarded)",
+        size: [mw, mh],
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        format: Engine.BLOOM_MASK_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.mirrorIdMsTexture = mrtIdsEnabled()
+        ? this.device.createTexture({
+            label: "mirror id (msaa, discarded)",
+            size: [mw, mh],
+            sampleCount: Engine.MULTISAMPLE_COUNT,
+            format: SCENE_ID_FORMAT,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          })
+        : null
+      this.mirrorDepthTexture = this.device.createTexture({
+        label: "mirror depth",
+        size: [mw, mh],
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        format: this.depthFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      const mirrorColor: GPURenderPassColorAttachment = {
+        view: this.mirrorColorMsTexture.createView(),
+        resolveTarget: this.mirrorColorView,
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "discard",
+      }
+      const mirrorMask: GPURenderPassColorAttachment = {
+        view: this.mirrorMaskMsTexture.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "discard",
+      }
+      const mirrorId: GPURenderPassColorAttachment | null = this.mirrorIdMsTexture
+        ? {
+            view: this.mirrorIdMsTexture.createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "discard",
+          }
+        : null
+      this.mirrorPassDescriptor = {
+        label: "mirror pass",
+        colorAttachments: mirrorId ? [mirrorColor, mirrorMask, mirrorId] : [mirrorColor, mirrorMask],
+        depthStencilAttachment: {
+          view: this.mirrorDepthTexture.createView(),
+          depthClearValue: this.depthClear,
+          depthLoadOp: "clear",
+          depthStoreOp: "discard",
+          stencilClearValue: 0,
+          stencilLoadOp: "clear",
+          stencilStoreOp: "discard",
+        },
       }
 
       // Bloom pyramid: mip 0 is half-res, each subsequent mip halves again.
@@ -5491,6 +5714,14 @@ export class Engine {
   private setupCamera() {
     this.cameraUniformBuffer = this.device.createBuffer({
       label: "camera uniforms",
+      size: 40 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    // The mirror's camera: same block, view folded with the reflection. Always
+    // allocated — it is 160 bytes, and the bind group that binds it is built
+    // once beside the main one rather than on the first frame a mirror turns on.
+    this.mirrorCameraBuffer = this.device.createBuffer({
+      label: "mirror camera uniforms",
       size: 40 * 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
@@ -6692,6 +6923,11 @@ export class Engine {
         size: args.byteLength,
         usage: argUsage,
       })
+      this.cullMirrorArgs = this.device.createBuffer({
+        label: "cull mirror indirect args",
+        size: args.byteLength,
+        usage: argUsage,
+      })
       if (!this.cullFrustaBuffer) {
         this.cullFrustaBuffer = this.device.createBuffer({
           label: "cull frusta",
@@ -6709,6 +6945,7 @@ export class Engine {
           { binding: 3, resource: { buffer: this.cullCameraArgs } },
           { binding: 4, resource: { buffer: this.cullShadowArgs } },
           { binding: 5, resource: { buffer: this.cullHiddenBuffer } },
+          { binding: 6, resource: { buffer: this.cullMirrorArgs } },
         ],
       })
     }
@@ -6719,6 +6956,7 @@ export class Engine {
     this.device.queue.writeBuffer(this.cullMetaBuffer!, 0, this.cullMetaBytes)
     this.device.queue.writeBuffer(this.cullCameraArgs!, 0, args.buffer as ArrayBuffer)
     this.device.queue.writeBuffer(this.cullShadowArgs!, 0, args.buffer as ArrayBuffer)
+    this.device.queue.writeBuffer(this.cullMirrorArgs!, 0, args.buffer as ArrayBuffer)
     // Seeded so the first frame is not a frame of everything hidden.
     this.writeCullHidden(true)
   }
@@ -6753,6 +6991,7 @@ export class Engine {
     this.cullHiddenBuffer?.destroy()
     this.cullCameraArgs?.destroy()
     this.cullShadowArgs?.destroy()
+    this.cullMirrorArgs?.destroy()
     this.cullMetaBuffer = null
     this.cullModelBuffer = null
     this.cullHiddenBuffer = null
@@ -6760,6 +6999,7 @@ export class Engine {
     this.cullModelCapacity = 0
     this.cullCameraArgs = null
     this.cullShadowArgs = null
+    this.cullMirrorArgs = null
     this.cullBindGroup = null
     this.cullReadback?.camera.destroy()
     this.cullReadback?.shadow.destroy()
@@ -6878,8 +7118,19 @@ export class Engine {
     // rasterizer clips each cascade to its own box — the argument that made
     // single-volume shadow culling exact, kept true for a list.
     writeFrustumPlanes(this.shadowLightVPMatrix.subarray(16 * (SHADOW_CASCADES.length - 1)), this.cullFrustaF32, 24)
-    this.cullFrustaU32[48] = this.cullDraws.length
-    this.cullFrustaU32[49] = this.cullEnabled ? 1 : 0
+    // The mirror pass sees the CAMERA frustum reflected about the floor plane:
+    // a close-up of the floor shows a reflection whose owner is out of frame,
+    // so the camera args would cull her out of her own mirror. When no
+    // reflection is active the camera planes stand in, keeping the args sane
+    // for bundles that never execute.
+    if (this.reflectionActive) {
+      Mat4.multiplyArrays(this.cameraMatrixData, 16, this.mirrorCameraData, 0, this.cullScratchVp, 0)
+      writeFrustumPlanes(this.cullScratchVp, this.cullFrustaF32, 48)
+    } else {
+      this.cullFrustaF32.copyWithin(48, 0, 24)
+    }
+    this.cullFrustaU32[72] = this.cullDraws.length
+    this.cullFrustaU32[73] = this.cullEnabled ? 1 : 0
     this.device.queue.writeBuffer(this.cullFrustaBuffer, 0, this.cullFrustaBytes)
   }
 
@@ -6919,17 +7170,33 @@ export class Engine {
     if (this.modelInstances.size === 0) {
       this.opaqueBundle = null
       this.transparentBundle = null
+      this.mirrorOpaqueBundle = null
+      this.mirrorTransparentBundle = null
       this.shadowBundles = []
       return
     }
 
+    const camView = this.sceneView("camera")
     const opaque = this.device.createRenderBundleEncoder({ label: "opaque phase", ...scene })
-    this.forEachInstance((inst) => this.renderModelOpaquePhase(opaque, inst))
+    this.forEachInstance((inst) => this.renderModelOpaquePhase(opaque, inst, camView))
     this.opaqueBundle = opaque.finish({ label: "opaque phase" })
 
     const transparent = this.device.createRenderBundleEncoder({ label: "transparent phase", ...scene })
-    this.forEachInstance((inst) => this.renderModelTransparentPhase(transparent, inst))
+    this.forEachInstance((inst) => this.renderModelTransparentPhase(transparent, inst, camView))
     this.transparentBundle = transparent.finish({ label: "transparent phase" })
+
+    // The mirror pair: the same draws against the same formats, with the
+    // mirrored camera baked into bind group 0 and the mirror cull args baked
+    // into the indirect draws. Recorded whether or not a mirror is active —
+    // recording is cheap, and the bundles only execute when the pass runs.
+    const mirrorView = this.sceneView("mirror")
+    const mo = this.device.createRenderBundleEncoder({ label: "mirror opaque phase", ...scene })
+    this.forEachInstance((inst) => this.renderModelOpaquePhase(mo, inst, mirrorView))
+    this.mirrorOpaqueBundle = mo.finish({ label: "mirror opaque phase" })
+
+    const mt = this.device.createRenderBundleEncoder({ label: "mirror transparent phase", ...scene })
+    this.forEachInstance((inst) => this.renderModelTransparentPhase(mt, inst, mirrorView))
+    this.mirrorTransparentBundle = mt.finish({ label: "mirror transparent phase" })
 
     // One bundle per cascade: the draws are identical — same pipeline, same
     // indirect args culled to the OUTERMOST volume — and only bind group 0
@@ -7108,9 +7375,10 @@ export class Engine {
   private issueDraw(
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     draw: DrawCall,
-    shadowPass: boolean,
+    kind: "camera" | "shadow" | "mirror",
   ): void {
-    const args = shadowPass ? this.cullShadowArgs : this.cullCameraArgs
+    const args =
+      kind === "shadow" ? this.cullShadowArgs : kind === "mirror" ? this.cullMirrorArgs : this.cullCameraArgs
     if (args && draw.cullIndex >= 0) {
       pass.drawIndexedIndirect(args, draw.cullIndex * Engine.CULL_ARG_WORDS * 4)
     } else {
@@ -8927,6 +9195,7 @@ export class Engine {
 
     // Frustum cull into indirect arguments. After the camera and shadow matrices
     // are settled, before the passes that draw from them.
+    if (this.reflectionActive) this.updateMirrorCamera()
     if (hasModels) this.dispatchCull(encoder)
 
     // After the cull, because a rebuild there can reallocate the argument
@@ -8971,6 +9240,7 @@ export class Engine {
     // Before the scene pass, which READS the slots this writes. Same buffer,
     // two access modes, never in one pass.
     this.emitLights(encoder)
+    this.renderMirrorPass(encoder)
 
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     // Phase order: opaque models → ground → transparent fabric.
@@ -9057,6 +9327,7 @@ export class Engine {
 
     // Over the finished frame, before the editor's own overlays: the whole
     // point is to see the id buffer instead of the scene.
+    this.renderReflectionDebugPass(encoder, swapchainView)
     this.renderIdDebugPass(encoder, swapchainView)
 
     if (this.selectedMaterial && hasModels) this.renderSelectionPasses(encoder, swapchainView)
@@ -9093,7 +9364,7 @@ export class Engine {
     sp.setIndexBuffer(inst.indexBuffer, "uint32")
     for (const draw of inst.shadowDrawCalls) {
       sp.setBindGroup(1, draw.bindGroup)
-      this.issueDraw(sp, draw, true)
+      this.issueDraw(sp, draw, "shadow")
     }
   }
 
@@ -9598,13 +9869,14 @@ export class Engine {
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
     type: "opaque" | "transparent",
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
     let currentPipeline: GPURenderPipeline | null = null
     let bound = false
     for (const draw of inst.drawCalls) {
       if (draw.type !== type) continue
       if (!bound) {
-        pass.setBindGroup(0, this.perFrameBindGroup)
+        pass.setBindGroup(0, view.perFrame)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true
       }
@@ -9614,16 +9886,16 @@ export class Engine {
         currentPipeline = pipeline
       }
       pass.setBindGroup(2, draw.bindGroup)
-      this.issueDraw(pass, draw, false)
-      if (draw.outline && this.outlineEnabled) {
+      this.issueDraw(pass, draw, view.args)
+      if (draw.outline && this.outlineEnabled && view.outlines) {
         // Same index range; own pipeline + groups 0/2. Group 1 (skinMats) is
         // layout-identical between the main and outline pipelines and stays
         // bound. Restore group 0 afterwards and force a pipeline re-set.
         pass.setPipeline(this.outlinePipeline)
         pass.setBindGroup(0, this.outlinePerFrameBindGroup)
         pass.setBindGroup(2, draw.outline.bindGroup)
-        this.issueDraw(pass, draw, false)
-        pass.setBindGroup(0, this.perFrameBindGroup)
+        this.issueDraw(pass, draw, view.args)
+        pass.setBindGroup(0, view.perFrame)
         currentPipeline = null
       }
     }
@@ -9648,15 +9920,39 @@ export class Engine {
     // instead of once per model. Non-stencil pipelines ignore the value.
   }
 
-  private renderModelOpaquePhase(pass: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
+  /**
+   * Which eye the scene is being drawn FOR — the main camera or the floor
+   * mirror. Threaded explicitly through the phase draws rather than read off
+   * the engine, because both sets of bundles are recorded in one call and
+   * ambient state at record time is how a mirror bundle ends up baked with the
+   * main camera's bind group.
+   */
+  private sceneView(kind: "camera" | "mirror"): {
+    perFrame: GPUBindGroup
+    args: "camera" | "mirror"
+    outlines: boolean
+  } {
+    return kind === "mirror"
+      ? // No outlines in the mirror: the hull pipeline culls back faces, and a
+        // reflection flips winding, so the hull would ink over the model.
+        { perFrame: this.mirrorPerFrameBindGroup, args: "mirror", outlines: false }
+      : { perFrame: this.perFrameBindGroup, args: "camera", outlines: true }
+  }
+
+  private renderModelOpaquePhase(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+  ): void {
     this.setModelDrawState(pass, inst)
-    this.drawMaterials(pass, inst, "opaque")
-    this.drawHairOverEyes(pass, inst)
+    this.drawMaterials(pass, inst, "opaque", view)
+    this.drawHairOverEyes(pass, inst, view)
   }
 
   private renderModelTransparentPhase(
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
     this.setModelDrawState(pass, inst)
     // Transparent: babylon-mmd's forceDepthWrite blending — PMX author order
@@ -9667,7 +9963,7 @@ export class Engine {
     //     holes to whatever sat far behind a fold.
     //   · depth-write OFF layering: every overlap visible everywhere — MORE
     //     gray patches and texture artifacts in practice.
-    this.drawMaterials(pass, inst, "transparent")
+    this.drawMaterials(pass, inst, "transparent", view)
   }
 
   /** Depth-only re-draw of transparent-bucket materials (see depth-prepass.ts).
@@ -9684,7 +9980,7 @@ export class Engine {
         bound = true
       }
       pass.setBindGroup(2, draw.bindGroup)
-      this.issueDraw(pass, draw, false)
+      this.issueDraw(pass, draw, "camera")
     }
   }
 
@@ -9694,7 +9990,11 @@ export class Engine {
    * `IS_OVER_EYES=true` (25% alpha), depth-write off. Ungrouped materials are neutral and
    * never participate.
    */
-  private drawHairOverEyes(pass: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
+  private drawHairOverEyes(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+  ): void {
     let bound = false
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
@@ -9702,7 +10002,7 @@ export class Engine {
       const overEyes = this.overEyesPipelineFor(inst, draw)
       if (!overEyes) continue
       if (!bound) {
-        pass.setBindGroup(0, this.perFrameBindGroup)
+        pass.setBindGroup(0, view.perFrame)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true
       }
@@ -9711,7 +10011,7 @@ export class Engine {
         currentPipeline = overEyes
       }
       pass.setBindGroup(2, draw.bindGroup)
-      this.issueDraw(pass, draw, false)
+      this.issueDraw(pass, draw, view.args)
     }
   }
 

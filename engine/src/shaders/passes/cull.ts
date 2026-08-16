@@ -1,9 +1,18 @@
 // GPU frustum cull writing indirect draw arguments.
 //
-// One dispatch covers every material draw in the scene and writes TWO argument
-// buffers — the camera pass and the shadow pass — because they differ only in
-// which frustum they test against, and splitting them into two dispatches would
-// read the same metadata twice. See docs/frame-graph.md.
+// One dispatch covers every material draw in the scene and writes THREE
+// argument buffers — the camera pass, the shadow pass and the mirror pass —
+// because they differ only in which frustum they test against, and splitting
+// them into separate dispatches would read the same metadata each time. See
+// docs/frame-graph.md.
+//
+// The MIRROR frustum is the camera frustum reflected about the floor plane: an
+// object is visible in the mirror exactly when its reflection is visible to
+// the camera, i.e. when the object itself lies in the reflected frustum. The
+// camera args would be WRONG for it — a close-up of the floor shows a dancer's
+// reflection while the dancer herself is out of frame. When no reflection is
+// active the CPU writes the camera planes into the mirror slots, so the args
+// stay sane for bundles that never execute.
 //
 // The compute writes ONLY `instanceCount` (word 1 of each 5-word record). The
 // other four words — indexCount, firstIndex, baseVertex, firstInstance — are
@@ -39,10 +48,10 @@ struct ModelRec {
   pad2: u32,
 };
 
-// Camera planes at 0..5, light planes at 6..11.
+// Camera planes at 0..5, light planes at 6..11, mirror planes at 12..17.
 // counts.x = draw count, counts.y = 0 to pass everything (setCullEnabled).
 struct Frusta {
-  planes: array<vec4f, 12>,
+  planes: array<vec4f, 18>,
   counts: vec4u,
 };
 
@@ -56,6 +65,7 @@ struct Frusta {
 // list: a face VMD rewrites the morph-hidden set every frame, so a bundle that
 // invalidated on it would re-record every frame and cost more than it saves.
 @group(0) @binding(5) var<storage, read> hidden: array<u32>;
+@group(0) @binding(6) var<storage, read_write> mirrorArgs: array<u32>;
 
 const DRAW_CASTS_SHADOW: u32 = 1u;
 const MODEL_VISIBLE: u32 = 1u;
@@ -94,6 +104,7 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var inCamera = false;
   var inLight = false;
+  var inMirror = false;
   if (visible) {
     if ((m.flags & MODEL_RIGID) != 0u) {
       let c = (dm.lo + dm.hi) * 0.5;
@@ -105,9 +116,11 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
       let we = a * e;
       inCamera = aabbVisible(0u, wc, we);
       inLight = aabbVisible(6u, wc, we);
+      inMirror = aabbVisible(12u, wc, we);
     } else {
       inCamera = sphereVisible(0u, m.sphere);
       inLight = sphereVisible(6u, m.sphere);
+      inMirror = sphereVisible(12u, m.sphere);
     }
   }
 
@@ -121,5 +134,6 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
   let castsShadow = (dm.flags & DRAW_CASTS_SHADOW) != 0u;
   cameraArgs[i * 5u + 1u] = select(0u, 1u, (inCamera || off) && shown);
   shadowArgs[i * 5u + 1u] = select(0u, 1u, ((inLight && castsShadow) || off) && shown);
+  mirrorArgs[i * 5u + 1u] = select(0u, 1u, (inMirror || off) && shown);
 }
 `
