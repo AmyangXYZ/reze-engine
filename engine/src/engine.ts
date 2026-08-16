@@ -1602,6 +1602,10 @@ export class Engine {
   private mirrorColorMsTexture: GPUTexture | null = null
   private mirrorColorTexture: GPUTexture | null = null
   private mirrorColorView: GPUTextureView | null = null
+  private mirrorMipCount = 1
+  private mirrorMipViews: GPUTextureView[] = []
+  private mirrorBlurBindGroups: GPUBindGroup[] | null = null
+  private groundMirrorBlur = 0
   private mirrorMaskMsTexture: GPUTexture | null = null
   private mirrorIdMsTexture: GPUTexture | null = null
   private mirrorDepthTexture: GPUTexture | null = null
@@ -2157,12 +2161,19 @@ export class Engine {
 
   /**
    * Dial the floor mirror without rebuilding the ground — the adjust-tier
-   * sibling of addGround's own option. False when there is no ground to dial.
+   * sibling of addGround's own options. False when there is no ground to dial.
+   * Blur 0 is a polished mirror; 1 samples the softest level the chain built,
+   * scaled up with distance so the contact stays sharper than the far floor.
    */
-  setGroundMirror(strength: number): boolean {
+  setGroundMirror(strength: number, blur?: number): boolean {
     if (!this.groundShadowMaterialBuffer) return false
     this.groundMirror = Math.min(Math.max(strength, 0), 1)
-    this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 15 * 4, new Float32Array([this.groundMirror]))
+    if (blur !== undefined) this.groundMirrorBlur = Math.min(Math.max(blur, 0), 1)
+    this.device.queue.writeBuffer(
+      this.groundShadowMaterialBuffer,
+      15 * 4,
+      new Float32Array([this.groundMirror, this.groundMirrorBlur]),
+    )
     return true
   }
 
@@ -2239,6 +2250,18 @@ export class Engine {
   private renderMirrorPass(encoder: GPUCommandEncoder): void {
     if (!this.reflectionActive || !this.mirrorPassDescriptor) return
     if (!this.mirrorOpaqueBundle && !this.mirrorTransparentBundle) return
+    // A mirror reflects the sky, not the void: clear to the scene's background
+    // so the empty regions of the reflection read as backdrop instead of
+    // black. Linearised, because the mirror lives in scene-linear HDR and the
+    // stored colour is display sRGB — and honestly APPROXIMATE: the real
+    // backdrop composites after the view transform, so the mirrored patch
+    // rides through AgX/filmic and lands close, not identical. A transparent
+    // background keeps the black clear; a 360 equirect gets the flat colour —
+    // sampling the skybox along reflected rays is the recorded follow-up.
+    const bg = this.backgroundColor
+    const lin = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4))
+    const atts = this.mirrorPassDescriptor.colorAttachments as GPURenderPassColorAttachment[]
+    atts[0].clearValue = bg ? { r: lin(bg.x), g: lin(bg.y), b: lin(bg.z), a: 1 } : { r: 0, g: 0, b: 0, a: 0 }
     const pass = encoder.beginRenderPass(this.mirrorPassDescriptor)
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
     const bundles: GPURenderBundle[] = []
@@ -2246,6 +2269,42 @@ export class Engine {
     if (this.mirrorTransparentBundle) bundles.push(this.mirrorTransparentBundle)
     pass.executeBundles(bundles)
     pass.end()
+    this.renderMirrorBlurChain(encoder)
+  }
+
+  /**
+   * Fill the mirror's mip levels — the bloom pyramid's own 13-tap downsample,
+   * one pass per level. Only when the blur dial is up: at zero the ground
+   * samples level 0 exactly and the chain would be work nobody reads.
+   */
+  private renderMirrorBlurChain(encoder: GPUCommandEncoder): void {
+    if (this.groundMirrorBlur <= 0 || this.mirrorMipCount < 2) return
+    if (!this.mirrorBlurBindGroups) {
+      const layout = this.bloomDownsamplePipeline.getBindGroupLayout(0)
+      this.mirrorBlurBindGroups = []
+      for (let i = 1; i < this.mirrorMipCount; i++) {
+        this.mirrorBlurBindGroups.push(
+          this.device.createBindGroup({
+            label: `mirror blur ${i}`,
+            layout,
+            entries: [
+              { binding: 0, resource: this.mirrorMipViews[i - 1] },
+              { binding: 1, resource: this.bloomSampler },
+            ],
+          }),
+        )
+      }
+    }
+    for (let i = 1; i < this.mirrorMipCount; i++) {
+      const p = encoder.beginRenderPass({
+        label: `mirror blur ${i}`,
+        colorAttachments: [{ view: this.mirrorMipViews[i], loadOp: "clear", storeOp: "store" }],
+      })
+      p.setPipeline(this.bloomDownsamplePipeline)
+      p.setBindGroup(0, this.mirrorBlurBindGroups[i - 1])
+      p.draw(3)
+      p.end()
+    }
   }
 
   /**
@@ -5262,14 +5321,15 @@ export class Engine {
         this.idView = this.idTexture.createView()
       }
 
-      // The floor mirror's targets — HALF resolution, but the SAME attachment
+      // The floor mirror's targets — FULL resolution, the same attachment
       // contract and sample count as the scene pass, which is what lets the
-      // mirror bundles reuse every scene pipeline unchanged. A reflection is
-      // low-frequency by the time a floor finishes with it; half res is the
-      // classic spend. Aux and id are along for pipeline compatibility and
-      // discarded; only the HDR colour resolves to something samplable.
-      const mw = Math.max(1, width >> 1)
-      const mh = Math.max(1, height >> 1)
+      // mirror bundles reuse every scene pipeline unchanged. Half res was the
+      // first cut and read soft at mirror 1 (user call, 2026-08-16); the blur
+      // dial makes softness a CHOICE now, so the base target is sharp. Aux and
+      // id are along for pipeline compatibility and discarded; only the HDR
+      // colour resolves to something samplable.
+      const mw = width
+      const mh = height
       this.mirrorColorMsTexture?.destroy()
       this.mirrorColorTexture?.destroy()
       this.mirrorMaskMsTexture?.destroy()
@@ -5283,13 +5343,25 @@ export class Engine {
         format: this.hdrFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
+      // Mipped: the blur dial samples a higher level, and the chain below
+      // fills the levels with the bloom pyramid's own 13-tap downsample. Mip 0
+      // is the resolve target; the ground's view spans them all, and a blur of
+      // exactly zero reads only level 0, which is why an unfilled chain is
+      // safe for scenes that never touch the dial.
+      this.mirrorMipCount = Math.max(1, Math.min(6, Math.floor(Math.log2(Math.min(mw, mh))) - 2))
       this.mirrorColorTexture = this.device.createTexture({
         label: "mirror HDR resolve",
         size: [mw, mh],
+        mipLevelCount: this.mirrorMipCount,
         format: this.hdrFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
       this.mirrorColorView = this.mirrorColorTexture.createView()
+      this.mirrorMipViews = []
+      for (let i = 0; i < this.mirrorMipCount; i++) {
+        this.mirrorMipViews.push(this.mirrorColorTexture.createView({ baseMipLevel: i, mipLevelCount: 1 }))
+      }
+      this.mirrorBlurBindGroups = null
       this.mirrorMaskMsTexture = this.device.createTexture({
         label: "mirror aux (msaa, discarded)",
         size: [mw, mh],
@@ -5315,7 +5387,7 @@ export class Engine {
       })
       const mirrorColor: GPURenderPassColorAttachment = {
         view: this.mirrorColorMsTexture.createView(),
-        resolveTarget: this.mirrorColorView,
+        resolveTarget: this.mirrorMipViews[0],
         clearValue: { r: 0, g: 0, b: 0, a: 0 },
         loadOp: "clear",
         storeOp: "discard",
@@ -6161,6 +6233,9 @@ export class Engine {
     /** Floor-mirror strength, 0–1: how much of the surface is the reflected
      *  cast. 0 (default) never renders the reflection pass at all. */
     mirror?: number
+    /** Mirror softness, 0–1: 0 a polished mirror, 1 the softest blur level,
+     *  scaled with distance so the contact stays sharper than the far floor. */
+    mirrorBlur?: number
   }): void {
     const opts = {
       width: 160,
@@ -6176,6 +6251,7 @@ export class Engine {
       noiseStrength: 0.05,
       opacity: 1.0,
       mirror: 0,
+      mirrorBlur: 0,
       ...options,
     }
     this.createGroundGeometry(opts.width, opts.height)
@@ -7885,6 +7961,7 @@ export class Engine {
     noiseStrength: number
     opacity: number
     mirror: number
+    mirrorBlur: number
   }) {
     const {
       diffuseColor,
@@ -7898,9 +7975,12 @@ export class Engine {
       noiseStrength,
       opacity,
       mirror,
+      mirrorBlur,
     } = opts
     // Shadow map is already created in setupPipelines()
-    const gb = new Float32Array(16)
+    // 20 floats: 16 for the original block, then (mirrorBlur, pad, pad, pad)
+    // keeping the uniform vec4-aligned.
+    const gb = new Float32Array(20)
     gb[0] = diffuseColor.x
     gb[1] = diffuseColor.y
     gb[2] = diffuseColor.z
@@ -7918,6 +7998,8 @@ export class Engine {
     gb[14] = gridLineColor.z
     gb[15] = Math.min(Math.max(mirror, 0), 1)
     this.groundMirror = gb[15]
+    gb[16] = Math.min(Math.max(mirrorBlur, 0), 1)
+    this.groundMirrorBlur = gb[16]
     this.groundShadowMaterialBuffer = this.device.createBuffer({
       size: gb.byteLength,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,

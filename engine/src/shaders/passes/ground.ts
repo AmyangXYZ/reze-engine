@@ -19,6 +19,7 @@ struct GroundShadowMat {
   fadeEnd: f32, shadowStrength: f32, pcfTexel: f32, gridSpacing: f32,
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, mirror: f32,
+  mirrorBlur: f32, _mb0: f32, _mb1: f32, _mb2: f32,
 };
 // One view-projection per shadow cascade, inner to outer — same buffer and
 // same order the materials read.
@@ -187,7 +188,15 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     let mc = mirrorVP.viewProj * vec4f(i.worldPos, 1.0);
     let mndc = mc.xyz / max(mc.w, 1e-6);
     let muv = vec2f(mndc.x * 0.5 + 0.5, 0.5 - mndc.y * 0.5);
-    let refl = textureSampleLevel(mirrorTex, linearSampler, clamp(muv, vec2f(0.0), vec2f(1.0)), 0.0).rgb;
+    // Softness reads a higher mip of the reflection, SCALED WITH DISTANCE so
+    // the contact under a foot stays sharper than the far floor — the cheap
+    // stand-in for true depth-proportional blur, which would need the
+    // reflection's own depth (recorded follow-up). Blur 0 is exactly level 0,
+    // which is why an unfilled mip chain is safe. The hardware clamps the
+    // level, so the nominal 5.0 needs no knowledge of the real chain length.
+    let viewDist = length(i.worldPos - camera.viewPos);
+    let lod = material.mirrorBlur * 5.0 * clamp(viewDist / 60.0, 0.15, 1.0);
+    let refl = textureSampleLevel(mirrorTex, linearSampler, clamp(muv, vec2f(0.0), vec2f(1.0)), lod).rgb;
     // Still under the received shadow: a polished floor in shade shows a dim
     // reflection, and a mirror that ignored the shadow would glow in it.
     baseColor = mix(baseColor, refl * (1.0 - dark * 0.65), material.mirror);
