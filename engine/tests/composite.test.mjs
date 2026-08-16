@@ -39,14 +39,7 @@ const field = (wgsl, hasBackground, hasForeground) => buildFieldShader(effect(wg
  *  substitution — real WGSL in this file is lower/camel case. */
 const PLACEHOLDER = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g
 /** The template's own compile-time constants, which legitimately look like one. */
-const ALLOWED = new Set([
-  "APPLY_GAMMA",
-  "FILMIC_LUT_W",
-  "RZ_MAX_ANCHORS",
-  "RZ_TRAIL_SAMPLES",
-  "RZ_GRID_SIZE",
-  "RZ_FIELD_EXPOSURE",
-])
+const ALLOWED = new Set(["APPLY_GAMMA", "FILMIC_LUT_W", "RZ_MAX_ANCHORS", "RZ_TRAIL_SAMPLES", "RZ_GRID_SIZE"])
 
 // Comments are prose and name things that don't exist in this file (engine-side
 // constants, the placeholders themselves) — scan the code the GPU sees.
@@ -66,11 +59,9 @@ test("every variant consumes every placeholder", () => {
 })
 
 test("the declared mounts are the ones called, in the field pass", () => {
-  // rzFieldOut is the conversion into scene light — the mount's output goes
-  // through it on the way into the layer, so it is what a call looks like now.
   const calls = (src) => ({
-    background: /rzFieldOut\(background\(/.test(src),
-    foreground: /rzFieldOut\(foreground\(/.test(src),
+    background: /clamp\(background\(/.test(src),
+    foreground: /clamp\(foreground\(/.test(src),
   })
   assert.deepEqual(calls(field(BACKGROUND, true, false)), { background: true, foreground: false })
   assert.deepEqual(calls(field(FOREGROUND, false, true)), { background: false, foreground: true })
@@ -119,34 +110,19 @@ test("a foreground alone leaves the background block gated on the equirect", () 
   assert.match(source(FOREGROUND, false, true), /if \(bg\.w > 1\.5 && sceneAlpha < 0\.999\) \{/)
 })
 
-test("the composite is ONE shader, whatever effects are installed", () => {
-  // It has no variants left. Effects draw inside the scene pass now — the field
-  // layer is blitted there, so nothing in this shader depends on which of them
-  // exist. The gate is the equirect's alone, and it is the same in every
-  // variant: behind a fully covered pixel the result is multiplied by
-  // (1 - alpha) = 0 anyway, and on a full-screen dome that is a third of the
-  // frame.
-  const derivative = "fn background(r: vec3f, uv: vec2f, t: f32) -> vec4f { return vec4f(fwidth(uv.x)); }"
-  const variants = [
-    COMPOSITE_SHADER_WGSL,
-    source(BACKGROUND, true, false),
-    source(FOREGROUND, false, true),
-    source(derivative, true, false),
-    source(`${BACKGROUND}\n${FOREGROUND}`, true, true),
-  ]
-  for (const v of variants) {
-    assert.match(v, /if \(bg\.w > 1\.5 && sceneAlpha < 0\.999\) \{/)
-    assert.equal(v, variants[0], "the composite must not vary with the effect list")
-  }
-})
+test("a background effect keeps the coverage gate, derivatives and all", () => {
+  assert.match(source(BACKGROUND, true, false), /if \(sceneAlpha < 0\.999\) \{/)
 
-test("the composite never samples the field layer", () => {
-  // It is drawn INTO the scene pass now. Reading it here as well would draw
-  // every field effect twice — and compositing it here at all is what kept the
-  // mount from ever reaching the bloom pyramid.
-  for (const name of ["fieldBgTex", "fieldFgTex", "fieldBgHalfTex", "fieldFgHalfTex", "rzFieldMerge"]) {
-    assert.ok(!COMPOSITE_SHADER_WGSL.includes(name), `${name} must be gone from the composite`)
-  }
+  // Derivative builtins are illegal in non-uniform control flow, and the gate
+  // used to be dropped for any effect using one. It no longer has to be: the
+  // user's code compiles in the FIELD shader, which runs the whole quad in
+  // uniform flow by construction, and the gate here now wraps nothing but the
+  // equirect sample and a texture read. An effect using fwidth keeps its gate.
+  const derivative = "fn background(r: vec3f, uv: vec2f, t: f32) -> vec4f { return vec4f(fwidth(uv.x)); }"
+  assert.match(source(derivative, true, false), /if \(sceneAlpha < 0\.999\) \{/)
+
+  const mixed = `${BACKGROUND}\nfn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f { return vec4f(dpdx(uv.x)); }`
+  assert.match(source(mixed, true, true), /if \(sceneAlpha < 0\.999\) \{/)
 })
 
 test("user code and its params land ahead of the entry points", () => {
@@ -214,22 +190,4 @@ test("@anchor declares slots in order, and only at the start of a line", () => {
     { bone: "頭", trail: false },
   ])
   assert.deepEqual(parseEffectAnchors("fn background() {}", 8), [])
-})
-
-test("a field effect's output is scene light, and may exceed 1", () => {
-  // The layer is drawn into the scene now, so it passes through the view
-  // transform like everything else. Two things follow, and both are the point:
-  const src = field(BACKGROUND, true, false)
-  // an authored 1.0 has to be told what it means in scene terms, or AgX lands
-  // it at mid grey and every effect that looked white arrives as a smear...
-  assert.match(src, /const RZ_FIELD_EXPOSURE: f32 = 3\.0;/)
-  assert.match(src, /out\.bg = rzFieldOut\(background\(/)
-  // ...and the UPPER clamp is gone, because above 1 is what reaches the bloom
-  // threshold. A field effect could never bloom while its output was clamped
-  // and composited past the pyramid.
-  assert.match(src, /max\(c\.rgb, vec3f\(0\.0\)\) \* RZ_FIELD_EXPOSURE/)
-  assert.doesNotMatch(src, /clamp\(background\(/, "the output must not be clamped to 1 any more")
-  // The lower clamp stays: the layer is premultiplied, so a negative channel
-  // would darken what it is drawn over rather than adding nothing.
-  assert.match(src, /max\(c\.rgb, vec3f\(0\.0\)\)/)
 })

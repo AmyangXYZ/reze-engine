@@ -176,12 +176,30 @@ override APPLY_GAMMA: bool = true;
 // vec4 slots: [0 .. 11] four subjects, three each (root+valid, hip, bounds);
 // then MAX_ANCHORS × four subjects, three each (pos+valid, vel, fwd).
 @group(0) @binding(11) var<storage, read> _rzCast: array<vec4f>;
-// The field layer is NOT read here any more. It is blitted into the HDR target
-// inside the scene pass — background before any geometry, foreground after all
-// of it — so field effects reach the bloom pyramid and take the same tone map
-// as everything else in the frame. Sampling it here as well would draw every
-// field effect twice, and compositing it here at all is what kept the mount
-// from ever blooming. See passes/field-blit.ts.
+// The FIELD LAYER: the user's background/foreground mounts, rendered at half
+// resolution in their own pass (see buildFieldShader) and sampled here. Field
+// effects are glows, fog, shafts, gradients — low-frequency by nature — and
+// running them per quarter-pixel was the single largest per-frame cost an
+// effect could add. Bilinear upsampling is invisible at that frequency.
+// The field layer, ONE PAIR PER RESOLUTION. 15/16 are full res, 20/21 half.
+// An effect draws into the pair it declared, so a starfield that upsamples
+// perfectly no longer pays full-resolution pixels because a neighbour needed
+// crisp edges. Both pairs are read every frame and combined full-over-half
+// below; a pair NO effect draws into is bound to a 1x1 transparent texture
+// instead of a target, so nothing has to clear a full-res pair to hand this
+// shader the transparent black it would then read.
+@group(0) @binding(15) var fieldBgTex: texture_2d<f32>;
+@group(0) @binding(16) var fieldFgTex: texture_2d<f32>;
+@group(0) @binding(20) var fieldBgHalfTex: texture_2d<f32>;
+@group(0) @binding(21) var fieldFgHalfTex: texture_2d<f32>;
+
+/** Two field layers into one, premultiplied OVER, top in front. A resolution
+ *  boundary is a layer boundary: within a pair, effects blend in document
+ *  order; across pairs, full res wins. (No backticks in here — this string is
+ *  a TS template literal and one ends it mid-shader.) */
+fn rzFieldMerge(top: vec4f, bot: vec4f) -> vec4f {
+  return vec4f(top.rgb + bot.rgb * (1.0 - top.a), top.a + bot.a * (1.0 - top.a));
+}
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
 const FILMIC_LUT_W: f32 = 256.0;
 
@@ -657,41 +675,89 @@ const COMPOSITE_BODY = /* wgsl */ `
   // arithmetic on uniforms, which every backend sinks into whatever reads it.
   let ndc = vec2f(fragCoord.x / fullSz.x * 2.0 - 1.0, 1.0 - fragCoord.y / fullSz.y * 2.0);
   let dir = normalize(viewU[5].xyz + ndc.x * viewU[3].w * viewU[3].xyz + ndc.y * viewU[4].w * viewU[4].xyz);
-  // The equirect, and nothing else now. Skipped behind pixels the scene fully
-  // covers — the composite multiplies the result by (1 - alpha) = 0 there
-  // anyway, and on a full-screen dome that is a third or more of the frame.
-  if (bg.w > 1.5 && sceneAlpha < 0.999) {
-    // LH world (+Z forward): longitude = atan2(x, z), Babylon-PhotoDome convention.
-    let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
-    let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
-    bgPm = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
+  if (BACKGROUND_COND) {
+    if (bg.w > 1.5) {
+      // LH world (+Z forward): longitude = atan2(x, z), Babylon-PhotoDome convention.
+      let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
+      let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
+      bgPm = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
+    }
+    BACKGROUND_CALL
   }
   // The frame, premultiplied: scene over background. A var, not the return
   // expression, because the foreground mount composites onto it.
   var outRgb = disp * sceneAlpha + bgPm * (1.0 - sceneAlpha);
   var outA = sceneAlpha + bgA * (1.0 - sceneAlpha);
-  // Neither ribbons nor field effects are read here any more: all of them draw
-  // inside the scene pass, so they are already in disp — tone mapped, and
-  // bloomed, which neither ever was while this line existed. Sampling them here
-  // as well would draw them twice.
+  // Ribbons are NOT read here any more: they draw inside the scene pass, so
+  // they are already in disp — tone mapped, and bloomed, which they never
+  // were while this line existed. Sampling them here as well would draw them
+  // twice, and the layer nothing clears would go stale the moment an effect
+  // was removed.
+  FOREGROUND_CALL
   return vec4f(outRgb, outA);
 }
 `
 
-/**
- * The composite, which is now the same shader for every scene.
+// uv flipped to bottom-left origin (shadertoy convention); clamped so a stray
+// effect can't push negatives/NaN into the premultiplied composite. Standard
+// OVER onto the base layer. No `if` around it: the pipeline is rebuilt per
+// effect, so this text only exists in variants whose WGSL defines background().
+const BACKGROUND_CALL = /* wgsl */ `
+    // The field layer is PREMULTIPLIED: N effects blend into it in document
+    // order, and premultiplied is the only form in which repeated OVER composes
+    // associatively — straight alpha would need the divide back out on every
+    // draw. So rgb is already scaled by its own alpha and must not be again.
+    // With one effect drawing over a cleared target this is identical to the
+    // straight form it replaced.
+    let bgFx = rzFieldMerge(
+      clamp(textureSampleLevel(fieldBgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)),
+      clamp(textureSampleLevel(fieldBgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)));
+    bgPm = bgFx.rgb + bgPm * (1.0 - bgFx.a);
+    bgA = bgFx.a + bgA * (1.0 - bgFx.a);
+`
+
+// Same OVER, one layer later — onto the finished frame rather than onto the
+// base. Ungated by design: a foreground runs at every pixel, including the ones
+// the model covers, because covering them is the point.
+const FOREGROUND_CALL = /* wgsl */ `
+  // Premultiplied, as the background layer above — same reason.
+  let fgFx = rzFieldMerge(
+    clamp(textureSampleLevel(fieldFgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)),
+    clamp(textureSampleLevel(fieldFgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)));
+  outRgb = fgFx.rgb + outRgb * (1.0 - fgFx.a);
+  outA = fgFx.a + outA * (1.0 - fgFx.a);
+`
+
+/** The condition on the background block (equirect sample + background effect).
  *
- * It tone maps the HDR target and composites it over the base background — a
- * colour, a 360 equirect, or transparency. It has no variants and no
- * substitutions left: effects draw inside the scene pass, so there is nothing
- * here that depends on which of them are installed.
+ *  Two jobs. It skips the block behind pixels the model fully covers — the
+ *  composite multiplies the result by (1 - alpha) = 0 there anyway, and on a
+ *  full-screen effect that's a third or more of the frame (the cost Safari feels
+ *  most). And with no background effect compiled in, it also skips the block
+ *  entirely unless the equirect needs it.
  *
- * The parameter is kept because every caller passes one and the anchor alias
- * still rides along for the scene API below; it no longer changes the body.
- */
+ *  Everything the gate wraps is an explicit-LOD sample or a texture read, both
+ *  always legal in non-uniform flow. It used to also wrap the user's code, which
+ *  meant an effect using a derivative builtin had to forfeit the gate; that
+ *  carve-out went with the field pass, and the last of it is below. */
+function backgroundCondition(effect?: CompositeEffectSource | null): string {
+  // sceneAlpha, not alpha: the bokeh gather spreads coverage, so a pixel the
+  // sharp scene fully covered can end up needing background behind its blur.
+  // (The old derivative carve-out is gone with the inline user code: the field
+  // pass runs the whole quad, which is uniform control flow by construction.)
+  const coverage = "sceneAlpha < 0.999"
+  if (!effect?.hasBackground) return `bg.w > 1.5 && ${coverage}`
+  return coverage
+}
+
 export function buildCompositeShader(effect?: CompositeEffectSource | null): string {
+  const body = COMPOSITE_BODY.replace("BACKGROUND_COND", backgroundCondition(effect))
+    .replace("BACKGROUND_CALL", effect?.hasBackground ? BACKGROUND_CALL.trim() : "")
+    .replace("FOREGROUND_CALL", effect?.hasForeground ? FOREGROUND_CALL.trim() : "")
+  // The composite is STATIC either way now: the user's code compiles in the
+  // field module alone, and the composite only decides whether to sample it.
   return COMPOSITE_HEAD +
-    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + scoreApi(0, 19) + COMPOSITE_BODY
+    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + scoreApi(0, 19) + body
 }
 
 /**
@@ -748,9 +814,11 @@ fn rzMaterialAt(uv: vec2f) -> u32 {
 }
 
 export function buildFieldShader(effect: CompositeEffectSource): string {
-  const bgLine = effect.hasBackground ? "  out.bg = rzFieldOut(background(dir, uv, _rzFieldClock.x));" : ""
+  const bgLine = effect.hasBackground
+    ? "out.bg = clamp(background(dir, uv, _rzFieldClock.x), vec4f(0.0), vec4f(1.0));"
+    : ""
   const fgLine = effect.hasForeground
-    ? "  out.fg = rzFieldOut(foreground(dir, uv, _rzFieldClock.x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))));"
+    ? "out.fg = clamp(foreground(dir, uv, _rzFieldClock.x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))), vec4f(0.0), vec4f(1.0));"
     : ""
   return (
     COMPOSITE_HEAD +
@@ -770,32 +838,6 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     effect.wgsl +
     "\n" +
     /* wgsl */ `
-/**
- * How bright an authored 1.0 is, in scene terms.
- *
- * The field layer is drawn INTO the scene now, so it passes through the view
- * transform like everything else. That transform is not a straight line: AgX
- * lands a linear 1.0 at roughly mid grey, so an effect that returned white and
- * looked white when it composited after tone mapping would arrive as a grey
- * smear. This is the exposure that puts an authored 1.0 back at approximately
- * white — the same order as the intensities the HDR mounts already carry
- * (Snow 3.0, Hand Ribbon 3.2), which is the corroboration for the number.
- *
- * It is a CONVERSION, not a fudge: the mount's contract is that a colour is
- * authored in 0..1 and this says what 1.0 means once it is light in a scene.
- * Values ABOVE 1 are legal and meaningful now — that is how a field effect
- * finally reaches the bloom threshold, which it could never do while its output
- * was clamped and composited past the pyramid.
- */
-const RZ_FIELD_EXPOSURE: f32 = 3.0;
-
-/** An effect's return, as scene light. Negatives are refused because the layer
- *  is premultiplied and a negative would darken what it is drawn over; the
- *  upper clamp is deliberately GONE, since above 1 is what blooms. */
-fn rzFieldOut(c: vec4f) -> vec4f {
-  return vec4f(max(c.rgb, vec3f(0.0)) * RZ_FIELD_EXPOSURE, clamp(c.a, 0.0, 1.0));
-}
-
 @group(0) @binding(14) var<uniform> fieldU: vec4f;
 /**
  * THIS EFFECT'S OWN clock, seconds since it was installed.
