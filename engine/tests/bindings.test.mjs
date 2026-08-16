@@ -79,3 +79,55 @@ test("every bind group covers exactly its layout's bindings", () => {
     )
   }
 })
+
+/** The class method containing `needle`, by brace matching from its signature. */
+function methodContaining(needle) {
+  const at = src.indexOf(needle)
+  assert.ok(at > 0, `not found in engine.ts: ${needle}`)
+  // The nearest method signature above it — a line at class-body indent that
+  // opens a brace. Nested closures are indented deeper and never match.
+  let start = -1
+  for (const m of src.matchAll(/^ {2}(?:private |protected |public )?(?:async )?[A-Za-z_]\w*\([^\n]*\{$/gm)) {
+    if (m.index < at) start = m.index
+    else break
+  }
+  assert.ok(start >= 0, "no enclosing method found")
+  let depth = 0
+  let i = src.indexOf("{", start)
+  for (; i < src.length; i++) {
+    if (src[i] === "{") depth++
+    else if (src[i] === "}") depth--
+    if (depth === 0) break
+  }
+  return src.slice(start, i)
+}
+
+// A buffer bound before it is created reads as `{ buffer: undefined }`, and
+// WebGPU rejects the whole bind group with "Required member is undefined" —
+// naming the descriptor, never the field. TypeScript cannot see it either: the
+// definite-assignment `!` on these fields is what makes the class compile at
+// all, and it silences exactly this.
+//
+// Sound only WITHIN one function, which is why this is scoped rather than
+// file-wide: across methods, file order says nothing about call order, and
+// seven fields legitimately appear bound above where they are assigned. Inside
+// a single body, statement order IS execution order.
+//
+// This is a real bug, shipped 2026-08-16: the lights buffer was created after
+// the per-frame bind group that binds it, and the app failed to start.
+test("a bind group's buffers are created before the bind group that binds them", () => {
+  for (const marker of ['label: "main per-frame bind group"', 'label: "composite bind group"']) {
+    const body = methodContaining(marker)
+    for (const use of body.matchAll(/\{\s*buffer:\s*this\.([A-Za-z0-9_]+)\s*\}/g)) {
+      const assign = body.indexOf(`this.${use[1]} = `)
+      // Assigned in ANOTHER method: this test cannot order those, and says so
+      // rather than guessing.
+      if (assign < 0) continue
+      assert.ok(
+        assign < use.index,
+        `this.${use[1]} is bound before it is assigned, inside the method holding ${marker} — ` +
+          `the bind group will see undefined and WebGPU will reject the whole descriptor`,
+      )
+    }
+  }
+})

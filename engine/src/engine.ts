@@ -4185,6 +4185,18 @@ export class Engine {
     void this.loadAgxLut()
     this.bakeFilmicLut()
 
+    // BEFORE the bind group below, which binds it. Full size from the start:
+    // every material pipeline binds this, so sizing it to the light count would
+    // mean rebuilding bind groups whenever a scene gained a lamp. Zero-filled,
+    // and float 0 is a count of 0.
+    this.lightsData = new Float32Array(LIGHTS_FLOATS)
+    this.lightsBuffer = this.device.createBuffer({
+      label: "positional lights",
+      size: this.lightsData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
+
     // Now that shadow resources exist, create the main per-frame bind group
     this.perFrameBindGroup = this.device.createBindGroup({
       label: "main per-frame bind group",
@@ -4511,16 +4523,6 @@ export class Engine {
       size: this.castData.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
-    // Full size from the start: the buffer is bound by every material pipeline,
-    // so resizing it with the light count would mean rebuilding bind groups
-    // whenever a scene gained a lamp. Zero-filled, and float 0 is a count of 0.
-    this.lightsData = new Float32Array(LIGHTS_FLOATS)
-    this.lightsBuffer = this.device.createBuffer({
-      label: "positional lights",
-      size: this.lightsData.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    })
-    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
     this.compositeBindGroupLayout = this.device.createBindGroupLayout({
       label: "composite bind group layout",
       entries: [
