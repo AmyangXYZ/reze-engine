@@ -39,7 +39,14 @@ const field = (wgsl, hasBackground, hasForeground) => buildFieldShader(effect(wg
  *  substitution — real WGSL in this file is lower/camel case. */
 const PLACEHOLDER = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g
 /** The template's own compile-time constants, which legitimately look like one. */
-const ALLOWED = new Set(["APPLY_GAMMA", "FILMIC_LUT_W", "RZ_MAX_ANCHORS", "RZ_TRAIL_SAMPLES", "RZ_GRID_SIZE"])
+const ALLOWED = new Set([
+  "APPLY_GAMMA",
+  "FILMIC_LUT_W",
+  "RZ_MAX_ANCHORS",
+  "RZ_TRAIL_SAMPLES",
+  "RZ_GRID_SIZE",
+  "RZ_FIELD_EXPOSURE",
+])
 
 // Comments are prose and name things that don't exist in this file (engine-side
 // constants, the placeholders themselves) — scan the code the GPU sees.
@@ -59,9 +66,11 @@ test("every variant consumes every placeholder", () => {
 })
 
 test("the declared mounts are the ones called, in the field pass", () => {
+  // rzFieldOut is the conversion into scene light — the mount's output goes
+  // through it on the way into the layer, so it is what a call looks like now.
   const calls = (src) => ({
-    background: /clamp\(background\(/.test(src),
-    foreground: /clamp\(foreground\(/.test(src),
+    background: /rzFieldOut\(background\(/.test(src),
+    foreground: /rzFieldOut\(foreground\(/.test(src),
   })
   assert.deepEqual(calls(field(BACKGROUND, true, false)), { background: true, foreground: false })
   assert.deepEqual(calls(field(FOREGROUND, false, true)), { background: false, foreground: true })
@@ -205,4 +214,22 @@ test("@anchor declares slots in order, and only at the start of a line", () => {
     { bone: "頭", trail: false },
   ])
   assert.deepEqual(parseEffectAnchors("fn background() {}", 8), [])
+})
+
+test("a field effect's output is scene light, and may exceed 1", () => {
+  // The layer is drawn into the scene now, so it passes through the view
+  // transform like everything else. Two things follow, and both are the point:
+  const src = field(BACKGROUND, true, false)
+  // an authored 1.0 has to be told what it means in scene terms, or AgX lands
+  // it at mid grey and every effect that looked white arrives as a smear...
+  assert.match(src, /const RZ_FIELD_EXPOSURE: f32 = 3\.0;/)
+  assert.match(src, /out\.bg = rzFieldOut\(background\(/)
+  // ...and the UPPER clamp is gone, because above 1 is what reaches the bloom
+  // threshold. A field effect could never bloom while its output was clamped
+  // and composited past the pyramid.
+  assert.match(src, /max\(c\.rgb, vec3f\(0\.0\)\) \* RZ_FIELD_EXPOSURE/)
+  assert.doesNotMatch(src, /clamp\(background\(/, "the output must not be clamped to 1 any more")
+  // The lower clamp stays: the layer is premultiplied, so a negative channel
+  // would darken what it is drawn over rather than adding nothing.
+  assert.match(src, /max\(c\.rgb, vec3f\(0\.0\)\)/)
 })

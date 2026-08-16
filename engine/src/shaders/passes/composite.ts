@@ -748,11 +748,9 @@ fn rzMaterialAt(uv: vec2f) -> u32 {
 }
 
 export function buildFieldShader(effect: CompositeEffectSource): string {
-  const bgLine = effect.hasBackground
-    ? "out.bg = clamp(background(dir, uv, _rzFieldClock.x), vec4f(0.0), vec4f(1.0));"
-    : ""
+  const bgLine = effect.hasBackground ? "  out.bg = rzFieldOut(background(dir, uv, _rzFieldClock.x));" : ""
   const fgLine = effect.hasForeground
-    ? "out.fg = clamp(foreground(dir, uv, _rzFieldClock.x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))), vec4f(0.0), vec4f(1.0));"
+    ? "  out.fg = rzFieldOut(foreground(dir, uv, _rzFieldClock.x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))));"
     : ""
   return (
     COMPOSITE_HEAD +
@@ -772,6 +770,32 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     effect.wgsl +
     "\n" +
     /* wgsl */ `
+/**
+ * How bright an authored 1.0 is, in scene terms.
+ *
+ * The field layer is drawn INTO the scene now, so it passes through the view
+ * transform like everything else. That transform is not a straight line: AgX
+ * lands a linear 1.0 at roughly mid grey, so an effect that returned white and
+ * looked white when it composited after tone mapping would arrive as a grey
+ * smear. This is the exposure that puts an authored 1.0 back at approximately
+ * white — the same order as the intensities the HDR mounts already carry
+ * (Snow 3.0, Hand Ribbon 3.2), which is the corroboration for the number.
+ *
+ * It is a CONVERSION, not a fudge: the mount's contract is that a colour is
+ * authored in 0..1 and this says what 1.0 means once it is light in a scene.
+ * Values ABOVE 1 are legal and meaningful now — that is how a field effect
+ * finally reaches the bloom threshold, which it could never do while its output
+ * was clamped and composited past the pyramid.
+ */
+const RZ_FIELD_EXPOSURE: f32 = 3.0;
+
+/** An effect's return, as scene light. Negatives are refused because the layer
+ *  is premultiplied and a negative would darken what it is drawn over; the
+ *  upper clamp is deliberately GONE, since above 1 is what blooms. */
+fn rzFieldOut(c: vec4f) -> vec4f {
+  return vec4f(max(c.rgb, vec3f(0.0)) * RZ_FIELD_EXPOSURE, clamp(c.a, 0.0, 1.0));
+}
+
 @group(0) @binding(14) var<uniform> fieldU: vec4f;
 /**
  * THIS EFFECT'S OWN clock, seconds since it was installed.
