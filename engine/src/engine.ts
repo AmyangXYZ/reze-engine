@@ -1365,14 +1365,22 @@ export class Engine {
    *  rg8unorm at 4× MSAA is 8 bytes/texel — still fits Apple TBDR tile memory comfortably. */
   private static readonly BLOOM_MASK_FORMAT: GPUTextureFormat = "rg8unorm"
   /**
-   * The master switch for the id attachment. ON.
+   * The master switch for the id attachment. OFF — and off having been proven
+   * to work, not off because it was never finished.
    *
-   * It costs a third multisampled attachment on every scene and buys nothing
-   * visible until something reads ids — setIdDebug draws them, which is how
-   * this was checked at all. Turning it back off is this line, which is the
-   * point of it being one.
+   * Turned on, checked through setIdDebug against a real scene, and turned back
+   * off: flat colour per material with hard edges (so nothing interpolates or
+   * resolves them), the floor on its reserved id, black exactly where nothing
+   * drew. What it costs is rg16uint at the pass's sample count — around 33MB at
+   * 1080p, cleared and stored every frame — and what it buys is nothing at all
+   * until something reads ids. That is the same order of bandwidth as the empty
+   * field-pass clears that were just removed, so leaving it on would have
+   * quietly handed that back.
+   *
+   * Phase 4 turns it on again, by this line, when there is a consumer to
+   * justify it. setIdDebug refuses while it is off rather than drawing black.
    */
-  private static readonly MRT_IDS = true
+  private static readonly MRT_IDS = false
   /** The id attachment. Multisampled with the pass and NEVER resolved: an
    *  averaged id belongs to nothing, so consumers textureLoad sample 0. */
   private idTexture: GPUTexture | null = null
