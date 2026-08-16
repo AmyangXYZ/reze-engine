@@ -1942,6 +1942,12 @@ export class Engine {
   private rebuildCompositeBindGroup(): void {
     if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView || !this.depthReadView) return
     if (!this.castBuffer) return
+    // BEFORE the entries below, not after: they ask fieldPairUsed which effects
+    // draw, and that answer includes whether an effect has its field bind group
+    // yet. Building the composite first and the field groups second would bind
+    // the fallback for a pair that then became drawable in the same call, and
+    // the effect would render into a target the composite was not reading.
+    this.rebuildFieldBindGroup()
     this.compositeBindGroup = this.device.createBindGroup({
       label: "composite bind group",
       layout: this.compositeBindGroupLayout,
@@ -1960,13 +1966,34 @@ export class Engine {
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.scoreBuffer } },
-        { binding: 15, resource: this.fieldBgViews[0] ?? this.trailFallbackView },
-        { binding: 16, resource: this.fieldFgViews[0] ?? this.trailFallbackView },
-        { binding: 20, resource: this.fieldBgViews[1] ?? this.trailFallbackView },
-        { binding: 21, resource: this.fieldFgViews[1] ?? this.trailFallbackView },
+        { binding: 15, resource: this.fieldLayerView(this.fieldBgViews[0], 0) },
+        { binding: 16, resource: this.fieldLayerView(this.fieldFgViews[0], 0) },
+        { binding: 20, resource: this.fieldLayerView(this.fieldBgViews[1], 1) },
+        { binding: 21, resource: this.fieldLayerView(this.fieldFgViews[1], 1) },
       ],
     })
-    this.rebuildFieldBindGroup()
+  }
+
+  /**
+   * Does any installed effect draw into field pair `layer`?
+   *
+   * Shared with renderFieldPass deliberately. The pass skips a pair nothing
+   * draws into, so the composite must read the 1x1 fallback for that pair
+   * rather than a target no one cleared. Two spellings of "empty" is two
+   * spellings that eventually disagree, and the frame it disagreed on would
+   * show last frame's effect after the effect was removed.
+   *
+   * It is only ever asked at bind-group build time, and setEffects rebuilds the
+   * bind group after assigning this.effects — which is exactly the moment a
+   * pair can change between empty and not.
+   */
+  private fieldPairUsed(layer: number): boolean {
+    return this.effects.some((e) => e.fieldPipeline && e.fieldBindGroups && e.fieldLayer === layer)
+  }
+
+  /** One half of one field pair, as the composite should read it. */
+  private fieldLayerView(view: GPUTextureView | null, layer: number): GPUTextureView {
+    return this.fieldPairUsed(layer) && view ? view : this.trailFallbackView
   }
 
   private createFieldTargets(): void {
@@ -2935,23 +2962,32 @@ export class Engine {
     // Alpha is the layer, the same rule the composite already states, and it
     // keeps memory flat however many effects a scene installs.
     //
-    // Both pairs are cleared even when empty: the composite reads both every
-    // frame, and a pair left holding last frame's content would keep drawing an
-    // effect that has been removed.
+    // An EMPTY pair is skipped rather than cleared. It used to be cleared on the
+    // grounds that the composite reads both pairs every frame and a stale one
+    // would keep drawing a removed effect — true of the target, but the composite
+    // does not read the target for an empty pair, it reads the 1x1 fallback
+    // (fieldLayerView). Clearing and storing an empty full-res rgba16f pair is
+    // two 16MB writes a frame to produce the transparent black the fallback
+    // already is. Most scenes leave the full-res pair empty, since an effect only
+    // lands there by declaring @fullres.
+    let stamped = false
     for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
       const bg = this.fieldBgViews[i]
       const fg = this.fieldFgViews[i]
-      if (!bg || !fg) continue
+      if (!bg || !fg || !this.fieldPairUsed(i)) continue
       const pass = encoder.beginRenderPass({
         label: `field layer (${Engine.FIELD_SCALES[i] === 1 ? "full" : "half"})`,
         colorAttachments: [
           { view: bg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
           { view: fg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
         ],
-        // Only the full-res pass is stamped: one query pair is reserved for
-        // "field", and it is the pass whose cost is worth watching.
-        timestampWrites: i === 0 ? this.stamps("field") : undefined,
+        // One query pair is reserved for "field", and it goes to the first pair
+        // that actually runs — full res when something declared @fullres, half
+        // otherwise. Pinning it to i === 0 would have measured a pass that, now
+        // that empty pairs are skipped, usually does not happen.
+        timestampWrites: stamped ? undefined : this.stamps("field"),
       })
+      stamped = true
       for (const e of drawn) {
         if (e.fieldLayer !== i) continue
         pass.setPipeline(e.fieldPipeline!)

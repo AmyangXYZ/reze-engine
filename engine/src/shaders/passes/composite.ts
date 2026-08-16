@@ -180,8 +180,10 @@ override APPLY_GAMMA: bool = true;
 // The field layer, ONE PAIR PER RESOLUTION. 15/16 are full res, 20/21 half.
 // An effect draws into the pair it declared, so a starfield that upsamples
 // perfectly no longer pays full-resolution pixels because a neighbour needed
-// crisp edges. Both pairs are read every frame — a pair with no effects in it
-// is cleared, not stale — and combined full-over-half below.
+// crisp edges. Both pairs are read every frame and combined full-over-half
+// below; a pair NO effect draws into is bound to a 1x1 transparent texture
+// instead of a target, so nothing has to clear a full-res pair to hand this
+// shader the transparent black it would then read.
 @group(0) @binding(15) var fieldBgTex: texture_2d<f32>;
 @group(0) @binding(16) var fieldFgTex: texture_2d<f32>;
 @group(0) @binding(20) var fieldBgHalfTex: texture_2d<f32>;
