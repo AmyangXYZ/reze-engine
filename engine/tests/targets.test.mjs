@@ -268,7 +268,10 @@ test("the ground's ids collide with no model's", () => {
   // Both engine counters are 1-based, so the bottom of the range is taken.
   assert.match(groundSrc, /GROUND_MATERIAL_ID = 0xffff/)
   assert.match(groundSrc, /GROUND_OBJECT_ID = 0xffff/)
-  assert.match(engine, /const modelId = this\.modelInstances\.size \+ 1/, "model ids are 1-based — 0 stays 'nothing'")
+  // Minted ONCE, on the instance. The pick pass and the id attachment have to
+  // name the same object by the same number, and this used to be derived twice.
+  assert.match(engine, /objectId: this\.modelInstances\.size \+ 1/, "model ids are 1-based — 0 stays 'nothing'")
+  assert.match(engine, /const modelId = inst\.objectId/, "the pick path must READ the id, not re-derive it")
 })
 
 test("the debug view refuses to draw when there is nothing to show", () => {
@@ -345,3 +348,52 @@ for (const [label, emit, structName, cls] of SHADERS) {
     assert.deepEqual(locations, [...locations.keys()], `${label} output locations are not 0..n`)
   })
 }
+
+// ── The id CONSUMER: what the whole MRT phase was built for ──
+
+import { buildFieldShader } from "../dist/shaders/passes/composite.js"
+
+const fieldWith = (ids) =>
+  buildFieldShader({
+    wgsl: "fn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f { return vec4f(0.0); }",
+    paramsDecl: "",
+    hasBackground: false,
+    hasForeground: true,
+    gridSize: 0,
+    ids,
+  })
+
+test("an effect can read the id buffer, and compare it against a subject", () => {
+  // Reading an id says nothing without something to compare it to, so both
+  // halves have to exist: the pixel's id, and the id of a character.
+  const src = fieldWith(true)
+  assert.match(src, /fn rzObjectAt\(uv: vec2f\) -> u32/)
+  assert.match(src, /fn rzMaterialAt\(uv: vec2f\) -> u32/)
+  assert.match(src, /fn rzSubjectId\(i: i32\) -> u32/)
+  // Multisampled and unresolved, read at sample 0 — the linearDepth rule. An
+  // averaged id belongs to nothing.
+  assert.match(src, /var _rzIdTex: texture_multisampled_2d<u32>/)
+  // Sample 0 explicitly. The naive [^)]* could not span the nested clamp() the
+  // load actually contains, so match the call and its sample index separately.
+  assert.match(src, /textureLoad\(_rzIdTex,/)
+  assert.match(src, /, 0\)\.y;/, "the object id is the y channel, read at sample 0")
+  assert.match(src, /, 0\)\.x;/, "the material id is the x channel, read at sample 0")
+})
+
+test("with ids off the accessors still resolve, and answer nothing", () => {
+  // An effect that masks by id must not fail to COMPILE on a device that could
+  // not give us the attachment — it should simply mask nothing. The binding is
+  // absent (no fallback texture exists to bind), so only the functions remain.
+  const src = fieldWith(false)
+  assert.match(src, /fn rzObjectAt\(uv: vec2f\) -> u32 \{ return 0u; \}/)
+  assert.match(src, /fn rzMaterialAt\(uv: vec2f\) -> u32 \{ return 0u; \}/)
+  assert.doesNotMatch(src, /_rzIdTex/, "no binding may be declared when the attachment does not exist")
+})
+
+test("the subject id and the pick id are the same number", () => {
+  // The cast carries objectId in the centre vec4's w; the pick pass reads the
+  // same field off the instance. Two derivations of one id are two that drift,
+  // and then a mask selects a different model than a click does.
+  assert.match(engine, /cd\[b \+ 7\] = inst\.objectId/, "the cast must carry the object id")
+  assert.match(fieldWith(true), /return u32\(_rzCast\[i \* 3 \+ 1\]\.w\)/, "rzSubjectId must read that same slot")
+})

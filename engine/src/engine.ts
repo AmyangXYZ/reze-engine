@@ -661,6 +661,10 @@ interface PickDrawCall {
 
 interface ModelInstance {
   name: string
+  /** This model's id in the id attachment — 1-based, so 0 stays "nothing".
+   *  The pick pass has always minted it; the cast carries it now too, so an
+   *  effect can compare what it reads out of the id buffer against a subject. */
+  objectId: number
   model: Model
   basePath: string
   assetReader: AssetReader
@@ -1399,19 +1403,20 @@ export class Engine {
    * The master switch for the id attachment. OFF — and off having been proven
    * to work, not off because it was never finished.
    *
-   * Turned on, checked through setIdDebug against a real scene, and turned back
-   * off: flat colour per material with hard edges (so nothing interpolates or
-   * resolves them), the floor on its reserved id, black exactly where nothing
-   * drew. What it costs is rg16uint at the pass's sample count — around 33MB at
-   * 1080p, cleared and stored every frame — and what it buys is nothing at all
-   * until something reads ids. That is the same order of bandwidth as the empty
-   * field-pass clears that were just removed, so leaving it on would have
-   * quietly handed that back.
+   * ON, because there is finally something that reads it: rzObjectAt and
+   * rzMaterialAt in the field module let an effect mask itself to one character
+   * or one material. It was switched off in the meantime rather than left
+   * running — rg16uint at the pass's sample count is around 33MB at 1080p,
+   * cleared and stored every frame, and paying that for a buffer nobody read
+   * would have handed back the same order of bandwidth the empty field-pass
+   * clears had just saved.
    *
-   * Phase 4 turns it on again, by this line, when there is a consumer to
-   * justify it. setIdDebug refuses while it is off rather than drawing black.
+   * Verified through setIdDebug against a real scene: flat colour per material
+   * with hard edges (so nothing interpolates or resolves them), the floor on
+   * its reserved id, black exactly where nothing drew. Turning it back off is
+   * this line, and the accessors then answer 0 rather than failing to compile.
    */
-  private static readonly MRT_IDS = false
+  private static readonly MRT_IDS = true
   /** The id attachment. Multisampled with the pass and NEVER resolved: an
    *  averaged id belongs to nothing, so consumers textureLoad sample 0. */
   private idTexture: GPUTexture | null = null
@@ -2250,6 +2255,7 @@ export class Engine {
           // The size uniform for the pair THIS effect draws into.
           { binding: 14, resource: { buffer: this.fieldUniformBuffers[owner.fieldLayer] } },
           { binding: 22, resource: { buffer: owner.fieldClock ?? this.fieldUniformBuffers[owner.fieldLayer] } },
+          ...(this.idView ? [{ binding: 23, resource: this.idView }] : []),
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
         ],
@@ -2528,7 +2534,7 @@ export class Engine {
       : FIELD_LAYER_BLEND
     let fieldPipeline: GPURenderPipeline | null = null
     if (fieldEffect) {
-      const fieldSource = buildFieldShader(fieldEffect)
+      const fieldSource = buildFieldShader({ ...fieldEffect, ids: mrtIdsEnabled() })
       const userLineOffset = fieldSource.slice(0, fieldSource.indexOf(wgsl)).split("\n").length - 1
       this.device.pushErrorScope("validation")
       const fieldModule = this.device.createShaderModule({ label: "field shader (effect)", code: fieldSource })
@@ -4109,6 +4115,19 @@ export class Engine {
         // This effect's own clock — see the field shader's note on why it is
         // not viewU[6].x.
         { binding: 22, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The id attachment, for rzObjectAt/rzMaterialAt. Declared only when it
+        // exists: the alternative is a multisampled uint fallback texture whose
+        // only job is to be bound, and the layout is built after the probe so
+        // both halves agree by construction.
+        ...(mrtIdsEnabled()
+          ? [
+              {
+                binding: 23,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: { sampleType: "uint" as const, viewDimension: "2d" as const, multisampled: true },
+              },
+            ]
+          : []),
         { binding: 17, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
         { binding: 18, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ],
@@ -7353,6 +7372,7 @@ export class Engine {
       styleGroups: new Map(),
       materialToGroup: new Map(),
       styleGroupGen: new Map(),
+      objectId: this.modelInstances.size + 1,
       cullModelIndex: 0,
       // Seeded false: the first skin-matrix upload decides it, and until then the
       // sphere path is the safe answer (it never culls something it should not).
@@ -7629,8 +7649,11 @@ export class Engine {
     if (materials.length === 0) throw new Error("Model has no materials")
     const textures = model.getTextures()
     const prefix = `${inst.name}: `
-    // 1-based so that (0,0) = clear color = "no hit"
-    const modelId = this.modelInstances.size + 1
+    // 1-based so that (0,0) = clear color = "no hit". Minted when the instance
+    // was built and READ here rather than derived again: two derivations of one
+    // id are two that can disagree, and the pick pass and the id attachment
+    // have to name the same object by the same number.
+    const modelId = inst.objectId
 
     const texLogicalPath = (texIndex: number): string | null =>
       texIndex < 0 || texIndex >= textures.length
@@ -9764,6 +9787,12 @@ export class Engine {
     cd[b + 4] = px
     cd[b + 5] = py
     cd[b + 6] = pz
+    // The centre vec4's w, unused until now: this subject's OBJECT ID. It is
+    // what makes the id attachment addressable from an effect — reading an id
+    // out of the buffer is useless without something to compare it against, and
+    // "the character I am following" is the comparison every masking effect
+    // actually wants.
+    cd[b + 7] = inst.objectId
     cd[b + 8] = px
     cd[b + 9] = floorY + height * 0.5
     cd[b + 10] = pz

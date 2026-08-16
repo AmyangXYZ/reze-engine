@@ -102,6 +102,9 @@ export type CompositeEffectSource = {
   hasForeground: boolean
   /** Grid resolution when the effect declared `// @grid`, else 0. */
   gridSize: number
+  /** Whether the scene pass carries the id attachment, so the field module can
+   *  bind it. False emits accessors that answer 0 rather than nothing at all. */
+  ids?: boolean
   /** This effect's local anchor slot → scene slot, from the shared table.
    *  Omitted or identity when it owns the table. The particle and trail modules
    *  have always taken this; the field module not taking it was the bug. */
@@ -408,6 +411,21 @@ fn rzHash21(p: vec2f) -> f32 {
 }
 fn rzHash13(x: f32) -> vec3f {
   return vec3f(rzHash11(x), rzHash11(x + 17.13), rzHash11(x + 41.71));
+}
+
+/**
+ * Subject i's OBJECT ID — what the id attachment writes for every pixel this
+ * character drew.
+ *
+ * The half that makes rzObjectAt() useful: reading an id out of the buffer says
+ * nothing until there is something to compare it against, and "the character I
+ * am following" is the comparison a masking effect actually wants. Zero for a
+ * subject past the end, and zero is the reserved nothing, so a bad index masks
+ * nothing rather than masking the wrong model.
+ */
+fn rzSubjectId(i: i32) -> u32 {
+  if (i < 0 || i >= rzSubjectCount()) { return 0u; }
+  return u32(_rzCast[i * 3 + 1].w);
 }
 
 fn rzSubject(i: i32) -> RzSubject {
@@ -751,6 +769,50 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
  * read — so an effect cannot tell it moved; it is simply asked half as often
  * in each direction.
  */
+/**
+ * Reading the scene's id attachment from a field effect — the consumer the MRT
+ * work exists for.
+ *
+ * A field effect covers the whole screen and has no idea what it is drawing
+ * over. These make it addressable: mask a glow to one character, dissolve one
+ * material, outline the thing someone selected. Without them the id buffer is
+ * written every frame and read by nobody.
+ *
+ * MULTISAMPLED AND UNRESOLVED, so it is read the way it is written —
+ * textureLoad of sample 0, the same rule linearDepth already follows. An
+ * averaged id belongs to nothing.
+ *
+ * When ids are OFF the buffer does not exist, so the accessors are still
+ * DECLARED and answer 0 — the reserved nothing. An effect that masks by id then
+ * masks nothing at all, which is a scene that renders rather than a shader that
+ * will not compile.
+ */
+function idApi(on: boolean, group: number, binding: number): string {
+  if (!on) {
+    return /* wgsl */ `
+fn rzObjectAt(uv: vec2f) -> u32 { return 0u; }
+fn rzMaterialAt(uv: vec2f) -> u32 { return 0u; }
+`
+  }
+  return /* wgsl */ `
+@group(${group}) @binding(${binding}) var _rzIdTex: texture_multisampled_2d<u32>;
+
+/** Which OBJECT drew this pixel — compare against rzSubjectId(i). 0 = nothing. */
+fn rzObjectAt(uv: vec2f) -> u32 {
+  let sz = vec2f(textureDimensions(_rzIdTex));
+  let p = vec2<i32>(clamp(uv, vec2f(0.0), vec2f(1.0)) * sz);
+  return textureLoad(_rzIdTex, clamp(p, vec2<i32>(0), vec2<i32>(sz) - vec2<i32>(1)), 0).y;
+}
+
+/** Which MATERIAL drew it, within that object. 0 = nothing. */
+fn rzMaterialAt(uv: vec2f) -> u32 {
+  let sz = vec2f(textureDimensions(_rzIdTex));
+  let p = vec2<i32>(clamp(uv, vec2f(0.0), vec2f(1.0)) * sz);
+  return textureLoad(_rzIdTex, clamp(p, vec2<i32>(0), vec2<i32>(sz) - vec2<i32>(1)), 0).x;
+}
+`
+}
+
 export function buildFieldShader(effect: CompositeEffectSource): string {
   const bgLine = effect.hasBackground
     ? "out.bg = clamp(background(dir, uv, _rzFieldClock.x), vec4f(0.0), vec4f(1.0));"
@@ -769,6 +831,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     // author has to know whether they are allowed to call.
     gridReadApi(0, 17, 18, effect.gridSize) +
     gridClockApi("_rzFieldClock.x") +
+    idApi(effect.ids === true, 0, 23) +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +
