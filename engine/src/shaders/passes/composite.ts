@@ -710,11 +710,6 @@ const FOREGROUND_CALL = /* wgsl */ `
   outA = fgFx.a + outA * (1.0 - fgFx.a);
 `
 
-// Derivative builtins are illegal in non-uniform control flow (WGSL uniformity
-// analysis rejects the pipeline), so the coverage gate below can only wrap
-// effect code that doesn't use them. Checked textually at build time.
-const USES_DERIVATIVES = /\b(?:fwidth|dpdx|dpdy)(?:Fine|Coarse)?\s*\(/
-
 /** The condition on the background block (equirect sample + background effect).
  *
  *  Two jobs. It skips the block behind pixels the model fully covers — the
@@ -723,12 +718,10 @@ const USES_DERIVATIVES = /\b(?:fwidth|dpdx|dpdy)(?:Fine|Coarse)?\s*\(/
  *  most). And with no background effect compiled in, it also skips the block
  *  entirely unless the equirect needs it.
  *
- *  The equirect uses explicit-LOD sampling, which is always legal in non-uniform
- *  flow; only derivative-using effects must keep uniform control flow and forgo
- *  the coverage half. The test is textual over the whole file, so a foreground
- *  that uses fwidth costs the background its gate — conservative, and only ever
- *  in the direction of correctness. (The foreground mount itself sits in uniform
- *  flow, so derivatives are always legal there.) */
+ *  Everything the gate wraps is an explicit-LOD sample or a texture read, both
+ *  always legal in non-uniform flow. It used to also wrap the user's code, which
+ *  meant an effect using a derivative builtin had to forfeit the gate; that
+ *  carve-out went with the field pass, and the last of it is below. */
 function backgroundCondition(effect?: CompositeEffectSource | null): string {
   // sceneAlpha, not alpha: the bokeh gather spreads coverage, so a pixel the
   // sharp scene fully covered can end up needing background behind its blur.
