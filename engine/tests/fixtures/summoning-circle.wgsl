@@ -236,3 +236,44 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   rgb = mix(rgb, HOT_COLOR, smoothstep(1.0, 1.9, heat));
   return vec4f(rgb, clamp(heat, 0.0, 1.0));
 }
+
+// ── The light the sigil throws ───────────────────────────────────────────────
+//
+// A magic circle that lights nothing is a decal on the floor. This one is drawn
+// as a violet figure on the ground plane through rzSubject().root with a column
+// standing in it, so the light belongs just above that plane, at the middle of
+// the ring — lighting her from BELOW, which is the whole reason a summoning
+// circle reads as one.
+//
+// One light, following the first subject, because that is the character the
+// sigil is drawn under. A scene with two summoners is two instances of this
+// effect, not one light budget split.
+// @lights 1
+const LIGHT_UP = 0.35;     // how far above the plane the source sits, in hip
+                           // heights — a light ON the floor grazes it and lights
+                           // nothing, since every floor normal is perpendicular
+                           // to it
+const LIGHT_I = 1.5;       // brightness at the source
+const LIGHT_REACH = 2.6;   // in hip heights: past the sigil's own extent, so
+                           // she is lit to the waist rather than the ankles
+
+fn lightEmit(i: u32, time: f32) -> RzLight {
+  var l: RzLight;
+  l.color = RING_COLOR;
+  l.intensity = 0.0;
+  l.radius = 1.0;
+  l.pos = vec3f(0.0, 0.0, 0.0);
+
+  let s = rzSubject(0);
+  if (!s.valid) { return l; }
+  // Hip height is this effect's unit for everything else it draws; the light
+  // measures in the same one, so it scales with the model like the sigil does.
+  let H = max(s.center.y - s.root.y, 0.05);
+  l.pos = vec3f(s.root.x, s.root.y + H * LIGHT_UP, s.root.z);
+  l.radius = H * LIGHT_REACH;
+  // The SAME breathing the figure has, so the glow on her and the glow on the
+  // floor are one thing pulsing rather than two that happen to overlap.
+  let pulse = 1.0 - PULSE * 0.5 + PULSE * 0.5 * sin(time * TAU * PULSE_HZ);
+  l.intensity = LIGHT_I * pulse;
+  return l;
+}
