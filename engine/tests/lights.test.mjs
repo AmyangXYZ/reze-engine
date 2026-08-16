@@ -120,12 +120,15 @@ test("intensity is usable at the scale a scene is actually built at", () => {
 
 // ── The lightEmit mount ──
 
-import { buildLightEmitShader, hasLightEmit, parseLightCount } from "../dist/shaders/lights.js"
+import { RZ_LIGHT_STRUCT_WGSL, buildLightEmitShader, hasLightEmit, parseLightCount } from "../dist/shaders/lights.js"
+import { buildFieldShader } from "../dist/shaders/passes/composite.js"
+import { buildParticleComputeShader, buildParticleRenderShader } from "../dist/shaders/passes/particles.js"
+import { buildTrailShader } from "../dist/shaders/passes/trails.js"
 
 const EMIT = `// @lights 3
-fn lightEmit(i: u32) -> RzLight {
+fn lightEmit(i: u32, time: f32) -> RzLight {
   var l: RzLight;
-  l.pos = vec3f(f32(i) * 2.0, 10.0, 0.0);
+  l.pos = vec3f(f32(i) * 2.0, 10.0 + time, 0.0);
   l.color = vec3f(1.0, 0.5, 0.2);
   l.intensity = 3.0;
   l.radius = 20.0;
@@ -159,6 +162,33 @@ test("the emit shader guards its dispatch tail", () => {
   // A workgroup is 64 wide and a count rarely is. Without this the tail threads
   // write into whatever slots follow — another effect's lights, silently.
   assert.match(src, /if \(i >= u32\(_rzLightU\.z\)\) \{ return; \}/)
+})
+
+test("time is a PARAMETER, so the same source compiles in every module", () => {
+  // An effect that emits lights AND draws something has its whole source
+  // spliced into the field, particle, trail or grid module too — where
+  // lightEmit is dead code that still has to resolve. Those modules already
+  // define rzTime differently or not at all, so lightEmit must not need it.
+  assert.match(buildLightEmitShader(EMIT), /let l = lightEmit\(i, _rzLightU\.x\);/)
+  assert.doesNotMatch(buildLightEmitShader(EMIT), /fn rzTime\(\)/)
+})
+
+test("RzLight resolves in every module a source is spliced into", () => {
+  // Exactly once each: absent is a compile error on a function the author was
+  // right to write, twice is a redefinition.
+  const CAST = { subjects: 4, samples: 128, base: 12, trailBase: 108, slots: 8, reversedZ: false, alias: [0], trailCount: 1 }
+  const P = { wgsl: "fn particleInit(id: u32, s: f32) -> Particle { var q: Particle; return q; }", count: 64, blend: "alpha", bloom: false }
+  const modules = {
+    field: buildFieldShader({ wgsl: "fn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f { return vec4f(0.0); }", paramsDecl: "", hasBackground: false, hasForeground: true, gridSize: 0 }),
+    "particle compute": buildParticleComputeShader(P, CAST),
+    "particle render": buildParticleRenderShader(P, CAST),
+    trail: buildTrailShader({ wgsl: "fn trailWidth(u: f32, a: f32) -> f32 { return 1.0; }", slots: 1, ribbonSlots: [0], blend: "additive", bloom: true }, CAST),
+    emit: buildLightEmitShader(EMIT),
+  }
+  for (const [name, src] of Object.entries(modules)) {
+    assert.equal((src.match(/struct RzLight\b/g) ?? []).length, 1, `${name} must declare RzLight exactly once`)
+  }
+  assert.match(RZ_LIGHT_STRUCT_WGSL, /struct RzLight/)
 })
 
 test("the slot base is a uniform, never baked into the text", () => {

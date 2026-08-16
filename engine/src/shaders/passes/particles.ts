@@ -1,3 +1,4 @@
+import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { anchorAliasWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
@@ -209,6 +210,7 @@ fn rzFalloff(d: f32, r: f32) -> f32 {
   return f * f * f;
 }
 fn rzTime() -> f32 { return pu.time; }
+${RZ_LIGHT_STRUCT_WGSL}
 fn rzViewportHeight() -> f32 { return cam.targetHeight; }
 fn rzCameraPos() -> vec3f { return cam.camPos; }
 fn rzCameraRight() -> vec3f { return vec3f(cam.view[0][0], cam.view[1][0], cam.view[2][0]); }

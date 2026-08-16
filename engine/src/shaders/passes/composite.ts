@@ -1,3 +1,4 @@
+import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { anchorAliasWgsl } from "../anchor-table"
 import { audioApi } from "../audio-api"
 import { scoreApi } from "../score-api"
@@ -537,6 +538,7 @@ fn rzWorldPos(ray: vec3f, depth: f32) -> vec3f {
 }
 
 fn bgWorldPos(ray: vec3f, depth: f32) -> vec3f { return rzWorldPos(ray, depth); }
+${RZ_LIGHT_STRUCT_WGSL}
 
 /** Color grading, applied to the tonemapped SCENE (not the background — see the
  *  call site). The core is ASC CDL, the film-industry interchange standard:

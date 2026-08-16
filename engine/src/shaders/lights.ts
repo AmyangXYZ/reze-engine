@@ -55,13 +55,34 @@ export function parseLightCount(wgsl: string, max: number): number {
   return Math.max(1, Math.min(max, parseInt(m[1], 10)))
 }
 
+/**
+ * The RzLight struct, declared in EVERY module a user's source is spliced into.
+ *
+ * One effect file goes into every module it has a mount in, so a foreground
+ * effect that also emits lights compiles its lightEmit inside the FIELD shader
+ * too — where nothing calls it, but it still has to resolve. Leaving the struct
+ * out of those modules is a compile error on a function the author was right to
+ * write, which is the same trap the grid's step-only half documents.
+ */
+export const RZ_LIGHT_STRUCT_WGSL = /* wgsl */ `
+/** What an effect returns for one of its lights. */
+struct RzLight {
+  pos: vec3f,
+  color: vec3f,
+  intensity: f32,
+  radius: f32,
+}
+`
+
 /** Does this source define the emit mount? */
 export function hasLightEmit(wgsl: string): boolean {
   return /\bfn\s+lightEmit\s*\(/.test(wgsl)
 }
 
 /**
- * The compute module that runs an effect's `lightEmit` once per light per frame.
+ * The compute module that runs an effect's lightEmit once per light per frame.
+ *
+ *     fn lightEmit(i: u32, time: f32) -> RzLight
  *
  * A COMPUTE stage rather than a CPU callback, and that is the whole point:
  * Fireworks knows where its bursts are as a closed form in WGSL, and mirroring
@@ -95,17 +116,7 @@ export function buildLightEmitShader(wgsl: string): string {
 // here and not in the text.
 @group(0) @binding(1) var<uniform> _rzLightU: vec4f;
 
-/** What an effect returns for one of its lights. */
-struct RzLight {
-  pos: vec3f,
-  color: vec3f,
-  intensity: f32,
-  radius: f32,
-}
-
-/** Seconds since this effect was installed — its own clock, not the scene's. */
-fn rzTime() -> f32 { return _rzLightU.x; }
-
+${RZ_LIGHT_STRUCT_WGSL}
 ${wgsl}
 
 @compute @workgroup_size(64)
@@ -114,7 +125,11 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   // The dispatch is sized to the count, but a workgroup is 64 wide and the
   // count rarely is — the tail must not write into the next effect's slots.
   if (i >= u32(_rzLightU.z)) { return; }
-  let l = lightEmit(i);
+  // Time is a PARAMETER, not an rzTime() call: this same source compiles
+  // inside the field, particle, trail and grid modules, and those already
+  // define rzTime differently or not at all. A parameter needs nothing from
+  // the module it lands in, which is why the field mounts take theirs too.
+  let l = lightEmit(i, _rzLightU.x);
   let b = ${LIGHT_HEADER}u + (u32(_rzLightU.y) + i) * ${LIGHT_STRIDE}u;
   _rzLightsOut[b] = l.pos.x;
   _rzLightsOut[b + 1u] = l.pos.y;

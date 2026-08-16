@@ -1,3 +1,4 @@
+import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
@@ -177,6 +178,7 @@ struct TrailU {
 // scope". The hardware depth test replaced what it was read for.
 
 fn rzTime() -> f32 { return tu.time; }
+${RZ_LIGHT_STRUCT_WGSL}
 fn rzCameraPos() -> vec3f { return cam.camPos; }
 fn rzCameraRight() -> vec3f { return vec3f(cam.view[0][0], cam.view[1][0], cam.view[2][0]); }
 fn rzCameraUp() -> vec3f { return vec3f(cam.view[0][1], cam.view[1][1], cam.view[2][1]); }
