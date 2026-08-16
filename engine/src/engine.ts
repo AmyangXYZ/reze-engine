@@ -57,6 +57,7 @@ import {
 import { AGX_LUT_GZ, AGX_LUT_SIZE } from "./shaders/agx-lut"
 import {
   buildCompositeShader,
+  EFFECT_SCENE_API,
   buildFieldShader,
   parseEffectAnchors,
   EFFECT_ANCHORS,
@@ -2642,7 +2643,7 @@ export class Engine {
       ])
     }
     if (declaredLights > 0) {
-      const built = await this.buildLightEmit(wgsl, declaredLights)
+      const built = await this.buildLightEmit(wgsl, declaredLights, alias)
       if (!built.ok) return abandon(built.diagnostics)
       lights = built.state
     }
@@ -2991,15 +2992,23 @@ export class Engine {
   private async buildLightEmit(
     wgsl: string,
     count: number,
+    alias: number[],
   ): Promise<{ ok: true; state: NonNullable<EffectInstance["lights"]> } | { ok: false; diagnostics: string[] }> {
     const layout = this.device.createBindGroupLayout({
       label: "light emit layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     })
-    const module = this.device.createShaderModule({ label: "light emit", code: buildLightEmitShader(wgsl) })
+    const module = this.device.createShaderModule({
+      label: "light emit",
+      // The same scene API and the same per-effect anchor alias its drawing
+      // half gets, so a lamp reads the cast exactly as the beam that paints it.
+      code: buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias)),
+    })
     const info = await module.getCompilationInfo()
     const diagnostics = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`)
     if (diagnostics.length) return { ok: false, diagnostics }
@@ -3026,6 +3035,8 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.lightsBuffer } },
         { binding: 1, resource: { buffer: uniform } },
+        { binding: 2, resource: { buffer: this.compositeUniformBuffer } },
+        { binding: 3, resource: { buffer: this.castBuffer } },
       ],
     })
     return { ok: true, state: { pipeline, bind, uniform, data, count } }

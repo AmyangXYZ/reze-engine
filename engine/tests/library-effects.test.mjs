@@ -12,6 +12,11 @@
 //   snow             particles
 //   summoning-circle foreground
 //   dry-ice          foreground + sim
+//   stage-lights     foreground + lightEmit — the only effect that both DRAWS
+//                    light and CASTS it, so the only one proving one source
+//                    resolves in a drawing module and in the emit module at once
+//   note-fall        background + score
+//   footprints       foreground + cast
 // They are COPIES, so refreshing them is a deliberate act — an effect edited in
 // the app cannot silently change what this asserts.
 //
@@ -25,10 +30,11 @@ import assert from "node:assert/strict"
 import { readFileSync, readdirSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { buildFieldShader, parseEffectAnchors } from "../dist/shaders/passes/composite.js"
+import { EFFECT_SCENE_API, buildFieldShader, parseEffectAnchors } from "../dist/shaders/passes/composite.js"
+import { buildLightEmitShader, hasLightEmit } from "../dist/shaders/lights.js"
 import { buildParticleComputeShader, buildParticleRenderShader, parseParticleCount } from "../dist/shaders/passes/particles.js"
 import { buildTrailShader } from "../dist/shaders/passes/trails.js"
-import { buildAnchorTable } from "../dist/shaders/anchor-table.js"
+import { anchorAliasWgsl, buildAnchorTable } from "../dist/shaders/anchor-table.js"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const load = (f) => readFileSync(join(here, "fixtures", f), "utf8")
@@ -90,6 +96,11 @@ function modulesFor(wgsl) {
   if (/\bfn\s+trailWidth\s*\(/.test(wgsl)) {
     const src = { wgsl, slots: trailed.length, ribbonSlots: trailed, blend: "additive", bloom: false }
     out.push(["trail", buildTrailShader(src, cast)])
+  }
+  // The emit stage gets the same scene API and the same alias the drawing half
+  // does, which is what lets a lamp aim at the dancer its beam is painting.
+  if (hasLightEmit(wgsl)) {
+    out.push(["light emit", buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias))])
   }
   return out
 }

@@ -100,14 +100,13 @@ export function hasLightEmit(wgsl: string): boolean {
  * lost a document light, because that is what shifts the slots underneath
  * them — a shader rebuild triggered by moving a lamp.
  *
- * Deliberately NARROW for now: the emit stage gets its own clock and nothing
- * else. Fireworks — the case this mount exists for — is closed-form in time, so
- * that is enough to be useful, and every extra interface spliced in here is
- * another binding to get wrong. The cast, audio and score buffers are the
- * obvious next ones (a light on a wrist, a light on the beat) and each is a
- * binding plus its accessor module.
+ * The scene API arrives as a STRING rather than being imported, so this module
+ * depends on nothing that depends on it. That API is what lets a lamp aim at
+ * someone: Stage Lights points its beams at rzSubject().root, and a light that
+ * did not know where she was could only sit where the fixture hangs. It also
+ * brings RzLight, which is why this builder does not declare it again.
  */
-export function buildLightEmitShader(wgsl: string): string {
+export function buildLightEmitShader(wgsl: string, sceneApi: string): string {
   return /* wgsl */ `
 // read_write HERE and read-only in the material shaders. Different passes, so
 // the two never coexist: this compute runs before the scene pass that reads it.
@@ -115,8 +114,12 @@ export function buildLightEmitShader(wgsl: string): string {
 // (time, base slot, count, _) — see buildLightEmitShader on why the base is
 // here and not in the text.
 @group(0) @binding(1) var<uniform> _rzLightU: vec4f;
-
-${RZ_LIGHT_STRUCT_WGSL}
+// The camera block and the cast — the two buffers the scene API reads. Same
+// contents the field and grid modules bind, so an effect's lightEmit sees the
+// scene exactly as its drawing half does.
+@group(0) @binding(2) var<uniform> viewU: array<vec4<f32>, 15>;
+@group(0) @binding(3) var<storage, read> _rzCast: array<vec4f>;
+${sceneApi}
 ${wgsl}
 
 @compute @workgroup_size(64)
