@@ -137,7 +137,13 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // same failure the shadow catcher exists to prevent.
   let lamps = rzLightsDiffuse(i.worldPos, n);
   let dark = (1.0 - vis) * material.shadowStrength;
-  var baseColor = material.diffuseColor * (sun + lamps) * (1.0 - dark * 0.65);
+  // The shadow darkens the SUN only. The dark term comes from the sun's shadow
+  // map, so applying it to the lamps too would have a lamp on the far side of
+  // the stage dimmed by a shadow cast away from it — the one light in the scene
+  // that provably is not blocking it.
+  // (No backticks in here: this string is a TS template literal and one ends it
+  // mid-shader, which is exactly how this line broke the build a moment ago.)
+  var baseColor = material.diffuseColor * (sun * (1.0 - dark * 0.65) + lamps);
   baseColor *= noiseTint;
   let finalColor = mix(baseColor, material.gridLineColor, gridLine * material.gridLineOpacity * edgeFade);
   // Whole-ground opacity fades the SURFACE (color, grid) but the shadow stays —
