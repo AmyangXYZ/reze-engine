@@ -2782,6 +2782,21 @@ export class Engine {
     this.effects = instances
     // The new list's emitters need their slots before the next frame reads them.
     this.allocateLightSlots()
+    // A rig the cap refused is worth saying out loud on the effect that asked
+    // for it — the dropped-anchor rule. Its lights are simply absent otherwise,
+    // and absence reads as a broken shader rather than a full scene.
+    {
+      let ok = 0
+      for (const r of results) {
+        if (!r.ok) continue
+        const l = instances[ok++]?.lights
+        if (l && l.count > 0 && l.data[2] === 0) {
+          r.diagnostics.push(
+            `${l.count} light${l.count === 1 ? "" : "s"} dropped: the scene is already using all ${MAX_LIGHTS} slots`,
+          )
+        }
+      }
+    }
     this.anchorTable = table
     // Slots have been re-dealt; a recorded path is stale by ADDRESS, not by age.
     this.clearTrailHistory()
@@ -5853,11 +5868,13 @@ export class Engine {
   ): void {
     const list = (lights ?? []).slice(0, MAX_LIGHTS)
     this.docLightCount = list.length
-    // Only the header and the document's OWN records are written. Zeroing the
-    // whole buffer would wipe the slots an emitting effect owns, and they are
-    // rewritten per frame — so the scene would flicker its effect lights every
-    // time someone moved a lamp.
-    this.lightsData.fill(0, 0, LIGHT_HEADER + list.length * LIGHT_STRIDE)
+    // RECORDS only — the header belongs to allocateLightSlots, the one writer.
+    // This used to zero-and-upload the header region too, which left two CPU
+    // mirrors of the count (this array's, holding a transient zero, and
+    // lightHeader's, holding the truth). Correct on the GPU by queue ordering,
+    // and a trap on the CPU: the first future path that uploads lightsData
+    // whole would silently switch every light off. Effects' slots are likewise
+    // untouched — they are rewritten per frame by their own compute.
     for (let i = 0; i < list.length; i++) {
       const l = list[i]
       const b = LIGHT_HEADER + i * LIGHT_STRIDE
@@ -5867,21 +5884,26 @@ export class Engine {
       // A radius of zero would switch the light off through the window term,
       // which is a confusing way to spell "off" — default to a stage-sized
       // reach instead, and let 0 mean 0 only when it is asked for explicitly.
-      this.lightsData[b + 3] = l.radius ?? 10
+      this.lightsData[b + 3] = Math.max(l.radius ?? 10, 0)
+      // Clamped at zero: the layer is ADDITIVE, and a negative channel would
+      // darken what it lands on — same rule the emit stage enforces.
       const k = l.intensity ?? 1
-      this.lightsData[b + 4] = l.color.x * k
-      this.lightsData[b + 5] = l.color.y * k
-      this.lightsData[b + 6] = l.color.z * k
+      this.lightsData[b + 4] = Math.max(l.color.x * k, 0)
+      this.lightsData[b + 5] = Math.max(l.color.y * k, 0)
+      this.lightsData[b + 6] = Math.max(l.color.z * k, 0)
       // [b + 7] is `type`, reserved: every light is a point light today.
     }
-    this.device.queue.writeBuffer(
-      this.lightsBuffer,
-      0,
-      this.lightsData.buffer as ArrayBuffer,
-      0,
-      (LIGHT_HEADER + list.length * LIGHT_STRIDE) * 4,
-    )
-    // The effects' bases move when the document's count does.
+    if (list.length) {
+      this.device.queue.writeBuffer(
+        this.lightsBuffer,
+        LIGHT_HEADER * 4,
+        this.lightsData.buffer as ArrayBuffer,
+        LIGHT_HEADER * 4,
+        list.length * LIGHT_STRIDE * 4,
+      )
+    }
+    // The effects' bases move when the document's count does; the header —
+    // count included — is written there.
     this.allocateLightSlots()
   }
 

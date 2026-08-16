@@ -121,9 +121,17 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
   // With no lights rzLightsDiffuse returns exactly zero and its loop never
   // runs, so every scene that declares none renders bit-for-bit as it did
   // before lights existed. That is the property this whole feature is gated on.
-  const LIT = ` + rzLightsDiffuse(input.worldPos, n) * tex_color`
+  // Modulated by `albedo`, a named local that TODAY is exactly tex_color — the
+  // raw texture. That is an approximation with a known failure: a graph that
+  // recolours a surface is lit by a colour it no longer shows. The local exists
+  // so the fix has an address — when graphs gain an optional albedo output
+  // (material-track era), it lands here and every light is corrected at once,
+  // instead of a hunt through the epilogue's string templates.
+  const LIT = ` + rzLightsDiffuse(input.worldPos, n) * albedo`
+  const ALBEDO = `  let albedo = tex_color;
+`
   if (renderClass === "hair") {
-    return `  var outAlpha = ${alphaBase};
+    return `${ALBEDO}  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
 
   var out: FSOut;
@@ -132,7 +140,7 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
 ${ID_WRITE}  return out;
 `
   }
-  return `  var out: FSOut;
+  return `${ALBEDO}  var out: FSOut;
   out.color = vec4f(final_color${LIT}, ${alphaBase});
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;

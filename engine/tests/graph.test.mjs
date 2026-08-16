@@ -167,7 +167,7 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
   // carries the positional-light layer beside final_color; that term is zero
   // with no lights, and pinning the whole expression here would make this test
   // fail for anything ever added to the epilogue.
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * tex_color, 1.0);"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo, 1.0);"))
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
 })
 
@@ -186,7 +186,7 @@ test("eye graph: default Principled + emission, rear-gate from renderClass", () 
   )
   // Slot-owned: rear-view gate in the prelude, standard alpha epilogue.
   assert.ok(r.wgsl.includes("if (dot(faceDir, v) < -0.15) { discard; }"))
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * tex_color, alpha);"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo, alpha);"))
 })
 
 test("face graph matches the hand-written shader (key terms)", () => {

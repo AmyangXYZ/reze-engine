@@ -133,16 +133,27 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   // define rzTime differently or not at all. A parameter needs nothing from
   // the module it lands in, which is why the field mounts take theirs too.
   let l = lightEmit(i, _rzLightU.x);
+  // SANITIZED at the one write site, because lightEmit is HOSTED USER CODE and
+  // this buffer feeds every fragment of every material: one NaN position would
+  // poison the whole frame, and WGSL leaves max(NaN, 0) indeterminate, so it
+  // would not even fail the same way on every GPU. A light that fails the
+  // check writes zeros — radius 0 is off. Colour is clamped at zero on top:
+  // this layer is ADDITIVE, and a negative channel would darken what it lands
+  // on and can push HDR negative into bloom.
+  let finite = l.pos.x == l.pos.x && l.pos.y == l.pos.y && l.pos.z == l.pos.z &&
+    l.radius == l.radius && l.intensity == l.intensity &&
+    l.color.x == l.color.x && l.color.y == l.color.y && l.color.z == l.color.z;
+  let c = select(vec3f(0.0), max(l.color * l.intensity, vec3f(0.0)), finite);
   let b = ${LIGHT_HEADER}u + (u32(_rzLightU.y) + i) * ${LIGHT_STRIDE}u;
-  _rzLightsOut[b] = l.pos.x;
-  _rzLightsOut[b + 1u] = l.pos.y;
-  _rzLightsOut[b + 2u] = l.pos.z;
-  _rzLightsOut[b + 3u] = l.radius;
+  _rzLightsOut[b] = select(0.0, l.pos.x, finite);
+  _rzLightsOut[b + 1u] = select(0.0, l.pos.y, finite);
+  _rzLightsOut[b + 2u] = select(0.0, l.pos.z, finite);
+  _rzLightsOut[b + 3u] = select(0.0, max(l.radius, 0.0), finite);
   // Colour carries intensity, exactly as the CPU writer stores it — one product,
   // one place, so the two producers cannot disagree about what a slot means.
-  _rzLightsOut[b + 4u] = l.color.x * l.intensity;
-  _rzLightsOut[b + 5u] = l.color.y * l.intensity;
-  _rzLightsOut[b + 6u] = l.color.z * l.intensity;
+  _rzLightsOut[b + 4u] = c.x;
+  _rzLightsOut[b + 5u] = c.y;
+  _rzLightsOut[b + 6u] = c.z;
 }
 `
 }

@@ -13,6 +13,7 @@
 // falloff that never reaches zero at the radius.
 
 import { test } from "node:test"
+import { readFileSync } from "node:fs"
 import assert from "node:assert/strict"
 import { LIGHT_HEADER, LIGHT_STRIDE, LIGHTS_FLOATS, MAX_LIGHTS, lightsApi } from "../dist/shaders/lights.js"
 import { COMMON_MATERIAL_PRELUDE_WGSL } from "../dist/shaders/materials/common.js"
@@ -155,9 +156,10 @@ test("the emit shader writes the slots the material shader reads", () => {
   // Same stride and header on both sides of the buffer, expressed against the
   // same constants — this is the seam where a writer and a reader drift.
   assert.match(src, new RegExp(`let b = ${LIGHT_HEADER}u \\+ \\(u32\\(_rzLightU\\.y\\) \\+ i\\) \\* ${LIGHT_STRIDE}u;`))
-  assert.match(src, /_rzLightsOut\[b \+ 3u\] = l\.radius;/)
-  // Colour x intensity, the same product the CPU writer stores.
-  assert.match(src, /_rzLightsOut\[b \+ 4u\] = l\.color\.x \* l\.intensity;/)
+  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite\);/)
+  // Colour x intensity, the same product the CPU writer stores — through the
+  // sanitized local, since the raw product is what the guard exists to check.
+  assert.match(src, /_rzLightsOut\[b \+ 4u\] = c\.x;/)
   assert.ok(src.includes(EMIT), "the author's source is spliced in verbatim")
 })
 
@@ -222,4 +224,31 @@ test("the writable view of the lights buffer exists only in the emit stage", () 
   assert.match(buildLightEmitShader(EMIT, API), /var<storage, read_write> _rzLightsOut/)
   assert.doesNotMatch(COMMON_MATERIAL_PRELUDE_WGSL, /read_write.*_rzLights/)
   assert.doesNotMatch(groundShaderWgsl(), /read_write.*_rzLights/)
+})
+
+test("the emit write is sanitized: hosted code cannot poison the frame", () => {
+  // lightEmit is USER WGSL, and this buffer feeds every fragment of every
+  // material — one NaN position would poison the whole frame, and WGSL leaves
+  // max(NaN, 0) indeterminate, so it would not even fail the same way on every
+  // GPU. The one write site checks, and a light that fails writes zeros.
+  const src = buildLightEmitShader(EMIT, API)
+  assert.match(src, /let finite = l\.pos\.x == l\.pos\.x/, "the NaN self-equality check must guard the write")
+  assert.match(src, /select\(vec3f\(0\.0\), max\(l\.color \* l\.intensity, vec3f\(0\.0\)\), finite\)/,
+    "colour must be clamped at zero — this layer is additive, and negative light darkens")
+  assert.match(src, /select\(0\.0, max\(l\.radius, 0\.0\), finite\)/)
+})
+
+test("the header has exactly one writer", () => {
+  // setLights used to upload the header region too, leaving two CPU mirrors of
+  // the count — correct on the GPU only by queue ordering, and a trap on the
+  // CPU: the first path that uploads lightsData whole would zero the count.
+  const engineSrc = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
+  const at = engineSrc.indexOf("setLights(")
+  const body = engineSrc.slice(at, engineSrc.indexOf("\n  }", at))
+  assert.match(body, /LIGHT_HEADER \* 4,\s*\n\s*this\.lightsData\.buffer/, "setLights must write records only, offset past the header")
+  // TWO offset-0 writes are legitimate: the one-time zero-fill at buffer
+  // creation (count 0, before anything renders) and allocateLightSlots. A
+  // third is someone writing the header from a new place — the trap returning.
+  const writes = [...engineSrc.matchAll(/writeBuffer\(\s*this\.lightsBuffer,\s*0,/g)].length
+  assert.equal(writes, 2, `offset-0 lights-buffer writes: want init zero-fill + allocateLightSlots only, found ${writes}`)
 })
