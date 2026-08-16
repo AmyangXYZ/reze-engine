@@ -1,3 +1,5 @@
+import { sceneFsOutWgsl } from "./scene-contract"
+
 // Ground shadow-catcher: receives directional shadow, grid lines, frosted noise,
 // radial distance fade. Writes bloom mask = 0 (ground never bloom-bleeds).
 
@@ -48,8 +50,7 @@ struct VO { @builtin(position) position: vec4f, @location(0) worldPos: vec3f, @l
   var o: VO; o.worldPos = position; o.normal = normal;
   o.position = camera.projection * camera.view * vec4f(position, 1.0); return o;
 }
-struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
-@fragment fn fs(i: VO) -> FSOut {
+${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // Derivatives first, unconditionally: WGSL requires fwidth in uniform control
   // flow and everything below branches on world position.
   let gp = i.worldPos.xz / material.gridSpacing;

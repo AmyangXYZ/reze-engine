@@ -1,3 +1,5 @@
+import { sceneFsOutWgsl } from "../passes/scene-contract"
+
 // Shared WGSL blocks concatenated by every material shader.
 // Splits the boilerplate (uniform structs, bind group layout, skinning VS, PCF shadow)
 // away from the per-material fragment code so each material file only contains what
@@ -200,14 +202,10 @@ export const COMMON_VS_WGSL = /* wgsl */ `
 //   out.r = mask_r · src.a + dst.r · (1-src.a)   (bloom mask, weighted by alpha)
 //   out.g = 1.0    · src.a + dst.g · (1-src.a)   (canonical premultiplied alpha-over)
 
-export const COMMON_FS_OUT_WGSL = /* wgsl */ `
-
-struct FSOut {
-  @location(0) color: vec4f,
-  @location(1) mask: vec4f,
-};
-
-`;
+// The struct itself comes from scene-contract, which owns what the scene pass's
+// attachments ARE — this is one of the two shaders that gains an output when
+// one is added, and the graph generator emits against this same declaration.
+export const COMMON_FS_OUT_WGSL = `\n\n${sceneFsOutWgsl()}\n`;
 
 // ─── Convenience: full shared prelude ───────────────────────────────
 // Material files compose this as `${NODES_WGSL}${COMMON_MATERIAL_PRELUDE_WGSL}` to

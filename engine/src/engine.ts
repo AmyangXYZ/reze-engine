@@ -26,6 +26,7 @@ import {
 import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
+import { sceneTargets as sceneTargetsFor, type SceneFormats } from "./shaders/passes/scene-contract"
 import { GROUND_SHADOW_SHADER_WGSL } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
 import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
@@ -1236,6 +1237,12 @@ export class Engine {
   // Stashed at createPipelines so group pipelines can be compiled later.
   private mainPipelineLayout!: GPUPipelineLayout
   private sceneTargets!: GPUColorTargetState[]
+  /** The scene pass's attachment formats, settled at init once the device has
+   *  said which HDR format it will blend. Every scene-pass pipeline asks
+   *  scene-contract for its targets against these. */
+  private get sceneFormats(): SceneFormats {
+    return { hdr: this.hdrFormat, aux: Engine.BLOOM_MASK_FORMAT }
+  }
   private fullVertexBufferLayouts!: GPUVertexBufferLayout[]
   // 1×64 vertical ramp for shared-toon materials: lit (top) → soft shadow
   // tone (bottom). Stand-in for MMD's toon01–10.bmp, which we can't ship.
@@ -2694,32 +2701,11 @@ export class Engine {
     const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE)
     const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT)
 
-    // Additive keeps the destination and adds to it; the alpha channel is left
-    // alone (dst factor one, src zero) so a glow does not also claim coverage
-    // it never occluded.
-    // Additive effects need the MASK to sum like the colour does — see the
-    // fragment shaders' mask comment. rg8unorm clamps the sum at 1, which is the
-    // saturation alpha-over would reach anyway.
-    const maskTarget: GPUColorTargetState =
-      src.blend === "additive"
-        ? {
-            format: Engine.BLOOM_MASK_FORMAT,
-            blend: {
-              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
-              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
-            },
-          }
-        : this.sceneTargets[1]
-    const colorTarget: GPUColorTargetState =
-      src.blend === "additive"
-        ? {
-            format: this.hdrFormat,
-            blend: {
-              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
-              alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
-            },
-          }
-        : this.sceneTargets[0]
+    // Additive keeps the destination and adds to it, and leaves alpha alone, so
+    // a glow does not claim coverage it never occluded. The MASK sums with it —
+    // otherwise an additive effect could never reach the bloom gate. Both live
+    // in scene-contract as the "particle-additive" class.
+    const targets = sceneTargetsFor(src.blend === "additive" ? "particle-additive" : "particle", this.sceneFormats)
 
     this.device.pushErrorScope("validation")
     try {
@@ -2732,7 +2718,7 @@ export class Engine {
         label: "particle render pipeline",
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
         vertex: { module: renderModule, entryPoint: "vs" },
-        fragment: { module: renderModule, entryPoint: "fs", targets: [colorTarget, maskTarget] },
+        fragment: { module: renderModule, entryPoint: "fs", targets },
         primitive: { topology: "triangle-list", cullMode: "none" },
         // Tested but not WRITTEN: particles are transparent, so writing depth
         // would make whichever quad drew first occlude the ones behind it.
@@ -2885,27 +2871,14 @@ export class Engine {
     //
     // Additive, where this used to be MAX. Max was right for a post-tonemap
     // layer; in HDR before bloom, overlapping light sums.
-    const layerTarget: GPUColorTargetState = {
-      format: this.hdrFormat,
-      blend: {
-        color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
-        alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
-      },
-    }
-    const layerMaskTarget: GPUColorTargetState = {
-      format: Engine.BLOOM_MASK_FORMAT,
-      blend: {
-        color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-      },
-    }
+    const targets = sceneTargetsFor("trail", this.sceneFormats)
     this.device.pushErrorScope("validation")
     try {
       const pipeline = await this.device.createRenderPipelineAsync({
         label: "trail pipeline",
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         vertex: { module, entryPoint: "vs" },
-        fragment: { module, entryPoint: "fs", targets: [layerTarget, layerMaskTarget] },
+        fragment: { module, entryPoint: "fs", targets },
         primitive: { topology: "triangle-list", cullMode: "none" },
         // Depth TESTED, never written: a ribbon is occluded by the body it
         // circles, and must not occlude the fabric drawn after it.
@@ -3841,38 +3814,16 @@ export class Engine {
     // Internal scene passes render into the HDR offscreen target; only the final
     // composite pass writes the swapchain. Tonemap moved to composite so bloom
     // (added next) can run on linear HDR.
-    const standardBlend: GPUColorTargetState = {
-      format: this.hdrFormat,
-      blend: {
-        color: {
-          srcFactor: "src-alpha",
-          dstFactor: "one-minus-src-alpha",
-          operation: "add",
-        },
-        alpha: {
-          srcFactor: "one",
-          dstFactor: "one-minus-src-alpha",
-          operation: "add",
-        },
-      },
-    }
-
-    // Aux target carrying (bloom mask, alpha). Src-alpha blend so the .g channel
-    // accumulates proper alpha-over (same semantic the old rgba16f hdr.a had).
-    // Materials write vec2f(mask, 1.0); ground writes vec2f(0.0, 1.0). With src.a
-    // coming from the fragment color.a, the blend equation produces
-    //   out.g = 1·src.a + dst.g·(1-src.a)  →  premultiplied over operator on alpha.
-    // .r gets weighted by src.a too, which is fine: opaque pixels (α=1) give full
-    // mask, partially translucent fragments dilute mask proportionally — acceptable
-    // for the bloom-gate use.
-    const maskBlend: GPUColorTargetState = {
-      format: Engine.BLOOM_MASK_FORMAT,
-      blend: {
-        color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-      },
-    }
-    const sceneTargets: GPUColorTargetState[] = [standardBlend, maskBlend]
+    //
+    // Formats, blends and write masks now come from scene-contract.ts, which is
+    // the one author of what this pass's attachments are. The aux target carries
+    // (bloom mask, alpha) and blends alpha-over so its .g accumulates coverage:
+    // materials write vec2f(mask, 1.0), ground writes vec2f(0.0, 1.0), and with
+    // src.a coming from the fragment's own colour.a the equation gives
+    //   out.g = 1·src.a + dst.g·(1-src.a)  →  the premultiplied over operator.
+    // .r is weighted by src.a as well, which is right for a bloom gate: an
+    // opaque pixel contributes its whole mask, a translucent one its share.
+    const sceneTargets = sceneTargetsFor("material", this.sceneFormats)
     this.sceneTargets = sceneTargets
     this.fullVertexBufferLayouts = fullVertexBuffers
 
@@ -3993,7 +3944,7 @@ export class Engine {
       fragment: {
         module: prepassModule,
         entryPoint: "fs",
-        targets: sceneTargets.map((t) => ({ format: (t as GPUColorTargetState).format, writeMask: 0 })),
+        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
       },
       primitive: { cullMode: "none" },
       multisample: { count: Engine.MULTISAMPLE_COUNT },
@@ -4105,7 +4056,7 @@ export class Engine {
       // 3-slot layout while renderGround binds one buffer is a WebGPU
       // validation error that invalidates the whole command buffer.
       vertexBuffers: [fullVertexBuffers[0]],
-      fragmentTargets: sceneTargets,
+      fragmentTargets: sceneTargetsFor("ground", this.sceneFormats),
       cullMode: "back",
       depthStencil: { format: this.depthFormat, depthWriteEnabled: true, depthCompare: this.depthAhead },
     })
@@ -4155,7 +4106,7 @@ export class Engine {
       layout: outlinePipelineLayout,
       shaderModule: outlineShaderModule,
       vertexBuffers: outlineVertexBuffers,
-      fragmentTargets: sceneTargets,
+      fragmentTargets: sceneTargetsFor("outline", this.sceneFormats),
       cullMode: "back",
       depthStencil: {
         format: this.depthFormat,
