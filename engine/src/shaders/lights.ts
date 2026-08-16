@@ -25,6 +25,10 @@
 // and the loop does not branch on it, so it is honest padding rather than a
 // switch with one case.
 
+import { audioApi } from "./audio-api"
+import { scoreApi } from "./score-api"
+import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
+
 /** Floats before the first record. One is the count; the rest keep the records
  *  vec4-aligned, which is what lets a future pass read them as vec4s. */
 export const LIGHT_HEADER = 4
@@ -106,7 +110,11 @@ export function hasLightEmit(wgsl: string): boolean {
  * did not know where she was could only sit where the fixture hangs. It also
  * brings RzLight, which is why this builder does not declare it again.
  */
-export function buildLightEmitShader(wgsl: string, sceneApi: string): string {
+export function buildLightEmitShader(
+  wgsl: string,
+  sceneApi: string,
+  cast: { trailCount: number },
+): string {
   return /* wgsl */ `
 // read_write HERE and read-only in the material shaders. Different passes, so
 // the two never coexist: this compute runs before the scene pass that reads it.
@@ -120,6 +128,24 @@ export function buildLightEmitShader(wgsl: string, sceneApi: string): string {
 @group(0) @binding(2) var<uniform> viewU: array<vec4<f32>, 15>;
 @group(0) @binding(3) var<storage, read> _rzCast: array<vec4f>;
 ${sceneApi}
+// Audio and score at 4 and 5, the same bindings the particle and trail modules
+// put them on. A lamp that pulses on the beat or lights on a note is the whole
+// point of a light an effect owns rather than one the document places, so this
+// is not compile-safety padding — it is the mount's reason to exist.
+${audioApi(0, 4)}
+${scoreApi(0, 5)}
+// The rest of the hosted API. Every one of these is here because the AUTHOR'S
+// WHOLE FILE lands below, not because lightEmit needs it: a trail effect that
+// grows a lamp at its tip compiles its ribbon code in this module too. The math
+// helpers and the Particle struct are NOT repeated — they arrive with the scene
+// API above, and a second copy is a redefinition error in engine code.
+${clockApi("_rzLightU.x", "0.0")}
+// Canvas height. The drawing modules report their render target's height, which
+// under supersampling is the larger number — nothing in a compute pass that
+// writes world-space lamp positions can use either, and this one is at least
+// the same value rzResolution() reports here.
+${viewportApi("viewU[6].w")}
+${trailSlotsApi(cast.trailCount)}
 ${wgsl}
 
 @compute @workgroup_size(64)

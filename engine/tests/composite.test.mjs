@@ -39,7 +39,17 @@ const field = (wgsl, hasBackground, hasForeground) => buildFieldShader(effect(wg
  *  substitution — real WGSL in this file is lower/camel case. */
 const PLACEHOLDER = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g
 /** The template's own compile-time constants, which legitimately look like one. */
-const ALLOWED = new Set(["APPLY_GAMMA", "FILMIC_LUT_W", "RZ_MAX_ANCHORS", "RZ_TRAIL_SAMPLES", "RZ_GRID_SIZE"])
+// The cast's shape, declared by CAST_API in every module that hosts an effect.
+const ALLOWED = new Set([
+  "APPLY_GAMMA",
+  "FILMIC_LUT_W",
+  "RZ_MAX_ANCHORS",
+  "RZ_TRAIL_SAMPLES",
+  "RZ_GRID_SIZE",
+  "RZ_SUBJECTS",
+  "RZ_SAMPLES",
+  "RZ_TRAIL_SLOTS",
+])
 
 // Comments are prose and name things that don't exist in this file (engine-side
 // constants, the placeholders themselves) — scan the code the GPU sees.

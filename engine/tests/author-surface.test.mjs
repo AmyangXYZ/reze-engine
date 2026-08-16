@@ -24,6 +24,9 @@ const effect = {
   hasBackground: true,
   hasForeground: false,
   simSize: 0,
+  // Two trailed anchors, so RZ_TRAIL_SLOTS is a number the assertions below can
+  // tell apart from the anchor address space.
+  trailCount: 2,
 }
 const cast = {
   subjects: 4,
@@ -68,11 +71,16 @@ for (const [name, code] of MODULES) {
   })
 }
 
+/** What the GPU sees. A comment naming a constant is prose, not a definition —
+ *  the sibling check in composite.test.mjs strips them for the same reason. */
+const code_only = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")
+
 test("RZ_TRAIL_SLOTS is defined wherever trails are reachable, and means trail COUNT", () => {
   // Not the anchor address space: that is RZ_MAX_ANCHORS, and conflating the
   // two is the original latent trail bug. An author looping `for s in
   // 0..RZ_TRAIL_SLOTS` must iterate their ribbons, not eight.
-  for (const [name, code] of MODULES) {
+  for (const [name, src] of MODULES) {
+    const code = code_only(src)
     if (!/RZ_TRAIL_SLOTS/.test(code)) continue
     assert.match(
       code,
@@ -81,13 +89,14 @@ test("RZ_TRAIL_SLOTS is defined wherever trails are reachable, and means trail C
     )
   }
   // The two modules that actually record/draw trails must define it.
-  for (const [name, code] of MODULES.filter(([n]) => n.startsWith("particle") || n === "trail shader")) {
-    assert.match(code, /const RZ_TRAIL_SLOTS: i32 =/, `${name} must define RZ_TRAIL_SLOTS — published effects use it`)
+  for (const [name, src] of MODULES.filter(([n]) => n.startsWith("particle") || n === "trail shader")) {
+    assert.match(code_only(src), /const RZ_TRAIL_SLOTS: i32 =/, `${name} must define RZ_TRAIL_SLOTS — published effects use it`)
   }
 })
 
 test("RZ_MAX_ANCHORS is the address space and is 8, not the trail count", () => {
-  for (const [name, code] of MODULES) {
+  for (const [name, src] of MODULES) {
+    const code = code_only(src)
     if (!/RZ_MAX_ANCHORS/.test(code)) continue
     assert.match(code, /const RZ_MAX_ANCHORS: i32 = 8;/, `${name} has the wrong anchor address space`)
   }

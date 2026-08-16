@@ -2,6 +2,8 @@ import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
+import { CAST_API } from "../cast-api"
+import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 // Ribbons along a bone's recorded path, drawn as geometry.
 //
 // This is the effect the whole geometry path was built for. As a fullscreen
@@ -85,65 +87,21 @@ export function buildTrailShader(
   },
 ): string {
   return (
-    `const RZ_SUBJECTS: i32 = ${cast.subjects};
-const RZ_SAMPLES: i32 = ${cast.samples};
-const RZ_SLOTS: i32 = ${src.slots};
-const RZ_TRAIL_SLOTS: i32 = ${src.slots};
-// The anchor ADDRESS SPACE — distinct from RZ_SLOTS, which is how many ribbons
-// this effect draws. The accessors bound by this; the instance loop by that.
-const RZ_MAX_ANCHORS: i32 = ${cast.slots};
+    CAST_API +
+    trailSlotsApi(src.slots) +
+    EFFECT_MATH_API +
+    PARTICLE_STRUCT_WGSL +
+    clockApi("tu.time", "0.0") +
+    viewportApi("cam.targetHeight") +
+    // RZ_SLOTS is this module's alone: how many ribbons to DRAW, which is the
+    // instance loop's bound. RZ_MAX_ANCHORS in CAST_API is the address space the
+    // accessors are bounded by, and the two being one number was the old trail
+    // bug — the comment that said so lived here, so it stays here.
+    `const RZ_SLOTS: i32 = ${src.slots};
 ${ribbonSlotWgsl(src.ribbonSlots)}
 ${anchorAliasWgsl(cast.alias)}
 const SUB: i32 = ${TRAIL_SUBDIVISIONS};
 
-// The same struct and helpers the particle modules define. The whole effect
-// file is spliced into EVERY module its mounts compile into, so an effect that
-// declares both trails and particles carries its particle functions through
-// this module as dead code — dead code that still has to type-check. Keeping
-// the two preludes' public surface identical is what makes one file, two
-// mounts work.
-struct Particle {
-  pos: vec3f,
-  age: f32,
-  vel: vec3f,
-  life: f32,
-  size: f32,
-  rot: f32,
-  seed: f32,
-  stretch: f32,
-}
-fn rzDt() -> f32 { return 0.0; }
-fn rzHash21(p: vec2f) -> f32 {
-  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
-  p3 = p3 + dot(p3, p3.yzx + 33.33);
-  return fract((p3.x + p3.y) * p3.z);
-}
-fn rzHash31(p: vec3f) -> f32 {
-  var p3 = fract(p * 0.1031);
-  p3 = p3 + dot(p3, p3.zyx + 31.32);
-  return fract((p3.x + p3.y) * p3.z);
-}
-fn rzHash13(x: f32) -> vec3f {
-  return vec3f(rzHash11(x), rzHash11(x + 17.13), rzHash11(x + 41.71));
-}
-fn rzValueNoise(p: vec3f) -> f32 {
-  let i = floor(p);
-  let f = fract(p);
-  let u = f * f * (3.0 - 2.0 * f);
-  let n000 = rzHash31(i);
-  let n100 = rzHash31(i + vec3f(1.0, 0.0, 0.0));
-  let n010 = rzHash31(i + vec3f(0.0, 1.0, 0.0));
-  let n110 = rzHash31(i + vec3f(1.0, 1.0, 0.0));
-  let n001 = rzHash31(i + vec3f(0.0, 0.0, 1.0));
-  let n101 = rzHash31(i + vec3f(1.0, 0.0, 1.0));
-  let n011 = rzHash31(i + vec3f(0.0, 1.0, 1.0));
-  let n111 = rzHash31(i + vec3f(1.0, 1.0, 1.0));
-  let x00 = mix(n000, n100, u.x);
-  let x10 = mix(n010, n110, u.x);
-  let x01 = mix(n001, n101, u.x);
-  let x11 = mix(n011, n111, u.x);
-  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
-}
 // World units a sample pair must span to count as a FULL contribution — the
 // original's REF_SEG_PX, converted out of pixels.
 //
@@ -177,7 +135,6 @@ struct TrailU {
 // "includes writable usage and another usage in the same synchronization
 // scope". The hardware depth test replaced what it was read for.
 
-fn rzTime() -> f32 { return tu.time; }
 ${RZ_LIGHT_STRUCT_WGSL}
 fn rzCameraPos() -> vec3f { return cam.camPos; }
 fn rzCameraRight() -> vec3f { return vec3f(cam.view[0][0], cam.view[1][0], cam.view[2][0]); }
@@ -189,7 +146,6 @@ fn rzProject(p: vec3f) -> vec3f {
   let w = max(clip.w, 1e-4);
   return vec3f(clip.xy / w * 0.5 + 0.5, clip.w);
 }
-fn rzViewportHeight() -> f32 { return cam.targetHeight; }
 fn rzCamPos() -> vec3f { return cam.camPos; }
 fn rzSubjectCount() -> i32 {
   var n = 0;
@@ -197,23 +153,6 @@ fn rzSubjectCount() -> i32 {
     if (_rzCast[i * 3 + 2].w > 0.0) { n = i + 1; }
   }
   return n;
-}
-fn rzTrailCount(subject: i32, slot: i32) -> i32 {
-  // Bounded by the scene's anchor cap, NOT by how many anchors asked for a
-  // trail. Those are different index spaces: storage is addressed by anchor
-  // slot, so an untrailed @anchor followed by a trailed one put the trail at
-  // index 1 with a bound of 1, and rzTrail returned zero — a ribbon that
-  // silently did not draw. The bound was redundant: an untrailed slot already
-  // reports a recorded count of zero.
-  let g = _rzSlot(slot);
-  if (subject < 0 || subject >= RZ_SUBJECTS || g < 0 || g >= RZ_MAX_ANCHORS) { return 0; }
-  return i32(_rzCast[${cast.base} + (g * RZ_SUBJECTS + subject) * 3 + 2].w);
-}
-/** Sample i of a path: xyz where it was, w how many seconds ago. i = 0 is now. */
-fn rzTrail(subject: i32, slot: i32, i: i32) -> vec4f {
-  let n = rzTrailCount(subject, slot);
-  if (i < 0 || i >= n) { return vec4f(0.0); }
-  return _rzCast[${cast.trailBase} + (_rzSlot(slot) * RZ_SUBJECTS + subject) * RZ_SAMPLES + i];
 }
 /** Catmull-Rom through four samples — passes through p1 and p2. */
 fn rzSpline(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, t: f32) -> vec3f {
@@ -278,16 +217,6 @@ fn rzTurnRadius(a: vec3f, b: vec3f, c: vec3f) -> f32 {
   let cr = length(cross(ab, ca));
   if (la < 1e-5 || lb < 1e-5 || cr < 1e-7) { return 1e6; }
   return (la * lb * length(ca)) / (2.0 * cr);
-}
-fn rzFalloff(d: f32, r: f32) -> f32 {
-  let x = clamp(d / max(r, 1e-6), 0.0, 1.0);
-  let f = 1.0 - x;
-  return f * f * f;
-}
-fn rzHash11(x: f32) -> f32 {
-  var p = fract(x * 0.1031);
-  p = p * (p + 33.33);
-  return fract(p * (p + p));
 }
 ` +
     audioApi(0, 4) +

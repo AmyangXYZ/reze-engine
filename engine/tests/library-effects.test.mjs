@@ -100,7 +100,10 @@ function modulesFor(wgsl) {
   // The emit stage gets the same scene API and the same alias the drawing half
   // does, which is what lets a lamp aim at the dancer its beam is painting.
   if (hasLightEmit(wgsl)) {
-    out.push(["light emit", buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias))])
+    out.push([
+      "light emit",
+      buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias), { ...cast, trailCount: trailed.length }),
+    ])
   }
   return out
 }

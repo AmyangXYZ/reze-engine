@@ -127,6 +127,9 @@ import { anchorAliasWgsl } from "../dist/shaders/anchor-table.js"
 
 /** What the engine hands the builder: the scene API plus this effect's alias. */
 const API = EFFECT_SCENE_API + anchorAliasWgsl([0])
+/** The cast shape the emit module turns into constants — two trailed anchors,
+ *  so RZ_TRAIL_SLOTS is a number a hosted trail loop could actually be wrong about. */
+const CAST = { trailCount: 2 }
 import { buildParticleComputeShader, buildParticleRenderShader } from "../dist/shaders/passes/particles.js"
 import { buildTrailShader } from "../dist/shaders/passes/trails.js"
 
@@ -152,7 +155,7 @@ test("an effect declares how many lights it emits", () => {
 })
 
 test("the emit shader writes the slots the material shader reads", () => {
-  const src = buildLightEmitShader(EMIT, API)
+  const src = buildLightEmitShader(EMIT, API, CAST)
   // Same stride and header on both sides of the buffer, expressed against the
   // same constants — this is the seam where a writer and a reader drift.
   assert.match(src, new RegExp(`let b = ${LIGHT_HEADER}u \\+ \\(u32\\(_rzLightU\\.y\\) \\+ i\\) \\* ${LIGHT_STRIDE}u;`))
@@ -164,7 +167,7 @@ test("the emit shader writes the slots the material shader reads", () => {
 })
 
 test("the emit shader guards its dispatch tail", () => {
-  const src = buildLightEmitShader(EMIT, API)
+  const src = buildLightEmitShader(EMIT, API, CAST)
   // A workgroup is 64 wide and a count rarely is. Without this the tail threads
   // write into whatever slots follow — another effect's lights, silently.
   assert.match(src, /if \(i >= u32\(_rzLightU\.z\)\) \{ return; \}/)
@@ -174,16 +177,47 @@ test("time is a PARAMETER, so the same source compiles in every module", () => {
   // An effect that emits lights AND draws something has its whole source
   // spliced into the field, particle, trail or grid module too — where
   // lightEmit is dead code that still has to resolve. Those modules already
-  // define rzTime differently or not at all, so lightEmit must not need it.
-  assert.match(buildLightEmitShader(EMIT, API), /let l = lightEmit\(i, _rzLightU\.x\);/)
-  assert.doesNotMatch(buildLightEmitShader(EMIT, API), /fn rzTime\(\)/)
+  // define rzTime differently, so lightEmit's SIGNATURE must not need it.
+  assert.match(buildLightEmitShader(EMIT, API, CAST), /let l = lightEmit\(i, _rzLightU\.x\);/)
+})
+
+test("the emit module hosts the whole file, so the whole API resolves in it", () => {
+  // The other half of the rule above, and the one that was missing: the
+  // signature must not DEPEND on rzTime, but the module must still DEFINE it,
+  // because a trail effect that grows a lamp at its tip compiles its ribbon
+  // code here too. Hand Ribbon failed on exactly this — rzTime, rzFalloff,
+  // rzViewportHeight and RZ_TRAIL_SLOTS, none of them called by lightEmit.
+  const src = buildLightEmitShader(EMIT, API, CAST)
+  for (const name of ["rzTime", "rzDt", "rzFalloff", "rzViewportHeight", "rzValueNoise", "rzCurlNoise"]) {
+    assert.match(src, new RegExp(`fn ${name}\\(`), `${name} must resolve in the emit module`)
+  }
+  assert.match(src, /const RZ_TRAIL_SLOTS: i32 = 2;/)
+  // Once each. EFFECT_SCENE_API is in this module too, so a helper added to
+  // both blocks is a redefinition rather than a convenience.
+  for (const name of ["rzTime", "rzFalloff", "rzHash11", "rzHash31"]) {
+    const n = (src.match(new RegExp(`fn ${name}\\(`, "g")) ?? []).length
+    assert.equal(n, 1, `${name} is defined ${n} times in the emit module`)
+  }
+})
+
+test("a lamp can pulse on the beat and light up on a note", () => {
+  // Audio and score are the reason an effect owns a light at all: a document
+  // light is placed once, and this one can answer the music. Without these the
+  // mount is only a way to move a lamp along a bone.
+  const src = buildLightEmitShader(EMIT, API, CAST)
+  assert.match(src, /fn rzAudioLevel\(/)
+  assert.match(src, /fn rzNoteVelocity\(/)
+  // On the same bindings the particle and trail modules use, so the layout in
+  // engine.ts is one convention rather than three.
+  assert.match(src, /@group\(0\) @binding\(4\) var<storage, read> _rzAudio/)
+  assert.match(src, /@group\(0\) @binding\(5\) var<storage, read> _rzScore/)
 })
 
 test("the emit stage can read the cast, so a lamp can aim at someone", () => {
   // Stage Lights points its beams at rzSubject().root. A light that could not
   // ask where she is could only sit where the fixture hangs, which is the one
   // place a follow-spot never is.
-  const src = buildLightEmitShader(EMIT, API)
+  const src = buildLightEmitShader(EMIT, API, CAST)
   assert.match(src, /fn rzSubject\(/)
   assert.match(src, /fn rzTrail\(/)
   // The alias too, or an effect sharing the anchor table reads someone else's
@@ -201,7 +235,7 @@ test("RzLight resolves in every module a source is spliced into", () => {
     "particle compute": buildParticleComputeShader(P, CAST),
     "particle render": buildParticleRenderShader(P, CAST),
     trail: buildTrailShader({ wgsl: "fn trailWidth(u: f32, a: f32) -> f32 { return 1.0; }", slots: 1, ribbonSlots: [0], blend: "additive", bloom: true }, CAST),
-    emit: buildLightEmitShader(EMIT, API),
+    emit: buildLightEmitShader(EMIT, API, CAST),
   }
   for (const [name, src] of Object.entries(modules)) {
     assert.equal((src.match(/struct RzLight\b/g) ?? []).length, 1, `${name} must declare RzLight exactly once`)
@@ -210,18 +244,18 @@ test("RzLight resolves in every module a source is spliced into", () => {
 })
 
 test("the slot base is a uniform, never baked into the text", () => {
-  const src = buildLightEmitShader(EMIT, API)
+  const src = buildLightEmitShader(EMIT, API, CAST)
   assert.match(src, /u32\(_rzLightU\.y\)/)
   // Baking it would mean recompiling every emitting effect whenever a scene
   // gained or lost a document light — a shader rebuild triggered by moving a
   // lamp. The builder takes no base at all, so it cannot regress to that.
-  assert.doesNotMatch(buildLightEmitShader(EMIT, API), /\+ \d+u\) \* 8u/)
+  assert.doesNotMatch(buildLightEmitShader(EMIT, API, CAST), /\+ \d+u\) \* 8u/)
 })
 
 test("the writable view of the lights buffer exists only in the emit stage", () => {
   // Everything that SHADES reads the buffer read-only. One writable binding, in
   // a compute pass that runs before the pass reading it.
-  assert.match(buildLightEmitShader(EMIT, API), /var<storage, read_write> _rzLightsOut/)
+  assert.match(buildLightEmitShader(EMIT, API, CAST), /var<storage, read_write> _rzLightsOut/)
   assert.doesNotMatch(COMMON_MATERIAL_PRELUDE_WGSL, /read_write.*_rzLights/)
   assert.doesNotMatch(groundShaderWgsl(), /read_write.*_rzLights/)
 })
@@ -231,7 +265,7 @@ test("the emit write is sanitized: hosted code cannot poison the frame", () => {
   // material — one NaN position would poison the whole frame, and WGSL leaves
   // max(NaN, 0) indeterminate, so it would not even fail the same way on every
   // GPU. The one write site checks, and a light that fails writes zeros.
-  const src = buildLightEmitShader(EMIT, API)
+  const src = buildLightEmitShader(EMIT, API, CAST)
   assert.match(src, /let finite = l\.pos\.x == l\.pos\.x/, "the NaN self-equality check must guard the write")
   assert.match(src, /select\(vec3f\(0\.0\), max\(l\.color \* l\.intensity, vec3f\(0\.0\)\), finite\)/,
     "colour must be clamped at zero — this layer is additive, and negative light darkens")

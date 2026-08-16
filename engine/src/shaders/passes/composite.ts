@@ -1,8 +1,11 @@
 import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { anchorAliasWgsl } from "../anchor-table"
+import { CAST_API } from "../cast-api"
+import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
+import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
 import { scoreApi } from "../score-api"
-import { gridClockApi, gridReadApi } from "./grid"
+import { gridReadApi } from "./grid"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
 //
@@ -76,20 +79,9 @@ export function parseEffectAnchors(wgsl: string, max: number): { bone: string; t
     .slice(0, max)
 }
 
-/**
- * The caps the cast buffer is built to, shared by the shader below and by the
- * engine that fills it. Interpolated into the WGSL rather than written twice:
- * the layout arithmetic on both sides has to agree exactly, and two literals
- * that must match are two literals that eventually will not.
- *
- * All three are MINIMUMS. Raising one breaks nothing, because effects read
- * through accessors and loop to the count functions; lowering one does.
- */
-export const EFFECT_SUBJECTS = 4
-export const EFFECT_ANCHORS = 8
-export const EFFECT_TRAIL_SAMPLES = 128
-/** vec4 slot where the trails begin — after the subjects and the anchors. */
-export const EFFECT_TRAIL_BASE = EFFECT_SUBJECTS * 3 + EFFECT_ANCHORS * EFFECT_SUBJECTS * 3
+// The cast's caps live in cast-layout.ts — re-exported here because half the
+// engine imports them from this file and the constants did not move in meaning.
+export { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 
 export type CompositeEffectSource = {
   /** The user's WGSL verbatim: helpers plus whichever entry points it defines. */
@@ -105,6 +97,11 @@ export type CompositeEffectSource = {
   /** Whether the scene pass carries the id attachment, so the field module can
    *  bind it. False emits accessors that answer 0 rather than nothing at all. */
   ids?: boolean
+  /** How many of this effect's anchors asked for a trail — RZ_TRAIL_SLOTS,
+   *  which a hosted particle or trail loop reads even in this module. REQUIRED,
+   *  and deliberately not defaulted: a silent 0 is a ribbon loop that iterates
+   *  nothing, which looks exactly like an effect that drew nothing. */
+  trailCount: number
   /** This effect's local anchor slot → scene slot, from the shared table.
    *  Omitted or identity when it owns the table. The particle and trail modules
    *  have always taken this; the field module not taking it was the bug. */
@@ -362,154 +359,17 @@ fn rzCameraRight() -> vec3f { return viewU[3].xyz; }
 fn rzCameraUp() -> vec3f { return viewU[4].xyz; }
 fn rzCameraForward() -> vec3f { return viewU[5].xyz; }
 
-/** A character, as much of one as a shader needs. */
-struct RzSubject {
-  /** On the FLOOR, under the body — where a ring or a magic circle belongs. */
-  root: vec3f,
-  /** At the hips, the middle of the body — where an aura belongs. */
-  center: vec3f,
-  /** Bounding sphere: xyz centre, w radius. Deliberately generous — cull with it. */
-  bounds: vec4f,
-  /** False past the end of the cast, and every field is then zero. */
-  valid: bool,
-}
+// The cast — subjects, anchors, trails — is CAST_API, shared verbatim with the
+// particle and trail modules. It used to be written out here, a second time, and
+// the two copies had drifted: this one had rzAnchor and that one did not.
+${CAST_API}
 
-/** One bone an effect asked for, by name, at the top of its own source. */
-struct RzAnchor {
-  pos: vec3f,
-  /** World units per second, from the previous frame. Direction for a trail,
-   *  magnitude for anything that should react to how hard someone is moving. */
-  vel: vec3f,
-  /** The bone's forward axis — which way a foot points, where a head looks. */
-  fwd: vec3f,
-  /** False when this rig has no such bone. Check it: the alternative is drawing
-   *  a hand effect at the world origin on every model that spells it differently. */
-  valid: bool,
-}
+// The hashes, the noise and rzFalloff — EFFECT_MATH_API, the same text the
+// particle and trail modules get. The field module used to be missing most of
+// it, so a helper an author wrote for one mount failed to compile in another
+// for no reason visible in the file.
+${EFFECT_MATH_API}${PARTICLE_STRUCT_WGSL}
 
-const RZ_MAX_ANCHORS: i32 = ${EFFECT_ANCHORS};
-
-/**
- * Character i. Loop to rzSubjectCount(), never to a constant — the caps here are
- * MINIMUMS and are free to grow, which is only true while nobody hardcodes them.
- */
-/**
- * Cheap hash, 0..1. The particle and trail modules have always had these; the
- * field module did not, so a helper an author wrote for one mount failed to
- * compile in another — for no reason anyone could see from the file. One noise
- * source, everywhere.
- */
-fn rzHash11(x: f32) -> f32 {
-  var p = fract(x * 0.1031);
-  p = p * (p + 33.33);
-  return fract(p * (p + p));
-}
-fn rzHash21(p: vec2f) -> f32 {
-  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
-  p3 = p3 + dot(p3, p3.yzx + 33.33);
-  return fract((p3.x + p3.y) * p3.z);
-}
-fn rzHash13(x: f32) -> vec3f {
-  return vec3f(rzHash11(x), rzHash11(x + 17.13), rzHash11(x + 41.71));
-}
-
-/**
- * Subject i's OBJECT ID — what the id attachment writes for every pixel this
- * character drew.
- *
- * The half that makes rzObjectAt() useful: reading an id out of the buffer says
- * nothing until there is something to compare it against, and "the character I
- * am following" is the comparison a masking effect actually wants. Zero for a
- * subject past the end, and zero is the reserved nothing, so a bad index masks
- * nothing rather than masking the wrong model.
- */
-fn rzSubjectId(i: i32) -> u32 {
-  if (i < 0 || i >= rzSubjectCount()) { return 0u; }
-  return u32(_rzCast[i * 3 + 1].w);
-}
-
-fn rzSubject(i: i32) -> RzSubject {
-  var s: RzSubject;
-  s.valid = i >= 0 && i < rzSubjectCount();
-  if (!s.valid) { return s; }
-  let b = i * 3;
-  s.root = _rzCast[b].xyz;
-  s.center = _rzCast[b + 1].xyz;
-  s.bounds = _rzCast[b + 2];
-  return s;
-}
-
-// _rzSlot — local slot → scene slot — is APPENDED by the builders below, from
-// the effect's own alias. It used to be hardcoded to the identity here, with a
-// comment promising that setEffects would replace the line; that replacement was
-// never written, so a field effect declaring anchors read the identity forever.
-// Alone that is correct (its declaration order IS the scene table), which is
-// exactly why it survived: it only breaks once a SECOND anchor-declaring effect
-// is installed ahead of it, and then the field effect silently reads the other
-// one's bones. Footprints composed after Hand Ribbon put its prints on the
-// hands. The particle, trail and grid modules always spliced the real alias;
-// only this one did not.
-
-/**
- * The slot-th bone this effect declared, on character subject.
- *
- * Slots are the order of the declarations at the top of your source:
- *
- *     // @anchor 左手首
- *     // @anchor 頭
- *
- * gives you slot 0 and slot 1. Any bone name the model has works; valid is
- * false when it does not have it, which is the normal case across rigs that
- * spell things differently.
- */
-fn rzAnchor(subject: i32, slot: i32) -> RzAnchor {
-  var a: RzAnchor;
-  a.valid = false;
-  // The author's slot is a NAME; _rzSlot turns it into the scene's address. With
-  // one effect installed the two coincide and this folds away.
-  let g = _rzSlot(slot);
-  if (subject < 0 || subject >= rzSubjectCount() || g < 0 || g >= RZ_MAX_ANCHORS) { return a; }
-  let b = ${EFFECT_SUBJECTS * 3} + (g * ${EFFECT_SUBJECTS} + subject) * 3;
-  a.valid = _rzCast[b].w > 0.5;
-  a.pos = _rzCast[b].xyz;
-  a.vel = _rzCast[b + 1].xyz;
-  a.fwd = _rzCast[b + 2].xyz;
-  return a;
-}
-
-const RZ_TRAIL_SAMPLES: i32 = ${EFFECT_TRAIL_SAMPLES};
-
-/**
- * How many path samples this anchor has. Zero unless it was declared with
- * trail, and it climbs from zero as the trail fills after the effect loads.
- *
- * Loop to THIS, never to RZ_TRAIL_SAMPLES: the cap is a minimum and is free to
- * grow, which stays true only while nobody hardcodes it.
- */
-fn rzTrailCount(subject: i32, slot: i32) -> i32 {
-  let g = _rzSlot(slot);
-  if (subject < 0 || subject >= rzSubjectCount() || g < 0 || g >= RZ_MAX_ANCHORS) { return 0; }
-  return i32(_rzCast[${EFFECT_SUBJECTS * 3} + (g * ${EFFECT_SUBJECTS} + subject) * 3 + 2].w);
-}
-
-/**
- * Sample i of an anchor's path: xyz where it was, w how many seconds ago.
- *
- * i = 0 is NOW and they run backwards in time, so a ribbon is drawn by walking i
- * upward and fading on .w. Sampled at a fixed rate on the SCENE clock, not the
- * display's — so the path is identical in the editor, in an export, and in a
- * re-export, and its spacing does not change with framerate.
- *
- * This is what a hand trail wants instead of position and velocity. One position
- * and one velocity is a straight segment that jitters, because a velocity is a
- * difference between two frames; a path is what actually happened.
- */
-fn rzTrail(subject: i32, slot: i32, i: i32) -> vec4f {
-  let n = rzTrailCount(subject, slot);
-  if (i < 0 || i >= n) { return vec4f(0.0); }
-  let base = ${EFFECT_TRAIL_BASE} + (_rzSlot(slot) * ${EFFECT_SUBJECTS} + subject) * RZ_TRAIL_SAMPLES;
-  return _rzCast[base + i];
-}
 
 fn bgResolution() -> vec2f { return rzResolution(); }
 fn bgCameraPos() -> vec3f { return rzCameraPos(); }
@@ -830,7 +690,9 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     // none, so rzGrid() is a function that always exists rather than one an
     // author has to know whether they are allowed to call.
     gridReadApi(0, 17, 18, effect.gridSize) +
-    gridClockApi("_rzFieldClock.x") +
+    clockApi("_rzFieldClock.x", "0.0") +
+    viewportApi("viewU[6].w") +
+    trailSlotsApi(effect.trailCount) +
     idApi(effect.ids === true, 0, 23) +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +

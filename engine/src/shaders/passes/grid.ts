@@ -3,6 +3,7 @@ import { anchorAliasWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
 import { EFFECT_SCENE_API } from "./composite"
 import { type CastLayout } from "./particles"
+import { clockApi, trailSlotsApi, viewportApi } from "./hosted-api"
 
 // A persistent grid an effect can step and read: the one thing an effect could
 // not have before, which is MEMORY.
@@ -90,15 +91,6 @@ fn rzGridFrame() -> i32 { return 1; }
 `
 }
 
-/** `rzTime`/`rzDt`, for a module that has no clock of its own — the field pass.
- *  Same reason as above: a spliced gridStep refers to them. */
-export function gridClockApi(timeExpr: string): string {
-  return /* wgsl */ `
-fn rzTime() -> f32 { return ${timeExpr}; }
-fn rzDt() -> f32 { return 0.0; }
-`
-}
-
 const SIM_UNIFORMS = /* wgsl */ `
 struct SimU {
   time: f32,
@@ -121,7 +113,7 @@ struct SimU {
  * from", and that place is almost never a texel centre. Point-sampling it is
  * what turns smoke into a staircase.
  */
-export function buildSimShader(wgsl: string, size: number, _cast: CastLayout): string {
+export function buildSimShader(wgsl: string, size: number, cast: CastLayout): string {
   return (
     SIM_UNIFORMS +
     /* wgsl */ `
@@ -134,9 +126,7 @@ export function buildSimShader(wgsl: string, size: number, _cast: CastLayout): s
 // thing here rather than a stub — a kernel can ask where a bone is, and a
 // foreground spliced into this module resolves its camera calls.
 @group(0) @binding(6) var<uniform> viewU: array<vec4<f32>, 15>;
-
-fn rzTime() -> f32 { return su.time; }
-fn rzDt() -> f32 { return su.dt; }
+${clockApi("su.time", "su.dt")}${viewportApi("viewU[6].w")}${trailSlotsApi(cast.trailCount)}
 /** Texels per side. */
 fn rzGridSize() -> f32 { return su.size; }
 /** One texel, in uv — the step a neighbour lookup takes. */

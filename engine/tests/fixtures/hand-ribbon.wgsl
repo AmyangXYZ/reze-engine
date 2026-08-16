@@ -182,3 +182,47 @@ fn particleShade(p: Particle, uv: vec2f) -> vec4f {
   let rgb = mix(SPARK_COLOR, SPARK_HOT, clamp(hot, 0.0, 1.0));
   return vec4f(rgb * SPARK_INTENSITY, alpha);
 }
+
+// ── The light the ribbons throw ──────────────────────────────────────────────
+//
+// The ribbons already GLOW: they draw inside the scene pass, so the bloom
+// pyramid catches them. What they never did is LIGHT anything — a neon band
+// whipping past a dress left it exactly as the sun had it, which is the same
+// tell the fire and the follow-spots had before they declared lights.
+//
+// One light per wrist, at the anchors the ribbons are already drawn from, so
+// the light is where the band is by construction rather than by a second guess
+// at where her hands are.
+// @lights 2
+const RIBBON_LIGHT_I = 1.4;   // brightness at the wrist
+const RIBBON_LIGHT_R = 7.0;   // world units — a band lights what it passes,
+                              // not the room; this is about an arm's length
+
+fn lightEmit(i: u32, time: f32) -> RzLight {
+  var l: RzLight;
+  // BODY_COLOR, not CORE_COLOR: the core is white-hot and would wash whatever
+  // it touched, and the colour a viewer reads off the ribbon is the body.
+  l.color = BODY_COLOR;
+  l.intensity = 0.0;
+  l.radius = 1.0;
+  l.pos = vec3f(0.0, 0.0, 0.0);
+
+  // Slot 0 is the left wrist, 1 the right — the same order the anchors are
+  // declared in at the top of this file, which is what rzAnchor's slots mean.
+  //
+  // SUBJECT 0, deliberately. The ribbons themselves are drawn for every
+  // character in the scene, but a light is a declared cost: covering four
+  // dancers would spend eight of the sixteen slots on one effect, and leave a
+  // composer no room for the stage. One dancer is what this is for.
+  let a = rzAnchor(0, i32(i));
+  if (!a.valid) { return l; }
+  l.pos = a.pos;
+  l.radius = RIBBON_LIGHT_R;
+
+  // Brighter the faster the hand moves, because that is when the ribbon is
+  // longest and brightest — a still hand trails almost nothing, and a light
+  // blazing off a motionless wrist reads as a lamp she is holding.
+  let speed = length(a.vel);
+  l.intensity = RIBBON_LIGHT_I * clamp(speed / 12.0, 0.0, 1.0);
+  return l;
+}

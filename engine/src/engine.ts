@@ -2526,7 +2526,7 @@ export class Engine {
     // `alias` goes in: a field effect reads bones through _rzSlot exactly as a
     // particle one does, and it was the only module never handed the mapping.
     const fieldEffect =
-      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, gridSize, alias } : null
+      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, gridSize, alias, trailCount: anchors.filter((a) => a.trail).length } : null
     const source = buildCompositeShader(fieldEffect)
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
@@ -2665,7 +2665,7 @@ export class Engine {
       ])
     }
     if (declaredLights > 0) {
-      const built = await this.buildLightEmit(wgsl, declaredLights, alias)
+      const built = await this.buildLightEmit(wgsl, declaredLights, alias, anchors)
       if (!built.ok) return abandon(built.diagnostics)
       lights = built.state
     }
@@ -2844,7 +2844,9 @@ export class Engine {
       label: "composite shader (effects)",
       code: buildCompositeShader(
         hasBackground || hasForeground
-          ? { wgsl: "", paramsDecl: "", hasBackground, hasForeground, gridSize: 0 }
+          ? // No wgsl and so no trails: the composite hosts no effect source at
+            // all, it only decides whether to sample the layer the field pass drew.
+            { wgsl: "", paramsDecl: "", hasBackground, hasForeground, gridSize: 0, trailCount: 0 }
           : null,
       ),
     })
@@ -3042,6 +3044,7 @@ export class Engine {
     wgsl: string,
     count: number,
     alias: number[],
+    anchors: { bone: string; trail: boolean }[],
   ): Promise<{ ok: true; state: NonNullable<EffectInstance["lights"]> } | { ok: false; diagnostics: string[] }> {
     const layout = this.device.createBindGroupLayout({
       label: "light emit layout",
@@ -3050,13 +3053,15 @@ export class Engine {
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     })
     const module = this.device.createShaderModule({
       label: "light emit",
       // The same scene API and the same per-effect anchor alias its drawing
       // half gets, so a lamp reads the cast exactly as the beam that paints it.
-      code: buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias)),
+      code: buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias), { trailCount: anchors.filter((a) => a.trail).length }),
     })
     const info = await module.getCompilationInfo()
     const diagnostics = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`)
@@ -3086,6 +3091,8 @@ export class Engine {
         { binding: 1, resource: { buffer: uniform } },
         { binding: 2, resource: { buffer: this.compositeUniformBuffer } },
         { binding: 3, resource: { buffer: this.castBuffer } },
+        { binding: 4, resource: { buffer: this.audioBuffer } },
+        { binding: 5, resource: { buffer: this.scoreBuffer } },
       ],
     })
     return { ok: true, state: { pipeline, bind, uniform, data, count } }
