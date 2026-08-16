@@ -24,6 +24,10 @@ export {
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export { parseMidi } from "./midi-loader"
+// A material parameter over time. The sampler is exported too: a host that
+// wants to draw a track, or scrub one, should read the same curve the engine
+// plays rather than reimplementing it a second time.
+export { sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 export {
   compileGraph,
   validateGraph,

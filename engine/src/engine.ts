@@ -27,6 +27,7 @@ import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
+import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1475,6 +1476,11 @@ export class Engine {
    *  drawing effect, and allocating a fresh array for each would be garbage
    *  every frame. */
   private fieldClockScratch = new Float32Array(4)
+  /** Material parameters driven by the scene clock — see setStyleParamTrack. */
+  private paramTracks = new Map<
+    string,
+    { modelName: string; groupId: string; paramId: string; keys: ParamKey[]; last: ParamValue | null }
+  >()
   private fieldBgTextures: (GPUTexture | null)[] = [null, null]
   private fieldBgViews: (GPUTextureView | null)[] = [null, null]
   private fieldFgTextures: (GPUTexture | null)[] = [null, null]
@@ -8932,6 +8938,9 @@ export class Engine {
 
     // Before the particles and before the field pass: both may read the grid,
     // and a grid stepped after them is one frame stale in everything that used it.
+    // Material parameters on the scene clock, before anything reads their
+    // uniforms this frame.
+    this.evaluateParamTracks()
     this.stepSim(encoder, deltaTime)
     this.stepParticles(encoder, deltaTime)
     // Before the scene pass, which READS the slots this writes. Same buffer,
@@ -9198,6 +9207,61 @@ export class Engine {
   }
 
   /** Instant adjust-tier write: set one exposed slider on a group's applied graph. */
+  /**
+   * Drive a material parameter from the SCENE CLOCK.
+   *
+   * The channel this writes into already existed — setStyleParam below puts a
+   * value straight into the style uniform. What a track adds is WHEN: the value
+   * is a pure function of scene time, so a scene describes a dissolve once and
+   * playback, a re-open and an offline export stepped at another rate all
+   * produce the same frames.
+   *
+   * Addressed BY NAME (model, group, param), not by id. Worth stating because
+   * the id attachment landed alongside this and the two look related: ids
+   * answer "which object is this PIXEL", which is a screen-space question, and
+   * a track answers "what is this parameter NOW". Nothing here needs MRT.
+   *
+   * Null or empty clears the track and leaves the parameter wherever it was —
+   * removing an animation is not the same as resetting a value, and guessing
+   * which the caller meant would be worse than either.
+   */
+  setStyleParamTrack(modelName: string, groupId: string, paramId: string, keys: ParamKey[] | null): boolean {
+    const id = `${modelName}\u0000${groupId}\u0000${paramId}`
+    if (!keys || keys.length === 0) {
+      this.paramTracks.delete(id)
+      return true
+    }
+    // Refused rather than stored if the target does not exist: a track on a
+    // parameter nobody has is silence, and silence is what makes an author
+    // hunt through their document for a typo the engine could have named.
+    const install = this.modelInstances.get(modelName)?.styleGroups.get(groupId)
+    if (!install?.slotMap.find((s) => s.id === paramId)) return false
+    // Sorted ONCE here so the per-frame sample can binary-search.
+    this.paramTracks.set(id, {
+      modelName,
+      groupId,
+      paramId,
+      keys: [...keys].sort((a, b) => a.t - b.t),
+      last: null,
+    })
+    return true
+  }
+
+  /** Every track, at the current scene clock. Called once per frame, before the
+   *  pass that reads the uniforms it writes. */
+  private evaluateParamTracks(): void {
+    if (this.paramTracks.size === 0) return
+    for (const track of this.paramTracks.values()) {
+      const v = sampleParamTrack(track.keys, this.sceneClock)
+      // Most tracks are flat most of the time. Writing only on a CHANGE is what
+      // keeps a still scene from spending a uniform write per parameter per
+      // frame for values nobody moved.
+      if (v === null || !paramChanged(v, track.last)) continue
+      track.last = v
+      this.setStyleParam(track.modelName, track.groupId, track.paramId, v)
+    }
+  }
+
   setStyleParam(
     modelName: string,
     groupId: string,
