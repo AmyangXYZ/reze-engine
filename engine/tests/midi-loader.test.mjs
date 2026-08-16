@@ -115,6 +115,67 @@ test("a note left hanging at the end keeps its pitch", () => {
   assert.deepEqual(n.map((x) => x.pitch).sort((a, b) => a - b), [72, 77])
 })
 
+test("a zero-length note lasts no time, rather than the rest of the file", () => {
+  // The awkward interaction between two rules that are each correct. Same-tick
+  // offs sort BEFORE ons so a restrike pairs with the note it releases; a note
+  // whose off is at its own onset therefore has its off read while nothing is
+  // held. Dropped, its on never closed and the note ran to the end of the file
+  // — a whole-piece note nobody wrote, from a note of no length.
+  const track = [
+    ...vlq(0), 0x90, 60, 100,
+    ...vlq(0), 0x80, 60, 0, // off at the SAME tick: zero length
+    ...vlq(960), 0x90, 64, 100,
+    ...vlq(480), 0x80, 64, 0,
+    ...vlq(0), 0xff, 0x2f, 0x00,
+  ]
+  const n = parseMidi(midi(480, [track]))
+  assert.equal(n.length, 2)
+  assert.equal(n[0].pitch, 60)
+  assert.equal(n[0].duration, 0, `zero-length note lasted ${n[0].duration}s`)
+  // The velocity still comes off the ON, which is the only event that carries one.
+  assert.ok(Math.abs(n[0].velocity - 100 / 127) < 1e-6)
+  assert.ok(Math.abs(n[1].duration - 0.5) < 1e-6, `the ordinary note beside it lasted ${n[1].duration}`)
+})
+
+test("two zero-length strikes of one pitch need two offs", () => {
+  // One off closes one note. Both are struck and released at the same tick, and
+  // a second look that reused a single off would close one and hang the other.
+  // A note LATER in the track, so the file has a length to hang to: without it
+  // the last event is at tick 0, hanging notes are closed at tick 0 as well,
+  // and a parser that dropped both offs would look correct by accident.
+  const track = [
+    ...vlq(0), 0x90, 60, 100,
+    ...vlq(0), 0x80, 60, 0,
+    ...vlq(0), 0x90, 60, 100,
+    ...vlq(0), 0x80, 60, 0,
+    ...vlq(960), 0x90, 67, 100,
+    ...vlq(480), 0x80, 67, 0,
+    ...vlq(0), 0xff, 0x2f, 0x00,
+  ]
+  const n = parseMidi(midi(480, [track]))
+  assert.equal(n.length, 3)
+  assert.equal(n[0].duration, 0, `first strike lasted ${n[0].duration}`)
+  assert.equal(n[1].duration, 0, `second strike lasted ${n[1].duration}`)
+  assert.ok(Math.abs(n[2].duration - 0.5) < 1e-6)
+})
+
+test("a stray off at a tick with no note is still discarded", () => {
+  // The second look is deliberately narrow: it matches an off against an on at
+  // THE SAME tick. An off elsewhere releases nothing and must not resurrect a
+  // note or shorten an unrelated one.
+  const track = [
+    ...vlq(0), 0x80, 55, 0, // releases nothing at all
+    ...vlq(240), 0x90, 60, 100,
+    ...vlq(240), 0x80, 62, 0, // wrong pitch: not this note's off
+    ...vlq(240), 0x80, 60, 0,
+    ...vlq(0), 0xff, 0x2f, 0x00,
+  ]
+  const n = parseMidi(midi(480, [track]))
+  assert.equal(n.length, 1, "the stray offs invented no notes")
+  assert.equal(n[0].pitch, 60)
+  assert.ok(Math.abs(n[0].duration - 0.5) < 1e-6, `duration ${n[0].duration}, want 0.5`)
+})
+
 test("velocity is normalised, and a non-MIDI file is rejected by name", () => {
   const track = [...vlq(0), 0x90, 60, 127, ...vlq(480), 0x80, 60, 0, ...vlq(0), 0xff, 0x2f, 0x00]
   assert.equal(parseMidi(midi(480, [track]))[0].velocity, 1)

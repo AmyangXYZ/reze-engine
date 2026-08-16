@@ -142,6 +142,21 @@ export function parseMidi(data: ArrayBuffer): ScoreNote[] {
 
   raw.sort((a, b) => a.tick - b.tick || (a.on ? 1 : 0) - (b.on ? 1 : 0))
   const pending = new Map<number, Pending[]>()
+  /**
+   * Note-offs that found nothing to close, by key, in the order they were read.
+   *
+   * At the same tick the sort above puts every off AHEAD of every on, which is
+   * what makes a restrike pair correctly — the release of the held note is read
+   * before the strike that follows it. The cost is a note whose off is at its
+   * own onset tick: genuinely zero-length, and its off arrives before the on
+   * exists to be closed. Dropping it here left the on unpaired, so the note
+   * hung to the end of the file — the one case where the ordering that fixes
+   * restrikes creates a note nothing wrote.
+   *
+   * Kept rather than discarded so the flush below can look again. An off at any
+   * OTHER tick really is stray and stays dropped.
+   */
+  const orphanOffs = new Map<number, number[]>()
   const notes: ScoreNote[] = []
   for (const e of raw) {
     const key = e.channel * 128 + e.pitch
@@ -156,7 +171,12 @@ export function parseMidi(data: ArrayBuffer): ScoreNote[] {
     // forever — the note would last the rest of the piece.
     const list = pending.get(key)
     const start = list?.shift()
-    if (!start) continue
+    if (!start) {
+      const seen = orphanOffs.get(key)
+      if (seen) seen.push(e.tick)
+      else orphanOffs.set(key, [e.tick])
+      continue
+    }
     const t0 = toSeconds(start.tick)
     notes.push({
       start: t0,
@@ -174,8 +194,18 @@ export function parseMidi(data: ArrayBuffer): ScoreNote[] {
     // on C-1, which then drags the score's reported pitch range down to it and
     // lays every keyboard out against an octave nothing plays in.
     const pitch = key % 128
+    const orphans = orphanOffs.get(key)
     for (const p of list) {
       const t0 = toSeconds(p.tick)
+      // The second look: an off read at this note's OWN tick is its off, seen
+      // early because same-tick offs sort first. One off closes one note, so it
+      // is consumed — two zero-length strikes of a pitch need two offs.
+      const i = orphans ? orphans.indexOf(p.tick) : -1
+      if (i >= 0) {
+        orphans!.splice(i, 1)
+        notes.push({ start: t0, duration: 0, pitch, velocity: p.velocity / 127 })
+        continue
+      }
       notes.push({ start: t0, duration: Math.max(0, toSeconds(lastTick) - t0), pitch, velocity: p.velocity / 127 })
     }
   }
