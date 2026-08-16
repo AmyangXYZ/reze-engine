@@ -38,7 +38,19 @@ const groundSrc = read("../src/shaders/passes/ground.ts")
  *  here is about count, order and blend rather than which float it is. */
 const FORMATS = { hdr: "rgba16float", aux: "rg8unorm" }
 
-const CLASSES = ["material", "ground", "outline", "particle", "particle-additive", "trail", "depth-prepass"]
+const CLASSES = [
+  "material",
+  "ground",
+  "outline",
+  "particle",
+  "particle-additive",
+  "trail",
+  // The field layer drawn INTO the scene, so it blooms and tone maps with
+  // everything else. It writes no id: a fullscreen layer names no object, and
+  // stamping one would destroy the buffer for everything that reads it.
+  "field-blit",
+  "depth-prepass",
+]
 
 /** Classes whose shaders write an id, and so declare a third fragment output. */
 const WRITES_ID = ["material", "ground"]

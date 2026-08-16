@@ -110,19 +110,34 @@ test("a foreground alone leaves the background block gated on the equirect", () 
   assert.match(source(FOREGROUND, false, true), /if \(bg\.w > 1\.5 && sceneAlpha < 0\.999\) \{/)
 })
 
-test("a background effect keeps the coverage gate, derivatives and all", () => {
-  assert.match(source(BACKGROUND, true, false), /if \(sceneAlpha < 0\.999\) \{/)
-
-  // Derivative builtins are illegal in non-uniform control flow, and the gate
-  // used to be dropped for any effect using one. It no longer has to be: the
-  // user's code compiles in the FIELD shader, which runs the whole quad in
-  // uniform flow by construction, and the gate here now wraps nothing but the
-  // equirect sample and a texture read. An effect using fwidth keeps its gate.
+test("the composite is ONE shader, whatever effects are installed", () => {
+  // It has no variants left. Effects draw inside the scene pass now — the field
+  // layer is blitted there, so nothing in this shader depends on which of them
+  // exist. The gate is the equirect's alone, and it is the same in every
+  // variant: behind a fully covered pixel the result is multiplied by
+  // (1 - alpha) = 0 anyway, and on a full-screen dome that is a third of the
+  // frame.
   const derivative = "fn background(r: vec3f, uv: vec2f, t: f32) -> vec4f { return vec4f(fwidth(uv.x)); }"
-  assert.match(source(derivative, true, false), /if \(sceneAlpha < 0\.999\) \{/)
+  const variants = [
+    COMPOSITE_SHADER_WGSL,
+    source(BACKGROUND, true, false),
+    source(FOREGROUND, false, true),
+    source(derivative, true, false),
+    source(`${BACKGROUND}\n${FOREGROUND}`, true, true),
+  ]
+  for (const v of variants) {
+    assert.match(v, /if \(bg\.w > 1\.5 && sceneAlpha < 0\.999\) \{/)
+    assert.equal(v, variants[0], "the composite must not vary with the effect list")
+  }
+})
 
-  const mixed = `${BACKGROUND}\nfn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f { return vec4f(dpdx(uv.x)); }`
-  assert.match(source(mixed, true, true), /if \(sceneAlpha < 0\.999\) \{/)
+test("the composite never samples the field layer", () => {
+  // It is drawn INTO the scene pass now. Reading it here as well would draw
+  // every field effect twice — and compositing it here at all is what kept the
+  // mount from ever reaching the bloom pyramid.
+  for (const name of ["fieldBgTex", "fieldFgTex", "fieldBgHalfTex", "fieldFgHalfTex", "rzFieldMerge"]) {
+    assert.ok(!COMPOSITE_SHADER_WGSL.includes(name), `${name} must be gone from the composite`)
+  }
 })
 
 test("user code and its params land ahead of the entry points", () => {
