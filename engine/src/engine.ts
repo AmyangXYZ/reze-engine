@@ -27,6 +27,7 @@ import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
+import { fieldBlitShaderWgsl } from "./shaders/passes/field-blit"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import {
   sceneTargets as sceneTargetsFor,
@@ -1179,7 +1180,20 @@ const FIELD_LAYER_BLEND: GPUBlendState = {
  */
 const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
   color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
-  alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+  // COVERAGE SUMS. It used to be (zero, one) — an additive effect contributed
+  // colour and no coverage at all — and that was right while the layer was
+  // composited in display space, where this alpha was an OCCLUSION weight and
+  // light must not occlude.
+  //
+  // Inside the scene it is the premultiply divisor instead: the composite and
+  // the bloom prefilter both recover straight colour as rgb / coverage. A layer
+  // with colour and no coverage divides by ~1e-6 and explodes — which is
+  // exactly how a starfield became flat white discs, and how it then moved the
+  // bloom of a frame it had no other business in.
+  //
+  // particle-additive's aux blend has summed coverage for this reason since
+  // additive particles existed. This is the same rule, arriving late.
+  alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
 }
 
 /**
@@ -1210,6 +1224,10 @@ interface EffectInstance {
   anchors: { bone: string; trail: boolean }[]
   /** Where this effect's own clock started, in scene seconds. */
   epochScene: number
+  /** Whether this effect declared `// @bloom`. Parsed for every mount now, not
+   *  only particles: a field effect's layer is blitted into the scene, so the
+   *  flag finally decides something for it too. */
+  fieldBloom: boolean
   /** This effect's OWN clock, as a uniform the field shader reads. Per effect
    *  because the shared one (viewU[6].x) is measured from the first installed
    *  effect's epoch, so everything later started mid-stream. Null when the
@@ -1472,6 +1490,14 @@ export class Engine {
    * the one thing document order stopped deciding.
    */
   private static readonly FIELD_SCALES = [1, 2] as const
+  /** The field layer drawn INTO the scene — see field-blit.ts. One pipeline;
+   *  one bind group and uniform per (mount, resolution), built when the targets
+   *  are and NOT per frame. */
+  private fieldBlitPipeline: GPURenderPipeline | null = null
+  private fieldBlitLayout: GPUBindGroupLayout | null = null
+  private fieldBlitBinds: (GPUBindGroup | null)[] = [null, null, null, null]
+  private fieldBlitUniforms: GPUBuffer[] = []
+  private fieldBlitScratch = new Float32Array(4)
   /** Reused for the per-frame field-clock upload — one 16-byte write per
    *  drawing effect, and allocating a fresh array for each would be garbage
    *  every frame. */
@@ -2174,10 +2200,6 @@ export class Engine {
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.scoreBuffer } },
-        { binding: 15, resource: this.fieldLayerView(this.fieldBgViews[0], 0) },
-        { binding: 16, resource: this.fieldLayerView(this.fieldFgViews[0], 0) },
-        { binding: 20, resource: this.fieldLayerView(this.fieldBgViews[1], 1) },
-        { binding: 21, resource: this.fieldLayerView(this.fieldFgViews[1], 1) },
       ],
     })
   }
@@ -2197,11 +2219,6 @@ export class Engine {
    */
   private fieldPairUsed(layer: number): boolean {
     return this.effects.some((e) => e.fieldPipeline && e.fieldBindGroups && e.fieldLayer === layer)
-  }
-
-  /** One half of one field pair, as the composite should read it. */
-  private fieldLayerView(view: GPUTextureView | null, layer: number): GPUTextureView {
-    return this.fieldPairUsed(layer) && view ? view : this.trailFallbackView
   }
 
   private createFieldTargets(): void {
@@ -2232,6 +2249,9 @@ export class Engine {
         new Float32Array([w, h, this.fieldFullW, this.fieldFullH]),
       )
     }
+    // The blit reads these views, so its bind groups are rebuilt HERE — with
+    // the targets, not per frame. They only change when the surface resizes.
+    this.rebuildFieldBlitBinds()
   }
 
   /**
@@ -2704,6 +2724,7 @@ export class Engine {
         fieldLayer: /^\s*\/\/\s*@fullres\s*$/m.test(wgsl) ? 0 : 1,
         fieldPipeline,
         fieldClock,
+        fieldBloom: parseParticleBloom(wgsl),
         // Filled by rebuildFieldBindGroup below, which needs the instance to
         // exist first — it binds this effect's own params buffer and grid.
         fieldBindGroups: null,
@@ -3326,6 +3347,93 @@ export class Engine {
   /** The user's field mounts, drawn at half resolution for the composite to
    *  upsample. Runs the whole quad — uniform control flow, so effects may use
    *  derivatives freely, which the old inline path had to forbid. */
+  /** The pipeline that draws a field layer into the scene, built once. Its
+   *  targets come from the scene contract like every other class in the pass,
+   *  so it cannot drift from the attachments. */
+  private ensureFieldBlitPipeline(): void {
+    if (this.fieldBlitPipeline || !this.device) return
+    this.fieldBlitLayout = this.device.createBindGroupLayout({
+      label: "field blit layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      ],
+    })
+    const module = this.device.createShaderModule({ label: "field blit", code: fieldBlitShaderWgsl() })
+    this.fieldBlitPipeline = this.device.createRenderPipeline({
+      label: "field blit pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.fieldBlitLayout] }),
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: sceneTargetsFor("field-blit", this.sceneFormats) },
+      primitive: { topology: "triangle-list" },
+      // Depth neither written nor tested: a background has nothing to test
+      // against, and a foreground already occludes itself against the depth it
+      // was handed.
+      depthStencil: { format: this.depthFormat, depthWriteEnabled: false, depthCompare: "always" },
+      multisample: { count: Engine.MULTISAMPLE_COUNT },
+    })
+    for (let i = 0; i < 4; i++) {
+      this.fieldBlitUniforms[i] = this.device.createBuffer({
+        label: `field blit uniform ${i}`,
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+    }
+  }
+
+  /** Bind groups for the four (mount, resolution) slots. Rebuilt with the
+   *  TARGETS, not per frame — the views only change on resize. */
+  private rebuildFieldBlitBinds(): void {
+    this.ensureFieldBlitPipeline()
+    if (!this.fieldBlitLayout) return
+    for (let which = 0; which < 2; which++) {
+      for (let layer = 0; layer < Engine.FIELD_SCALES.length; layer++) {
+        const view = which === 0 ? this.fieldBgViews[layer] : this.fieldFgViews[layer]
+        const slot = which * 2 + layer
+        this.fieldBlitBinds[slot] = view
+          ? this.device.createBindGroup({
+              label: `field blit bind ${slot}`,
+              layout: this.fieldBlitLayout,
+              entries: [
+                { binding: 0, resource: view },
+                { binding: 1, resource: this.bloomSampler },
+                { binding: 2, resource: { buffer: this.fieldBlitUniforms[slot] } },
+              ],
+            })
+          : null
+      }
+    }
+  }
+
+  /**
+   * Draw one mount's field layer into the scene pass — 0 background, 1
+   * foreground.
+   *
+   * Half resolution first, then full, so a resolution boundary stays a layer
+   * boundary and full res still wins, which is the rule the composite's own
+   * merge used to state. A pair no effect draws into is skipped.
+   */
+  private blitFieldLayer(pass: GPURenderPassEncoder, which: 0 | 1): void {
+    if (!this.fieldBlitPipeline) return
+    for (let layer = Engine.FIELD_SCALES.length - 1; layer >= 0; layer--) {
+      if (!this.fieldPairUsed(layer)) continue
+      const slot = which * 2 + layer
+      const bind = this.fieldBlitBinds[slot]
+      if (!bind) continue
+      // Any effect in this pair asking for the pyramid puts the whole layer in
+      // it — the pair is what was rendered, so separating them would mean a
+      // target each.
+      this.fieldBlitScratch[0] = this.effects.some((e) => e.fieldLayer === layer && e.fieldBloom) ? 1 : 0
+      this.fieldBlitScratch[2] = this.fieldFullW
+      this.fieldBlitScratch[3] = this.fieldFullH
+      this.device.queue.writeBuffer(this.fieldBlitUniforms[slot], 0, this.fieldBlitScratch.buffer as ArrayBuffer)
+      pass.setPipeline(this.fieldBlitPipeline)
+      pass.setBindGroup(0, bind)
+      pass.draw(3)
+    }
+  }
+
   private renderFieldPass(encoder: GPUCommandEncoder): void {
     const drawn = this.effects.filter((e) => e.fieldPipeline && e.fieldBindGroups)
     if (drawn.length === 0) return
@@ -4803,13 +4911,6 @@ export class Engine {
         // The score. 19 rather than a low number because both this layout and
         // the field layer's already speak for everything below it.
         { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        // The field layer's two halves. Fallback-bound when no field effect runs.
-        { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        { binding: 16, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        // The half-resolution pair. Always bound, empty or not — see the
-        // composite's own note on why both are read every frame.
-        { binding: 20, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        { binding: 21, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
     this.fallbackEquirectTexture = this.device.createTexture({
@@ -8960,6 +9061,9 @@ export class Engine {
     // GPURenderBundleEncoder has no setStencilReference, and this is a constant
     // anyway — eye writes it, hair tests not-equal, hairOverEyes tests equal.
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    // The field BACKGROUND, before any geometry — what "under the scene" means
+    // once it is inside the pass rather than composited after it.
+    this.blitFieldLayer(pass, 0)
     if (this.opaqueBundle) pass.executeBundles([this.opaqueBundle])
     if (this.hasGround) this.renderGround(pass)
     if (this.transparentBundle) pass.executeBundles([this.transparentBundle])
@@ -8972,6 +9076,11 @@ export class Engine {
     // to run after pass.end() into a layer of its own, which is precisely what
     // kept ribbons out of bloom.
     this.drawTrails(pass)
+    // The field FOREGROUND, after everything and still inside the pass, so it
+    // reaches the bloom pyramid and takes the same tone map as the frame it is
+    // over. Compositing it after the tone map is what kept the mount from ever
+    // blooming.
+    this.blitFieldLayer(pass, 1)
     pass.end()
     // The field mounts, likewise: after the scene so foregrounds can read its
     // depth, before the composite that samples both layers.

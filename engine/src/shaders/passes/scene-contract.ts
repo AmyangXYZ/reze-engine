@@ -96,6 +96,11 @@ export type SceneRenderClass =
    *  whole, and an ordinary alpha-over aux so a ribbon's mask does not
    *  saturate along every overlap. */
   | "trail"
+  /** The field layer blitted into the scene — background before any geometry,
+   *  foreground after all of it. Premultiplied, like the ground, because the
+   *  field targets have composed N effects into one associatively and that is
+   *  only possible premultiplied. */
+  | "field-blit"
   /** The transparent depth prepass: it exists to write DEPTH after the fabric's
    *  colour blended, so an outline drawn later is occluded behind it. It must
    *  therefore write no colour at all — the targets exist only to make the
@@ -157,6 +162,9 @@ const ADD_PREMULTIPLIED: GPUBlendState = {
  * things you would ever address by id, and a hull would overwrite the id of the
  * body it traces.
  */
+// NOT the field blit: a fullscreen layer names no object, and stamping one
+// would overwrite the whole screen's ids and destroy the buffer for everything
+// that reads it.
 const WRITES_ID = new Set<SceneRenderClass>(["material", "ground"])
 
 /** The blends each class writes its two attachments with. */
@@ -170,6 +178,9 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
   particle: [ALPHA_OVER, ALPHA_OVER],
   "particle-additive": [ADD_KEEP_ALPHA, ADD_BOTH],
   trail: [ADD_PREMULTIPLIED, ALPHA_OVER],
+  // Colour arrives premultiplied; the aux does not — the blit writes its mask
+  // unweighted and this blend applies coverage, as the materials do.
+  "field-blit": [PREMULTIPLIED_OVER, ALPHA_OVER],
 }
 
 /**

@@ -59,9 +59,11 @@ test("every variant consumes every placeholder", () => {
 })
 
 test("the declared mounts are the ones called, in the field pass", () => {
+  // rzFieldOut is the mount's output on its way into the layer — a lower clamp
+  // and nothing else, so what a call looks like now.
   const calls = (src) => ({
-    background: /clamp\(background\(/.test(src),
-    foreground: /clamp\(foreground\(/.test(src),
+    background: /rzFieldOut\(background\(/.test(src),
+    foreground: /rzFieldOut\(foreground\(/.test(src),
   })
   assert.deepEqual(calls(field(BACKGROUND, true, false)), { background: true, foreground: false })
   assert.deepEqual(calls(field(FOREGROUND, false, true)), { background: false, foreground: true })
@@ -110,19 +112,42 @@ test("a foreground alone leaves the background block gated on the equirect", () 
   assert.match(source(FOREGROUND, false, true), /if \(bg\.w > 1\.5 && sceneAlpha < 0\.999\) \{/)
 })
 
-test("a background effect keeps the coverage gate, derivatives and all", () => {
-  assert.match(source(BACKGROUND, true, false), /if \(sceneAlpha < 0\.999\) \{/)
-
-  // Derivative builtins are illegal in non-uniform control flow, and the gate
-  // used to be dropped for any effect using one. It no longer has to be: the
-  // user's code compiles in the FIELD shader, which runs the whole quad in
-  // uniform flow by construction, and the gate here now wraps nothing but the
-  // equirect sample and a texture read. An effect using fwidth keeps its gate.
+test("the composite is ONE shader, whatever effects are installed", () => {
+  // No variants left. Effects draw inside the scene pass, so nothing here
+  // depends on which of them exist, and the only gate is the equirect's own.
   const derivative = "fn background(r: vec3f, uv: vec2f, t: f32) -> vec4f { return vec4f(fwidth(uv.x)); }"
-  assert.match(source(derivative, true, false), /if \(sceneAlpha < 0\.999\) \{/)
+  const variants = [
+    COMPOSITE_SHADER_WGSL,
+    source(BACKGROUND, true, false),
+    source(FOREGROUND, false, true),
+    source(derivative, true, false),
+    source(`${BACKGROUND}\n${FOREGROUND}`, true, true),
+  ]
+  for (const v of variants) {
+    assert.match(v, /if \(bg\.w > 1\.5 && sceneAlpha < 0\.999\) \{/)
+    assert.equal(v, variants[0], "the composite must not vary with the effect list")
+  }
+})
 
-  const mixed = `${BACKGROUND}\nfn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f { return vec4f(dpdx(uv.x)); }`
-  assert.match(source(mixed, true, true), /if \(sceneAlpha < 0\.999\) \{/)
+test("the composite never samples the field layer", () => {
+  // It is drawn INTO the scene pass. Reading it here as well would draw every
+  // field effect twice, and compositing it here at all is what kept the mount
+  // from reaching the bloom pyramid.
+  for (const name of ["fieldBgTex", "fieldFgTex", "fieldBgHalfTex", "fieldFgHalfTex", "rzFieldMerge"]) {
+    assert.ok(!COMPOSITE_SHADER_WGSL.includes(name), `${name} must be gone from the composite`)
+  }
+})
+
+test("a field effect's output is scene light, with no mount-specific exposure", () => {
+  const src = field(BACKGROUND, true, false)
+  // Measured, not assumed: this engine's AgX puts a linear 1.0 at 0.77 display,
+  // so the first attempt's 3.0 boost was ~7x the midtone-preserving value and
+  // flattened every falloff on its own. No constant at all means 1.0 means one
+  // thing everywhere in the engine.
+  assert.doesNotMatch(src, /RZ_FIELD_EXPOSURE/, "no mount-specific exposure constant")
+  assert.match(src, /fn rzFieldOut\(c: vec4f\) -> vec4f \{\s*\n\s*return vec4f\(max\(c\.rgb, vec3f\(0\.0\)\), clamp\(c\.a, 0\.0, 1\.0\)\);/)
+  // The upper clamp is gone — above 1 is what reaches the bloom threshold.
+  assert.doesNotMatch(src, /clamp\(background\(/)
 })
 
 test("user code and its params land ahead of the entry points", () => {
