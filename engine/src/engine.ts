@@ -35,7 +35,15 @@ import {
   SCENE_ID_FORMAT,
   type SceneFormats,
 } from "./shaders/passes/scene-contract"
-import { LIGHT_HEADER, LIGHT_STRIDE, LIGHTS_FLOATS, MAX_LIGHTS } from "./shaders/lights"
+import {
+  LIGHT_HEADER,
+  LIGHT_STRIDE,
+  LIGHTS_FLOATS,
+  MAX_LIGHTS,
+  buildLightEmitShader,
+  hasLightEmit,
+  parseLightCount,
+} from "./shaders/lights"
 import { groundShaderWgsl } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
 import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
@@ -1196,6 +1204,18 @@ interface EffectInstance {
   anchors: { bone: string; trail: boolean }[]
   /** Where this effect's own clock started, in scene seconds. */
   epochScene: number
+  /** The lightEmit mount: a compute stage that writes this effect's own slots
+   *  in the shared lights buffer, once per light per frame. Null unless the
+   *  source declares `// @lights n` AND defines fn lightEmit. */
+  lights: {
+    pipeline: GPUComputePipeline
+    bind: GPUBindGroup
+    uniform: GPUBuffer
+    data: Float32Array<ArrayBuffer>
+    /** How many slots it asked for. Its base is assigned by the engine and can
+     *  move, which is why it travels in the uniform rather than the shader. */
+    count: number
+  } | null
   /** The field mount's pipeline and its two parity bind groups, or null when the
    *  effect declares neither background nor foreground. */
   fieldPipeline: GPURenderPipeline | null
@@ -1611,6 +1631,10 @@ export class Engine {
    *  zero rather than an absent binding. */
   private lightsBuffer!: GPUBuffer
   private lightsData!: Float32Array<ArrayBuffer>
+  /** Just the header, for rewriting the total without touching a record. */
+  private lightHeader = new Float32Array(LIGHT_HEADER)
+  /** How many of the slots belong to the DOCUMENT. Effects get what follows. */
+  private docLightCount = 0
   private castData!: Float32Array<ArrayBuffer>
   /** Last frame's anchor world positions, for velocity. Keyed model id → slot. */
   private anchorPrev = new Map<string, Float32Array>()
@@ -2388,14 +2412,18 @@ export class Engine {
         mounts: noMounts,
       }
     }
-    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails) {
+    // lightEmit counts as a mount on its own: a pure lighting rig draws nothing
+    // and is still an effect — it is how a scene gets stage lights without also
+    // getting geometry it did not ask for.
+    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails && !hasLightEmit(wgsl)) {
       return {
         ok: false,
         diagnostics: [
           "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f, " +
             "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f, " +
             "the particle trio (particleInit/particleStep/particleShade), " +
-            "or the ribbon pair (trailWidth/trailShade)",
+            "the ribbon pair (trailWidth/trailShade), " +
+            "or fn lightEmit(i: u32) -> RzLight with // @lights <n>",
         ],
         mounts: noMounts,
       }
@@ -2596,6 +2624,29 @@ export class Engine {
       trails = built.state
     }
 
+    // ── The lightEmit mount ──
+    //
+    // Both halves or neither, the same rule the particle trio and the ribbon
+    // pair follow: a count with no emitter allocates slots nobody writes (a
+    // light stuck wherever the buffer last left it), and an emitter with no
+    // count is a function nothing calls. Either alone is a silent blank, which
+    // is the worst way for an effect to fail.
+    let lights: EffectInstance["lights"] = null
+    const declaredLights = parseLightCount(wgsl, MAX_LIGHTS)
+    const emits = hasLightEmit(wgsl)
+    if (declaredLights > 0 !== emits) {
+      return abandon([
+        emits
+          ? "an effect defining fn lightEmit(i: u32) -> RzLight must also declare how many with // @lights <n>"
+          : "// @lights <n> needs fn lightEmit(i: u32) -> RzLight to fill those slots",
+      ])
+    }
+    if (declaredLights > 0) {
+      const built = await this.buildLightEmit(wgsl, declaredLights)
+      if (!built.ok) return abandon(built.diagnostics)
+      lights = built.state
+    }
+
     let paramsBuffer: GPUBuffer | null = null
     if (entries.length) {
       paramsBuffer = this.device.createBuffer({
@@ -2626,6 +2677,7 @@ export class Engine {
         particles,
         grid,
         trails,
+        lights,
     }
     return { ok: true, instance, warnings }
   }
@@ -2662,11 +2714,15 @@ export class Engine {
 
     const requested = list ?? []
     if (requested.length === 0) {
-      for (const e of this.effects) e.paramsBuffer?.destroy()
+      for (const e of this.effects) {
+      e.paramsBuffer?.destroy()
+      e.lights?.uniform.destroy()
+    }
       this.releaseParticles()
       this.releaseTrails()
       this.releaseGrid()
       this.effects = []
+      this.allocateLightSlots()
       this.anchorTable = EMPTY_ANCHOR_TABLE
       this.clearTrailHistory()
       const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
@@ -2715,11 +2771,16 @@ export class Engine {
 
     // ── Swap. Everything above either succeeded or was excluded, so the scene
     // that was running is only torn down now.
-    for (const e of this.effects) e.paramsBuffer?.destroy()
+    for (const e of this.effects) {
+      e.paramsBuffer?.destroy()
+      e.lights?.uniform.destroy()
+    }
     this.releaseParticles()
     this.releaseTrails()
     this.releaseGrid()
     this.effects = instances
+    // The new list's emitters need their slots before the next frame reads them.
+    this.allocateLightSlots()
     this.anchorTable = table
     // Slots have been re-dealt; a recorded path is stale by ADDRESS, not by age.
     this.clearTrailHistory()
@@ -2919,6 +2980,99 @@ export class Engine {
    * one — and it has to precede the draw that reads the same buffer, or the
    * quads render last frame's positions.
    */
+  /**
+   * Compile an effect's lightEmit stage and give it a bind group.
+   *
+   * Its own layout rather than a shared one: this is the only place the lights
+   * buffer is WRITABLE, and every other binding of it is read-only. Keeping the
+   * writable view here means a material pipeline cannot accidentally acquire
+   * one.
+   */
+  private async buildLightEmit(
+    wgsl: string,
+    count: number,
+  ): Promise<{ ok: true; state: NonNullable<EffectInstance["lights"]> } | { ok: false; diagnostics: string[] }> {
+    const layout = this.device.createBindGroupLayout({
+      label: "light emit layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      ],
+    })
+    const module = this.device.createShaderModule({ label: "light emit", code: buildLightEmitShader(wgsl) })
+    const info = await module.getCompilationInfo()
+    const diagnostics = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`)
+    if (diagnostics.length) return { ok: false, diagnostics }
+    const data = new Float32Array(4)
+    const uniform = this.device.createBuffer({
+      label: "light emit uniform",
+      size: data.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.device.pushErrorScope("validation")
+    const pipeline = await this.device.createComputePipelineAsync({
+      label: "light emit pipeline",
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+      compute: { module, entryPoint: "lightEmitMain" },
+    })
+    const scoped = await this.device.popErrorScope()
+    if (scoped) {
+      uniform.destroy()
+      return { ok: false, diagnostics: [scoped.message] }
+    }
+    const bind = this.device.createBindGroup({
+      label: "light emit bind",
+      layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.lightsBuffer } },
+        { binding: 1, resource: { buffer: uniform } },
+      ],
+    })
+    return { ok: true, state: { pipeline, bind, uniform, data, count } }
+  }
+
+  /**
+   * Hand every emitting effect its slot range, and write the total.
+   *
+   * Document lights sit FIRST, at slot 0, and effects follow in document order.
+   * That ordering is the stable one: a scene's own lamps are the thing a person
+   * placed and can see in a list, so they should not move because an effect was
+   * installed ahead of them.
+   *
+   * Called whenever either producer changes. The base lands in each effect's
+   * uniform, so nothing recompiles.
+   */
+  private allocateLightSlots(): void {
+    let next = this.docLightCount
+    for (const e of this.effects) {
+      if (!e.lights) continue
+      // Past the cap an effect gets NOTHING rather than a partial rig: half a
+      // set of stage lights is a lighting design nobody authored.
+      const fits = next + e.lights.count <= MAX_LIGHTS
+      e.lights.data[1] = next
+      e.lights.data[2] = fits ? e.lights.count : 0
+      if (fits) next += e.lights.count
+      this.device.queue.writeBuffer(e.lights.uniform, 0, e.lights.data.buffer as ArrayBuffer)
+    }
+    this.lightHeader[0] = Math.min(next, MAX_LIGHTS)
+    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightHeader)
+  }
+
+  /** Run every effect's lightEmit, before the pass that reads the result. */
+  private emitLights(encoder: GPUCommandEncoder): void {
+    for (const e of this.effects) {
+      const l = e.lights
+      if (!l || l.data[2] === 0) continue
+      l.data[0] = this.sceneClock - e.epochScene
+      this.device.queue.writeBuffer(l.uniform, 0, l.data.buffer as ArrayBuffer)
+      const cp = encoder.beginComputePass({ label: "light emit" })
+      cp.setPipeline(l.pipeline)
+      cp.setBindGroup(0, l.bind)
+      cp.dispatchWorkgroups(Math.ceil(l.data[2] / 64))
+      cp.end()
+    }
+  }
+
   private stepParticles(encoder: GPUCommandEncoder, deltaTime: number): void {
     for (const e of this.effects) {
       const p = e.particles
@@ -5687,8 +5841,12 @@ export class Engine {
     lights: { position: XYZ; color: XYZ; intensity?: number; radius?: number }[] | null,
   ): void {
     const list = (lights ?? []).slice(0, MAX_LIGHTS)
-    this.lightsData.fill(0)
-    this.lightsData[0] = list.length
+    this.docLightCount = list.length
+    // Only the header and the document's OWN records are written. Zeroing the
+    // whole buffer would wipe the slots an emitting effect owns, and they are
+    // rewritten per frame — so the scene would flicker its effect lights every
+    // time someone moved a lamp.
+    this.lightsData.fill(0, 0, LIGHT_HEADER + list.length * LIGHT_STRIDE)
     for (let i = 0; i < list.length; i++) {
       const l = list[i]
       const b = LIGHT_HEADER + i * LIGHT_STRIDE
@@ -5705,12 +5863,20 @@ export class Engine {
       this.lightsData[b + 6] = l.color.z * k
       // [b + 7] is `type`, reserved: every light is a point light today.
     }
-    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
+    this.device.queue.writeBuffer(
+      this.lightsBuffer,
+      0,
+      this.lightsData.buffer as ArrayBuffer,
+      0,
+      (LIGHT_HEADER + list.length * LIGHT_STRIDE) * 4,
+    )
+    // The effects' bases move when the document's count does.
+    this.allocateLightSlots()
   }
 
   /** How many positional lights the scene is carrying. */
   getLightCount(): number {
-    return this.lightsData[0]
+    return this.lightHeader[0]
   }
 
   private updateLightBuffer() {
@@ -8675,6 +8841,9 @@ export class Engine {
     // and a grid stepped after them is one frame stale in everything that used it.
     this.stepSim(encoder, deltaTime)
     this.stepParticles(encoder, deltaTime)
+    // Before the scene pass, which READS the slots this writes. Same buffer,
+    // two access modes, never in one pass.
+    this.emitLights(encoder)
 
     const pass = encoder.beginRenderPass(this.renderPassDescriptor)
     // Phase order: opaque models → ground → transparent fabric.

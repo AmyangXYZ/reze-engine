@@ -40,6 +40,95 @@ export const MAX_LIGHTS = 16
 /** Floats in the whole buffer. */
 export const LIGHTS_FLOATS = LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE
 
+/**
+ * `// @lights 3` — how many lights this effect emits.
+ *
+ * Declared, like every other mount: what the file says is what gets allocated,
+ * so an effect that emits none costs no slots and nobody pays for a cap they
+ * did not ask for. Clamped rather than rejected, the same choice `@particles`
+ * makes — an author asking for a hundred gets the most the engine will give and
+ * a scene that still runs.
+ */
+export function parseLightCount(wgsl: string, max: number): number {
+  const m = /^\s*\/\/\s*@lights\s+(\d+)\s*$/m.exec(wgsl)
+  if (!m) return 0
+  return Math.max(1, Math.min(max, parseInt(m[1], 10)))
+}
+
+/** Does this source define the emit mount? */
+export function hasLightEmit(wgsl: string): boolean {
+  return /\bfn\s+lightEmit\s*\(/.test(wgsl)
+}
+
+/**
+ * The compute module that runs an effect's `lightEmit` once per light per frame.
+ *
+ * A COMPUTE stage rather than a CPU callback, and that is the whole point:
+ * Fireworks knows where its bursts are as a closed form in WGSL, and mirroring
+ * that on the CPU to place a light would be two derivations of one trajectory
+ * that drift apart. Emitting in the shader means the light is wherever the
+ * effect says it is, on the scene clock — which is also what makes it survive
+ * an offline export frame-stepped at a different rate.
+ *
+ * The author writes local index 0..n-1 and never learns the global one, the
+ * same aliasing the anchor table uses — so installing another effect ahead of
+ * this one moves its lights without touching its source.
+ *
+ * The base arrives in the UNIFORM rather than baked into the text. Baking it
+ * would mean recompiling every emitting effect the moment a scene gained or
+ * lost a document light, because that is what shifts the slots underneath
+ * them — a shader rebuild triggered by moving a lamp.
+ *
+ * Deliberately NARROW for now: the emit stage gets its own clock and nothing
+ * else. Fireworks — the case this mount exists for — is closed-form in time, so
+ * that is enough to be useful, and every extra interface spliced in here is
+ * another binding to get wrong. The cast, audio and score buffers are the
+ * obvious next ones (a light on a wrist, a light on the beat) and each is a
+ * binding plus its accessor module.
+ */
+export function buildLightEmitShader(wgsl: string): string {
+  return /* wgsl */ `
+// read_write HERE and read-only in the material shaders. Different passes, so
+// the two never coexist: this compute runs before the scene pass that reads it.
+@group(0) @binding(0) var<storage, read_write> _rzLightsOut: array<f32>;
+// (time, base slot, count, _) — see buildLightEmitShader on why the base is
+// here and not in the text.
+@group(0) @binding(1) var<uniform> _rzLightU: vec4f;
+
+/** What an effect returns for one of its lights. */
+struct RzLight {
+  pos: vec3f,
+  color: vec3f,
+  intensity: f32,
+  radius: f32,
+}
+
+/** Seconds since this effect was installed — its own clock, not the scene's. */
+fn rzTime() -> f32 { return _rzLightU.x; }
+
+${wgsl}
+
+@compute @workgroup_size(64)
+fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  // The dispatch is sized to the count, but a workgroup is 64 wide and the
+  // count rarely is — the tail must not write into the next effect's slots.
+  if (i >= u32(_rzLightU.z)) { return; }
+  let l = lightEmit(i);
+  let b = ${LIGHT_HEADER}u + (u32(_rzLightU.y) + i) * ${LIGHT_STRIDE}u;
+  _rzLightsOut[b] = l.pos.x;
+  _rzLightsOut[b + 1u] = l.pos.y;
+  _rzLightsOut[b + 2u] = l.pos.z;
+  _rzLightsOut[b + 3u] = l.radius;
+  // Colour carries intensity, exactly as the CPU writer stores it — one product,
+  // one place, so the two producers cannot disagree about what a slot means.
+  _rzLightsOut[b + 4u] = l.color.x * l.intensity;
+  _rzLightsOut[b + 5u] = l.color.y * l.intensity;
+  _rzLightsOut[b + 6u] = l.color.z * l.intensity;
+}
+`
+}
+
 /** The rz*Light accessors, with the buffer declared at the given binding. */
 export function lightsApi(group: number, binding: number): string {
   return /* wgsl */ `

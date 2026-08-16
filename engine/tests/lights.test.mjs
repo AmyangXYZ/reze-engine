@@ -117,3 +117,63 @@ test("intensity is usable at the scale a scene is actually built at", () => {
   // And still nothing at all past the radius.
   assert.equal(contribution(light, [0, 12, 20], [0, 0, -1]), 0)
 })
+
+// ── The lightEmit mount ──
+
+import { buildLightEmitShader, hasLightEmit, parseLightCount } from "../dist/shaders/lights.js"
+
+const EMIT = `// @lights 3
+fn lightEmit(i: u32) -> RzLight {
+  var l: RzLight;
+  l.pos = vec3f(f32(i) * 2.0, 10.0, 0.0);
+  l.color = vec3f(1.0, 0.5, 0.2);
+  l.intensity = 3.0;
+  l.radius = 20.0;
+  return l;
+}`
+
+test("an effect declares how many lights it emits", () => {
+  assert.equal(parseLightCount(EMIT, MAX_LIGHTS), 3)
+  assert.equal(parseLightCount("// nothing here", MAX_LIGHTS), 0)
+  // Clamped, not rejected: the same choice @particles makes.
+  assert.equal(parseLightCount("// @lights 999", MAX_LIGHTS), MAX_LIGHTS)
+  // Mid-sentence prose must not declare anything, the @anchor rule.
+  assert.equal(parseLightCount("// mentioning @lights 4 in a sentence", MAX_LIGHTS), 0)
+  assert.equal(hasLightEmit(EMIT), true)
+  assert.equal(hasLightEmit("fn background() {}"), false)
+})
+
+test("the emit shader writes the slots the material shader reads", () => {
+  const src = buildLightEmitShader(EMIT)
+  // Same stride and header on both sides of the buffer, expressed against the
+  // same constants — this is the seam where a writer and a reader drift.
+  assert.match(src, new RegExp(`let b = ${LIGHT_HEADER}u \\+ \\(u32\\(_rzLightU\\.y\\) \\+ i\\) \\* ${LIGHT_STRIDE}u;`))
+  assert.match(src, /_rzLightsOut\[b \+ 3u\] = l\.radius;/)
+  // Colour x intensity, the same product the CPU writer stores.
+  assert.match(src, /_rzLightsOut\[b \+ 4u\] = l\.color\.x \* l\.intensity;/)
+  assert.ok(src.includes(EMIT), "the author's source is spliced in verbatim")
+})
+
+test("the emit shader guards its dispatch tail", () => {
+  const src = buildLightEmitShader(EMIT)
+  // A workgroup is 64 wide and a count rarely is. Without this the tail threads
+  // write into whatever slots follow — another effect's lights, silently.
+  assert.match(src, /if \(i >= u32\(_rzLightU\.z\)\) \{ return; \}/)
+})
+
+test("the slot base is a uniform, never baked into the text", () => {
+  const src = buildLightEmitShader(EMIT)
+  assert.match(src, /u32\(_rzLightU\.y\)/)
+  // Baking it would mean recompiling every emitting effect whenever a scene
+  // gained or lost a document light — a shader rebuild triggered by moving a
+  // lamp. The builder takes no base at all, so it cannot regress to that.
+  assert.equal(buildLightEmitShader.length, 1, "buildLightEmitShader must take only the source")
+})
+
+test("the writable view of the lights buffer exists only in the emit stage", () => {
+  // Everything that SHADES reads the buffer read-only. One writable binding, in
+  // a compute pass that runs before the pass reading it.
+  assert.match(buildLightEmitShader(EMIT), /var<storage, read_write> _rzLightsOut/)
+  assert.doesNotMatch(COMMON_MATERIAL_PRELUDE_WGSL, /read_write.*_rzLights/)
+  assert.doesNotMatch(groundShaderWgsl(), /read_write.*_rzLights/)
+})
