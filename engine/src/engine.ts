@@ -26,7 +26,7 @@ import {
 import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
-import { sceneTargets as sceneTargetsFor, type SceneFormats } from "./shaders/passes/scene-contract"
+import { sceneTargets as sceneTargetsFor, sceneColorFormats, type SceneFormats } from "./shaders/passes/scene-contract"
 import { GROUND_SHADOW_SHADER_WGSL } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
 import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
@@ -6358,7 +6358,7 @@ export class Engine {
   private recordBundles(): void {
     this.bundlesDirty = false
     const scene = {
-      colorFormats: [this.hdrFormat, Engine.BLOOM_MASK_FORMAT],
+      colorFormats: sceneColorFormats(this.sceneFormats),
       depthStencilFormat: this.depthFormat,
       sampleCount: Engine.MULTISAMPLE_COUNT,
     }

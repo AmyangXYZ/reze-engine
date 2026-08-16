@@ -124,6 +124,21 @@ export function sceneTargets(cls: SceneRenderClass, formats: SceneFormats): GPUC
 }
 
 /**
+ * The pass's colour attachments, in order — for the things that describe the
+ * pass itself rather than a draw within it.
+ *
+ * A render bundle declares the formats it will be replayed into and is rejected
+ * against a pass that does not match, so the bundle encoder has to move in
+ * lockstep with the targets above. It restated the list independently until
+ * this existed, which made it the one consumer an MRT change would have missed
+ * — a bundle is recorded once and replayed, so the failure would have arrived
+ * at replay, naming the bundle rather than the attachment that changed.
+ */
+export function sceneColorFormats(formats: SceneFormats): GPUTextureFormat[] {
+  return [formats.hdr, formats.aux]
+}
+
+/**
  * The fragment-output struct a scene-pass shader returns.
  *
  * Emitted rather than written out per file so that the attachment list has one
