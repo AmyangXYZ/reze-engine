@@ -2,9 +2,9 @@
 // @anchor センター trail
 
 // Tunables — edit and ⌘⏎.
-const COLOR_L = vec3f(0.60, 0.76, 1.0);   // stage left, cool
+const COLOR_L = vec3f(0.42, 0.64, 1.0);   // stage left, cool
 const COLOR_T = vec3f(1.0, 0.98, 0.95);   // overhead, white
-const COLOR_R = vec3f(1.0, 0.74, 0.86);   // stage right, warm
+const COLOR_R = vec3f(1.0, 0.58, 0.78);   // stage right, warm
 const HEIGHT = 42.0;     // world units above the floor the lamps hang
 const SPREAD = 25.0;     // how far left and right of centre they sit — this
                          // against HEIGHT is the rake angle of the outer beams
@@ -23,6 +23,9 @@ const STEPS = 20;        // march steps. Twenty against the beam's own cylinder
                          // samples DENSER than thirty-four did against the old
                          // bounding sphere, which was mostly empty air
 const FAR_CLAMP = 400.0;
+const LIGHT_VIVID = 2.6;  // saturation of the CAST light vs the shaft's own
+                          // colour — see vivid(). 1.0 casts exactly what the
+                          // beam looks like, which reads white on a lit surface
 
 // Follow-spots that track the cast.
 //
@@ -222,6 +225,15 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   return vec4f(mix(lit, vec3f(1.0), smoothstep(0.8, 1.5, alpha)), a);
 }
 
+/** Saturation about the colour's own luminance. k = 1 is unchanged; above it
+ *  pushes away from grey while holding hue and rough brightness. Clamped at
+ *  zero because k > 1 drives the weakest channel negative, and a negative
+ *  channel in an ADDITIVE light darkens what it lands on. */
+fn vivid(c: vec3f, k: f32) -> vec3f {
+  let luma = dot(c, vec3f(0.2126, 0.7152, 0.0722));
+  return max(mix(vec3f(luma), c, k), vec3f(0.0));
+}
+
 // ── The light the beams actually cast ────────────────────────────────────────
 //
 // Until this mount existed a beam could only PAINT light: the shaft was drawn
@@ -241,7 +253,16 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
 // @lights 3
 fn lightEmit(i: u32, time: f32) -> RzLight {
   var l: RzLight;
-  l.color = select(select(COLOR_L, COLOR_T, i == 1u), COLOR_R, i == 2u);
+  // The SAME palette as the shafts, pushed. Haze reads pale because it is
+  // scattered light seen edge-on; the same lamp landing on a dress has to read
+  // by its hue or three spots converging look like one white one — which is
+  // what they did. Deriving it rather than keeping a second set of constants
+  // means editing a beam's colour moves the light it casts with it.
+  //
+  // AgX is the other half of why this is needed: it desaturates as it
+  // compresses, so a colour that survives the tone map has to start further out
+  // than it would in a linear render.
+  l.color = vivid(select(select(COLOR_L, COLOR_T, i == 1u), COLOR_R, i == 2u), LIGHT_VIVID);
   // Sides match beamFor's: -1 stage left, 0 overhead, +1 stage right.
   let side = f32(i32(i) - 1);
 
