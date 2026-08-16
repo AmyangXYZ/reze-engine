@@ -152,8 +152,15 @@ ${sceneIdWriteWgsl("out", `${GROUND_MATERIAL_ID}u`, `${GROUND_OBJECT_ID}u`)}  re
 `
 }
 
-/** The ground belongs to no model instance, so it takes reserved ids of its
- *  own. Id 0 is "nothing" and must stay unclaimed — it is what the attachment
- *  clears to, and therefore what every pixel nothing drew reports. */
-export const GROUND_MATERIAL_ID = 1
-export const GROUND_OBJECT_ID = 1
+/**
+ * The ground belongs to no model instance, so it takes ids of its own — at the
+ * TOP of the u16 range, not at the bottom.
+ *
+ * Both of the engine's counters are 1-based (model id is instance count + 1,
+ * material id counts from one), so 1 is the first model's first material and
+ * the floor would have shared it. 0 stays unclaimed in the other direction: it
+ * is what the attachment clears to, and so what every pixel nothing drew
+ * reports.
+ */
+export const GROUND_MATERIAL_ID = 0xffff
+export const GROUND_OBJECT_ID = 0xffff

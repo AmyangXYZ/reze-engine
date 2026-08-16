@@ -26,7 +26,14 @@ import {
 import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
-import { sceneTargets as sceneTargetsFor, sceneColorFormats, type SceneFormats } from "./shaders/passes/scene-contract"
+import {
+  sceneTargets as sceneTargetsFor,
+  sceneColorFormats,
+  setMrtIds,
+  mrtIdsEnabled,
+  SCENE_ID_FORMAT,
+  type SceneFormats,
+} from "./shaders/passes/scene-contract"
 import { groundShaderWgsl } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
 import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
@@ -1356,6 +1363,19 @@ export class Engine {
    *        cleared / edge-faded regions like before).
    *  rg8unorm at 4× MSAA is 8 bytes/texel — still fits Apple TBDR tile memory comfortably. */
   private static readonly BLOOM_MASK_FORMAT: GPUTextureFormat = "rg8unorm"
+  /**
+   * The master switch for the id attachment. OFF.
+   *
+   * Everything behind it is built and tested; what it costs is a third
+   * multisampled attachment on every scene, and what it buys is nothing until
+   * something reads ids. Turning it on is this line, and turning it back off is
+   * this line, which is the point of it being one.
+   */
+  private static readonly MRT_IDS = false
+  /** The id attachment. Multisampled with the pass and NEVER resolved: an
+   *  averaged id belongs to nothing, so consumers textureLoad sample 0. */
+  private idTexture: GPUTexture | null = null
+  private idView: GPUTextureView | null = null
   private multisampleMaskTexture!: GPUTexture
   private maskResolveTexture!: GPUTexture
   private maskResolveView!: GPUTextureView
@@ -1947,6 +1967,41 @@ export class Engine {
     // few switches that genuinely has to re-record. It is a user toggle, not a
     // per-frame state, which is what makes that affordable.
     this.bundlesDirty = true
+  }
+
+  /**
+   * Can this device multisample the id format at the pass's sample count?
+   *
+   * Asked by creating one and catching the validation error, because there is
+   * no capability flag for it — WebGPU guarantees multisampling for renderable
+   * colour formats but implementations have differed on uint targets, and the
+   * cost of finding out the hard way is a device-lost on someone's machine and
+   * a black canvas.
+   *
+   * The scope is popped in a finally: leaving an error scope pushed swallows
+   * the NEXT error in this device, wherever it happens, and that error would
+   * then be attributed to nothing.
+   */
+  private async probeMultisampledIds(): Promise<boolean> {
+    this.device.pushErrorScope("validation")
+    let probe: GPUTexture | null = null
+    try {
+      probe = this.device.createTexture({
+        label: "id attachment probe",
+        size: [4, 4],
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        format: SCENE_ID_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+    } catch {
+      // A synchronous throw is the other way this can fail.
+      probe = null
+    }
+    // Outside the try, and unconditional: the scope is pushed once and must be
+    // popped once whichever way creation went.
+    const err = await this.device.popErrorScope()
+    probe?.destroy()
+    return probe !== null && !err
   }
 
   private rebuildCompositeBindGroup(): void {
@@ -3370,6 +3425,17 @@ export class Engine {
     }
     this.device = device
     if (hasRg11b10) this.hdrFormat = "rg11b10ufloat"
+    // The id attachment, if this device will multisample a uint texture at the
+    // pass's sample count. Probed by ASKING — creating one inside an error
+    // scope — rather than by reading a feature flag, because there is no
+    // feature to read: multisampled uint support is a limit of the
+    // implementation, not an extension. A device that refuses leaves ids off
+    // and every shader is assembled without the output, which is why this runs
+    // before any pipeline or module is built.
+    //
+    // Gated by MRT_IDS as well, which is the master switch: the probe says
+    // CAN, and that says SHOULD.
+    setMrtIds(Engine.MRT_IDS && (await this.probeMultisampledIds()))
     if (hasTimestamp) {
       this.timestampQuerySet = device.createQuerySet({
         label: "pass timings",
@@ -4633,6 +4699,24 @@ export class Engine {
       })
       this.maskResolveView = this.maskResolveTexture.createView()
 
+      // The id attachment. Multisampled like the rest of the pass, and with NO
+      // resolve texture beside it: resolving averages, and the average of two
+      // ids is a third id naming something that was never drawn. Consumers read
+      // sample 0 with textureLoad, the way linearDepth already does.
+      this.idTexture?.destroy()
+      this.idTexture = null
+      this.idView = null
+      if (mrtIdsEnabled()) {
+        this.idTexture = this.device.createTexture({
+          label: "object id",
+          size: [width, height],
+          sampleCount: Engine.MULTISAMPLE_COUNT,
+          format: SCENE_ID_FORMAT,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        })
+        this.idView = this.idTexture.createView()
+      }
+
       // Bloom pyramid: mip 0 is half-res, each subsequent mip halves again.
       // Mip count chosen so the coarsest mip is ≥4 px on the short side, capped at BLOOM_MAX_LEVELS.
       const bw = Math.max(1, Math.floor(width / 2))
@@ -4697,10 +4781,24 @@ export class Engine {
         storeOp: "discard",
       }
 
+      // Cleared to 0, which is the reserved "nothing" id — so a pixel nothing
+      // drew reports nothing rather than whatever the last frame left. Stored,
+      // since the whole point is to be read after the pass.
+      const idAttachment: GPURenderPassColorAttachment | null = this.idView
+        ? {
+            view: this.idView,
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          }
+        : null
+
       this.renderPassDescriptor = {
         label: "renderPass",
         timestampWrites: this.stamps("scene"),
-        colorAttachments: [colorAttachment, maskAttachment],
+        colorAttachments: idAttachment
+          ? [colorAttachment, maskAttachment, idAttachment]
+          : [colorAttachment, maskAttachment],
         depthStencilAttachment: {
           view: depthTextureView,
           depthClearValue: this.depthClear,
@@ -7216,10 +7314,17 @@ export class Engine {
         toonTexture = await loadTextureByIndex(mat.toonTextureIndex)
       }
 
-      const materialUniformBuffer = this.createMaterialUniformBuffer(prefix + mat.name, mat, sphereMode, headBoneIndex)
+      const materialUniformBuffer = this.createMaterialUniformBuffer(
+        prefix + mat.name,
+        mat,
+        sphereMode,
+        headBoneIndex,
+        materialId,
+        modelId,
+      )
       inst.gpuBuffers.push(materialUniformBuffer)
       if (morphedMaterials.has(pmxMaterialIndex)) {
-        const base = this.materialUniformData(mat, sphereMode, headBoneIndex)
+        const base = this.materialUniformData(mat, sphereMode, headBoneIndex, materialId, modelId)
         morphTargets.push({
           pmxIndex: pmxMaterialIndex,
           materialName: mat.name,
@@ -7344,7 +7449,17 @@ export class Engine {
 
   /** Matches the WGSL MaterialUniforms struct in common.ts — 64 bytes
    *  (diffuse+alpha | ambient+shininess | specular+sphereMode | headIdx+pad). */
-  private materialUniformData(mat: Material, sphereMode: number, headBoneIndex: number): Float32Array {
+  private materialUniformData(
+    mat: Material,
+    sphereMode: number,
+    headBoneIndex: number,
+    /** This draw's identity for the id attachment. Both 1-based, so 0 stays the
+     *  reserved "nothing". NOT defaulted: the material-morph path rebuilds this
+     *  whole block from a `base` copy and writes it back, so a base built
+     *  without them would blank a material's id for as long as it morphed. */
+    materialId: number,
+    objectId: number,
+  ): Float32Array {
     const data = new Float32Array(16)
     data[0] = mat.diffuse[0]
     data[1] = mat.diffuse[1]
@@ -7359,6 +7474,11 @@ export class Engine {
     data[10] = mat.specular[2]
     data[11] = sphereMode
     data[12] = headBoneIndex
+    // 13 and 14 are the padding MaterialUniforms already carried, now named:
+    // the ids ride the uniform the material binds anyway, so nothing new is
+    // bound and the indirect-draw path is untouched.
+    data[13] = materialId
+    data[14] = objectId
     return data
   }
 
@@ -7367,10 +7487,12 @@ export class Engine {
     mat: Material,
     sphereMode: number,
     headBoneIndex: number,
+    materialId: number,
+    objectId: number,
   ): GPUBuffer {
     return this.createUniformBuffer(
       `material uniform: ${label}`,
-      this.materialUniformData(mat, sphereMode, headBoneIndex),
+      this.materialUniformData(mat, sphereMode, headBoneIndex, materialId, objectId),
     )
   }
 

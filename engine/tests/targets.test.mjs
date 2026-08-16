@@ -31,6 +31,7 @@ import * as trails from "../dist/shaders/passes/trails.js"
 const here = dirname(fileURLToPath(import.meta.url))
 const read = (p) => readFileSync(join(here, p), "utf8")
 const engine = read("../src/engine.ts")
+const groundSrc = read("../src/shaders/passes/ground.ts")
 
 /** The formats the engine settles on at init. rgba16float is the fallback; the
  *  rg11b10ufloat path differs only in the colour format, and every assertion
@@ -202,6 +203,72 @@ test("the bundle encoder is handed the same attachment list as the pipelines", (
     /colorFormats: sceneColorFormats\(this\.sceneFormats\)/,
     "recordBundles must take its formats from scene-contract",
   )
+})
+
+// ── The engine half: the attachment, the probe, and the ids themselves ──
+//
+// Source-level, because none of it can run without a device. What is being
+// pinned is that the pieces move together — an attachment created but not
+// attached, or ids written to a buffer nothing reads, are each silent.
+
+test("the id attachment is created and attached under the same condition", () => {
+  assert.match(engine, /if \(mrtIdsEnabled\(\)\) \{\s*\n\s*this\.idTexture = this\.device\.createTexture\(/, "the id texture must be created only when ids are on")
+  assert.match(engine, /colorAttachments: idAttachment\s*\n?\s*\? \[colorAttachment, maskAttachment, idAttachment\]/, "the scene pass must attach the id texture when it exists")
+})
+
+test("the id attachment is multisampled and never resolved", () => {
+  const at = engine.indexOf('label: "object id"')
+  assert.ok(at > 0, "the id texture was renamed and this test went blind with it")
+  const desc = engine.slice(at, engine.indexOf("})", at))
+  assert.match(desc, /sampleCount: Engine\.MULTISAMPLE_COUNT/, "it shares the pass's sample count or it cannot join it")
+  assert.match(desc, /format: SCENE_ID_FORMAT/)
+  // The attachment must have no resolveTarget: resolving averages, and the
+  // average of two ids names something that was never drawn.
+  const attachAt = engine.indexOf("view: this.idView")
+  // A fixed window, not up to the next "}" — clearValue is itself an object, so
+  // brace-hunting stops inside it and never reaches loadOp/storeOp.
+  const attach = engine.slice(attachAt, attachAt + 300)
+  assert.doesNotMatch(attach, /resolveTarget/, "an averaged id is not an id — this attachment must not resolve")
+  assert.match(attach, /loadOp: "clear"/, "id 0 is the reserved nothing; a stale id is worse than none")
+  assert.match(attach, /storeOp: "store"/, "an attachment nothing can read afterwards is pure cost")
+})
+
+test("the probe pops its error scope exactly once, on both paths", () => {
+  const at = engine.indexOf("private async probeMultisampledIds()")
+  assert.ok(at > 0, "probeMultisampledIds not found")
+  const body = engine.slice(at, engine.indexOf("\n  }", at))
+  assert.equal((body.match(/pushErrorScope/g) ?? []).length, 1)
+  assert.equal((body.match(/popErrorScope/g) ?? []).length, 1)
+  // Outside the try. A scope left pushed swallows the next error anywhere in
+  // the device, and that error would then be attributed to nothing.
+  assert.match(body, /\}\n\s*\/\/[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*const err = await this\.device\.popErrorScope\(\)/)
+})
+
+test("the ids ride the material uniform's existing padding", () => {
+  // Slots 13 and 14 of a 16-float block that was already this size. If these
+  // moved to a buffer of their own, the indirect-draw path would need a new
+  // binding and this comment would be the only warning.
+  assert.match(engine, /data\[13\] = materialId/)
+  assert.match(engine, /data\[14\] = objectId/)
+  assert.match(engine, /const data = new Float32Array\(16\)/, "the block must not have grown")
+})
+
+test("a morphing material keeps its id", () => {
+  // The morph path rebuilds the whole uniform block from `base` and writes it
+  // back, so a base built without ids would blank a material's identity for as
+  // long as it morphed — visible only to whatever reads ids, and only sometimes.
+  assert.match(
+    engine,
+    /const base = this\.materialUniformData\(mat, sphereMode, headBoneIndex, materialId, modelId\)/,
+    "the morph base must carry the ids too",
+  )
+})
+
+test("the ground's ids collide with no model's", () => {
+  // Both engine counters are 1-based, so the bottom of the range is taken.
+  assert.match(groundSrc, /GROUND_MATERIAL_ID = 0xffff/)
+  assert.match(groundSrc, /GROUND_OBJECT_ID = 0xffff/)
+  assert.match(engine, /const modelId = this\.modelInstances\.size \+ 1/, "model ids are 1-based — 0 stays 'nothing'")
 })
 
 /** Fragment-output locations a shader writes, from its output struct. */
