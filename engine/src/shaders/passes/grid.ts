@@ -143,6 +143,12 @@ fn rzGridPrev(uv: vec2f) -> vec4f {
 }
 ` +
     EFFECT_SCENE_API +
+    // The alias _rzSlot, which the scene API's accessors route through. Every
+    // module embedding EFFECT_SCENE_API must splice this; the sim module was
+    // the one that did not, and every gridStep effect failed to install with
+    // "unresolved call target" from the day the identity fallback was removed.
+    // Found by tools/validate-wgsl.mjs on its first run.
+    anchorAliasWgsl(cast.alias) +
     audioApi(0, 5) +
     scoreApi(0, 7) +
     // rzGrid itself, so a kernel may read the grid it is writing — through the

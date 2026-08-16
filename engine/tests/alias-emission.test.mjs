@@ -15,6 +15,10 @@ import assert from "node:assert/strict"
 import { buildCompositeShader, buildFieldShader } from "../dist/shaders/passes/composite.js"
 import { buildParticleComputeShader, buildParticleRenderShader } from "../dist/shaders/passes/particles.js"
 import { buildTrailShader } from "../dist/shaders/passes/trails.js"
+import { buildSimShader } from "../dist/shaders/passes/grid.js"
+import { buildLightEmitShader } from "../dist/shaders/lights.js"
+import { EFFECT_SCENE_API } from "../dist/shaders/passes/composite.js"
+import { anchorAliasWgsl } from "../dist/shaders/anchor-table.js"
 
 const effect = {
   wgsl: "fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f { return vec4f(0.0); }",
@@ -22,6 +26,7 @@ const effect = {
   hasBackground: true,
   hasForeground: false,
   simSize: 0,
+  trailCount: 0,
 }
 const cast = { subjects: 4, samples: 128, base: 12, trailBase: 108, slots: 8, alias: [0, 1], reversedZ: false }
 const particleSrc = { wgsl: "", count: 64, blend: "alpha", bloom: false }
@@ -37,6 +42,11 @@ for (const [name, code] of [
   ["particle compute", buildParticleComputeShader(particleSrc, cast)],
   ["particle render", buildParticleRenderShader(particleSrc, cast)],
   ["trail shader", buildTrailShader(trailSrc, cast)],
+  // The two modules added after this guard was written — and the sim module is
+  // the cautionary tale: absent from this list, its missing _rzSlot shipped and
+  // every gridStep effect failed to install until the WGSL validator caught it.
+  ["grid step", buildSimShader("fn gridStep(uv: vec2f) -> vec4f { return vec4f(rzAnchor(0, 0).pos, 0.0); }", 256, { ...cast, trailCount: 0 })],
+  ["light emit", buildLightEmitShader("// @lights 1\nfn lightEmit(i: u32, t: f32) -> RzLight { var l: RzLight; return l; }", EFFECT_SCENE_API + anchorAliasWgsl([0]), { trailCount: 0 })],
 ]) {
   test(`${name}: _rzSlot is defined exactly once wherever it is called`, () => {
     assert.ok(refs(code) > 0, "the accessors should route through the alias — if this fails, the aliasing was removed")
