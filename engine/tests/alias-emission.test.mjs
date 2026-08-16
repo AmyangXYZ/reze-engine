@@ -44,14 +44,25 @@ for (const [name, code] of [
   })
 }
 
-test("the ribbon occlusion compare follows the depth convention", () => {
-  // Manual WGSL compare — the one depth test the pipeline-level depthCompare
-  // flip cannot reach. Unflipped on a reversed-Z device it drew ribbons only
-  // when OCCLUDED, which shipped once and looked like ribbons simply gone.
-  const fwd = buildTrailShader(trailSrc, cast)
-  const rev = buildTrailShader(trailSrc, { ...cast, reversedZ: true })
-  assert.match(fwd, /in\.clip\.z > sceneD/)
-  assert.match(rev, /in\.clip\.z < sceneD/)
+test("ribbons draw as scene geometry: bloom mask written, no hand-rolled depth", () => {
+  // This used to assert the manual compare matched the depth convention —
+  // unflipped on a reversed-Z device it drew ribbons only when OCCLUDED, which
+  // shipped once and looked like ribbons simply gone. That compare is gone with
+  // the layer it belonged to: ribbons draw inside the scene pass now, so the
+  // hardware tests depth from the pipeline and the trap cannot recur.
+  //
+  // What the shader must still do is write the AUX target. Mask 1 is what puts
+  // a ribbon through the bloom gate, and without it they would draw in HDR and
+  // never bloom — which is the entire reason they were moved.
+  const src = buildTrailShader(trailSrc, cast)
+  assert.doesNotMatch(src, /textureLoad\(sceneDepth/, "hardware depth replaced the hand-rolled compare")
+  assert.match(src, /@location\(1\) aux/, "ribbons must write the scene's aux target")
+  // And the mask is the AUTHOR's call, as it already is for particles: @bloom
+  // opts in. A ribbon that never asked to bloom must not start blooming just
+  // because it moved into the scene pass.
+  assert.match(src, /o\.aux = vec4f\(0\.0/, "no @bloom means no bloom mask")
+  const lit = buildTrailShader({ ...trailSrc, bloom: true }, cast)
+  assert.match(lit, /o\.aux = vec4f\(1\.0/, "@bloom is what puts a ribbon through the gate")
 })
 
 test("a FIELD effect's _rzSlot carries its real alias, not the identity", () => {

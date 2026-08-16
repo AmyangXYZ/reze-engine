@@ -670,11 +670,11 @@ const COMPOSITE_BODY = /* wgsl */ `
   // expression, because the foreground mount composites onto it.
   var outRgb = disp * sceneAlpha + bgPm * (1.0 - sceneAlpha);
   var outA = sceneAlpha + bgA * (1.0 - sceneAlpha);
-  // The trail layer, straight-alpha over the tone-mapped frame — the author's
-  // colours verbatim, never through AgX.
-  let trailFx = textureLoad(trailTex, vec2i(fragCoord.xy), 0);
-  outRgb = trailFx.rgb * trailFx.a + outRgb * (1.0 - trailFx.a);
-  outA = trailFx.a + outA * (1.0 - trailFx.a);
+  // Ribbons are NOT read here any more: they draw inside the scene pass, so
+  // they are already in disp — tone mapped, and bloomed, which they never
+  // were while this line existed. Sampling them here as well would draw them
+  // twice, and the layer nothing clears would go stale the moment an effect
+  // was removed.
   FOREGROUND_CALL
   return vec4f(outRgb, outA);
 }

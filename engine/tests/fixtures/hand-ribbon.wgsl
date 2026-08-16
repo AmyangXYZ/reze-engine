@@ -38,13 +38,23 @@ const TAIL_EASE = 0.22;  // last stretch of life spent fading to nothing
 // Rebalanced toward the saber grammar: the white-hot part is a THIN line and
 // the saturated colour is most of the visible width. CORE high makes white
 // spread; HALO carries the neon.
-const CORE = 2.6;        // weight of the core — what makes it read as light
+const CORE = 3.4;        // weight of the core — what makes it read as light
 // 0.55 in the original — times the overlap its `+=` accumulated. There every
 // pixel SUMMED every segment within the glow radius (about 1.5 segments' worth
 // on a straight path); here the quads tile, so each pixel samples the profile
 // once and the weight carries the difference.
-const HALO = 0.85;
+// The wide soft skirt. It is what BLOOM has to catch: the pyramid works on
+// what is already on screen, so a thin hot filament with nothing around it
+// blooms into a thin hot filament. Widening the skirt is what makes the
+// light spread rather than just brighten.
+const HALO = 1.9;
 const LIGHT = 1.35;      // final gain on the ribbon's alpha
+// Ribbons draw INSIDE the scene pass now — HDR, before tone mapping — so this
+// colour is no longer what reaches the screen. vec3f(1.0) goes through AgX and
+// lands as grey, which is why the ribbon dimmed the moment it stopped being
+// pasted over the finished frame. Same constant Snow carries, for the same
+// reason: anything meant to read as LIGHT has to out-shine the paper.
+const INTENSITY = 7.0;
 
 // Sparks. World units; a model stands ~20 units tall, judge against that.
 // Sparks are PARTICLES, so unlike the ribbon they render in the scene pass and
@@ -96,7 +106,7 @@ fn trailShade(u: f32, v: f32, age: f32, weight: f32, slot: i32) -> vec4f {
   rgb = mix(rgb, CORE_COLOR, smoothstep(0.45, 1.30, heat));
   // No gain, no tone-map compensation: the layer composites after AgX, so what
   // is written here is what appears — the original's own contract.
-  return vec4f(rgb, clamp(heat * LIGHT, 0.0, 1.0));
+  return vec4f(rgb * INTENSITY, clamp(heat * LIGHT, 0.0, 1.0));
 }
 
 // ── The sparks ──────────────────────────────────────────────────────────────

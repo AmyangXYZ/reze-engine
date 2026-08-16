@@ -2828,29 +2828,34 @@ export class Engine {
         },
         { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        // The scene's depth, for the fragment's manual occlusion test.
-        {
-          binding: 3,
-          visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "depth", viewDimension: "2d", multisampled: true },
-        },
+        // No depth binding, and binding 3 stays vacant rather than renumbering.
+        // Ribbons draw inside the scene pass now, and sampling that pass's own
+        // depth attachment from within it is a usage conflict WebGPU rejects.
         // The audio analysis, for rzAudio* in width and shade alike.
         { binding: 4, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         // The score, for rzNote*/rzKey*.
         { binding: 5, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     })
-    // ONE target: the ribbons' own layer, blended with MAX in both channels.
-    // Max is the original's core-takes-the-max rule as a blend mode — parallel
-    // strands of a circling hand meet as max and cannot double into bright
-    // dashes, which every additive variant of this pipeline drew. The layer is
-    // composited over the frame after tone mapping (see composite.ts), which is
-    // where the fullscreen ribbon always ran.
+    // TWO targets, the scene pass's own: HDR colour and the aux (bloom mask,
+    // coverage). Ribbons draw INSIDE that pass now, so they are lit geometry
+    // rather than a layer pasted over the finished frame — which is the whole
+    // point: a layer composited after tone mapping can never bloom.
+    //
+    // Additive, where this used to be MAX. Max was right for a post-tonemap
+    // layer; in HDR before bloom, overlapping light sums.
     const layerTarget: GPUColorTargetState = {
-      format: "rgba16float",
+      format: this.hdrFormat,
       blend: {
-        color: { srcFactor: "one", dstFactor: "one", operation: "max" },
-        alpha: { srcFactor: "one", dstFactor: "one", operation: "max" },
+        color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
+        alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+      },
+    }
+    const layerMaskTarget: GPUColorTargetState = {
+      format: Engine.BLOOM_MASK_FORMAT,
+      blend: {
+        color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
       },
     }
     this.device.pushErrorScope("validation")
@@ -2859,11 +2864,16 @@ export class Engine {
         label: "trail pipeline",
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         vertex: { module, entryPoint: "vs" },
-        fragment: { module, entryPoint: "fs", targets: [layerTarget] },
+        fragment: { module, entryPoint: "fs", targets: [layerTarget, layerMaskTarget] },
         primitive: { topology: "triangle-list", cullMode: "none" },
-        // No depth attachment and no MSAA: the layer is a lone colour target,
-        // and occlusion happens in the fragment against the scene's own depth.
-        multisample: { count: 1 },
+        // Depth TESTED, never written: a ribbon is occluded by the body it
+        // circles, and must not occlude the fabric drawn after it.
+        depthStencil: {
+          format: this.depthFormat,
+          depthWriteEnabled: false,
+          depthCompare: this.reversedZ ? "greater" : "less",
+        },
+        multisample: { count: Engine.MULTISAMPLE_COUNT },
       })
       const scoped = await this.device.popErrorScope()
       if (scoped) {
@@ -2884,7 +2894,6 @@ export class Engine {
               { binding: 0, resource: { buffer: this.castBuffer } },
               { binding: 1, resource: { buffer: uniform } },
               { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
-              { binding: 3, resource: this.depthReadView! },
               { binding: 4, resource: { buffer: this.audioBuffer } },
               { binding: 5, resource: { buffer: this.scoreBuffer } },
             ],
@@ -2905,29 +2914,28 @@ export class Engine {
     }
   }
 
-  /** Draw the ribbons into their own layer — cleared, max-blended, and
-   *  composited over the frame after tone mapping. */
-  private renderTrailLayer(encoder: GPUCommandEncoder): void {
+  /**
+   * Ribbons, drawn INSIDE the scene pass — as geometry, in HDR, before bloom.
+   *
+   * They used to own a colour target and be pasted over the finished frame
+   * after tone mapping, which is exactly why they could not bloom: nothing
+   * composited post-tonemap can. Here they are lit like anything else in the
+   * scene, depth-tested against the body they circle, and their emission
+   * reaches the bloom prefilter through the aux mask they now write.
+   *
+   * Takes the pass rather than opening one: that IS the change.
+   */
+  private drawTrails(pass: GPURenderPassEncoder): void {
     const drawn = this.effects.filter((e) => e.trails)
-    if (drawn.length === 0 || !this.trailLayerView) return
+    if (drawn.length === 0) return
     for (const e of drawn) {
       const t = e.trails!
       t.data[0] = this.sceneClock - e.epochScene
       this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
-    }
-    const pass = encoder.beginRenderPass({
-      label: "trail layer",
-      colorAttachments: [
-        { view: this.trailLayerView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
-      ],
-    })
-    for (const e of drawn) {
-      const t = e.trails!
       pass.setPipeline(t.pipeline)
       pass.setBindGroup(0, t.bind)
       pass.draw(6, t.instances)
     }
-    pass.end()
   }
 
   /** The user's field mounts, drawn at half resolution for the composite to
@@ -2982,7 +2990,6 @@ export class Engine {
         { binding: 0, resource: { buffer: this.castBuffer } },
         { binding: 1, resource: { buffer: t.uniform } },
         { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
-        { binding: 3, resource: this.depthReadView },
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.scoreBuffer } },
       ],
@@ -8413,11 +8420,12 @@ export class Engine {
     // particle behind the character is simply hidden, and still inside the HDR
     // target so an `@bloom` effect reaches the pyramid below.
     this.renderParticles(pass)
+    // Ribbons, in the same pass and after the particles: both are additive
+    // light in HDR, and both reach the bloom pyramid because of it. This used
+    // to run after pass.end() into a layer of its own, which is precisely what
+    // kept ribbons out of bloom.
+    this.drawTrails(pass)
     pass.end()
-
-    // Ribbons draw AFTER the scene pass ends, so its depth is resolved for
-    // their manual occlusion test — and before the composite that reads them.
-    this.renderTrailLayer(encoder)
     // The field mounts, likewise: after the scene so foregrounds can read its
     // depth, before the composite that samples both layers.
     this.renderFieldPass(encoder)

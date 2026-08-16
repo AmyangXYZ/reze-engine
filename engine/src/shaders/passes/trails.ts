@@ -170,7 +170,11 @@ struct TrailU {
 @group(0) @binding(0) var<storage, read> _rzCast: array<vec4f>;
 @group(0) @binding(1) var<uniform> tu: TrailU;
 @group(0) @binding(2) var<uniform> cam: CameraU;
-@group(0) @binding(3) var sceneDepth: texture_depth_multisampled_2d;
+// Binding 3 is GONE, and it had to go. Ribbons draw inside the scene pass now,
+// and the depth buffer is that pass's render attachment — binding it for
+// sampling in the same pass is a usage conflict WebGPU rejects outright:
+// "includes writable usage and another usage in the same synchronization
+// scope". The hardware depth test replaced what it was read for.
 
 fn rzTime() -> f32 { return tu.time; }
 fn rzCameraPos() -> vec3f { return cam.camPos; }
@@ -422,24 +426,31 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   return out;
 }
 
+struct TrailFSOut {
+  @location(0) color: vec4f,
+  // The scene's aux target: (bloom mask, coverage). Writing mask 1 is what
+  // makes a ribbon BLOOM — it is light, and the gate is what says so.
+  @location(1) aux: vec4f,
+}
+
 @fragment
-fn fs(in: VSOut) -> @location(0) vec4f {
-  // Manual depth test against the scene's own buffer — the layer has no depth
-  // attachment, and a per-fragment compare is exactly what the fullscreen
-  // version did. position.z IS this fragment's depth, and the DIRECTION of the
-  // compare is baked at build time to match the scene's depth convention —
-  // "behind" is larger z non-reversed and smaller z reversed.
-  let sceneD = textureLoad(sceneDepth, vec2i(in.clip.xy), 0);
-  if (in.clip.z ${cast.reversedZ ? "<" : ">"} sceneD) { discard; }
+fn fs(in: VSOut) -> TrailFSOut {
+  // No manual depth test any more. This drew into its own attachment-less
+  // layer and compared position.z against the scene's depth texture by hand,
+  // with the direction baked per depth convention. Inside the scene pass the
+  // hardware does it, correctly and for free, and the reversed-Z trap that
+  // needed its own regression test goes with it.
   let c = trailShade(in.uv.x, in.uv.y, in.age, in.weight, i32(in.slot));
   if (c.a <= 0.0) { discard; }
-  // STRAIGHT colour, into a layer that blends with MAX — which is the
-  // original's core-takes-the-max rule turned into a blend mode. Parallel
-  // strands of a circling hand meet as max, so they can never sum into the
-  // doubled bright dashes that additive drew along the path. The layer then
-  // composites over the frame AFTER tone mapping, where the fullscreen ribbon
-  // always ran — so these colours reach the screen verbatim.
-  return vec4f(c.rgb, c.a);
+  var o: TrailFSOut;
+  // STRAIGHT colour into an ADDITIVE target, which reverses the old MAX rule
+  // deliberately: max existed so parallel strands could not double into bright
+  // dashes on a layer composited after tone mapping. In HDR before bloom,
+  // overlapping light SHOULD sum — that is what neon does — and the tone
+  // mapper is what keeps the sum from clipping.
+  o.color = vec4f(c.rgb, c.a);
+  o.aux = vec4f(${src.bloom ? "1.0" : "0.0"}, 1.0, 0.0, c.a);
+  return o;
 }
 `
   )
