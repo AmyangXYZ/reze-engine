@@ -2,9 +2,9 @@
 // @anchor センター trail
 
 // Tunables — edit and ⌘⏎.
-const COLOR_L = vec3f(0.08, 0.82, 1.00);  // stage left, electric cyan
-const COLOR_T = vec3f(1.00, 0.72, 0.22);  // overhead, hot amber
-const COLOR_R = vec3f(1.00, 0.14, 0.66);  // stage right, hot magenta
+const COLOR_L = vec3f(0.231, 0.510, 0.965);  // stage left — blue-500 #3b82f6
+const COLOR_T = vec3f(1.000, 1.000, 1.000);  // overhead — white, the key
+const COLOR_R = vec3f(0.937, 0.267, 0.267);  // stage right — red-500 #ef4444
 const HEIGHT = 42.0;     // world units above the floor the lamps hang
 const SPREAD = 25.0;     // how far left and right of centre they sit — this
                          // against HEIGHT is the rake angle of the outer beams
