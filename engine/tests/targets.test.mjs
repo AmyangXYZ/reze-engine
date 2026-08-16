@@ -21,7 +21,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { sceneTargets } from "../dist/shaders/passes/scene-contract.js"
+import { sceneTargets, sceneColorFormats, mrtIdsEnabled, setMrtIds, SCENE_ID_FORMAT } from "../dist/shaders/passes/scene-contract.js"
 import * as materials from "../dist/shaders/materials/common.js"
 import * as ground from "../dist/shaders/passes/ground.js"
 import * as outline from "../dist/shaders/passes/outline.js"
@@ -39,12 +39,74 @@ const FORMATS = { hdr: "rgba16float", aux: "rg8unorm" }
 
 const CLASSES = ["material", "ground", "outline", "particle", "particle-additive", "trail", "depth-prepass"]
 
-test("every render class declares the scene pass's two attachments, in order", () => {
+/** Classes whose shaders write an id, and so declare a third fragment output. */
+const WRITES_ID = ["material", "ground"]
+
+/** How many attachments the pass carries right now. */
+const ATTACHMENTS = () => (mrtIdsEnabled() ? 3 : 2)
+
+test("every render class declares the pass's attachments, in order", () => {
   for (const cls of CLASSES) {
     const t = sceneTargets(cls, FORMATS)
-    assert.equal(t.length, 2, `${cls} declares ${t.length} targets`)
+    assert.equal(t.length, ATTACHMENTS(), `${cls} declares ${t.length} targets`)
     assert.equal(t[0].format, FORMATS.hdr, `${cls} location 0 must be the HDR colour attachment`)
     assert.equal(t[1].format, FORMATS.aux, `${cls} location 1 must be the aux attachment`)
+  }
+})
+
+// The id attachment, exercised whatever the flag is set to right now: flipping
+// it must not be the moment anyone finds out what it does. setMrtIds is
+// restored in a finally, so the rest of the file sees the state it expected.
+test("with ids on, every class carries the id target and only two write it", () => {
+  const was = mrtIdsEnabled()
+  try {
+    setMrtIds(true)
+    for (const cls of CLASSES) {
+      const t = sceneTargets(cls, FORMATS)
+      assert.equal(t.length, 3, `${cls} must carry the id target — every pipeline in a pass shares its attachments`)
+      assert.equal(t[2].format, SCENE_ID_FORMAT)
+      assert.equal(t[2].blend, undefined, "a uint target takes no blend; an averaged id is not an id")
+      const writes = WRITES_ID.includes(cls)
+      assert.equal(
+        t[2].writeMask,
+        writes ? 0xf : 0,
+        `${cls} ${writes ? "writes ids and must not be masked off" : "writes no id and must be masked off — an " +
+          "output with no target is the ungoverned direction, a target with no output is legal at writeMask 0"}`,
+      )
+    }
+    assert.deepEqual(sceneColorFormats(FORMATS), [FORMATS.hdr, FORMATS.aux, SCENE_ID_FORMAT])
+
+    // And the two that write it say so, as vec2u — the type the format needs.
+    for (const [what, wgsl] of [
+      ["ground", ground.groundShaderWgsl()],
+      ["materials", materials.commonFsOutWgsl()],
+    ]) {
+      assert.match(wgsl, /@location\(2\) id: vec2u,/, `${what} must declare the id output when ids are on`)
+      // @interpolate is legal only on a vertex output or a fragment input, so
+      // it must never appear on this one — the plan called for it, and it would
+      // not have compiled.
+      assert.doesNotMatch(wgsl, /@interpolate\([a-z]+\)\s+id:/, `${what} must not put @interpolate on a fragment output`)
+    }
+    assert.match(ground.groundShaderWgsl(), /out\.id = vec2u\(/, "ground must actually assign its id")
+  } finally {
+    setMrtIds(was)
+  }
+})
+
+test("with ids off, nothing carries an id target and no shader writes one", () => {
+  const was = mrtIdsEnabled()
+  try {
+    setMrtIds(false)
+    for (const cls of CLASSES) assert.equal(sceneTargets(cls, FORMATS).length, 2, `${cls} must not carry an id target`)
+    assert.deepEqual(sceneColorFormats(FORMATS), [FORMATS.hdr, FORMATS.aux])
+    // Scoped to the OUTPUT STRUCT, not the whole file. A bare /@location\(2\)/
+    // also matches ground's vertex attribute `@location(2) uv` — vertex inputs
+    // and fragment outputs number independently, and conflating them makes this
+    // assertion fail on a shader that is entirely correct.
+    assert.deepEqual(outputLocations(ground.groundShaderWgsl(), "FSOut"), [0, 1], "ground writes an output with no target")
+    assert.deepEqual(outputLocations(materials.commonFsOutWgsl(), "FSOut"), [0, 1], "materials write an output with no target")
+  } finally {
+    setMrtIds(was)
   }
 })
 
@@ -156,8 +218,8 @@ function outputLocations(wgsl, structName) {
 const CAST = { subjects: 4, samples: 128, base: 12, trailBase: 108, slots: 8, reversedZ: false, alias: [0], trailCount: 1 }
 
 const SHADERS = [
-  ["materials (shared prelude)", () => materials.COMMON_FS_OUT_WGSL, "FSOut", "material"],
-  ["ground", () => ground.GROUND_SHADOW_SHADER_WGSL, "FSOut", "ground"],
+  ["materials (shared prelude)", () => materials.commonFsOutWgsl(), "FSOut", "material"],
+  ["ground", () => ground.groundShaderWgsl(), "FSOut", "ground"],
   ["outline", () => outline.OUTLINE_SHADER_WGSL, "FSOut", "outline"],
   [
     "particles",

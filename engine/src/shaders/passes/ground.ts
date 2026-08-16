@@ -1,9 +1,14 @@
-import { sceneFsOutWgsl } from "./scene-contract"
+import { sceneFsOutWgsl, sceneIdWriteWgsl } from "./scene-contract"
 
 // Ground shadow-catcher: receives directional shadow, grid lines, frosted noise,
 // radial distance fade. Writes bloom mask = 0 (ground never bloom-bleeds).
+//
+// A FUNCTION, not a constant, since the id attachment is a device capability:
+// the struct this returns depends on what the probe at init found, and a string
+// baked at import time cannot know that. Called once, when the module is built.
 
-export const GROUND_SHADOW_SHADER_WGSL = /* wgsl */ `
+export function groundShaderWgsl(): string {
+  return /* wgsl */ `
 struct CameraUniforms { view: mat4x4f, projection: mat4x4f, viewPos: vec3f, _p: f32, };
 struct Light { direction: vec4f, color: vec4f, };
 struct LightUniforms { ambientColor: vec4f, lights: array<Light, 4>, };
@@ -142,6 +147,13 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // from outA at the center to 0 at the radial edge — letting the page
   // background show through under the premultiplied canvas alphaMode.
   out.mask = vec4f(0.0, 1.0, 0.0, outA);
-  return out;
+${sceneIdWriteWgsl("out", `${GROUND_MATERIAL_ID}u`, `${GROUND_OBJECT_ID}u`)}  return out;
 }
 `
+}
+
+/** The ground belongs to no model instance, so it takes reserved ids of its
+ *  own. Id 0 is "nothing" and must stay unclaimed — it is what the attachment
+ *  clears to, and therefore what every pixel nothing drew reports. */
+export const GROUND_MATERIAL_ID = 1
+export const GROUND_OBJECT_ID = 1

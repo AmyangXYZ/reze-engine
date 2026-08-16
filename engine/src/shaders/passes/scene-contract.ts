@@ -34,6 +34,41 @@ export type SceneFormats = {
 }
 
 /**
+ * The id attachment's format: (material index, object index), one u16 each.
+ *
+ * Two 16-bit channels rather than one 32-bit: 32-bit formats are not
+ * multisamplable, and this attachment is multisampled with the rest of the
+ * pass. Uint targets take no blend at all per spec, which is exactly right —
+ * an averaged id is not an id.
+ */
+export const SCENE_ID_FORMAT: GPUTextureFormat = "rg16uint"
+
+/**
+ * Whether the scene pass carries the id attachment.
+ *
+ * Runtime rather than a compile-time constant, and mutable, because it is not
+ * only a decision — it is a CAPABILITY. Multisampled rg16uint has to be probed
+ * on the device (see the engine's init), and a device that cannot do it must
+ * leave this off. That forces the shaders to be assembled after the probe,
+ * which is why the two shader modules that gain an output stopped being
+ * module-level constants: a string baked at import cannot know what the device
+ * said.
+ *
+ * Set ONCE at init, before any pipeline or shader module is built. Nothing
+ * reads it per frame.
+ */
+let mrtIds = false
+
+/** Called by the engine at init, after probing the device. */
+export function setMrtIds(on: boolean): void {
+  mrtIds = on
+}
+
+export function mrtIdsEnabled(): boolean {
+  return mrtIds
+}
+
+/**
  * What is being drawn, which is the only thing that varies.
  *
  * The classes differ ONLY in blend and write mask; formats are the pass's, not
@@ -89,6 +124,23 @@ const ADD_PREMULTIPLIED: GPUBlendState = {
   alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
 }
 
+/**
+ * Which classes actually WRITE an id, and so gain a fragment output for it.
+ *
+ * Everything else keeps its shader exactly as it is and takes the id target at
+ * writeMask 0 — legal, specified, and free. The alternative (leaving the target
+ * off those pipelines) is not available: every pipeline in a pass must agree
+ * with the pass's attachments.
+ *
+ * The ground is in because a mark placed by id needs the floor to have one.
+ * Transparent fabric writes ids too — dissolving a dress needs the dress's own
+ * pixels, and last write wins there, which is a documented choice rather than a
+ * consequence. Outline hulls, particles and ribbons are OUT: they are not
+ * things you would ever address by id, and a hull would overwrite the id of the
+ * body it traces.
+ */
+const WRITES_ID = new Set<SceneRenderClass>(["material", "ground"])
+
 /** The blends each class writes its two attachments with. */
 const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState, GPUBlendState]> = {
   material: [ALPHA_OVER, ALPHA_OVER],
@@ -109,18 +161,26 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
  * pipeline blending unlike its neighbours.
  */
 export function sceneTargets(cls: SceneRenderClass, formats: SceneFormats): GPUColorTargetState[] {
-  if (cls === "depth-prepass") {
-    // Format only, and writeMask 0. Note the asymmetry this leans on, which is
-    // the same one MRT will: a target the shader has no output for is legal at
-    // writeMask 0 (gpuweb#1918), while an output with no target is not
-    // governed. This direction is the specified one.
-    return [{ format: formats.hdr, writeMask: 0 }, { format: formats.aux, writeMask: 0 }]
-  }
-  const [color, aux] = BLENDS[cls]
-  return [
-    { format: formats.hdr, blend: { color: { ...color.color }, alpha: { ...color.alpha } } },
-    { format: formats.aux, blend: { color: { ...aux.color }, alpha: { ...aux.alpha } } },
-  ]
+  const targets: GPUColorTargetState[] =
+    cls === "depth-prepass"
+      ? // Format only, and writeMask 0. Note the asymmetry this leans on, which
+        // is the same one the id target leans on below: a target the shader has
+        // no output for is legal at writeMask 0 (gpuweb#1918), while an output
+        // with no target is NOT governed (gpuweb#5341). This is the specified
+        // direction, and it is the only one this file ever uses.
+        [
+          { format: formats.hdr, writeMask: 0 },
+          { format: formats.aux, writeMask: 0 },
+        ]
+      : (() => {
+          const [color, aux] = BLENDS[cls]
+          return [
+            { format: formats.hdr, blend: { color: { ...color.color }, alpha: { ...color.alpha } } },
+            { format: formats.aux, blend: { color: { ...aux.color }, alpha: { ...aux.alpha } } },
+          ]
+        })()
+  if (mrtIds) targets.push({ format: SCENE_ID_FORMAT, writeMask: WRITES_ID.has(cls) ? 0xf : 0 })
+  return targets
 }
 
 /**
@@ -135,7 +195,7 @@ export function sceneTargets(cls: SceneRenderClass, formats: SceneFormats): GPUC
  * at replay, naming the bundle rather than the attachment that changed.
  */
 export function sceneColorFormats(formats: SceneFormats): GPUTextureFormat[] {
-  return [formats.hdr, formats.aux]
+  return mrtIds ? [formats.hdr, formats.aux, SCENE_ID_FORMAT] : [formats.hdr, formats.aux]
 }
 
 /**
@@ -155,9 +215,31 @@ export function sceneColorFormats(formats: SceneFormats): GPUTextureFormat[] {
 export function sceneFsOutWgsl(opts?: { name?: string; aux?: string }): string {
   const name = opts?.name ?? "FSOut"
   const aux = opts?.aux ?? "mask"
+  // No @interpolate here, deliberately. The plan called for
+  // `@location(2) @interpolate(flat)`, and that attribute is only legal on a
+  // vertex OUTPUT or a fragment INPUT — a fragment output is neither, so it
+  // would not compile. It is also unnecessary: the id is read from the per-draw
+  // uniform, not carried across the triangle as a varying, so there is no
+  // interpolation to suppress. (A varying carrying it WOULD need flat, since an
+  // integer varying must be.)
+  //
+  // vec2u for rg16uint: the output type must be compatible with the format, and
+  // uint targets take no blend, which is what makes last-write-wins the rule.
+  const id = mrtIds ? `  @location(2) id: vec2u,\n` : ""
   return `struct ${name} {
   @location(0) color: vec4f,
   @location(1) ${aux}: vec4f,
-};
+${id}};
 `
+}
+
+/**
+ * The line a fragment shader assigns its id with, or nothing when ids are off.
+ *
+ * Emitted rather than written into each shader for the same reason as the
+ * struct: with ids off there must be no assignment either, and a shader cannot
+ * ask the device what it supports.
+ */
+export function sceneIdWriteWgsl(out: string, material: string, object: string): string {
+  return mrtIds ? `  ${out}.id = vec2u(${material}, ${object});\n` : ""
 }

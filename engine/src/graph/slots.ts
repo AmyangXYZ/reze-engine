@@ -8,7 +8,8 @@
 // See docs/style-groups-spec.md §5, §7.
 
 import { NODES_WGSL } from "../shaders/materials/nodes"
-import { COMMON_MATERIAL_PRELUDE_WGSL } from "../shaders/materials/common"
+import { COMMON_MATERIAL_PRELUDE_WGSL, commonFsOutWgsl } from "../shaders/materials/common"
+import { sceneIdWriteWgsl } from "../shaders/passes/scene-contract"
 import type { AlphaMode, RenderClass } from "./render-class"
 
 // ── Module-scope declarations ──
@@ -108,6 +109,10 @@ ${gate}
 // pass when IS_OVER_EYES is compiled true.
 function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
   const alphaBase = alphaMode === "hashed" ? "1.0" : "alpha"
+  // Empty while ids are off, so the epilogue is exactly what it was. The values
+  // ride in the per-draw material uniform (see MaterialUniforms), which is what
+  // keeps this working through the indirect-draw path.
+  const ID_WRITE = sceneIdWriteWgsl("out", "u32(material.materialId)", "u32(material.objectId)")
   if (renderClass === "hair") {
     return `  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
@@ -115,13 +120,13 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
   var out: FSOut;
   out.color = vec4f(final_color, outAlpha);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
-  return out;
+${ID_WRITE}  return out;
 `
   }
   return `  var out: FSOut;
   out.color = vec4f(final_color, ${alphaBase});
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
-  return out;
+${ID_WRITE}  return out;
 `
 }
 
@@ -139,6 +144,10 @@ export function assembleModule(
   return (
     NODES_WGSL +
     COMMON_MATERIAL_PRELUDE_WGSL +
+    // Exactly where it sat inside the prelude constant. It moved out because
+    // the id attachment is probed at init and this module is assembled per
+    // compile, which is late enough to know the answer.
+    commonFsOutWgsl() +
     (includeStyleUniforms ? STYLE_UNIFORMS_WGSL : "") +
     decls(renderClass, alphaMode) +
     prelude(renderClass, alphaMode) +

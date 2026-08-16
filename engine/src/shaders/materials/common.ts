@@ -55,8 +55,15 @@ struct MaterialUniforms {
   // Skeleton index of the 頭 (head) bone, or -1. Lets the eye shader gate
   // the post-alpha-eye stencil by camera-vs-face hemisphere.
   headBoneIndex: f32,
-  _pad0: f32,
-  _pad1: f32,
+  // The draw's identity, for the id attachment: which material, which object.
+  // They ride HERE, in padding this struct already carried, so the buffer's
+  // size and layout are untouched and the indirect-draw path keeps working —
+  // the ids arrive with the same per-draw uniform the material already binds,
+  // rather than needing a channel of their own. Zero while ids are off, and
+  // zero is the reserved "nothing" value, so reading them then is not wrong,
+  // just empty. f32 because the buffer is written as floats; the shader casts.
+  materialId: f32,
+  objectId: f32,
   _pad2: f32,
 };
 
@@ -205,11 +212,19 @@ export const COMMON_VS_WGSL = /* wgsl */ `
 // The struct itself comes from scene-contract, which owns what the scene pass's
 // attachments ARE — this is one of the two shaders that gains an output when
 // one is added, and the graph generator emits against this same declaration.
-export const COMMON_FS_OUT_WGSL = `\n\n${sceneFsOutWgsl()}\n`;
+//
+// A FUNCTION, and no longer part of the prelude constant below, because the id
+// attachment is a device capability probed at init: a struct baked at import
+// time would be built before the answer exists. The graph appends it where the
+// constant used to end, so the assembled module is unchanged.
+export function commonFsOutWgsl(): string {
+  return `\n\n${sceneFsOutWgsl()}\n`;
+}
 
 // ─── Convenience: full shared prelude ───────────────────────────────
 // Material files compose this as `${NODES_WGSL}${COMMON_MATERIAL_PRELUDE_WGSL}` to
 // pull in everything structural. Each material then adds its own constants + fs().
 
-export const COMMON_MATERIAL_PRELUDE_WGSL =
-  COMMON_BINDINGS_WGSL + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL + COMMON_FS_OUT_WGSL
+// The FSOut struct is NOT in here any more — see commonFsOutWgsl above. Every
+// consumer of this constant appends it immediately, which is where it was.
+export const COMMON_MATERIAL_PRELUDE_WGSL = COMMON_BINDINGS_WGSL + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL

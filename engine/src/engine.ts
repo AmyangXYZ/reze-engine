@@ -27,7 +27,7 @@ import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { sceneTargets as sceneTargetsFor, sceneColorFormats, type SceneFormats } from "./shaders/passes/scene-contract"
-import { GROUND_SHADOW_SHADER_WGSL } from "./shaders/passes/ground"
+import { groundShaderWgsl } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
 import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
@@ -4046,7 +4046,7 @@ export class Engine {
     })
     const groundShadowShader = this.device.createShaderModule({
       label: "ground shadow",
-      code: GROUND_SHADOW_SHADER_WGSL,
+      code: groundShaderWgsl(),
     })
     this.groundShadowPipeline = this.createRenderPipeline({
       label: "ground shadow pipeline",
