@@ -2,9 +2,9 @@
 // @anchor センター trail
 
 // Tunables — edit and ⌘⏎.
-const COLOR_L = vec3f(0.42, 0.64, 1.0);   // stage left, cool
-const COLOR_T = vec3f(1.0, 0.98, 0.95);   // overhead, white
-const COLOR_R = vec3f(1.0, 0.58, 0.78);   // stage right, warm
+const COLOR_L = vec3f(0.08, 0.82, 1.00);  // stage left, electric cyan
+const COLOR_T = vec3f(1.00, 0.72, 0.22);  // overhead, hot amber
+const COLOR_R = vec3f(1.00, 0.14, 0.66);  // stage right, hot magenta
 const HEIGHT = 42.0;     // world units above the floor the lamps hang
 const SPREAD = 25.0;     // how far left and right of centre they sit — this
                          // against HEIGHT is the rake angle of the outer beams
@@ -13,9 +13,10 @@ const TOP_R = 2.4;       // beam radius at the lamp
 const BOT_R = 4.8;       // ...and where it lands — close to TOP_R keeps the
                          // shaft near parallel instead of a wide fan
 const EDGE = 0.09;       // softness of the shaft's rim, as a fraction of BOT_R
-const DENSITY = 0.7;     // how much haze the beam lights up
+const DENSITY = 1.15;    // how much haze the beam lights up — carries the
+                         // shaft's brightness, since coverage IS its intensity
 const POOL_R = 3.6;      // bright pool on the floor — inside the beam's landing
-const POOL = 0.16;
+const POOL = 0.26;
 const FLATNESS = 0.35;   // world units of ground the pool may lie on
 const LAG = 0.30;        // seconds the aim trails the dancer
 const AIM_STRIDE = 4;    // trail samples skipped when averaging the aim
@@ -23,7 +24,7 @@ const STEPS = 20;        // march steps. Twenty against the beam's own cylinder
                          // samples DENSER than thirty-four did against the old
                          // bounding sphere, which was mostly empty air
 const FAR_CLAMP = 400.0;
-const LIGHT_VIVID = 2.6;  // saturation of the CAST light vs the shaft's own
+const LIGHT_VIVID = 1.5;  // saturation of the CAST light vs the shaft's own
                           // colour — see vivid(). 1.0 casts exactly what the
                           // beam looks like, which reads white on a lit surface
 
@@ -216,13 +217,15 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
 
   let a = clamp(alpha, 0.0, 1.0);
   if (a <= 0.002) { return vec4f(0.0); }
-  // Colour from intensity: light goes white where it is strong and keeps its
-  // tint only in the falloff.
-  // Un-premultiply for the straight-alpha the mount wants, and only whiten at
-  // the very top of the range — pushing to white early is the other half of how
-  // the convergence went flat.
+  // Un-premultiply for the straight alpha the mount wants.
+  //
+  // The tint is HELD now. This used to lerp toward white from alpha 0.8, which
+  // whitened the core of every shaft — the exact place a coloured beam should
+  // read most strongly, and most of why three lamps looked like one. Neon is
+  // saturated where it is brightest; only the last sliver before full coverage
+  // blooms out, and at alpha 1 that is a couple of per cent rather than a fifth.
   let lit = rgbPm / max(alpha, 1e-4);
-  return vec4f(mix(lit, vec3f(1.0), smoothstep(0.8, 1.5, alpha)), a);
+  return vec4f(mix(lit, vec3f(1.0), smoothstep(0.96, 1.7, alpha)), a);
 }
 
 /** Saturation about the colour's own luminance. k = 1 is unchanged; above it
