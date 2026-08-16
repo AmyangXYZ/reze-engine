@@ -3089,7 +3089,20 @@ export class Engine {
     for (const e of this.effects) {
       const l = e.lights
       if (!l || l.data[2] === 0) continue
-      l.data[0] = this.sceneClock - e.epochScene
+      // THE SAME CLOCK THE EFFECT'S DRAWING HALF READS, or the light fires at
+      // a different moment than the thing it is lighting. A field mount is
+      // handed viewU[6].x, which is measured from the FIRST installed effect's
+      // epoch rather than its own (a known shared-clock gap), so an emitting
+      // field effect has to be given that same base — otherwise Fireworks
+      // installed fifth flashes seconds away from its own burst. Particle and
+      // ribbon effects read their own epoch, and so does this.
+      //
+      // The real fix is a per-effect field clock; until then this makes the two
+      // halves of one file agree, which is the property that actually matters.
+      l.data[0] =
+        e.hasBackground || e.hasForeground
+          ? this.sceneClock - (this.effects[0]?.epochScene ?? 0)
+          : this.sceneClock - e.epochScene
       this.device.queue.writeBuffer(l.uniform, 0, l.data.buffer as ArrayBuffer)
       const cp = encoder.beginComputePass({ label: "light emit" })
       cp.setPipeline(l.pipeline)
