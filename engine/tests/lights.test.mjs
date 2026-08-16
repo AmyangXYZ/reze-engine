@@ -71,13 +71,13 @@ test("both surfaces that shade get the same accessors", () => {
 /** The shader's falloff, reimplemented against the same constants. */
 function contribution(light, p, n) {
   const d = [light.pos[0] - p[0], light.pos[1] - p[1], light.pos[2] - p[2]]
-  const dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
-  const dist = Math.sqrt(dist2)
+  const dist = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
   const inv = 1 / Math.max(dist, 1e-4)
   const ndl = Math.max(n[0] * d[0] * inv + n[1] * d[1] * inv + n[2] * d[2] * inv, 0)
   if (ndl <= 0) return 0
-  const w = Math.min(Math.max(1 - dist / Math.max(light.radius, 1e-4), 0), 1)
-  return (ndl * w * w) / (1 + dist2)
+  const t = Math.min(Math.max(dist / Math.max(light.radius, 1e-4), 0), 1)
+  const falloff = 1 - t * t
+  return ndl * falloff * falloff
 }
 
 test("a light's reach ENDS at its radius", () => {
@@ -103,4 +103,17 @@ test("the falloff is finite at the source", () => {
   const light = { pos: [0, 0, 0], radius: 5 }
   const v = contribution(light, [0, 0, 1e-5], [0, 0, -1])
   assert.ok(Number.isFinite(v) && v <= 1.0, `contribution at the source was ${v}`)
+})
+
+test("intensity is usable at the scale a scene is actually built at", () => {
+  // The bug this replaced: a windowed real inverse-square is measured in world
+  // units, an MMD character is ~18 of them tall, and a lamp a couple of units
+  // off her shoulder divided by nearly 40. Intensity 4 landed as 0.06 and
+  // nothing on screen changed. A light well inside its own radius has to
+  // deliver most of its intensity, or the dial is a lie.
+  const light = { pos: [0, 12, -6], radius: 25 }
+  const chest = contribution(light, [0, 12, 0], [0, 0, -1])
+  assert.ok(chest > 0.5, `six units in, a 25-unit light delivered ${chest.toFixed(3)} of its intensity`)
+  // And still nothing at all past the radius.
+  assert.equal(contribution(light, [0, 12, 20], [0, 0, -1]), 0)
 })

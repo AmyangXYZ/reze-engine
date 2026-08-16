@@ -75,27 +75,34 @@ fn rzLightColor(i: u32) -> vec3f {
  * existed. That is the property the whole feature is gated on: adding this to
  * every material must cost nothing until someone asks for a light.
  *
- * Falloff is inverse-square WINDOWED to the radius. Pure inverse-square never
- * reaches zero, so every light would touch every fragment in the scene and the
- * cap would be the only thing bounding the cost; the window makes the radius
- * mean what it says.
+ * FALLOFF IS RELATIVE TO THE RADIUS, and deliberately not physical.
+ *
+ * The first version windowed a real inverse-square, and it was unusable: 1/d²
+ * is measured in world units, an MMD character is about 18 of them tall, so a
+ * lamp two metres off her shoulder divided by 37 and an intensity of 4 landed
+ * as 0.06 — invisible. Radius and intensity were fighting, and intensity had no
+ * scale a person could learn.
+ *
+ * So: intensity is the brightness AT the light, radius is where it reaches
+ * zero, and the curve between them is the same shape whatever the scene's
+ * scale. Both dials now mean what they say, which for a composer beats being
+ * right about photons. (1 - t²)² — smooth at both ends, exactly 0 at the
+ * radius, so the bound a cull could be derived from is still real.
  */
 fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
   var acc = vec3f(0.0);
   let count = rzLightCount();
   for (var i = 0u; i < count; i = i + 1u) {
     let d = rzLightPos(i) - p;
-    let dist2 = dot(d, d);
-    let dist = sqrt(dist2);
+    let dist = length(d);
     // Facing the light, and nothing behind it. No wrap or half-lambert: this
     // layer adds light, and a wrapped term would lift the shadow side, which is
     // the ramp's business and not this one's.
     let ndl = max(dot(n, d / max(dist, 1e-4)), 0.0);
     if (ndl <= 0.0) { continue; }
-    let window = clamp(1.0 - dist / max(rzLightRadius(i), 1e-4), 0.0, 1.0);
-    // 1 + dist2 rather than dist2: an unbounded 1/r² is infinite at the source,
-    // and a light sitting inside geometry would blow the frame out.
-    acc = acc + rzLightColor(i) * (ndl * window * window / (1.0 + dist2));
+    let t = clamp(dist / max(rzLightRadius(i), 1e-4), 0.0, 1.0);
+    let falloff = 1.0 - t * t;
+    acc = acc + rzLightColor(i) * (ndl * falloff * falloff);
   }
   return acc;
 }
