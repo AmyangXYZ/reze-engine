@@ -1,4 +1,5 @@
 import { sceneFsOutWgsl } from "../passes/scene-contract"
+import { lightsApi } from "../lights"
 
 // Shared WGSL blocks concatenated by every material shader.
 // Splits the boilerplate (uniform structs, bind group layout, skinning VS, PCF shadow)
@@ -227,4 +228,5 @@ export function commonFsOutWgsl(): string {
 
 // The FSOut struct is NOT in here any more — see commonFsOutWgsl above. Every
 // consumer of this constant appends it immediately, which is where it was.
-export const COMMON_MATERIAL_PRELUDE_WGSL = COMMON_BINDINGS_WGSL + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL
+export const COMMON_MATERIAL_PRELUDE_WGSL =
+  COMMON_BINDINGS_WGSL + lightsApi(0, 6) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL

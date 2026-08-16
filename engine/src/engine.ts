@@ -35,6 +35,7 @@ import {
   SCENE_ID_FORMAT,
   type SceneFormats,
 } from "./shaders/passes/scene-contract"
+import { LIGHT_HEADER, LIGHT_STRIDE, LIGHTS_FLOATS, MAX_LIGHTS } from "./shaders/lights"
 import { groundShaderWgsl } from "./shaders/passes/ground"
 import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
 import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
@@ -347,6 +348,10 @@ export type SunOptions = {
  *  Structural {x,y,z} rather than the Vec3 class so JSON-derived values (a
  *  shared scene document's params) pass straight in. */
 export type EffectParamValue = number | { x: number; y: number; z: number }
+
+/** A vector by shape rather than by class — Vec3 satisfies it, and so does a
+ *  JSON object out of a scene document or a literal typed into a console. */
+export type XYZ = { x: number; y: number; z: number }
 export type EffectResult = {
   ok: boolean
   /** Compile/validation errors, line:col relative to the USER's WGSL. Also
@@ -1601,6 +1606,11 @@ export class Engine {
   /** The cast, as the effect API sees it. Written per frame while an effect is
    *  installed, and only up to what that effect actually declared. */
   private castBuffer!: GPUBuffer
+  /** The positional lights, as data — see shaders/lights.ts for the layout.
+   *  Allocated once at full size and zero-filled, so "no lights" is a count of
+   *  zero rather than an absent binding. */
+  private lightsBuffer!: GPUBuffer
+  private lightsData!: Float32Array<ArrayBuffer>
   private castData!: Float32Array<ArrayBuffer>
   /** Last frame's anchor world positions, for velocity. Keyed model id → slot. */
   private anchorPrev = new Map<string, Float32Array>()
@@ -3991,6 +4001,9 @@ export class Engine {
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" } },
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The positional lights. Always bound, empty or not, so every material
+        // pipeline shares one layout whether or not the scene has any.
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
@@ -4183,6 +4196,7 @@ export class Engine {
         { binding: 3, resource: this.shadowMapDepthView },
         { binding: 4, resource: this.shadowComparisonSampler },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
+        { binding: 6, resource: { buffer: this.lightsBuffer } },
         { binding: 9, resource: this.brdfLutView },
       ],
     })
@@ -4196,6 +4210,9 @@ export class Engine {
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // Same lights the materials read. A lamp that lit the cast and not the
+        // floor under her would read as a sticker.
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     })
     const groundShadowShader = this.device.createShaderModule({
@@ -4494,6 +4511,16 @@ export class Engine {
       size: this.castData.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
+    // Full size from the start: the buffer is bound by every material pipeline,
+    // so resizing it with the light count would mean rebuilding bind groups
+    // whenever a scene gained a lamp. Zero-filled, and float 0 is a count of 0.
+    this.lightsData = new Float32Array(LIGHTS_FLOATS)
+    this.lightsBuffer = this.device.createBuffer({
+      label: "positional lights",
+      size: this.lightsData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
     this.compositeBindGroupLayout = this.device.createBindGroupLayout({
       label: "composite bind group layout",
       entries: [
@@ -5636,6 +5663,52 @@ export class Engine {
       bounds: new Float32Array([-opts.width / 2, 0, -opts.height / 2, opts.width / 2, 0, opts.height / 2]),
       cullIndex: -1,
     }
+  }
+
+  /**
+   * The scene's positional lights — an ADDITIVE layer over the sun, which stays
+   * the key light and keeps the toon ramp to itself.
+   *
+   * Colour and intensity are multiplied here rather than stored apart: every
+   * read is the product, and two numbers that are only ever multiplied are two
+   * numbers that can disagree.
+   *
+   * Past MAX_LIGHTS the extras are DROPPED, not wrapped: the lights that fit
+   * keep the meaning the caller gave them, which is the same rule the anchor
+   * table follows. Passing none (or an empty list) turns the layer off and the
+   * scene renders exactly as it did before lights existed.
+   */
+  setLights(
+    /** Structural {x,y,z} rather than the Vec3 class, the same choice effect
+     *  params make: a scene document's JSON passes straight in, and so does a
+     *  literal typed into a console. Vec3 satisfies it either way. */
+    lights: { position: XYZ; color: XYZ; intensity?: number; radius?: number }[] | null,
+  ): void {
+    const list = (lights ?? []).slice(0, MAX_LIGHTS)
+    this.lightsData.fill(0)
+    this.lightsData[0] = list.length
+    for (let i = 0; i < list.length; i++) {
+      const l = list[i]
+      const b = LIGHT_HEADER + i * LIGHT_STRIDE
+      this.lightsData[b] = l.position.x
+      this.lightsData[b + 1] = l.position.y
+      this.lightsData[b + 2] = l.position.z
+      // A radius of zero would switch the light off through the window term,
+      // which is a confusing way to spell "off" — default to a stage-sized
+      // reach instead, and let 0 mean 0 only when it is asked for explicitly.
+      this.lightsData[b + 3] = l.radius ?? 10
+      const k = l.intensity ?? 1
+      this.lightsData[b + 4] = l.color.x * k
+      this.lightsData[b + 5] = l.color.y * k
+      this.lightsData[b + 6] = l.color.z * k
+      // [b + 7] is `type`, reserved: every light is a point light today.
+    }
+    this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
+  }
+
+  /** How many positional lights the scene is carrying. */
+  getLightCount(): number {
+    return this.lightsData[0]
   }
 
   private updateLightBuffer() {
@@ -7255,6 +7328,7 @@ export class Engine {
         { binding: 3, resource: this.shadowComparisonSampler },
         { binding: 4, resource: { buffer: this.groundShadowMaterialBuffer } },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
+        { binding: 6, resource: { buffer: this.lightsBuffer } },
       ],
     })
   }

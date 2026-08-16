@@ -1,4 +1,5 @@
 import { sceneFsOutWgsl, sceneIdWriteWgsl } from "./scene-contract"
+import { lightsApi } from "../lights"
 
 // Ground shadow-catcher: receives directional shadow, grid lines, frosted noise,
 // radial distance fade. Writes bloom mask = 0 (ground never bloom-bleeds).
@@ -25,6 +26,7 @@ struct LightVP { viewProj: mat4x4f, };
 @group(0) @binding(3) var shadowSampler: sampler_comparison;
 @group(0) @binding(4) var<uniform> material: GroundShadowMat;
 @group(0) @binding(5) var<uniform> lightVP: LightVP;
+${lightsApi(0, 6)}
 
 fn hash2(p: vec2f) -> f32 {
   var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
@@ -130,8 +132,12 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     smoothstep(halfLine - gridDeriv.y, halfLine + gridDeriv.y, gridFrac.y)
   );
   let sun = light.ambientColor.xyz + light.lights[0].color.xyz * light.lights[0].color.w * max(dot(n, -light.lights[0].direction.xyz), 0.0);
+  // The positional layer reaches the floor too. A stage light that lit the
+  // cast and not the ground under her would read as a sticker, which is the
+  // same failure the shadow catcher exists to prevent.
+  let lamps = rzLightsDiffuse(i.worldPos, n);
   let dark = (1.0 - vis) * material.shadowStrength;
-  var baseColor = material.diffuseColor * sun * (1.0 - dark * 0.65);
+  var baseColor = material.diffuseColor * (sun + lamps) * (1.0 - dark * 0.65);
   baseColor *= noiseTint;
   let finalColor = mix(baseColor, material.gridLineColor, gridLine * material.gridLineOpacity * edgeFade);
   // Whole-ground opacity fades the SURFACE (color, grid) but the shadow stays —

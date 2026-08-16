@@ -113,18 +113,27 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
   // ride in the per-draw material uniform (see MaterialUniforms), which is what
   // keeps this working through the indirect-draw path.
   const ID_WRITE = sceneIdWriteWgsl("out", "u32(material.materialId)", "u32(material.objectId)")
+  // The positional lights, ADDED to whatever the graph decided and tinted by
+  // the surface's own texture colour — a red lamp on a blue dress must not wash
+  // it toward white. Deliberately outside the graph: this layer does not
+  // re-ramp, because two ramped terminators crossing a cheek read as plastic.
+  //
+  // With no lights rzLightsDiffuse returns exactly zero and its loop never
+  // runs, so every scene that declares none renders bit-for-bit as it did
+  // before lights existed. That is the property this whole feature is gated on.
+  const LIT = ` + rzLightsDiffuse(input.worldPos, n) * tex_color`
   if (renderClass === "hair") {
     return `  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
 
   var out: FSOut;
-  out.color = vec4f(final_color, outAlpha);
+  out.color = vec4f(final_color${LIT}, outAlpha);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `  var out: FSOut;
-  out.color = vec4f(final_color, ${alphaBase});
+  out.color = vec4f(final_color${LIT}, ${alphaBase});
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;
 `

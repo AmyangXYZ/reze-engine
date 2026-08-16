@@ -163,7 +163,11 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
   for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
   // Slot-owned behaviors: Wyman hash gate replaces the alpha threshold; alpha out = 1.
   assert.ok(r.wgsl.includes("if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"))
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color, 1.0);"))
+  // The ALPHA is what this test is about — hashed forces it to 1. The colour
+  // carries the positional-light layer beside final_color; that term is zero
+  // with no lights, and pinning the whole expression here would make this test
+  // fail for anything ever added to the epilogue.
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * tex_color, 1.0);"))
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
 })
 
@@ -182,7 +186,7 @@ test("eye graph: default Principled + emission, rear-gate from renderClass", () 
   )
   // Slot-owned: rear-view gate in the prelude, standard alpha epilogue.
   assert.ok(r.wgsl.includes("if (dot(faceDir, v) < -0.15) { discard; }"))
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color, alpha);"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * tex_color, alpha);"))
 })
 
 test("face graph matches the hand-written shader (key terms)", () => {
