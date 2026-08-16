@@ -1370,16 +1370,7 @@ export class Engine {
    */
   private simSampler!: GPUSampler
   private simFallbackView!: GPUTextureView
-  /**
-   * The installed effect's ribbons, or null when it declared none.
-   *
-   * No buffer of its own: it reads the very same path history the field-based
-   * ribbon read through rzTrail, so a trail costs one draw and nothing recorded.
-   */
-  /** The ribbons' own offscreen target — max-blended, composited after tone map. */
-  private trailLayerTexture: GPUTexture | null = null
-  private trailLayerView: GPUTextureView | null = null
-  /** 1×1 transparent stand-in so the composite layout binds with no trails installed. */
+  /** 1×1 transparent stand-in, for every layer binding with nothing behind it. */
   private trailFallbackView!: GPUTextureView
   /**
    * The field layer: user background/foreground mounts, ONE TARGET PAIR PER
@@ -1967,11 +1958,6 @@ export class Engine {
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
         { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
-        {
-          binding: 12,
-          resource:
-            this.effects.some((e) => e.trails) && this.trailLayerView ? this.trailLayerView : this.trailFallbackView,
-        },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.scoreBuffer } },
         { binding: 15, resource: this.fieldBgViews[0] ?? this.trailFallbackView },
@@ -4371,9 +4357,6 @@ export class Engine {
         // The cast, for rzSubject/rzAnchor. Always bound so the base shader's
         // layout matches; the base shader simply never reads it.
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        // The trail layer. Bound to a transparent 1×1 when no ribbon effect is
-        // installed, so the base shader's layout always matches.
-        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         // The audio analysis, for rzAudio*. Silence fallback when the scene has
         // no track.
         { binding: 13, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
@@ -4612,18 +4595,6 @@ export class Engine {
         format: this.hdrFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
-
-      // rgba16float explicitly, NOT hdrFormat: the composite reads this layer's
-      // ALPHA to composite it over the frame, and an rg11b10 hdr fallback has no
-      // alpha channel to read.
-      this.trailLayerTexture?.destroy()
-      this.trailLayerTexture = this.device.createTexture({
-        label: "trail layer",
-        size: [width, height],
-        format: "rgba16float",
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      })
-      this.trailLayerView = this.trailLayerTexture.createView()
 
       // The field layer — half resolution by default, full for @fullres effects.
       this.fieldFullW = width

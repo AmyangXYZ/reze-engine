@@ -194,10 +194,6 @@ override APPLY_GAMMA: bool = true;
 fn rzFieldMerge(top: vec4f, bot: vec4f) -> vec4f {
   return vec4f(top.rgb + bot.rgb * (1.0 - top.a), top.a + bot.a * (1.0 - top.a));
 }
-// Geometry ribbons, max-blended in their own layer (trails.ts). Composited in
-// display space below, where the fullscreen ribbon effects always ran.
-@group(0) @binding(12) var trailTex: texture_2d<f32>;
-
 // Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
 const FILMIC_LUT_W: f32 = 256.0;
 
