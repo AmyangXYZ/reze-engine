@@ -26,6 +26,7 @@ import {
 import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
 import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
+import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1364,18 +1365,23 @@ export class Engine {
    *  rg8unorm at 4× MSAA is 8 bytes/texel — still fits Apple TBDR tile memory comfortably. */
   private static readonly BLOOM_MASK_FORMAT: GPUTextureFormat = "rg8unorm"
   /**
-   * The master switch for the id attachment. OFF.
+   * The master switch for the id attachment. ON.
    *
-   * Everything behind it is built and tested; what it costs is a third
-   * multisampled attachment on every scene, and what it buys is nothing until
-   * something reads ids. Turning it on is this line, and turning it back off is
-   * this line, which is the point of it being one.
+   * It costs a third multisampled attachment on every scene and buys nothing
+   * visible until something reads ids — setIdDebug draws them, which is how
+   * this was checked at all. Turning it back off is this line, which is the
+   * point of it being one.
    */
-  private static readonly MRT_IDS = false
+  private static readonly MRT_IDS = true
   /** The id attachment. Multisampled with the pass and NEVER resolved: an
    *  averaged id belongs to nothing, so consumers textureLoad sample 0. */
   private idTexture: GPUTexture | null = null
   private idView: GPUTextureView | null = null
+  /** The id buffer drawn to the screen — see setIdDebug. */
+  private idDebugPipeline: GPURenderPipeline | null = null
+  private idDebugBindGroupLayout: GPUBindGroupLayout | null = null
+  private idDebugBindGroup: GPUBindGroup | null = null
+  private idDebug = false
   private multisampleMaskTexture!: GPUTexture
   private maskResolveTexture!: GPUTexture
   private maskResolveView!: GPUTextureView
@@ -1967,6 +1973,80 @@ export class Engine {
     // few switches that genuinely has to re-record. It is a user toggle, not a
     // per-frame state, which is what makes that affordable.
     this.bundlesDirty = true
+  }
+
+  /**
+   * Draw the id attachment instead of the scene.
+   *
+   * The only way to SEE whether ids are right: with no consumer, a correct id
+   * buffer and a wrong one render the same frame. See id-debug.ts for what
+   * correct looks like and what each failure looks like instead.
+   *
+   * Returns false when there is nothing to show — ids compiled out, or a device
+   * that cannot multisample the format — rather than turning on and drawing
+   * black, which would read as "the ids are all zero".
+   */
+  setIdDebug(on: boolean): boolean {
+    if (on && !this.idView) return false
+    this.idDebug = on
+    return true
+  }
+
+  /** True when the id attachment exists on this device. */
+  hasObjectIds(): boolean {
+    return this.idView !== null
+  }
+
+  /** The pass that draws it, built lazily so a scene that never asks for the
+   *  debug view never compiles it. */
+  private ensureIdDebugPipeline(): boolean {
+    if (!this.idView) return false
+    if (!this.idDebugBindGroupLayout) {
+      this.idDebugBindGroupLayout = this.device.createBindGroupLayout({
+        label: "id debug bind group layout",
+        entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.FRAGMENT,
+            texture: { sampleType: "uint", viewDimension: "2d", multisampled: true },
+          },
+        ],
+      })
+    }
+    if (!this.idDebugPipeline) {
+      const module = this.device.createShaderModule({ label: "id debug", code: ID_DEBUG_SHADER_WGSL })
+      this.idDebugPipeline = this.device.createRenderPipeline({
+        label: "id debug pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.idDebugBindGroupLayout] }),
+        vertex: { module, entryPoint: "vs" },
+        // The swapchain, unmultisampled — this pass replaces the finished frame
+        // rather than joining the scene pass.
+        fragment: { module, entryPoint: "fs", targets: [{ format: this.presentationFormat }] },
+        primitive: { topology: "triangle-list" },
+      })
+    }
+    if (!this.idDebugBindGroup) {
+      this.idDebugBindGroup = this.device.createBindGroup({
+        label: "id debug bind group",
+        layout: this.idDebugBindGroupLayout,
+        entries: [{ binding: 0, resource: this.idView }],
+      })
+    }
+    return true
+  }
+
+  private renderIdDebugPass(encoder: GPUCommandEncoder, swapchainView: GPUTextureView): void {
+    if (!this.idDebug || !this.ensureIdDebugPipeline()) return
+    const pass = encoder.beginRenderPass({
+      label: "id debug",
+      colorAttachments: [
+        { view: swapchainView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
+      ],
+    })
+    pass.setPipeline(this.idDebugPipeline!)
+    pass.setBindGroup(0, this.idDebugBindGroup!)
+    pass.draw(3)
+    pass.end()
   }
 
   /**
@@ -4706,6 +4786,10 @@ export class Engine {
       this.idTexture?.destroy()
       this.idTexture = null
       this.idView = null
+      // The debug bind group holds the OLD view. Dropped here so it is rebuilt
+      // against the new one — keeping it would sample a destroyed texture at
+      // the first resize with the debug view open.
+      this.idDebugBindGroup = null
       if (mrtIdsEnabled()) {
         this.idTexture = this.device.createTexture({
           label: "object id",
@@ -8590,6 +8674,10 @@ export class Engine {
     cpass.setBindGroup(0, this.compositeBindGroup)
     cpass.draw(3)
     cpass.end()
+
+    // Over the finished frame, before the editor's own overlays: the whole
+    // point is to see the id buffer instead of the scene.
+    this.renderIdDebugPass(encoder, swapchainView)
 
     if (this.selectedMaterial && hasModels) this.renderSelectionPasses(encoder, swapchainView)
     if (this.selectedBone && hasModels) this.renderGizmoPass(encoder, swapchainView)

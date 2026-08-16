@@ -271,6 +271,24 @@ test("the ground's ids collide with no model's", () => {
   assert.match(engine, /const modelId = this\.modelInstances\.size \+ 1/, "model ids are 1-based — 0 stays 'nothing'")
 })
 
+test("the debug view refuses to draw when there is nothing to show", () => {
+  // Turning it on with no id attachment would clear the screen to black, and
+  // black is what "every id is zero" looks like — the one wrong answer this
+  // instrument must never give, since it exists to be believed.
+  const at = engine.indexOf("setIdDebug(on: boolean)")
+  assert.ok(at > 0, "setIdDebug not found")
+  const body = engine.slice(at, engine.indexOf("\n  }", at))
+  assert.match(body, /if \(on && !this\.idView\) return false/, "it must refuse rather than draw a misleading frame")
+})
+
+test("the debug bind group is dropped when the attachment is recreated", () => {
+  // It holds a view of a texture the resize destroys. Keeping it would sample
+  // freed memory the first time the window changed size with the view open.
+  const at = engine.indexOf("this.idTexture?.destroy()")
+  const body = engine.slice(at, at + 500)
+  assert.match(body, /this\.idDebugBindGroup = null/, "the stale bind group must be dropped alongside the texture")
+})
+
 /** Fragment-output locations a shader writes, from its output struct. */
 function outputLocations(wgsl, structName) {
   const at = wgsl.indexOf(`struct ${structName}`)
