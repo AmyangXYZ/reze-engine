@@ -1205,6 +1205,11 @@ interface EffectInstance {
   anchors: { bone: string; trail: boolean }[]
   /** Where this effect's own clock started, in scene seconds. */
   epochScene: number
+  /** This effect's OWN clock, as a uniform the field shader reads. Per effect
+   *  because the shared one (viewU[6].x) is measured from the first installed
+   *  effect's epoch, so everything later started mid-stream. Null when the
+   *  effect has no field mount to read it. */
+  fieldClock: GPUBuffer | null
   /** The lightEmit mount: a compute stage that writes this effect's own slots
    *  in the shared lights buffer, once per light per frame. Null unless the
    *  source declares `// @lights n` AND defines fn lightEmit. */
@@ -1461,6 +1466,10 @@ export class Engine {
    * the one thing document order stopped deciding.
    */
   private static readonly FIELD_SCALES = [1, 2] as const
+  /** Reused for the per-frame field-clock upload — one 16-byte write per
+   *  drawing effect, and allocating a fresh array for each would be garbage
+   *  every frame. */
+  private fieldClockScratch = new Float32Array(4)
   private fieldBgTextures: (GPUTexture | null)[] = [null, null]
   private fieldBgViews: (GPUTextureView | null)[] = [null, null]
   private fieldFgTextures: (GPUTexture | null)[] = [null, null]
@@ -2240,6 +2249,7 @@ export class Engine {
           { binding: 19, resource: { buffer: this.scoreBuffer } },
           // The size uniform for the pair THIS effect draws into.
           { binding: 14, resource: { buffer: this.fieldUniformBuffers[owner.fieldLayer] } },
+          { binding: 22, resource: { buffer: owner.fieldClock ?? this.fieldUniformBuffers[owner.fieldLayer] } },
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
         ],
@@ -2648,6 +2658,15 @@ export class Engine {
       lights = built.state
     }
 
+    // One per emitting-or-drawing field effect. 16 bytes, written per frame.
+    const fieldClock = fieldPipeline
+      ? this.device.createBuffer({
+          label: "field clock",
+          size: 16,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+      : null
+
     let paramsBuffer: GPUBuffer | null = null
     if (entries.length) {
       paramsBuffer = this.device.createBuffer({
@@ -2672,6 +2691,7 @@ export class Engine {
         // for full res is not promoted because a neighbour did.
         fieldLayer: /^\s*\/\/\s*@fullres\s*$/m.test(wgsl) ? 0 : 1,
         fieldPipeline,
+        fieldClock,
         // Filled by rebuildFieldBindGroup below, which needs the instance to
         // exist first — it binds this effect's own params buffer and grid.
         fieldBindGroups: null,
@@ -2718,6 +2738,7 @@ export class Engine {
       for (const e of this.effects) {
       e.paramsBuffer?.destroy()
       e.lights?.uniform.destroy()
+      e.fieldClock?.destroy()
     }
       this.releaseParticles()
       this.releaseTrails()
@@ -2775,6 +2796,7 @@ export class Engine {
     for (const e of this.effects) {
       e.paramsBuffer?.destroy()
       e.lights?.uniform.destroy()
+      e.fieldClock?.destroy()
     }
     this.releaseParticles()
     this.releaseTrails()
@@ -3089,20 +3111,11 @@ export class Engine {
     for (const e of this.effects) {
       const l = e.lights
       if (!l || l.data[2] === 0) continue
-      // THE SAME CLOCK THE EFFECT'S DRAWING HALF READS, or the light fires at
-      // a different moment than the thing it is lighting. A field mount is
-      // handed viewU[6].x, which is measured from the FIRST installed effect's
-      // epoch rather than its own (a known shared-clock gap), so an emitting
-      // field effect has to be given that same base — otherwise Fireworks
-      // installed fifth flashes seconds away from its own burst. Particle and
-      // ribbon effects read their own epoch, and so does this.
-      //
-      // The real fix is a per-effect field clock; until then this makes the two
-      // halves of one file agree, which is the property that actually matters.
-      l.data[0] =
-        e.hasBackground || e.hasForeground
-          ? this.sceneClock - (this.effects[0]?.epochScene ?? 0)
-          : this.sceneClock - e.epochScene
+      // The effect's OWN epoch — the same one its field, particle, ribbon and
+      // grid halves now read. This was briefly conditional, to match a field
+      // clock that was shared from the first installed effect; that clock is
+      // per effect now, so every mount in one file agrees by construction.
+      l.data[0] = this.sceneClock - e.epochScene
       this.device.queue.writeBuffer(l.uniform, 0, l.data.buffer as ArrayBuffer)
       const cp = encoder.beginComputePass({ label: "light emit" })
       cp.setPipeline(l.pipeline)
@@ -3304,6 +3317,14 @@ export class Engine {
   private renderFieldPass(encoder: GPUCommandEncoder): void {
     const drawn = this.effects.filter((e) => e.fieldPipeline && e.fieldBindGroups)
     if (drawn.length === 0) return
+    // Each effect's own clock, before the pass that reads it. Seconds since
+    // THIS effect was installed — so an effect added to a running scene starts
+    // at zero and can seed, rather than joining whatever the first one is up to.
+    for (const e of drawn) {
+      if (!e.fieldClock) continue
+      this.fieldClockScratch[0] = this.sceneClock - e.epochScene
+      this.device.queue.writeBuffer(e.fieldClock, 0, this.fieldClockScratch.buffer as ArrayBuffer)
+    }
     // ONE PASS PER RESOLUTION, N draws each, in document order — a pair is
     // cleared once and each effect blends over what the earlier ones left.
     // Alpha is the layer, the same rule the composite already states, and it
@@ -4085,6 +4106,9 @@ export class Engine {
         // the field layer's already speak for everything below it.
         { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // This effect's own clock — see the field shader's note on why it is
+        // not viewU[6].x.
+        { binding: 22, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 17, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
         { binding: 18, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ],

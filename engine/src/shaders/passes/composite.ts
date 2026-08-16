@@ -753,10 +753,10 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
  */
 export function buildFieldShader(effect: CompositeEffectSource): string {
   const bgLine = effect.hasBackground
-    ? "out.bg = clamp(background(dir, uv, viewU[6].x), vec4f(0.0), vec4f(1.0));"
+    ? "out.bg = clamp(background(dir, uv, _rzFieldClock.x), vec4f(0.0), vec4f(1.0));"
     : ""
   const fgLine = effect.hasForeground
-    ? "out.fg = clamp(foreground(dir, uv, viewU[6].x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))), vec4f(0.0), vec4f(1.0));"
+    ? "out.fg = clamp(foreground(dir, uv, _rzFieldClock.x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))), vec4f(0.0), vec4f(1.0));"
     : ""
   return (
     COMPOSITE_HEAD +
@@ -768,7 +768,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     // none, so rzGrid() is a function that always exists rather than one an
     // author has to know whether they are allowed to call.
     gridReadApi(0, 17, 18, effect.gridSize) +
-    gridClockApi("viewU[6].x") +
+    gridClockApi("_rzFieldClock.x") +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +
@@ -776,6 +776,16 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     "\n" +
     /* wgsl */ `
 @group(0) @binding(14) var<uniform> fieldU: vec4f;
+/**
+ * THIS EFFECT'S OWN clock, seconds since it was installed.
+ *
+ * Per effect, and that is the whole point of it existing. The time argument
+ * used to come from viewU[6].x, which is measured from the FIRST installed
+ * effect's epoch — so every later effect started mid-stream, and an effect
+ * whose lightEmit read its own epoch disagreed with its own background()
+ * about what time it was. One buffer per effect, one answer.
+ */
+@group(0) @binding(22) var<uniform> _rzFieldClock: vec4f;
 
 @vertex fn fieldVs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let x = f32((vi & 1u) << 2u) - 1.0;

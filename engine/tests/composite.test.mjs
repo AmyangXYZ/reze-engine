@@ -82,7 +82,25 @@ test("the declared mounts are the ones called, in the field pass", () => {
 test("the foreground is handed the scene's depth", () => {
   // The field pass stands in for a full-resolution pixel, so the depth read is
   // at the reconstructed full-res coordinate, clamped inside the buffer.
-  assert.match(field(FOREGROUND, false, true), /foreground\(dir, uv, viewU\[6\]\.x, linearDepth\(/)
+  assert.match(field(FOREGROUND, false, true), /foreground\(dir, uv, _rzFieldClock\.x, linearDepth\(/)
+})
+
+test("a mount is handed ITS OWN clock, never the shared one", () => {
+  // viewU[6].x is measured from the FIRST installed effect's epoch, so every
+  // later effect started mid-stream — and an effect whose lightEmit read its
+  // own epoch disagreed with its own background() about what time it was.
+  // Nothing in the field module may reach for it again.
+  for (const [what, src] of [
+    ["background", field(BACKGROUND, true, false)],
+    ["foreground", field(FOREGROUND, false, true)],
+  ]) {
+    assert.match(src, /_rzFieldClock\.x/, `${what} must read the per-effect clock`)
+    // BOTH comment forms stripped: the note explaining why this rule exists
+    // names viewU[6].x, and a stripper that only handles // would fail on the
+    // documentation of the very thing it is checking.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")
+    assert.doesNotMatch(code, /viewU\[6\]\.x/, `${what} must not read the shared clock`)
+  }
 })
 
 test("a foreground alone leaves the background block gated on the equirect", () => {
