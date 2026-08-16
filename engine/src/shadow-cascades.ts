@@ -42,6 +42,13 @@ export const SHADOW_CASCADES: readonly ShadowCascade[] = [
   // The shipped volume: 64 units at 4096² ≈ 64 texels/unit — crisp contact
   // shadows on the ground catcher (2048 read visibly blurry).
   { span: 64, back: 72, near: 1, far: 140, mapSize: 4096 },
+  // The stage volume: 4× the span on each side, so a set piece 100 units out
+  // still throws and receives shade instead of popping lit at the near box's
+  // edge. 2048² over 256 units ≈ 8 texels/unit — soft, and read at distances
+  // where soft is what a shadow looks like anyway. 16 MB where the near map
+  // is 64. Depth reach scales with the span (same eye direction, deeper box),
+  // keeping the containment invariant checkable from the specs alone.
+  { span: 256, back: 288, near: 1, far: 560, mapSize: 2048 },
 ]
 
 /**

@@ -1,5 +1,6 @@
 import { sceneFsOutWgsl } from "../passes/scene-contract"
 import { lightsApi } from "../lights"
+import { SHADOW_CASCADES } from "../../shadow-cascades"
 
 // Shared WGSL blocks concatenated by every material shader.
 // Splits the boilerplate (uniform structs, bind group layout, skinning VS, PCF shadow)
@@ -82,7 +83,9 @@ struct VertexOutput {
   @location(3) restPos: vec3f,
 };
 
-struct LightVP { viewProj: mat4x4f, };
+// One view-projection per shadow cascade, inner to outer — the volumes built
+// by shadow-cascades.ts, in the same order.
+struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> light: LightUniforms;
@@ -90,6 +93,10 @@ struct LightVP { viewProj: mat4x4f, };
 @group(0) @binding(3) var shadowMap: texture_depth_2d;
 @group(0) @binding(4) var shadowSampler: sampler_comparison;
 @group(0) @binding(5) var<uniform> lightVP: LightVP;
+// The far cascade's map — coarser texels over a much wider box, so the stage
+// keeps its shadows when the crisp near volume ends. Binding 7: 6 is the
+// positional lights, 9 the BRDF LUT.
+@group(0) @binding(7) var shadowMapFar: texture_depth_2d;
 // binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
@@ -121,33 +128,62 @@ fn safe_normal(nIn: vec3f) -> vec3f {
 
 `;
 
-// ─── Shadow sampler (3×3 PCF) ───────────────────────────────────────
-// 4096-map (MUST match Engine.SHADOW_MAP_SIZE), normal-bias 0.08, depth-bias
-// 0.001. Unrolled — Safari's Metal backend doesn't unroll nested shadow loops
-// reliably. The texel size was stale at 1/2048 after the map grew to 4096:
-// PCF taps landed TWO texels apart, quantizing self-shadow edges into
-// texel-sized gray/black squares that crawled with the animation.
+// ─── Shadow sampler (3×3 PCF, cascade-selected) ─────────────────────
+// Normal-bias 0.08, depth-bias 0.001 NDC. Unrolled — Safari's Metal backend
+// doesn't unroll nested shadow loops reliably. Texel sizes are interpolated
+// from SHADOW_CASCADES so they cannot go stale the way the hardcoded 1/2048
+// once did (PCF taps landed TWO texels apart after the map grew to 4096,
+// quantizing self-shadow edges into crawling gray squares).
+//
+// Selection: the crisp near cascade wherever its box covers the point — with a
+// margin that keeps the whole PCF kernel inside the map, so selection never
+// mixes maps mid-kernel — else the far cascade, else LIT. Lit is a fix, not
+// merely a default: the old single-volume path clamped, and past the light's
+// far plane the comparison failed against every stored depth, silently
+// shadowing any stage deeper than the box.
+
+const pcf9 = (map: string, ts: string) => /* wgsl */ `
+  let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let cmpZ = ndc.z - 0.001;
+  let ts = ${ts};
+  let s00 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(-ts, -ts), cmpZ);
+  let s10 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(0.0, -ts), cmpZ);
+  let s20 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f( ts, -ts), cmpZ);
+  let s01 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(-ts, 0.0), cmpZ);
+  let s11 = textureSampleCompareLevel(${map}, shadowSampler, suv, cmpZ);
+  let s21 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f( ts, 0.0), cmpZ);
+  let s02 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(-ts,  ts), cmpZ);
+  let s12 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(0.0,  ts), cmpZ);
+  let s22 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f( ts,  ts), cmpZ);
+  return (s00 + s10 + s20 + s01 + s11 + s21 + s02 + s12 + s22) * (1.0 / 9.0);
+`
 
 export const SAMPLE_SHADOW_WGSL = /* wgsl */ `
+
+fn sampleShadowNear(ndc: vec3f) -> f32 {
+${pcf9("shadowMap", `1.0 / ${SHADOW_CASCADES[0].mapSize}.0`)}
+}
+
+fn sampleShadowFar(ndc: vec3f) -> f32 {
+${pcf9("shadowMapFar", `1.0 / ${SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize}.0`)}
+}
 
 fn sampleShadow(worldPos: vec3f, n: vec3f) -> f32 {
   if (dot(n, -light.lights[0].direction.xyz) <= 0.0) { return 0.0; }
   let biasedPos = worldPos + n * 0.08;
-  let lclip = lightVP.viewProj * vec4f(biasedPos, 1.0);
-  let ndc = lclip.xyz / max(lclip.w, 1e-6);
-  let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-  let cmpZ = ndc.z - 0.001;
-  let ts = 1.0 / 4096.0;
-  let s00 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(-ts, -ts), cmpZ);
-  let s10 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(0.0, -ts), cmpZ);
-  let s20 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f( ts, -ts), cmpZ);
-  let s01 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(-ts, 0.0), cmpZ);
-  let s11 = textureSampleCompareLevel(shadowMap, shadowSampler, suv, cmpZ);
-  let s21 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f( ts, 0.0), cmpZ);
-  let s02 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(-ts,  ts), cmpZ);
-  let s12 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f(0.0,  ts), cmpZ);
-  let s22 = textureSampleCompareLevel(shadowMap, shadowSampler, suv + vec2f( ts,  ts), cmpZ);
-  return (s00 + s10 + s20 + s01 + s11 + s21 + s02 + s12 + s22) * (1.0 / 9.0);
+  let c0 = lightVP.viewProj[0] * vec4f(biasedPos, 1.0);
+  let n0 = c0.xyz / max(c0.w, 1e-6);
+  if (all(abs(n0.xy) < vec2f(0.98)) && n0.z > 0.0 && n0.z < 1.0) {
+    return sampleShadowNear(n0);
+  }
+  let c1 = lightVP.viewProj[1] * vec4f(biasedPos, 1.0);
+  let n1 = c1.xyz / max(c1.w, 1e-6);
+  if (all(abs(n1.xy) < vec2f(0.98)) && n1.z > 0.0 && n1.z < 1.0) {
+    return sampleShadowFar(n1);
+  }
+  // Outside every cascade there is no occlusion information; lit is the only
+  // honest answer.
+  return 1.0;
 }
 
 `;

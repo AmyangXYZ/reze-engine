@@ -679,7 +679,7 @@ interface ModelInstance {
   skinMatrixBuffer: GPUBuffer
   drawCalls: DrawCall[]
   shadowDrawCalls: DrawCall[]
-  shadowBindGroup: GPUBindGroup
+  shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
@@ -1554,7 +1554,7 @@ export class Engine {
   // ── Render bundles ──
   private opaqueBundle: GPURenderBundle | null = null
   private transparentBundle: GPURenderBundle | null = null
-  private shadowBundle: GPURenderBundle | null = null
+  private shadowBundles: GPURenderBundle[] = []
   /** Set by scene STRUCTURE only. Every frame of animation, every physics step
    *  and every camera move must leave this alone — re-recording constantly is
    *  worse than having no bundles at all. */
@@ -1728,20 +1728,20 @@ export class Engine {
   private groundVertexBuffer?: GPUBuffer
   private groundIndexBuffer?: GPUBuffer
   private hasGround = false
-  private shadowMapTexture!: GPUTexture
-  private shadowMapDepthView!: GPUTextureView
+  private shadowMapTextures: GPUTexture[] = []
+  private shadowMapDepthViews: GPUTextureView[] = []
   private brdfLutTexture!: GPUTexture
   private brdfLutView!: GPUTextureView
   private filmicLutTexture!: GPUTexture
   private filmicLutView!: GPUTextureView
   // Width of the baked Filmic tone LUT (composite.ts FILMIC_LUT_W must match).
   private static readonly FILMIC_LUT_WIDTH = 256
-  // 4096² over the 64-unit light box ≈ 64 texels/world-unit — crisp contact
-  // shadows on the ground catcher (2048 read visibly blurry). ~64 MB depth,
-  // acceptable for WebGPU-class hardware; deliberately NOT user-configurable.
-  private static readonly SHADOW_MAP_SIZE = 4096
   private shadowDepthPipeline!: GPURenderPipeline
   private shadowLightVPBuffer!: GPUBuffer
+  // The shadow PASS reads one cascade's matrix per pass, and a uniform binding
+  // into the aggregate would need 256-byte alignment padding — two tiny buffers
+  // are simpler than teaching every reader about a stride.
+  private shadowCascadeVPBuffers: GPUBuffer[] = []
   // All cascades' view-projections, 16 floats each, inner to outer.
   private shadowLightVPMatrix = new Float32Array(16 * SHADOW_CASCADES.length)
   private groundShadowBindGroup?: GPUBindGroup
@@ -4255,6 +4255,8 @@ export class Engine {
         // The positional lights. Always bound, empty or not, so every material
         // pipeline shares one layout whether or not the scene has any.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The far cascade's shadow map. 8 stays free; 9 is the BRDF LUT.
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
@@ -4377,6 +4379,13 @@ export class Engine {
       size: 64 * SHADOW_CASCADES.length,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    this.shadowCascadeVPBuffers = SHADOW_CASCADES.map((_, i) =>
+      this.device.createBuffer({
+        label: `shadow cascade ${i} view-projection`,
+        size: 64,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      }),
+    )
     const shadowBindGroupLayout = this.device.createBindGroupLayout({
       label: "shadow depth bind layout",
       entries: [
@@ -4416,13 +4425,17 @@ export class Engine {
       magFilter: "linear",
       minFilter: "linear",
     })
-    this.shadowMapTexture = this.device.createTexture({
-      label: "shadow map",
-      size: [Engine.SHADOW_MAP_SIZE, Engine.SHADOW_MAP_SIZE],
-      format: "depth32float",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.shadowMapDepthView = this.shadowMapTexture.createView()
+    // One map per cascade, each at its own resolution — the near one crisp,
+    // the far one wide. Same format so one pipeline records into both.
+    this.shadowMapTextures = SHADOW_CASCADES.map((c, i) =>
+      this.device.createTexture({
+        label: `shadow map cascade ${i}`,
+        size: [c.mapSize, c.mapSize],
+        format: "depth32float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      }),
+    )
+    this.shadowMapDepthViews = this.shadowMapTextures.map((t) => t.createView())
 
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
     this.bakeBrdfLut()
@@ -4456,10 +4469,11 @@ export class Engine {
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: { buffer: this.lightUniformBuffer } },
         { binding: 2, resource: this.materialSampler },
-        { binding: 3, resource: this.shadowMapDepthView },
+        { binding: 3, resource: this.shadowMapDepthViews[0] },
         { binding: 4, resource: this.shadowComparisonSampler },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
+        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 9, resource: this.brdfLutView },
       ],
     })
@@ -4476,6 +4490,7 @@ export class Engine {
         // Same lights the materials read. A lamp that lit the cast and not the
         // floor under her would read as a sticker.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
       ],
     })
     const groundShadowShader = this.device.createShaderModule({
@@ -6904,7 +6919,7 @@ export class Engine {
     if (this.modelInstances.size === 0) {
       this.opaqueBundle = null
       this.transparentBundle = null
-      this.shadowBundle = null
+      this.shadowBundles = []
       return
     }
 
@@ -6916,14 +6931,20 @@ export class Engine {
     this.forEachInstance((inst) => this.renderModelTransparentPhase(transparent, inst))
     this.transparentBundle = transparent.finish({ label: "transparent phase" })
 
-    const shadow = this.device.createRenderBundleEncoder({
-      label: "shadow pass",
-      colorFormats: [],
-      depthStencilFormat: "depth32float",
+    // One bundle per cascade: the draws are identical — same pipeline, same
+    // indirect args culled to the OUTERMOST volume — and only bind group 0
+    // (which cascade's view-projection) differs. Each cascade's rasterizer
+    // clips the shared list to its own box.
+    this.shadowBundles = SHADOW_CASCADES.map((_, ci) => {
+      const shadow = this.device.createRenderBundleEncoder({
+        label: `shadow pass, cascade ${ci}`,
+        colorFormats: [],
+        depthStencilFormat: "depth32float",
+      })
+      shadow.setPipeline(this.shadowDepthPipeline)
+      this.forEachInstance((inst) => this.drawInstanceShadow(shadow, inst, ci))
+      return shadow.finish({ label: `shadow pass, cascade ${ci}` })
     })
-    shadow.setPipeline(this.shadowDepthPipeline)
-    this.forEachInstance((inst) => this.drawInstanceShadow(shadow, inst))
-    this.shadowBundle = shadow.finish({ label: "shadow pass" })
     this.bundleRecords++
   }
 
@@ -7325,15 +7346,19 @@ export class Engine {
       if (this.wind) physics.setWind(this.wind)
     }
 
-    const shadowBindGroup = this.device.createBindGroup({
-      label: `${name}: shadow bind`,
-      layout: this.shadowDepthPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.shadowLightVPBuffer } },
-        { binding: 1, resource: { buffer: skinMatrixBuffer } },
-        { binding: 2, resource: this.materialSampler },
-      ],
-    })
+    // One per cascade: the shadow VERTEX shader reads a single matrix, and
+    // which one is the only thing that differs between the cascade passes.
+    const shadowBindGroups = SHADOW_CASCADES.map((_, ci) =>
+      this.device.createBindGroup({
+        label: `${name}: shadow bind, cascade ${ci}`,
+        layout: this.shadowDepthPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.shadowCascadeVPBuffers[ci] } },
+          { binding: 1, resource: { buffer: skinMatrixBuffer } },
+          { binding: 2, resource: this.materialSampler },
+        ],
+      }),
+    )
 
     const mainPerInstanceBindGroup = this.device.createBindGroup({
       label: `${name}: main per-instance bind group`,
@@ -7374,7 +7399,7 @@ export class Engine {
       skinMatrixBuffer,
       drawCalls: [],
       shadowDrawCalls: [],
-      shadowBindGroup,
+      shadowBindGroups,
       mainPerInstanceBindGroup,
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
@@ -7580,7 +7605,7 @@ export class Engine {
     gb[3] = fadeStart
     gb[4] = fadeEnd
     gb[5] = shadowStrength
-    gb[6] = 1 / Engine.SHADOW_MAP_SIZE
+    gb[6] = 1 / SHADOW_CASCADES[0].mapSize
     gb[7] = gridSpacing
     gb[8] = gridLineWidth
     gb[9] = gridLineOpacity
@@ -7601,11 +7626,12 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-        { binding: 2, resource: this.shadowMapDepthView },
+        { binding: 2, resource: this.shadowMapDepthViews[0] },
         { binding: 3, resource: this.shadowComparisonSampler },
         { binding: 4, resource: { buffer: this.groundShadowMaterialBuffer } },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
+        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
       ],
     })
   }
@@ -7640,6 +7666,7 @@ export class Engine {
 
     for (let i = 0; i < SHADOW_CASCADES.length; i++) {
       buildShadowVP(t, this.sun.direction, SHADOW_CASCADES[i], this.shadowLightVPMatrix, i * 16)
+      this.device.queue.writeBuffer(this.shadowCascadeVPBuffers[i], 0, this.shadowLightVPMatrix, i * 16, 16)
     }
     this.device.queue.writeBuffer(this.shadowLightVPBuffer, 0, this.shadowLightVPMatrix)
   }
@@ -8912,22 +8939,25 @@ export class Engine {
     // keeps PCF-sampling a character that is no longer in the scene. One clearing
     // pass on the transition to empty, then it stops.
     if (hasModels || this.shadowMapPopulated) {
-      const sp = encoder.beginRenderPass({
-        timestampWrites: this.stamps("shadow"),
-        colorAttachments: [],
-        depthStencilAttachment: {
-          view: this.shadowMapDepthView,
-          depthClearValue: 1.0,
-          depthLoadOp: "clear",
-          depthStoreOp: "store",
-        },
-      })
-      // The per-model `visible` test that used to guard this is gone: it is a
-      // per-frame boolean, and baking it into a bundle would make toggling a
-      // model re-record. It lives in the cull compute now, which zeroes the
-      // instance count of an invisible model's draws.
-      if (this.shadowBundle) sp.executeBundles([this.shadowBundle])
-      sp.end()
+      for (let ci = 0; ci < SHADOW_CASCADES.length; ci++) {
+        const sp = encoder.beginRenderPass({
+          // One timestamp pair exists for "shadow"; the near cascade wears it.
+          timestampWrites: ci === 0 ? this.stamps("shadow") : undefined,
+          colorAttachments: [],
+          depthStencilAttachment: {
+            view: this.shadowMapDepthViews[ci],
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+          },
+        })
+        // The per-model `visible` test that used to guard this is gone: it is a
+        // per-frame boolean, and baking it into a bundle would make toggling a
+        // model re-record. It lives in the cull compute now, which zeroes the
+        // instance count of an invisible model's draws.
+        if (this.shadowBundles[ci]) sp.executeBundles([this.shadowBundles[ci]])
+        sp.end()
+      }
       this.shadowMapPopulated = hasModels
     }
 
@@ -9055,8 +9085,8 @@ export class Engine {
     this.updateStats(deltaTime * 1000)
   }
 
-  private drawInstanceShadow(sp: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
-    sp.setBindGroup(0, inst.shadowBindGroup)
+  private drawInstanceShadow(sp: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance, cascade: number): void {
+    sp.setBindGroup(0, inst.shadowBindGroups[cascade])
     sp.setVertexBuffer(0, inst.vertexBuffer)
     sp.setVertexBuffer(1, inst.jointsBuffer)
     sp.setVertexBuffer(2, inst.weightsBuffer)

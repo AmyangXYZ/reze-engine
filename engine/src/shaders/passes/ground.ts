@@ -1,5 +1,6 @@
 import { sceneFsOutWgsl, sceneIdWriteWgsl } from "./scene-contract"
 import { lightsApi } from "../lights"
+import { SHADOW_CASCADES } from "../../shadow-cascades"
 
 // Ground shadow-catcher: receives directional shadow, grid lines, frosted noise,
 // radial distance fade. Writes bloom mask = 0 (ground never bloom-bleeds).
@@ -19,13 +20,17 @@ struct GroundShadowMat {
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, _pad2: f32,
 };
-struct LightVP { viewProj: mat4x4f, };
+// One view-projection per shadow cascade, inner to outer — same buffer and
+// same order the materials read.
+struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> light: LightUniforms;
 @group(0) @binding(2) var shadowMap: texture_depth_2d;
 @group(0) @binding(3) var shadowSampler: sampler_comparison;
 @group(0) @binding(4) var<uniform> material: GroundShadowMat;
 @group(0) @binding(5) var<uniform> lightVP: LightVP;
+// The far cascade's map, binding 7 as in the materials' layout.
+@group(0) @binding(7) var shadowMapFar: texture_depth_2d;
 ${lightsApi(0, 6)}
 
 fn hash2(p: vec2f) -> f32 {
@@ -76,15 +81,20 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     return out;
   }
 
-  let lclip = lightVP.viewProj * vec4f(i.worldPos, 1.0);
-  let ndc = lclip.xyz / max(lclip.w, 1e-6);
-  // Outside the light's frustum there IS no shadow information — the clamped
+  // Outside a cascade's frustum there IS no shadow information — the clamped
   // border samples compare against unrelated depths and read "shadowed",
   // darkening the whole far plane with a visible band at the frustum edge
   // (masked by the opaque surface normally, glaring in green-screen mode where
-  // only the shadow-catcher term renders). Fade to fully lit near the border.
+  // only the shadow-catcher term renders). So each cascade fades out near its
+  // border — the near one INTO the far one's answer, the far one into lit.
+  let l0 = lightVP.viewProj[0] * vec4f(i.worldPos, 1.0);
+  let ndc = l0.xyz / max(l0.w, 1e-6);
   let inZ = select(0.0, 1.0, ndc.z > 0.0 && ndc.z < 1.0);
   let frustum = (1.0 - smoothstep(0.88, 0.96, abs(ndc.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc.y))) * inZ;
+  let l1 = lightVP.viewProj[1] * vec4f(i.worldPos, 1.0);
+  let ndc1 = l1.xyz / max(l1.w, 1e-6);
+  let inZ1 = select(0.0, 1.0, ndc1.z > 0.0 && ndc1.z < 1.0);
+  let frustum1 = (1.0 - smoothstep(0.88, 0.96, abs(ndc1.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc1.y))) * inZ1;
 
   // THE cost of this shader, measured: a full-screen ground ran 25 shadow
   // comparisons per pixel, and each one is hardware-bilinear, so ~100 depth
@@ -96,10 +106,23 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // almost entirely once the comparison sampler's own 2x2 filter is counted.
   // Nine taps instead of twenty-five for the same blur radius.
   //
-  // Skipped altogether outside the light frustum, where the mix below discards
-  // the result anyway: the shadow map covers a small area around the character
-  // and the ground is vastly larger than it.
+  // The far cascade's taps run ONLY where the near one is fading or absent
+  // (frustum < 1), so a pixel in the near core costs exactly what it did with
+  // one cascade — and that core is where the camera usually looks.
   var vis = 1.0;
+  if (frustum < 1.0 && frustum1 > 0.0) {
+    let suv1 = vec2f(ndc1.x * 0.5 + 0.5, 0.5 - ndc1.y * 0.5);
+    let suv1_c = clamp(suv1, vec2f(0.02), vec2f(0.98));
+    let st1 = ${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize} * 2.0;
+    let compareZ1 = ndc1.z - 0.0035;
+    var acc1 = 0.0;
+    for (var y = -1; y <= 1; y++) {
+      for (var x = -1; x <= 1; x++) {
+        acc1 += textureSampleCompareLevel(shadowMapFar, shadowSampler, suv1_c + vec2f(f32(x), f32(y)) * st1, compareZ1);
+      }
+    }
+    vis = mix(1.0, acc1 * (1.0 / 9.0), frustum1);
+  }
   if (frustum > 0.0) {
     let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     let suv_c = clamp(suv, vec2f(0.02), vec2f(0.98));
@@ -113,7 +136,9 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
         acc += textureSampleCompareLevel(shadowMap, shadowSampler, suv_c + vec2f(f32(x), f32(y)) * st, compareZ);
       }
     }
-    vis = mix(1.0, acc * (1.0 / 9.0), frustum);
+    // The base is whatever the far cascade decided, so the near border blends
+    // cascade to cascade rather than snapping to lit mid-floor.
+    vis = mix(vis, acc * (1.0 / 9.0), frustum);
   }
 
   // Frosted/matte micro-texture. Scenes leaving it at zero were still paying
