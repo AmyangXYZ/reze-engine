@@ -78,7 +78,9 @@ export function mrtIdsEnabled(): boolean {
 export type SceneRenderClass =
   /** Models, opaque and transparent. Straight alpha over. */
   | "material"
-  /** The shadow-catcher floor. Blends exactly as a material does. */
+  /** The shadow-catcher floor. Blends PREMULTIPLIED, not like a material: its
+   *  coverage is a lit surface plus a colourless shadow layer, so it weights
+   *  its own colour before the blend sees it. */
   | "ground"
   /** Backface-expanded hulls. Also a material blend — it is geometry. */
   | "outline"
@@ -118,6 +120,22 @@ const ADD_BOTH: GPUBlendState = {
   alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
 }
 
+/**
+ * OVER for something that arrives ALREADY premultiplied: take the source whole
+ * and let it displace the destination by its own coverage.
+ *
+ * The ground needs this and nothing else does. Every other class writes a
+ * straight colour and an alpha, and the src-alpha factor premultiplies it once
+ * on the way in. The ground cannot: its coverage is the SUM of a lit surface
+ * and a colourless shadow-catcher layer, so it has to weight its own colour by
+ * the surface's share before it gets here. Handed to the src-alpha blend, that
+ * weighting happened a second time.
+ */
+const PREMULTIPLIED_OVER: GPUBlendState = {
+  color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+}
+
 /** Additive, premultiplied by the fragment's alpha as it writes. */
 const ADD_PREMULTIPLIED: GPUBlendState = {
   color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
@@ -144,7 +162,10 @@ const WRITES_ID = new Set<SceneRenderClass>(["material", "ground"])
 /** The blends each class writes its two attachments with. */
 const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState, GPUBlendState]> = {
   material: [ALPHA_OVER, ALPHA_OVER],
-  ground: [ALPHA_OVER, ALPHA_OVER],
+  // PREMULTIPLIED colour, alone among the classes — see the blend's own note.
+  // The aux is ordinary alpha-over: the ground writes its mask unweighted, like
+  // everything else, and coverage is what the blend applies.
+  ground: [PREMULTIPLIED_OVER, ALPHA_OVER],
   outline: [ALPHA_OVER, ALPHA_OVER],
   particle: [ALPHA_OVER, ALPHA_OVER],
   "particle-additive": [ADD_KEEP_ALPHA, ADD_BOTH],

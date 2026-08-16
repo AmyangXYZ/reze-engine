@@ -397,3 +397,24 @@ test("the subject id and the pick id are the same number", () => {
   assert.match(engine, /cd\[b \+ 7\] = inst\.objectId/, "the cast must carry the object id")
   assert.match(fieldWith(true), /return u32\(_rzCast\[i \* 3 \+ 1\]\.w\)/, "rzSubjectId must read that same slot")
 })
+
+test("only the ground blends premultiplied, and only because it premultiplies", () => {
+  // The ground writes `finalColor * surfA` — it weights its own colour by the
+  // SURFACE's share, because its coverage also includes a colourless
+  // shadow-catcher layer. Handed to the src-alpha blend every other class uses,
+  // that weighting was applied twice: the surface came out as finalColor x
+  // edgeFade^2 where it should be x edgeFade, so the radial fade fell off
+  // faster than authored.
+  const [groundColor] = sceneTargets("ground", FORMATS)
+  assert.equal(groundColor.blend.color.srcFactor, "one", "the ground's colour arrives premultiplied")
+  assert.equal(groundColor.blend.color.dstFactor, "one-minus-src-alpha")
+  assert.match(groundSrc, /out\.color = vec4f\(finalColor \* surfA, outA\)/, "…which is only correct while it still does this")
+
+  // Everyone else writes a straight colour, so src-alpha premultiplying it once
+  // is exactly right. If one of these ever pre-scales its rgb, it needs the
+  // ground's blend too — and this is where that gets noticed.
+  for (const cls of ["material", "outline", "particle"]) {
+    const [c] = sceneTargets(cls, FORMATS)
+    assert.equal(c.blend.color.srcFactor, "src-alpha", `${cls} writes straight colour and must be premultiplied by the blend`)
+  }
+})
