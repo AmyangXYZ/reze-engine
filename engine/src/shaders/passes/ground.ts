@@ -18,7 +18,7 @@ struct GroundShadowMat {
   diffuseColor: vec3f, fadeStart: f32,
   fadeEnd: f32, shadowStrength: f32, pcfTexel: f32, gridSpacing: f32,
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
-  gridLineColor: vec3f, _pad2: f32,
+  gridLineColor: vec3f, mirror: f32,
 };
 // One view-projection per shadow cascade, inner to outer — same buffer and
 // same order the materials read.
@@ -31,6 +31,12 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 @group(0) @binding(5) var<uniform> lightVP: LightVP;
 // The far cascade's map, binding 7 as in the materials' layout.
 @group(0) @binding(7) var shadowMapFar: texture_depth_2d;
+// The floor mirror (step 7D): the reflection target, the camera that rendered
+// it, and an ordinary sampler — the two shadow bindings above are comparison.
+struct MirrorVP { viewProj: mat4x4f, };
+@group(0) @binding(8) var<uniform> mirrorVP: MirrorVP;
+@group(0) @binding(9) var mirrorTex: texture_2d<f32>;
+@group(0) @binding(10) var linearSampler: sampler;
 ${lightsApi(0, 6)}
 
 fn hash2(p: vec2f) -> f32 {
@@ -170,6 +176,22 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // mid-shader, which is exactly how this line broke the build a moment ago.)
   var baseColor = material.diffuseColor * (sun * (1.0 - dark * 0.65) + lamps);
   baseColor *= noiseTint;
+  // The floor mirror. The reflection was rendered by the MIRROR camera, so
+  // projecting this fragment's world position through that camera yields
+  // exactly the texel where its reflection landed — projective mapping, no
+  // screen-space guess. Reflectivity is UNIFORM by design: the classic MMD
+  // stage floor is a flat mirror on a dial, not a fresnel surface, and
+  // anime-stylised is the standing rule. The branch is on a uniform, so the
+  // whole cost vanishes for the scenes that leave the dial at zero.
+  if (material.mirror > 0.0) {
+    let mc = mirrorVP.viewProj * vec4f(i.worldPos, 1.0);
+    let mndc = mc.xyz / max(mc.w, 1e-6);
+    let muv = vec2f(mndc.x * 0.5 + 0.5, 0.5 - mndc.y * 0.5);
+    let refl = textureSampleLevel(mirrorTex, linearSampler, clamp(muv, vec2f(0.0), vec2f(1.0)), 0.0).rgb;
+    // Still under the received shadow: a polished floor in shade shows a dim
+    // reflection, and a mirror that ignored the shadow would glow in it.
+    baseColor = mix(baseColor, refl * (1.0 - dark * 0.65), material.mirror);
+  }
   // THREE LAYERS, composited premultiplied, bottom to top: the shadow the
   // catcher receives, the ground surface, and the grid.
   //

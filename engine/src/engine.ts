@@ -1595,6 +1595,9 @@ export class Engine {
   private static readonly REFLECTION_PLANE_Y = 0
   private mirrorCameraData = new Float32Array(40)
   private mirrorCameraBuffer!: GPUBuffer
+  // proj x mirrorView, for the ground's projective sample and the cull planes.
+  private mirrorVPData = new Float32Array(16)
+  private mirrorVPBuffer!: GPUBuffer
   private mirrorPerFrameBindGroup!: GPUBindGroup
   private mirrorColorMsTexture: GPUTexture | null = null
   private mirrorColorTexture: GPUTexture | null = null
@@ -2152,6 +2155,17 @@ export class Engine {
     this.reflectionDebug = on
   }
 
+  /**
+   * Dial the floor mirror without rebuilding the ground — the adjust-tier
+   * sibling of addGround's own option. False when there is no ground to dial.
+   */
+  setGroundMirror(strength: number): boolean {
+    if (!this.groundShadowMaterialBuffer) return false
+    this.groundMirror = Math.min(Math.max(strength, 0), 1)
+    this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 15 * 4, new Float32Array([this.groundMirror]))
+    return true
+  }
+
   private ensureReflectionDebugPipeline(): boolean {
     if (!this.mirrorColorView) return false
     if (!this.reflectionDebugBindGroupLayout) {
@@ -2205,6 +2219,8 @@ export class Engine {
   private updateMirrorCamera(): void {
     buildMirrorCamera(this.cameraMatrixData, Engine.REFLECTION_PLANE_Y, this.mirrorCameraData)
     this.device.queue.writeBuffer(this.mirrorCameraBuffer, 0, this.mirrorCameraData)
+    Mat4.multiplyArrays(this.cameraMatrixData, 16, this.mirrorCameraData, 0, this.mirrorVPData, 0)
+    this.device.queue.writeBuffer(this.mirrorVPBuffer, 0, this.mirrorVPData)
   }
 
   /**
@@ -4627,6 +4643,11 @@ export class Engine {
         // floor under her would read as a sticker.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+        // The floor mirror: the mirror camera's view-projection, the reflection
+        // resolve, and an ordinary sampler beside the comparison one.
+        { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 10, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
       ],
     })
     const groundShadowShader = this.device.createShaderModule({
@@ -5326,6 +5347,8 @@ export class Engine {
           stencilStoreOp: "discard",
         },
       }
+      // The ground binds the reflection resolve; rebind it against the new one.
+      this.buildGroundBindGroup()
 
       // Bloom pyramid: mip 0 is half-res, each subsequent mip halves again.
       // Mip count chosen so the coarsest mip is ≥4 px on the short side, capped at BLOOM_MAX_LEVELS.
@@ -5723,6 +5746,11 @@ export class Engine {
     this.mirrorCameraBuffer = this.device.createBuffer({
       label: "mirror camera uniforms",
       size: 40 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.mirrorVPBuffer = this.device.createBuffer({
+      label: "mirror view-projection",
+      size: 64,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
@@ -6130,6 +6158,9 @@ export class Engine {
     noiseStrength?: number
     /** Whole-ground opacity, 0–1 (multiplies the radial edge fade). Default 1. */
     opacity?: number
+    /** Floor-mirror strength, 0–1: how much of the surface is the reflected
+     *  cast. 0 (default) never renders the reflection pass at all. */
+    mirror?: number
   }): void {
     const opts = {
       width: 160,
@@ -6144,6 +6175,7 @@ export class Engine {
       gridLineColor: new Vec3(0.85, 0.85, 0.85),
       noiseStrength: 0.05,
       opacity: 1.0,
+      mirror: 0,
       ...options,
     }
     this.createGroundGeometry(opts.width, opts.height)
@@ -7124,8 +7156,8 @@ export class Engine {
     // reflection is active the camera planes stand in, keeping the args sane
     // for bundles that never execute.
     if (this.reflectionActive) {
-      Mat4.multiplyArrays(this.cameraMatrixData, 16, this.mirrorCameraData, 0, this.cullScratchVp, 0)
-      writeFrustumPlanes(this.cullScratchVp, this.cullFrustaF32, 48)
+      // Computed by updateMirrorCamera, which ran before the cull this frame.
+      writeFrustumPlanes(this.mirrorVPData, this.cullFrustaF32, 48)
     } else {
       this.cullFrustaF32.copyWithin(48, 0, 24)
     }
@@ -7852,6 +7884,7 @@ export class Engine {
     gridLineColor: Vec3
     noiseStrength: number
     opacity: number
+    mirror: number
   }) {
     const {
       diffuseColor,
@@ -7864,6 +7897,7 @@ export class Engine {
       gridLineColor,
       noiseStrength,
       opacity,
+      mirror,
     } = opts
     // Shadow map is already created in setupPipelines()
     const gb = new Float32Array(16)
@@ -7882,12 +7916,24 @@ export class Engine {
     gb[12] = gridLineColor.x
     gb[13] = gridLineColor.y
     gb[14] = gridLineColor.z
-    gb[15] = 0
+    gb[15] = Math.min(Math.max(mirror, 0), 1)
+    this.groundMirror = gb[15]
     this.groundShadowMaterialBuffer = this.device.createBuffer({
       size: gb.byteLength,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 0, gb)
+    this.buildGroundBindGroup()
+  }
+
+  /**
+   * (Re)build the ground's bind group. Its own method because the RESIZE path
+   * needs it too: the reflection resolve is recreated at every canvas size,
+   * and a bind group holding the old view would sample a destroyed texture on
+   * the first resized frame with a mirror on.
+   */
+  private buildGroundBindGroup(): void {
+    if (!this.groundShadowMaterialBuffer) return
     this.groundShadowBindGroup = this.device.createBindGroup({
       label: "ground shadow bind",
       layout: this.groundShadowBindGroupLayout,
@@ -7900,8 +7946,14 @@ export class Engine {
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
         { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
+        { binding: 8, resource: { buffer: this.mirrorVPBuffer } },
+        // Created in handleResize, which runs during init — before any ground
+        // can exist to bind it.
+        { binding: 9, resource: this.mirrorColorView! },
+        { binding: 10, resource: this.materialSampler },
       ],
     })
+    if (this.groundDrawCall) this.groundDrawCall.bindGroup = this.groundShadowBindGroup
   }
 
 
