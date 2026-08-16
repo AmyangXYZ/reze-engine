@@ -140,10 +140,10 @@ ${scoreApi(0, 5)}
 // helpers and the Particle struct are NOT repeated — they arrive with the scene
 // API above, and a second copy is a redefinition error in engine code.
 ${clockApi("_rzLightU.x", "0.0")}
-// Canvas height. The drawing modules report their render target's height, which
-// under supersampling is the larger number — nothing in a compute pass that
-// writes world-space lamp positions can use either, and this one is at least
-// the same value rzResolution() reports here.
+// Canvas height — the same number the drawing modules read out of their camera
+// struct, both written from canvas.height, so this name means ONE value in
+// every module. Verified against the writers, not assumed: cameraMatrixData[35]
+// and viewU[6].w have the same source.
 ${viewportApi("viewU[6].w")}
 ${trailSlotsApi(cast.trailCount)}
 ${wgsl}
