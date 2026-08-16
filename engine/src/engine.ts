@@ -28,6 +28,7 @@ import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
+import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1741,7 +1742,8 @@ export class Engine {
   private static readonly SHADOW_MAP_SIZE = 4096
   private shadowDepthPipeline!: GPURenderPipeline
   private shadowLightVPBuffer!: GPUBuffer
-  private shadowLightVPMatrix = new Float32Array(16)
+  // All cascades' view-projections, 16 floats each, inner to outer.
+  private shadowLightVPMatrix = new Float32Array(16 * SHADOW_CASCADES.length)
   private groundShadowBindGroup?: GPUBindGroup
   private shadowComparisonSampler!: GPUSampler
   private groundShadowMaterialBuffer?: GPUBuffer
@@ -4372,7 +4374,7 @@ export class Engine {
     })
 
     this.shadowLightVPBuffer = this.device.createBuffer({
-      size: 64,
+      size: 64 * SHADOW_CASCADES.length,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     const shadowBindGroupLayout = this.device.createBindGroupLayout({
@@ -6844,11 +6846,11 @@ export class Engine {
    * disagree with what the vertex shader actually projects.
    *
    * Culling shadow casters to the light's frustum looks like it should lose
-   * casters that stand outside the volume and throw shade into it. It cannot,
-   * because the shadow map is a single fixed 64×64 ortho box and the rasterizer
-   * already clips to exactly these six planes — anything this rejects was
-   * contributing nothing. That equivalence is a property of the one-cascade
-   * setup and stops holding the day a second cascade arrives.
+   * casters that stand outside the volume and throw shade into it. It cannot:
+   * the cull tests the OUTERMOST cascade's box, each cascade's rasterizer clips
+   * to its own box, and every inner box lies inside the outer one (the
+   * containment invariant in shadow-cascades.ts) — so anything rejected here
+   * was contributing to no cascade at all.
    */
   private writeCullFrusta(): void {
     if (!this.cullFrustaBuffer) return
@@ -6856,7 +6858,11 @@ export class Engine {
     // this frame by updateCameraUniforms.
     Mat4.multiplyArrays(this.cameraMatrixData, 16, this.cameraMatrixData, 0, this.cullScratchVp, 0)
     writeFrustumPlanes(this.cullScratchVp, this.cullFrustaF32, 0)
-    writeFrustumPlanes(this.shadowLightVPMatrix, this.cullFrustaF32, 24)
+    // The OUTERMOST cascade: it contains every inner one (the containment
+    // invariant in shadow-cascades.ts), so its six planes are the union and the
+    // rasterizer clips each cascade to its own box — the argument that made
+    // single-volume shadow culling exact, kept true for a list.
+    writeFrustumPlanes(this.shadowLightVPMatrix.subarray(16 * (SHADOW_CASCADES.length - 1)), this.cullFrustaF32, 24)
     this.cullFrustaU32[48] = this.cullDraws.length
     this.cullFrustaU32[49] = this.cullEnabled ? 1 : 0
     this.device.queue.writeBuffer(this.cullFrustaBuffer, 0, this.cullFrustaBytes)
@@ -7619,8 +7625,10 @@ export class Engine {
   private readonly shadowCenter = new Vec3(0, 11, 0)
 
   private updateShadowLightVP() {
-    // The 64×64-unit volume follows the camera target so a character carried far
-    // from the origin by code-driven root motion stays inside the lit frustum.
+    // The volumes follow the camera target so a character carried far from the
+    // origin by code-driven root motion stays inside the lit frustum. The
+    // volume MATH lives in shadow-cascades.ts, where it is testable without a
+    // GPU; this method owns only the dirty-tracking and the upload.
     const t = this.camera.target
     const moved =
       Math.abs(t.x - this.shadowCenter.x) > 1e-3 ||
@@ -7630,29 +7638,9 @@ export class Engine {
     this.shadowLightVPDirty = false
     this.shadowCenter.setXYZ(t.x, t.y, t.z)
 
-    const dir = new Vec3(this.sun.direction.x, this.sun.direction.y, this.sun.direction.z)
-    dir.normalize()
-    const up = Math.abs(dir.y) > 0.99 ? new Vec3(0, 0, -1) : new Vec3(0, 1, 0)
-
-    // Snap the center to shadow-map texels in the light's right/up plane so the
-    // moving volume doesn't shimmer the shadow edges while running.
-    const right = Vec3.crossInto(up, dir, new Vec3(0, 0, 0)).normalize()
-    const upv = Vec3.crossInto(dir, right, new Vec3(0, 0, 0))
-    const texel = 64 / Engine.SHADOW_MAP_SIZE
-    const tr = Math.round(t.dot(right) / texel) * texel
-    const tu = Math.round(t.dot(upv) / texel) * texel
-    const td = t.dot(dir)
-    const target = new Vec3(
-      right.x * tr + upv.x * tu + dir.x * td,
-      right.y * tr + upv.y * tu + dir.y * td,
-      right.z * tr + upv.z * tu + dir.z * td
-    )
-
-    const eye = new Vec3(target.x - dir.x * 72, target.y - dir.y * 72, target.z - dir.z * 72)
-    const view = Mat4.lookAt(eye, target, up)
-    const proj = Mat4.orthographicLh(-32, 32, -32, 32, 1, 140)
-    const vp = proj.multiply(view)
-    this.shadowLightVPMatrix.set(vp.values)
+    for (let i = 0; i < SHADOW_CASCADES.length; i++) {
+      buildShadowVP(t, this.sun.direction, SHADOW_CASCADES[i], this.shadowLightVPMatrix, i * 16)
+    }
     this.device.queue.writeBuffer(this.shadowLightVPBuffer, 0, this.shadowLightVPMatrix)
   }
 
