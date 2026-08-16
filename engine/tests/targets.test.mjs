@@ -408,7 +408,11 @@ test("only the ground blends premultiplied, and only because it premultiplies", 
   const [groundColor] = sceneTargets("ground", FORMATS)
   assert.equal(groundColor.blend.color.srcFactor, "one", "the ground's colour arrives premultiplied")
   assert.equal(groundColor.blend.color.dstFactor, "one-minus-src-alpha")
-  assert.match(groundSrc, /out\.color = vec4f\(finalColor \* surfA, outA\)/, "…which is only correct while it still does this")
+  // It composites three layers by hand — shadow, surface, grid — into a
+  // premultiplied accumulator, which is the reason it cannot use the src-alpha
+  // blend: its coverage is the sum of layers, only one of which has colour.
+  assert.match(groundSrc, /out\.color = vec4f\(pm, outA\)/, "…which is only correct while it still premultiplies")
+  assert.match(groundSrc, /pm = baseColor \* surfA \+ pm \* \(1\.0 - surfA\)/)
 
   // Everyone else writes a straight colour, so src-alpha premultiplying it once
   // is exactly right. If one of these ever pre-scales its rgb, it needs the

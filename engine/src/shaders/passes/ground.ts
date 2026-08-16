@@ -145,15 +145,33 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // mid-shader, which is exactly how this line broke the build a moment ago.)
   var baseColor = material.diffuseColor * (sun * (1.0 - dark * 0.65) + lamps);
   baseColor *= noiseTint;
-  let finalColor = mix(baseColor, material.gridLineColor, gridLine * material.gridLineOpacity * edgeFade);
-  // Whole-ground opacity fades the SURFACE (color, grid) but the shadow stays —
-  // as opacity drops, the received shadow becomes a translucent dark layer
-  // (Blender's Shadow Catcher), so models still feel grounded on a photo or
-  // 360 backdrop. At opacity 1 this reduces exactly to the plain surface.
+  // THREE LAYERS, composited premultiplied, bottom to top: the shadow the
+  // catcher receives, the ground surface, and the grid.
+  //
+  // The grid used to be MIXED INTO the surface and then weighted by the
+  // surface's own alpha, so turning the ground down to nothing took the grid
+  // with it — you could not have a bare grid over a photo, which is most of
+  // what a grid is for. It is its own layer now: the ground plane keeps an
+  // alpha, and the grid is simply on or off.
   let surfA = edgeFade * material.opacity;
+  let gridA = gridLine * material.gridLineOpacity * edgeFade;
+  // As opacity drops the received shadow becomes a translucent dark layer
+  // (Blender's Shadow Catcher), so models still feel grounded on a photo or a
+  // 360 backdrop. Colourless by construction: it darkens by covering.
   let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity);
-  let outA = surfA + catchA;
-  out.color = vec4f(finalColor * surfA, outA);
+
+  var pm = vec3f(0.0);
+  var cov = catchA;
+  // Surface over shadow.
+  pm = baseColor * surfA + pm * (1.0 - surfA);
+  cov = surfA + cov * (1.0 - surfA);
+  // Grid over surface. Unshadowed, as it has always been — a painted line reads
+  // as paint, and darkening it was never what the mix did either.
+  pm = material.gridLineColor * gridA + pm * (1.0 - gridA);
+  cov = gridA + cov * (1.0 - gridA);
+
+  let outA = cov;
+  out.color = vec4f(pm, outA);
   // mask.r = 0: ground never contributes to bloom. mask.g = 1.0 with src.a =
   // outA turns the aux blend into alpha-over, so the drawable alpha goes
   // from outA at the center to 0 at the radial edge — letting the page
