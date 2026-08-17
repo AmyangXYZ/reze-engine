@@ -1555,7 +1555,7 @@ export class Model {
    *
    * `tracks: "morphs"` takes only the expression half and lays it over whatever
    * clip `name` already holds — see AnimationState.setMorphTracks for why an
-   * expression file overwrites rather than merges. Everything else about the
+   * morph file overwrites rather than merges. Everything else about the
    * load is identical, which is the reason it is an option here rather than a
    * second method: the path resolution below (site fetch, blob, or a folder
    * upload's asset reader) is the part nobody should own twice.
@@ -1613,7 +1613,7 @@ export class Model {
   }
 
   /** Zero the morphs a replaced track set drove and the new one does not, so
-   *  the face it left behind does not sit frozen under the new expressions.
+   *  the face it left behind does not sit frozen under the new morphs.
    *  See retiredMorphs for why nothing else clears them. */
   private clearRetiredMorphs(name: string, next: Map<string, MorphKeyframe[]>): void {
     for (const morphName of retiredMorphs(this.animationState.getAnimationClip(name), next)) {

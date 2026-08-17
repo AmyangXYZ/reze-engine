@@ -54,6 +54,28 @@ npm install reze-engine
 - Camera: orbit, bone-follow, or a driven MMD camera VMD; GPU picking, gizmos, morph/material editing surfaces
 - Every emitted shader is compiled on a real GPU device by the repo's validation tool (`engine/tools/validate-wgsl.mjs`) before release
 
+## Quick start
+
+```javascript
+import { Engine } from "reze-engine"
+
+const engine = new Engine(canvas)
+await engine.init()
+
+const model = await engine.loadModel("reze", "/models/reze/reze.pmx")
+await engine.autoStyleGroups("reze")
+
+await model.loadVmd("dance", "/animations/dance.vmd")
+model.show("dance")
+model.play()
+
+engine.runRenderLoop()
+```
+
+`autoStyleGroups` reads the model's own material names and gives each group a
+shader graph, so hair, eyes and skin come out looking like MMD with no shading
+code of your own.
+
 ## Architecture
 
 One frame, top to bottom. The CPU describes the scene once and the GPU runs it: culling and effect simulation in compute, shadows and the floor mirror feeding a scene pass that draws MMD the way MMD artists expect — author order, outlines, the eye/hair stencil — then bloom, film tone mapping, and depth of field finish the image.
