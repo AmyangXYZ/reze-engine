@@ -2169,14 +2169,18 @@ export class Engine {
   }
 
   /**
-   * Dial the floor mirror without rebuilding the ground — the adjust-tier
-   * sibling of addGround's own options. False when there is no ground to dial.
-   * Blur 0 is a polished mirror; 1 samples the softest level the chain built,
-   * scaled up with distance so the contact stays sharper than the far floor.
+   * Switch the floor mirror without rebuilding the ground — the adjust-tier
+   * sibling of addGround's own options. False when there is no ground.
+   *
+   * ON OR OFF, deliberately not a strength: the reflection is an independent
+   * LAYER beneath the floor surface, and how much of it shows is the ground's
+   * own opacity covering it. Blur 0 is a polished mirror; 1 samples the
+   * softest level, scaled by how far the reflected geometry sits behind the
+   * surface.
    */
-  setGroundMirror(strength: number, blur?: number): boolean {
+  setGroundMirror(on: boolean, blur?: number): boolean {
     if (!this.groundShadowMaterialBuffer) return false
-    this.groundMirror = Math.min(Math.max(strength, 0), 1)
+    this.groundMirror = on ? 1 : 0
     if (blur !== undefined) this.groundMirrorBlur = Math.min(Math.max(blur, 0), 1)
     this.device.queue.writeBuffer(
       this.groundShadowMaterialBuffer,
@@ -6290,11 +6294,12 @@ export class Engine {
     noiseStrength?: number
     /** Whole-ground opacity, 0–1 (multiplies the radial edge fade). Default 1. */
     opacity?: number
-    /** Floor-mirror strength, 0–1: how much of the surface is the reflected
-     *  cast. 0 (default) never renders the reflection pass at all. */
-    mirror?: number
+    /** Floor mirror, on or off — NOT a strength: the reflection is its own
+     *  layer, and how much of it shows is the surface's own `opacity`
+     *  covering it. Off (default) never renders the reflection pass at all. */
+    mirror?: boolean
     /** Mirror softness, 0–1: 0 a polished mirror, 1 the softest blur level,
-     *  scaled with distance so the contact stays sharper than the far floor. */
+     *  scaled by how far the reflected geometry sits behind the surface. */
     mirrorBlur?: number
   }): void {
     const opts = {
@@ -6310,7 +6315,7 @@ export class Engine {
       gridLineColor: new Vec3(0.85, 0.85, 0.85),
       noiseStrength: 0.05,
       opacity: 1.0,
-      mirror: 0,
+      mirror: false,
       mirrorBlur: 0,
       ...options,
     }
@@ -8020,7 +8025,7 @@ export class Engine {
     gridLineColor: Vec3
     noiseStrength: number
     opacity: number
-    mirror: number
+    mirror: boolean
     mirrorBlur: number
   }) {
     const {
@@ -8056,7 +8061,7 @@ export class Engine {
     gb[12] = gridLineColor.x
     gb[13] = gridLineColor.y
     gb[14] = gridLineColor.z
-    gb[15] = Math.min(Math.max(mirror, 0), 1)
+    gb[15] = mirror ? 1 : 0
     this.groundMirror = gb[15]
     gb[16] = Math.min(Math.max(mirrorBlur, 0), 1)
     this.groundMirrorBlur = gb[16]

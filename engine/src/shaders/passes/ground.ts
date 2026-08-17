@@ -180,13 +180,15 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // mid-shader, which is exactly how this line broke the build a moment ago.)
   var baseColor = material.diffuseColor * (sun * (1.0 - dark * 0.65) + lamps);
   baseColor *= noiseTint;
-  // The floor mirror. The reflection was rendered by the MIRROR camera, so
-  // projecting this fragment's world position through that camera yields
-  // exactly the texel where its reflection landed — projective mapping, no
-  // screen-space guess. Reflectivity is UNIFORM by design: the classic MMD
-  // stage floor is a flat mirror on a dial, not a fresnel surface, and
-  // anime-stylised is the standing rule. The branch is on a uniform, so the
-  // whole cost vanishes for the scenes that leave the dial at zero.
+  // The floor mirror — its OWN LAYER, not a blend into the surface. The
+  // reflection was rendered by the MIRROR camera, so projecting this
+  // fragment's world position through that camera yields exactly the texel
+  // where its reflection landed — projective mapping, no screen-space guess.
+  // There is deliberately NO strength dial: mirror is on or off, and how much
+  // of it shows is the SURFACE's own opacity covering it — the same
+  // independence the grid won earlier. The branch is on a uniform, so the
+  // whole cost vanishes for the scenes that leave it off.
+  var reflShadowed = vec3f(0.0);
   if (material.mirror > 0.0) {
     let mc = mirrorVP.viewProj * vec4f(i.worldPos, 1.0);
     let mndc = mc.xyz / max(mc.w, 1e-6);
@@ -224,7 +226,7 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     let refl = textureSampleLevel(mirrorTex, linearSampler, muv, lod).rgb;
     // Still under the received shadow: a polished floor in shade shows a dim
     // reflection, and a mirror that ignored the shadow would glow in it.
-    baseColor = mix(baseColor, refl * (1.0 - dark * 0.65), material.mirror);
+    reflShadowed = refl * (1.0 - dark * 0.65);
   }
   // THREE LAYERS, composited premultiplied, bottom to top: the shadow the
   // catcher receives, the ground surface, and the grid.
@@ -236,13 +238,25 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // alpha, and the grid is simply on or off.
   let surfA = edgeFade * material.opacity;
   let gridA = gridLine * material.gridLineOpacity * edgeFade;
+  // The mirror is opaque across the ground's extent when on — it always shows
+  // SOMETHING, because the backdrop rides in the reflection target itself.
+  let mirrA = material.mirror * edgeFade;
   // As opacity drops the received shadow becomes a translucent dark layer
   // (Blender's Shadow Catcher), so models still feel grounded on a photo or a
-  // 360 backdrop. Colourless by construction: it darkens by covering.
-  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity);
+  // 360 backdrop. Colourless by construction: it darkens by covering. The
+  // MIRROR subsumes it: the reflection already carries the received shadow,
+  // and a catcher stacked on top would darken the same shadow twice.
+  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity) * (1.0 - material.mirror);
 
-  var pm = vec3f(0.0);
-  var cov = catchA;
+  // FOUR LAYERS, premultiplied, bottom to top: reflection, received shadow,
+  // ground surface, grid. Each with its own coverage, none scaling another —
+  // ground opacity REVEALS the mirror rather than the mirror carrying a
+  // strength of its own.
+  var pm = reflShadowed * mirrA;
+  var cov = mirrA;
+  // Shadow catcher over the reflection-or-nothing: black, it covers.
+  pm = pm * (1.0 - catchA);
+  cov = catchA + cov * (1.0 - catchA);
   // Surface over shadow.
   pm = baseColor * surfA + pm * (1.0 - surfA);
   cov = surfA + cov * (1.0 - surfA);
