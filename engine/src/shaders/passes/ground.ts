@@ -34,10 +34,13 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 @group(0) @binding(7) var shadowMapFar: texture_depth_2d;
 // The floor mirror (step 7D): the reflection target, the camera that rendered
 // it, and an ordinary sampler — the two shadow bindings above are comparison.
-struct MirrorVP { viewProj: mat4x4f, };
+// params = (projA, projB, _, _) — the depth-linearisation pair of the SHARED
+// projection, refreshed per frame beside the matrix.
+struct MirrorVP { viewProj: mat4x4f, params: vec4f, };
 @group(0) @binding(8) var<uniform> mirrorVP: MirrorVP;
 @group(0) @binding(9) var mirrorTex: texture_2d<f32>;
 @group(0) @binding(10) var linearSampler: sampler;
+@group(0) @binding(11) var mirrorDepth: texture_depth_multisampled_2d;
 ${lightsApi(0, 6)}
 
 fn hash2(p: vec2f) -> f32 {
@@ -187,16 +190,38 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   if (material.mirror > 0.0) {
     let mc = mirrorVP.viewProj * vec4f(i.worldPos, 1.0);
     let mndc = mc.xyz / max(mc.w, 1e-6);
-    let muv = vec2f(mndc.x * 0.5 + 0.5, 0.5 - mndc.y * 0.5);
-    // Softness reads a higher mip of the reflection, SCALED WITH DISTANCE so
-    // the contact under a foot stays sharper than the far floor — the cheap
-    // stand-in for true depth-proportional blur, which would need the
-    // reflection's own depth (recorded follow-up). Blur 0 is exactly level 0,
-    // which is why an unfilled mip chain is safe. The hardware clamps the
-    // level, so the nominal 5.0 needs no knowledge of the real chain length.
-    let viewDist = length(i.worldPos - camera.viewPos);
-    let lod = material.mirrorBlur * 5.0 * clamp(viewDist / 60.0, 0.15, 1.0);
-    let refl = textureSampleLevel(mirrorTex, linearSampler, clamp(muv, vec2f(0.0), vec2f(1.0)), lod).rgb;
+    let muv = clamp(vec2f(mndc.x * 0.5 + 0.5, 0.5 - mndc.y * 0.5), vec2f(0.0), vec2f(1.0));
+    var lod = 0.0;
+    if (material.mirrorBlur > 0.0) {
+      // DEPTH-PROPORTIONAL softness: the real driver is how far BEHIND the
+      // mirror surface the reflected geometry sits — a foot on the floor
+      // reflects sharp, a head reflects soft, the empty backdrop softest.
+      //
+      // Read the mirror pass's own depth at this texel, linearise it with the
+      // shared projection's pair (viewZ = projB / (z - projA); the formula
+      // inverts both depth conventions, see the composite's linearDepth), and
+      // reconstruct the reflected image point along the ray from the MIRRORED
+      // eye through this fragment. The plane is y = 0, so mirroring the eye
+      // and the camera forward is a sign flip on y, and the image point's
+      // depth below the plane IS the reflected object's height above it.
+      let dims = vec2f(textureDimensions(mirrorDepth));
+      let texel = clamp(vec2i(muv * dims), vec2i(0), vec2i(dims) - vec2i(1));
+      let z = textureLoad(mirrorDepth, texel, 0);
+      let viewZ = clamp(mirrorVP.params.y / (z - mirrorVP.params.x), 0.05, 100000.0);
+      let eyeM = vec3f(camera.viewPos.x, -camera.viewPos.y, camera.viewPos.z);
+      let fwd = vec3f(camera.view[0][2], camera.view[1][2], camera.view[2][2]);
+      let fwdM = vec3f(fwd.x, -fwd.y, fwd.z);
+      let toFrag = i.worldPos - eyeM;
+      let dir = toFrag * inverseSqrt(max(dot(toFrag, toFrag), 1e-8));
+      let t = viewZ / max(dot(dir, fwdM), 1e-4);
+      let height = max(-(eyeM.y + dir.y * t), 0.0);
+      // Full softness by BLUR_SPAN units above the floor — about a character's
+      // height. The hardware clamps the level, so the nominal 5.0 needs no
+      // knowledge of the real chain length, and blur 0 reads exactly level 0.
+      let BLUR_SPAN = 14.0;
+      lod = material.mirrorBlur * 5.0 * clamp(height / BLUR_SPAN, 0.0, 1.0);
+    }
+    let refl = textureSampleLevel(mirrorTex, linearSampler, muv, lod).rgb;
     // Still under the received shadow: a polished floor in shade shows a dim
     // reflection, and a mirror that ignored the shadow would glow in it.
     baseColor = mix(baseColor, refl * (1.0 - dark * 0.65), material.mirror);

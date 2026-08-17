@@ -1110,7 +1110,11 @@ interface EffectParticles {
   render: GPURenderPipeline
   renderLayout: GPUBindGroupLayout
   renderBind: GPUBindGroup
-  rebind: () => { computeBind: GPUBindGroup; renderBind: GPUBindGroup }
+  /** Same draw, the MIRRORED camera: how particles join the floor mirror. The
+   *  billboards face whichever eye is bound, so one extra bind group is the
+   *  whole cost. */
+  mirrorRenderBind: GPUBindGroup
+  rebind: () => { computeBind: GPUBindGroup; renderBind: GPUBindGroup; mirrorRenderBind: GPUBindGroup }
 }
 
 /**
@@ -1151,6 +1155,8 @@ interface EffectTrails {
   pipeline: GPURenderPipeline
   layout: GPUBindGroupLayout
   bind: GPUBindGroup
+  /** The mirrored camera's view of the same ribbons — the floor mirror's. */
+  mirrorBind: GPUBindGroup
 }
 
 /**
@@ -1595,8 +1601,10 @@ export class Engine {
   private static readonly REFLECTION_PLANE_Y = 0
   private mirrorCameraData = new Float32Array(40)
   private mirrorCameraBuffer!: GPUBuffer
-  // proj x mirrorView, for the ground's projective sample and the cull planes.
-  private mirrorVPData = new Float32Array(16)
+  // proj x mirrorView for the ground's projective sample and the cull planes,
+  // then (projA, projB, 0, 0) — the depth-linearisation pair, read off the
+  // SHARED projection the way dofU does, for the depth-proportional blur.
+  private mirrorVPData = new Float32Array(20)
   private mirrorVPBuffer!: GPUBuffer
   private mirrorPerFrameBindGroup!: GPUBindGroup
   private mirrorColorMsTexture: GPUTexture | null = null
@@ -1609,6 +1617,7 @@ export class Engine {
   private mirrorMaskMsTexture: GPUTexture | null = null
   private mirrorIdMsTexture: GPUTexture | null = null
   private mirrorDepthTexture: GPUTexture | null = null
+  private mirrorDepthReadView: GPUTextureView | null = null
   private mirrorPassDescriptor: GPURenderPassDescriptor | null = null
   private mirrorOpaqueBundle: GPURenderBundle | null = null
   private mirrorTransparentBundle: GPURenderBundle | null = null
@@ -2231,6 +2240,11 @@ export class Engine {
     buildMirrorCamera(this.cameraMatrixData, Engine.REFLECTION_PLANE_Y, this.mirrorCameraData)
     this.device.queue.writeBuffer(this.mirrorCameraBuffer, 0, this.mirrorCameraData)
     Mat4.multiplyArrays(this.cameraMatrixData, 16, this.mirrorCameraData, 0, this.mirrorVPData, 0)
+    // projA/projB ARE m[10] and m[14] of the projection (the dofU discipline:
+    // read them off the matrix, never re-derive from near/far). The mirror
+    // shares the main projection, so the pair linearises its depth too.
+    this.mirrorVPData[16] = this.cameraMatrixData[16 + 10]
+    this.mirrorVPData[17] = this.cameraMatrixData[16 + 14]
     this.device.queue.writeBuffer(this.mirrorVPBuffer, 0, this.mirrorVPData)
   }
 
@@ -2268,6 +2282,13 @@ export class Engine {
     if (this.mirrorOpaqueBundle) bundles.push(this.mirrorOpaqueBundle)
     if (this.mirrorTransparentBundle) bundles.push(this.mirrorTransparentBundle)
     pass.executeBundles(bundles)
+    // Particles and ribbons are scene geometry, and a mirror that dropped them
+    // showed a dancer whose hand ribbon cast no reflection. Field effects stay
+    // out BY DESIGN: they are display-space overlays composited after the view
+    // transform, with no world position to mirror. executeBundles reset the
+    // pass state, so these draws bind everything themselves — which they do.
+    this.renderParticles(pass, "mirror")
+    this.drawTrails(pass, "mirror")
     pass.end()
     this.renderMirrorBlurChain(encoder)
   }
@@ -3146,13 +3167,13 @@ export class Engine {
           { binding: 5, visibility, buffer: { type: "read-only-storage" } },
         ],
       })
-    const bindFor = (layout: GPUBindGroupLayout) =>
+    const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer) =>
       this.device.createBindGroup({
         layout,
         entries: [
           { binding: 0, resource: { buffer } },
           { binding: 1, resource: { buffer: uniform } },
-          { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
+          { binding: 2, resource: { buffer: camera } },
           { binding: 3, resource: { buffer: this.castBuffer } },
           { binding: 4, resource: { buffer: this.audioBuffer } },
           { binding: 5, resource: { buffer: this.scoreBuffer } },
@@ -3205,11 +3226,16 @@ export class Engine {
           counts: uniformView.uints,
           compute,
           computeLayout,
-          computeBind: bindFor(computeLayout),
+          computeBind: bindFor(computeLayout, this.cameraUniformBuffer),
           render,
           renderLayout,
-          renderBind: bindFor(renderLayout),
-          rebind: () => ({ computeBind: bindFor(computeLayout), renderBind: bindFor(renderLayout) }),
+          renderBind: bindFor(renderLayout, this.cameraUniformBuffer),
+          mirrorRenderBind: bindFor(renderLayout, this.mirrorCameraBuffer),
+          rebind: () => ({
+            computeBind: bindFor(computeLayout, this.cameraUniformBuffer),
+            renderBind: bindFor(renderLayout, this.cameraUniformBuffer),
+            mirrorRenderBind: bindFor(renderLayout, this.mirrorCameraBuffer),
+          }),
         },
       }
     } catch (e) {
@@ -3359,12 +3385,12 @@ export class Engine {
   }
 
   /** Draw the pool. Inside the scene pass, so it is depth-tested and pre-bloom. */
-  private renderParticles(pass: GPURenderPassEncoder): void {
+  private renderParticles(pass: GPURenderPassEncoder, view: "camera" | "mirror"): void {
     for (const e of this.effects) {
       const p = e.particles
       if (!p) continue
       pass.setPipeline(p.render)
-      pass.setBindGroup(0, p.renderBind)
+      pass.setBindGroup(0, view === "mirror" ? p.mirrorRenderBind : p.renderBind)
       pass.draw(6, p.count)
     }
   }
@@ -3485,6 +3511,16 @@ export class Engine {
               { binding: 5, resource: { buffer: this.scoreBuffer } },
             ],
           }),
+          mirrorBind: this.device.createBindGroup({
+            layout,
+            entries: [
+              { binding: 0, resource: { buffer: this.castBuffer } },
+              { binding: 1, resource: { buffer: uniform } },
+              { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
+              { binding: 4, resource: { buffer: this.audioBuffer } },
+              { binding: 5, resource: { buffer: this.scoreBuffer } },
+            ],
+          }),
         },
       }
     } catch (e) {
@@ -3512,15 +3548,20 @@ export class Engine {
    *
    * Takes the pass rather than opening one: that IS the change.
    */
-  private drawTrails(pass: GPURenderPassEncoder): void {
+  private drawTrails(pass: GPURenderPassEncoder, view: "camera" | "mirror"): void {
     const drawn = this.effects.filter((e) => e.trails)
     if (drawn.length === 0) return
     for (const e of drawn) {
       const t = e.trails!
-      t.data[0] = this.sceneClock - e.epochScene
-      this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
+      // The clock upload happens once, on the camera draw: queue writes land
+      // before the encoder submits, so both passes read the same value — the
+      // mirror draw writing it again would only write it twice.
+      if (view === "camera") {
+        t.data[0] = this.sceneClock - e.epochScene
+        this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
+      }
       pass.setPipeline(t.pipeline)
-      pass.setBindGroup(0, t.bind)
+      pass.setBindGroup(0, view === "mirror" ? t.mirrorBind : t.bind)
       pass.draw(6, t.instances)
     }
   }
@@ -3594,6 +3635,16 @@ export class Engine {
         { binding: 0, resource: { buffer: this.castBuffer } },
         { binding: 1, resource: { buffer: t.uniform } },
         { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 4, resource: { buffer: this.audioBuffer } },
+        { binding: 5, resource: { buffer: this.scoreBuffer } },
+      ],
+    })
+    t.mirrorBind = this.device.createBindGroup({
+      layout: t.layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.castBuffer } },
+        { binding: 1, resource: { buffer: t.uniform } },
+        { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.scoreBuffer } },
       ],
@@ -4703,10 +4754,12 @@ export class Engine {
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
         // The floor mirror: the mirror camera's view-projection, the reflection
-        // resolve, and an ordinary sampler beside the comparison one.
+        // resolve, an ordinary sampler beside the comparison one, and the
+        // mirror pass's own depth for the depth-proportional blur.
         { binding: 8, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 11, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth", multisampled: true } },
       ],
     })
     const groundShadowShader = this.device.createShaderModule({
@@ -5383,8 +5436,11 @@ export class Engine {
         size: [mw, mh],
         sampleCount: Engine.MULTISAMPLE_COUNT,
         format: this.depthFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        // TEXTURE_BINDING: the ground reads it back for depth-proportional
+        // blur — how far behind the mirror surface the reflection sits.
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
+      this.mirrorDepthReadView = this.mirrorDepthTexture.createView({ aspect: "depth-only" })
       const mirrorColor: GPURenderPassColorAttachment = {
         view: this.mirrorColorMsTexture.createView(),
         resolveTarget: this.mirrorMipViews[0],
@@ -5413,7 +5469,9 @@ export class Engine {
           view: this.mirrorDepthTexture.createView(),
           depthClearValue: this.depthClear,
           depthLoadOp: "clear",
-          depthStoreOp: "discard",
+          // Stored, not discarded: the ground's blur reads it. Stencil stays
+          // discarded — nothing reads stencil back.
+          depthStoreOp: "store",
           stencilClearValue: 0,
           stencilLoadOp: "clear",
           stencilStoreOp: "discard",
@@ -5822,7 +5880,7 @@ export class Engine {
     })
     this.mirrorVPBuffer = this.device.createBuffer({
       label: "mirror view-projection",
-      size: 64,
+      size: 80,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
@@ -5962,6 +6020,7 @@ export class Engine {
       const b = e.particles.rebind()
       e.particles.computeBind = b.computeBind
       e.particles.renderBind = b.renderBind
+      e.particles.mirrorRenderBind = b.mirrorRenderBind
     }
   }
 
@@ -6029,6 +6088,7 @@ export class Engine {
       const b = e.particles.rebind()
       e.particles.computeBind = b.computeBind
       e.particles.renderBind = b.renderBind
+      e.particles.mirrorRenderBind = b.mirrorRenderBind
     }
   }
 
@@ -8033,6 +8093,7 @@ export class Engine {
         // can exist to bind it.
         { binding: 9, resource: this.mirrorColorView! },
         { binding: 10, resource: this.materialSampler },
+        { binding: 11, resource: this.mirrorDepthReadView! },
       ],
     })
     if (this.groundDrawCall) this.groundDrawCall.bindGroup = this.groundShadowBindGroup
@@ -9395,12 +9456,12 @@ export class Engine {
     // Last in the pass: depth-tested against everything drawn above, so a
     // particle behind the character is simply hidden, and still inside the HDR
     // target so an `@bloom` effect reaches the pyramid below.
-    this.renderParticles(pass)
+    this.renderParticles(pass, "camera")
     // Ribbons, in the same pass and after the particles: both are additive
     // light in HDR, and both reach the bloom pyramid because of it. This used
     // to run after pass.end() into a layer of its own, which is precisely what
     // kept ribbons out of bloom.
-    this.drawTrails(pass)
+    this.drawTrails(pass, "camera")
     pass.end()
     // The field mounts, likewise: after the scene so foregrounds can read its
     // depth, before the composite that samples both layers.
