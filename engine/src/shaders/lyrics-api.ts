@@ -2,28 +2,32 @@
 // the lights, and shaped like them: one shared buffer, read through accessors,
 // never touched directly.
 //
-// What an effect gets is the TIMING of the words: which line is live at the
-// scene clock, how far through it is, when the next one lands. That is what
-// karaoke bars, per-line pulses and line-change bursts are made of, and it is
-// export-safe by construction because it reads the same clock everything else
-// does. Drawing the TEXT itself is a renderer concern with its own recorded
-// design (Canvas2D rasterisation — CJK rules out glyph atlases) and rides on
-// top of this, not inside it.
+// An effect gets the TIMING of the words — which line is live at the scene
+// clock, how far through it is — and, in the field module, the words
+// themselves: the host rasterises each line once (Canvas2D; CJK rules out
+// glyph atlases) into a fixed atlas the effect samples through rzLyricText.
+// The look — fill, outline, wipe, motion — is the effect author's, in WGSL.
 //
 // LAYOUT. A 4-float header (count, then padding that keeps the records
-// vec4-aligned), then LYRIC_LINES_MAX records of 4 floats:
+// vec4-aligned), then LYRIC_LINES_MAX records of 8 floats:
 //
-//   [0] start seconds   [1] end seconds   [2] character count   [3] reserved
+//   [0] start s   [1] end s   [2] character count   [3] reserved
+//   [4..7] atlas rect: u0, vTop, u1, vBottom
 //
 // FIXED SIZE, unlike the score: a song carries tens of lines, not thousands
-// of notes, so capping at 256 costs 4 KB and buys the property that setLyrics
+// of notes, so capping at 256 costs 8 KB and buys the property that setLyrics
 // is a buffer write — the buffer identity never changes, so nothing ever has
-// to re-bind for lyrics arriving late.
+// to re-bind for lyrics arriving late. The atlas holds the same property by
+// being allocated once at a fixed size (LYRIC_ATLAS_W × LYRIC_ATLAS_H).
 
 export const LYRIC_LINES_MAX = 256
 export const LYRIC_HEADER = 4
-export const LYRIC_STRIDE = 4
+export const LYRIC_STRIDE = 8
 export const LYRICS_FLOATS = LYRIC_HEADER + LYRIC_LINES_MAX * LYRIC_STRIDE
+
+/** The line atlas the host packs rasterised lines into — one allocation, ever. */
+export const LYRIC_ATLAS_W = 2048
+export const LYRIC_ATLAS_H = 4096
 
 export type LyricLine = {
   /** Seconds on the scene clock. */
@@ -33,11 +37,16 @@ export type LyricLine = {
   text: string
 }
 
+/** Where a rasterised line sits in the atlas: u0, vTop, u1, vBottom, in 0..1. */
+export type LyricRect = [number, number, number, number]
+
 /**
  * Parse an .lrc file: `[mm:ss.xx]` tags (several per line share the text),
  * an optional `[offset:±ms]` tag, blank-text tags kept as instrumental gaps'
  * end markers. Lines come out sorted; each line's end is the next line's
- * start, and the last line gets a ten-second hold.
+ * start, and the last line gets a ten-second hold. The offset follows the
+ * LRC convention: positive shows lines EARLIER — the knob to turn when the
+ * words feel late against this particular rip.
  */
 export function parseLRC(source: string): LyricLine[] {
   let offset = 0
@@ -53,7 +62,7 @@ export function parseLRC(source: string): LyricLine[] {
     const text = raw.slice(tags[tags.length - 1].index! + tags[tags.length - 1][0].length).trim()
     for (const t of tags) {
       const frac = t[3] ? parseInt(t[3], 10) / 10 ** t[3].length : 0
-      stamped.push({ start: parseInt(t[1], 10) * 60 + parseInt(t[2], 10) + frac + offset, text })
+      stamped.push({ start: Math.max(0, parseInt(t[1], 10) * 60 + parseInt(t[2], 10) + frac - offset), text })
     }
   }
   stamped.sort((a, b) => a.start - b.start)
@@ -73,7 +82,7 @@ export function parseLRC(source: string): LyricLine[] {
 }
 
 /** Fill the shared buffer's floats from parsed lines, clamped to the cap. */
-export function packLyrics(lines: LyricLine[]): Float32Array<ArrayBuffer> {
+export function packLyrics(lines: LyricLine[], rects?: LyricRect[]): Float32Array<ArrayBuffer> {
   const out = new Float32Array(new ArrayBuffer(LYRICS_FLOATS * 4))
   const n = Math.min(lines.length, LYRIC_LINES_MAX)
   out[0] = n
@@ -82,11 +91,18 @@ export function packLyrics(lines: LyricLine[]): Float32Array<ArrayBuffer> {
     out[b] = lines[i].start
     out[b + 1] = lines[i].end
     out[b + 2] = lines[i].text.length
+    const r = rects?.[i]
+    if (r) {
+      out[b + 4] = r[0]
+      out[b + 5] = r[1]
+      out[b + 6] = r[2]
+      out[b + 7] = r[3]
+    }
   }
   return out
 }
 
-/** The rzLyric* accessors, with the buffer declared at the given binding. */
+/** The rzLyric* timing accessors, with the buffer declared at the given binding. */
 export function lyricsApi(group: number, binding: number): string {
   return /* wgsl */ `
 @group(${group}) @binding(${binding}) var<storage, read> _rzLyrics: array<f32>;
@@ -111,6 +127,19 @@ fn rzLyricChars(i: i32) -> f32 {
   return _rzLyrics[${LYRIC_HEADER} + i * ${LYRIC_STRIDE} + 2];
 }
 
+/** Where line i sits in the lyric atlas: u0, vTop, u1, vBottom. Zero when the
+ *  host never rasterised text — check with rzLyricHasText. */
+fn rzLyricRect(i: i32) -> vec4f {
+  if (i < 0 || i >= rzLyricCount()) { return vec4f(0.0); }
+  let b = ${LYRIC_HEADER} + i * ${LYRIC_STRIDE};
+  return vec4f(_rzLyrics[b + 4], _rzLyrics[b + 5], _rzLyrics[b + 6], _rzLyrics[b + 7]);
+}
+
+fn rzLyricHasText(i: i32) -> bool {
+  let r = rzLyricRect(i);
+  return r.z > r.x;
+}
+
 /** The line live at time t, or -1 between lines and outside the track. */
 fn rzLyricIndex(t: f32) -> i32 {
   let n = rzLyricCount();
@@ -126,6 +155,34 @@ fn rzLyricProgress(i: i32, t: f32) -> f32 {
   let e = rzLyricEnd(i);
   if (e <= s) { return 0.0; }
   return clamp((t - s) / (e - s), 0.0, 1.0);
+}
+`
+}
+
+/**
+ * The text half — field module only, where the atlas is bound. uv is 0..1
+ * across LINE i's own box, y-up like everything else; the return is glyph
+ * coverage. textureSampleLevel, so it is legal after any branch.
+ */
+export function lyricsTextApi(group: number, texBinding: number, samplerName: string): string {
+  return /* wgsl */ `
+@group(${group}) @binding(${texBinding}) var _rzLyricTex: texture_2d<f32>;
+
+fn rzLyricText(i: i32, uv: vec2f) -> f32 {
+  let r = rzLyricRect(i);
+  if (r.z <= r.x || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return 0.0; }
+  let at = vec2f(mix(r.x, r.z, uv.x), mix(r.w, r.y, uv.y));
+  return textureSampleLevel(_rzLyricTex, ${samplerName}, at, 0.0).r;
+}
+
+/** Line i's width over its height as rasterised — size a box with it so the
+ *  glyphs keep their proportions on any canvas. */
+fn rzLyricAspect(i: i32) -> f32 {
+  let r = rzLyricRect(i);
+  let h = r.w - r.y;
+  if (h <= 0.0) { return 1.0; }
+  let dim = vec2f(textureDimensions(_rzLyricTex));
+  return ((r.z - r.x) * dim.x) / (h * dim.y);
 }
 `
 }

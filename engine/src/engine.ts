@@ -32,7 +32,7 @@ import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import { packHalf, type HdrImage } from "./hdr"
 import { evalIrradianceSH, projectIrradianceSH } from "./ibl"
-import { LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine } from "./shaders/lyrics-api"
+import { LYRIC_ATLAS_H, LYRIC_ATLAS_W, LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1520,6 +1520,10 @@ export class Engine {
   /** Fixed-size (LYRICS_FLOATS): setLyrics is a write, never a reallocation,
    *  so lyric data arriving after any effect reaches it with no re-binding. */
   private lyricsBuffer!: GPUBuffer
+  /** The rasterised lines, for rzLyricText. Fixed-size for the same reason
+   *  the buffer is: allocated once, written into, never re-bound. */
+  private lyricsTexture!: GPUTexture
+  private lyricsTextureView!: GPUTextureView
   /** The notes as installed, kept CPU-side because the per-pitch key map is
    *  rebuilt from them every time the clock moves. */
   private scoreNotes: ScoreNote[] = []
@@ -2517,7 +2521,8 @@ export class Engine {
           { binding: 11, resource: { buffer: this.castBuffer } },
           { binding: 13, resource: { buffer: this.audioBuffer } },
           { binding: 19, resource: { buffer: this.scoreBuffer } },
-        { binding: 24, resource: { buffer: this.lyricsBuffer } },
+          { binding: 24, resource: { buffer: this.lyricsBuffer } },
+          { binding: 25, resource: this.lyricsTextureView },
           // The size uniform for the pair THIS effect draws into.
           { binding: 14, resource: { buffer: this.fieldUniformBuffers[owner.fieldLayer] } },
           { binding: 22, resource: { buffer: owner.fieldClock ?? this.fieldUniformBuffers[owner.fieldLayer] } },
@@ -4471,6 +4476,8 @@ export class Engine {
         // the field layer's already speak for everything below it.
         { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 24, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The lyric line atlas, for rzLyricText.
+        { binding: 25, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         // This effect's own clock — see the field shader's note on why it is
         // not viewU[6].x.
@@ -4811,6 +4818,15 @@ export class Engine {
       size: LYRICS_FLOATS * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
+    // One channel is all a glyph mask is; textures clear to zero, which reads
+    // as "no text" until the first setLyrics with an atlas arrives.
+    this.lyricsTexture = this.device.createTexture({
+      label: "lyric line atlas",
+      size: [LYRIC_ATLAS_W, LYRIC_ATLAS_H],
+      format: "r8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    this.lyricsTextureView = this.lyricsTexture.createView()
 
     // Now that shadow resources exist, create the main per-frame bind group
     this.perFrameBindGroup = this.device.createBindGroup({
@@ -6147,11 +6163,25 @@ export class Engine {
    */
   /**
    * Install the track's lyric lines for the rzLyric* effect functions — the
-   * timing of the words on the scene clock. Null clears. A plain buffer write:
-   * the buffer is fixed-size, so nothing re-binds whenever lyrics arrive.
+   * timing of the words on the scene clock, and optionally the words
+   * themselves: `atlas.source` is a canvas/bitmap of rasterised lines (the
+   * host draws them — Canvas2D handles every script the platform does) with
+   * `atlas.rects` saying where each line sits, in 0..1 [u0, vTop, u1, vBottom].
+   * Null clears. A plain buffer write plus at most a texture copy: buffer and
+   * atlas are both fixed-size, so nothing re-binds whenever lyrics arrive.
    */
-  setLyrics(lines: LyricLine[] | null): void {
-    this.device.queue.writeBuffer(this.lyricsBuffer, 0, packLyrics(lines ?? []))
+  setLyrics(
+    lines: LyricLine[] | null,
+    atlas?: { source: GPUCopyExternalImageSource; width: number; height: number; rects: LyricRect[] },
+  ): void {
+    this.device.queue.writeBuffer(this.lyricsBuffer, 0, packLyrics(lines ?? [], atlas?.rects))
+    if (atlas) {
+      this.device.queue.copyExternalImageToTexture(
+        { source: atlas.source },
+        { texture: this.lyricsTexture },
+        [Math.min(atlas.width, LYRIC_ATLAS_W), Math.min(atlas.height, LYRIC_ATLAS_H)],
+      )
+    }
   }
 
   setScore(notes: ScoreNote[] | null, release = 0.35): void {

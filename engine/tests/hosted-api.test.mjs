@@ -102,6 +102,10 @@ const EXCEPTIONS = {
   rzTurnRadius: "same",
   RZ_REF_SPAN: "the ribbon's line-integral reference span",
   RZ_SLOTS: "how many ribbons THIS module draws; RZ_TRAIL_SLOTS is the author-facing count",
+  // The lyric atlas texture is bound only where lines get DRAWN — the field
+  // module. Timing (rzLyric*) is universal; the words are a field concern.
+  rzLyricText: "samples the lyric atlas, which only the field module binds",
+  rzLyricAspect: "same",
 }
 
 test("every author-facing name is in every module, or listed as an exception", () => {

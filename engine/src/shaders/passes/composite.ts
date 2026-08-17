@@ -4,7 +4,7 @@ import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
-import { lyricsApi } from "../lyrics-api"
+import { lyricsApi, lyricsTextApi } from "../lyrics-api"
 import { scoreApi } from "../score-api"
 import { gridReadApi } from "./grid"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
@@ -701,6 +701,9 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     audioApi(0, 13) +
     scoreApi(0, 19) +
     lyricsApi(0, 24) +
+    // The words themselves — the atlas rides the grid's sampler, which is
+    // declared just below and resolves module-wide.
+    lyricsTextApi(0, 25, "_rzGridSamp") +
     // The persistent grid, always bound — a 1×1 of zeroes when the effect has
     // none, so rzGrid() is a function that always exists rather than one an
     // author has to know whether they are allowed to call.

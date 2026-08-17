@@ -30,9 +30,11 @@ test("several tags on one line share its text, sorted into place", () => {
   )
 })
 
-test("an offset tag shifts every timestamp, in milliseconds", () => {
-  const lines = parseLRC("[offset:-500]\n[00:10.00]shifted")
-  assert.equal(lines[0].start, 9.5)
+test("offset follows the LRC convention: positive shows lines earlier", () => {
+  assert.equal(parseLRC("[offset:+500]\n[00:10.00]shifted")[0].start, 9.5)
+  assert.equal(parseLRC("[offset:-500]\n[00:10.00]shifted")[0].start, 10.5)
+  // ...and never drives a line before the song exists.
+  assert.equal(parseLRC("[offset:+900]\n[00:00.20]early")[0].start, 0)
 })
 
 test("an empty-text stamp closes its predecessor without becoming a line", () => {
@@ -61,6 +63,24 @@ test("packing writes count, start, end and character count at the stride", () =>
   assert.equal(out[LYRIC_HEADER], 1.5)
   assert.equal(out[LYRIC_HEADER + 1], 4)
   assert.equal(out[LYRIC_HEADER + 2], 5)
+})
+
+test("packing carries each line's atlas rect when the host rasterised text", () => {
+  const out = packLyrics(
+    [
+      { start: 0, end: 1, text: "a" },
+      { start: 1, end: 2, text: "b" },
+    ],
+    [
+      [0.1, 0.2, 0.3, 0.25],
+      [0.1, 0.25, 0.5, 0.3],
+    ],
+  )
+  const b = LYRIC_HEADER + LYRIC_STRIDE
+  assert.deepEqual([...out.slice(b + 4, b + 8)].map((v) => Math.round(v * 100) / 100), [0.1, 0.25, 0.5, 0.3])
+  // Without rects the lane stays zero — rzLyricHasText reads that as "timing only".
+  const bare = packLyrics([{ start: 0, end: 1, text: "a" }])
+  assert.deepEqual([...bare.slice(LYRIC_HEADER + 4, LYRIC_HEADER + 8)], [0, 0, 0, 0])
 })
 
 test("packing clamps to the line cap", () => {
