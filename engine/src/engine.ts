@@ -6193,7 +6193,16 @@ export class Engine {
       // effect reading rzLyric* is never interrupted by lyrics arriving.
       this.rebuildFieldBindGroup()
     }
-    this.device.queue.copyExternalImageToTexture({ source: atlas.source }, { texture: this.lyricsTexture }, [w, h])
+    // premultipliedAlpha: a 2D canvas IS premultiplied, and the default (false)
+    // makes the copy UNpremultiply — which divides each texel by its own alpha
+    // and turns every antialiased glyph edge into a hard one. Saying the
+    // destination is premultiplied means no conversion, so the red channel
+    // arrives as the coverage the rasteriser drew.
+    this.device.queue.copyExternalImageToTexture(
+      { source: atlas.source },
+      { texture: this.lyricsTexture, premultipliedAlpha: true },
+      [w, h],
+    )
   }
 
   setMidiNotes(notes: MidiNote[] | null, release = 0.35): void {
