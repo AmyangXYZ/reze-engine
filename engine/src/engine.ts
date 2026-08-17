@@ -31,7 +31,7 @@ import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import { packHalf, type HdrImage } from "./hdr"
-import { projectIrradianceSH } from "./ibl"
+import { evalIrradianceSH, projectIrradianceSH } from "./ibl"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -2178,6 +2178,28 @@ export class Engine {
    */
   setReflectionDebug(on: boolean): void {
     this.reflectionDebug = on
+  }
+
+  /**
+   * What is lighting the world seat right now — the dev-console answer to
+   * "did the HDRI actually arrive". Flat mode reports the same colour for
+   * every direction, which is what flat means.
+   */
+  getWorldLighting(): {
+    source: "hdri" | "flat"
+    strength: number
+    up: [number, number, number]
+    down: [number, number, number]
+  } {
+    const s = this.world.strength
+    if (this.worldSH) {
+      const at = (n: { x: number; y: number; z: number }) =>
+        evalIrradianceSH(this.worldSH!, n).map((v) => Math.max(v * s, 0)) as [number, number, number]
+      return { source: "hdri", strength: s, up: at({ x: 0, y: 1, z: 0 }), down: at({ x: 0, y: -1, z: 0 }) }
+    }
+    const c = this.world.color
+    const flat: [number, number, number] = [c.x * s, c.y * s, c.z * s]
+    return { source: "flat", strength: s, up: flat, down: flat }
   }
 
   /**
