@@ -32,6 +32,7 @@ import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import { packHalf, type HdrImage } from "./hdr"
 import { evalIrradianceSH, projectIrradianceSH } from "./ibl"
+import { LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine } from "./shaders/lyrics-api"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1516,6 +1517,9 @@ export class Engine {
   // ── Score (note events) ──
   private scoreBuffer!: GPUBuffer
   private scoreFallbackBuffer!: GPUBuffer
+  /** Fixed-size (LYRICS_FLOATS): setLyrics is a write, never a reallocation,
+   *  so lyric data arriving after any effect reaches it with no re-binding. */
+  private lyricsBuffer!: GPUBuffer
   /** The notes as installed, kept CPU-side because the per-pitch key map is
    *  rebuilt from them every time the clock moves. */
   private scoreNotes: ScoreNote[] = []
@@ -2428,6 +2432,7 @@ export class Engine {
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.scoreBuffer } },
+        { binding: 24, resource: { buffer: this.lyricsBuffer } },
         { binding: 15, resource: this.fieldLayerView(this.fieldBgViews[0], 0) },
         { binding: 16, resource: this.fieldLayerView(this.fieldFgViews[0], 0) },
         { binding: 20, resource: this.fieldLayerView(this.fieldBgViews[1], 1) },
@@ -2512,6 +2517,7 @@ export class Engine {
           { binding: 11, resource: { buffer: this.castBuffer } },
           { binding: 13, resource: { buffer: this.audioBuffer } },
           { binding: 19, resource: { buffer: this.scoreBuffer } },
+        { binding: 24, resource: { buffer: this.lyricsBuffer } },
           // The size uniform for the pair THIS effect draws into.
           { binding: 14, resource: { buffer: this.fieldUniformBuffers[owner.fieldLayer] } },
           { binding: 22, resource: { buffer: owner.fieldClock ?? this.fieldUniformBuffers[owner.fieldLayer] } },
@@ -3247,6 +3253,7 @@ export class Engine {
           // The score, for rzNote*/rzKey* — bound wherever audio is, so a spawn
           // rule and a background read the same instant.
           { binding: 5, visibility, buffer: { type: "read-only-storage" } },
+          { binding: 6, visibility, buffer: { type: "read-only-storage" } },
         ],
       })
     const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer) =>
@@ -3259,6 +3266,7 @@ export class Engine {
           { binding: 3, resource: { buffer: this.castBuffer } },
           { binding: 4, resource: { buffer: this.audioBuffer } },
           { binding: 5, resource: { buffer: this.scoreBuffer } },
+          { binding: 6, resource: { buffer: this.lyricsBuffer } },
         ],
       })
 
@@ -3358,6 +3366,7 @@ export class Engine {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     })
     const module = this.device.createShaderModule({
@@ -3396,6 +3405,7 @@ export class Engine {
         { binding: 3, resource: { buffer: this.castBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.scoreBuffer } },
+        { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
     return { ok: true, state: { pipeline, bind, uniform, data, count } }
@@ -3543,6 +3553,8 @@ export class Engine {
         { binding: 4, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         // The score, for rzNote*/rzKey*.
         { binding: 5, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        // The lyrics, for rzLyric*.
+        { binding: 6, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
       ],
     })
     // TWO targets, the scene pass's own: HDR colour and the aux (bloom mask,
@@ -3591,6 +3603,7 @@ export class Engine {
               { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
               { binding: 4, resource: { buffer: this.audioBuffer } },
               { binding: 5, resource: { buffer: this.scoreBuffer } },
+              { binding: 6, resource: { buffer: this.lyricsBuffer } },
             ],
           }),
           mirrorBind: this.device.createBindGroup({
@@ -3601,6 +3614,7 @@ export class Engine {
               { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
               { binding: 4, resource: { buffer: this.audioBuffer } },
               { binding: 5, resource: { buffer: this.scoreBuffer } },
+              { binding: 6, resource: { buffer: this.lyricsBuffer } },
             ],
           }),
         },
@@ -3719,6 +3733,7 @@ export class Engine {
         { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.scoreBuffer } },
+        { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
     t.mirrorBind = this.device.createBindGroup({
@@ -3729,6 +3744,7 @@ export class Engine {
         { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.scoreBuffer } },
+        { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
     }
@@ -3794,6 +3810,7 @@ export class Engine {
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     })
 
@@ -3839,6 +3856,7 @@ export class Engine {
             { binding: 5, resource: { buffer: this.audioBuffer } },
             { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
             { binding: 7, resource: { buffer: this.scoreBuffer } },
+            { binding: 8, resource: { buffer: this.lyricsBuffer } },
           ],
         })
       return {
@@ -4452,6 +4470,7 @@ export class Engine {
         // The score. 19 rather than a low number because both this layout and
         // the field layer's already speak for everything below it.
         { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        { binding: 24, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         // This effect's own clock — see the field shader's note on why it is
         // not viewU[6].x.
@@ -4786,6 +4805,12 @@ export class Engine {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
+    // Zero-filled = zero lines, which every accessor answers gracefully.
+    this.lyricsBuffer = this.device.createBuffer({
+      label: "lyrics",
+      size: LYRICS_FLOATS * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
 
     // Now that shadow resources exist, create the main per-frame bind group
     this.perFrameBindGroup = this.device.createBindGroup({
@@ -5178,6 +5203,7 @@ export class Engine {
         // The score. 19 rather than a low number because both this layout and
         // the field layer's already speak for everything below it.
         { binding: 19, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        { binding: 24, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         // The field layer's two halves. Fallback-bound when no field effect runs.
         { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 16, visibility: GPUShaderStage.FRAGMENT, texture: {} },
@@ -6119,6 +6145,15 @@ export class Engine {
    * It belongs here rather than in the effect because the key map it feeds is
    * computed on the CPU — see writeScoreClock.
    */
+  /**
+   * Install the track's lyric lines for the rzLyric* effect functions — the
+   * timing of the words on the scene clock. Null clears. A plain buffer write:
+   * the buffer is fixed-size, so nothing re-binds whenever lyrics arrive.
+   */
+  setLyrics(lines: LyricLine[] | null): void {
+    this.device.queue.writeBuffer(this.lyricsBuffer, 0, packLyrics(lines ?? []))
+  }
+
   setScore(notes: ScoreNote[] | null, release = 0.35): void {
     if (this.scoreBuffer !== this.scoreFallbackBuffer) this.scoreBuffer.destroy()
     this.scoreRelease = Math.max(0, release)

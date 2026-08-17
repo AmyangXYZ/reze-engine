@@ -1,4 +1,5 @@
 import { audioApi } from "../audio-api"
+import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
 import { scoreApi } from "../score-api"
 import { EFFECT_SCENE_API } from "./composite"
@@ -151,6 +152,7 @@ fn rzGridPrev(uv: vec2f) -> vec4f {
     anchorAliasWgsl(cast.alias) +
     audioApi(0, 5) +
     scoreApi(0, 7) +
+    lyricsApi(0, 8) +
     // rzGrid itself, so a kernel may read the grid it is writing — through the
     // PREVIOUS frame's texture, which is the only version of it that exists
     // while the current one is still being written.

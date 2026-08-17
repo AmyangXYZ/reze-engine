@@ -4,6 +4,7 @@ import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
+import { lyricsApi } from "../lyrics-api"
 import { scoreApi } from "../score-api"
 import { gridReadApi } from "./grid"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
@@ -630,7 +631,7 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
   // The composite is STATIC either way now: the user's code compiles in the
   // field module alone, and the composite only decides whether to sample it.
   return COMPOSITE_HEAD +
-    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + scoreApi(0, 19) + body
+    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + scoreApi(0, 19) + lyricsApi(0, 24) + body
 }
 
 /**
@@ -699,6 +700,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     anchorAliasWgsl(effect.alias ?? []) +
     audioApi(0, 13) +
     scoreApi(0, 19) +
+    lyricsApi(0, 24) +
     // The persistent grid, always bound — a 1×1 of zeroes when the effect has
     // none, so rzGrid() is a function that always exists rather than one an
     // author has to know whether they are allowed to call.

@@ -27,6 +27,7 @@
 
 import { audioApi } from "./audio-api"
 import { scoreApi } from "./score-api"
+import { lyricsApi } from "./lyrics-api"
 import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
 
 /** Floats before the first record. One is the count; the rest keep the records
@@ -158,6 +159,7 @@ ${sceneApi}
 // is not compile-safety padding — it is the mount's reason to exist.
 ${audioApi(0, 4)}
 ${scoreApi(0, 5)}
+${lyricsApi(0, 6)}
 // The rest of the hosted API. Every one of these is here because the AUTHOR'S
 // WHOLE FILE lands below, not because lightEmit needs it: a trail effect that
 // grows a lamp at its tip compiles its ribbon code in this module too. The math
