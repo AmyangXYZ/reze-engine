@@ -14,7 +14,10 @@ export enum RigidbodyShape {
 export enum RigidbodyType {
   Static = 0, // follows bone (anchor)
   Dynamic = 1,
-  Kinematic = 2, // follows bone (legacy alias; loader no longer emits it)
+  // The loader no longer emits this — it maps mode 2 to Dynamic, which is the
+  // fix above. The member stays because the physics step still names it when
+  // asking "does this body follow its bone", and a host may set it directly.
+  Kinematic = 2,
 }
 
 export interface Rigidbody {
