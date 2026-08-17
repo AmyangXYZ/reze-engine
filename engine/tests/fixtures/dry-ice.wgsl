@@ -31,6 +31,7 @@
 // sharpness and changes nothing else, which is the property you want and the
 // original does not have.
 
+// Tunables — every const below is one, grouped by what it shapes. Edit and ⌘⏎.
 // ── Where it lies, and how big ────────────────────────────────────────────────
 //
 // The original ties every length to one: fog 0.24 deep across a field 2 wide,

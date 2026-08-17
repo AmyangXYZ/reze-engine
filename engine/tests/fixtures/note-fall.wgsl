@@ -46,6 +46,7 @@
 // gives a thin hot core inside a wide falloff, which is what reads as emissive
 // once bloom picks it up.
 
+// Tunables — every const below is one, grouped by what it shapes. Edit and ⌘⏎.
 // ── Layout ──────────────────────────────────────────────────────────────────
 const LINE_Y: f32 = 0.20;      // the strike line, 0 = bottom of frame
 const FALL: f32 = 2.2;         // seconds of music visible above the line

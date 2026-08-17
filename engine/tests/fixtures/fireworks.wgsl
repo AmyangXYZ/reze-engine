@@ -85,7 +85,7 @@ fn background(ray: vec3f, uv0: vec2f, clock: f32) -> vec4f {
   // all read this clock, so slowing it slows them together instead of drifting
   // out of step with each other.
   let time = clock * SPEED;
-  let res = bgResolution();
+  let res = rzResolution();
   // Square units, y in −1..1, x carrying the aspect — the convention this came
   // from, and the one the ballistics constants are tuned in.
   let uv = vec2f((uv0.x * 2.0 - 1.0) * (res.x / max(res.y, 1.0)), uv0.y * 2.0 - 1.0);
