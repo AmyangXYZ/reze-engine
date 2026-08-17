@@ -102,6 +102,31 @@ export class AnimationState {
     })
   }
 
+  /**
+   * Replace a clip's morph tracks wholesale, leaving its bones alone.
+   *
+   * MMD authors ship expressions as their own file (表情モーション) beside the
+   * body motion, and when they do it is AUTHORITATIVE: whatever morphs the body
+   * motion carried are the ones the expression pass was made to replace. So
+   * this overwrites rather than merges per-morph — a half-overridden face is
+   * nobody's intent. With no expression file loaded, the motion's own morphs
+   * play untouched, because nothing calls this.
+   *
+   * The clip is created if it does not exist yet, so the two files may arrive
+   * in either order, and frameCount grows to cover the longer of the two — an
+   * expression track running past the body motion is common and must not be
+   * truncated to it.
+   */
+  setMorphTracks(name: string, morphTracks: Map<string, MorphKeyframe[]>, frameCount: number): void {
+    const clip = this.animations.get(name)
+    this.animations.set(name, {
+      boneTracks: clip?.boneTracks ?? new Map(),
+      morphTracks,
+      ikTracks: clip?.ikTracks,
+      frameCount: Math.max(clip?.frameCount ?? 0, frameCount),
+    })
+  }
+
   removeAnimation(name: string): void {
     this.animations.delete(name)
     if (this.currentAnimationName === name) {

@@ -1549,7 +1549,17 @@ export class Model {
     return { boneTracks, morphTracks, frameCount: maxFrame }
   }
 
-  loadVmd(name: string, urlOrRelative: string): Promise<void> {
+  /**
+   * Load a VMD as the clip called `name`.
+   *
+   * `tracks: "morphs"` takes only the expression half and lays it over whatever
+   * clip `name` already holds — see AnimationState.setMorphTracks for why an
+   * expression file overwrites rather than merges. Everything else about the
+   * load is identical, which is the reason it is an option here rather than a
+   * second method: the path resolution below (site fetch, blob, or a folder
+   * upload's asset reader) is the part nobody should own twice.
+   */
+  loadVmd(name: string, urlOrRelative: string, options?: { tracks?: "all" | "morphs" }): Promise<void> {
     const loadBuffer = (): Promise<ArrayBuffer> => {
       const u = urlOrRelative.trim()
       const useSiteFetch =
@@ -1575,6 +1585,10 @@ export class Model {
     return loadBuffer().then((buf) => {
       const vmdKeyFrames = VMDLoader.loadFromBuffer(buf)
       const clip = this.buildClipFromVmdKeyFrames(vmdKeyFrames)
+      if (options?.tracks === "morphs") {
+        this.animationState.setMorphTracks(name, clip.morphTracks, clip.frameCount)
+        return
+      }
       // The IK block lives past every other section, so it is read separately
       // rather than threaded through the keyframe grouping.
       const ikFrames = VMDLoader.loadIkFromBuffer(buf)
