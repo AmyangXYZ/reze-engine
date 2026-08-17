@@ -24,6 +24,9 @@ export {
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export { parseMidi } from "./midi-loader"
+// Radiance .hdr, for HDRI worlds — the host fetches the file and hands the
+// parsed image to setBackdropEquirect.
+export { parseHDR, type HdrImage } from "./hdr"
 // A material parameter over time. The sampler is exported too: a host that
 // wants to draw a track, or scrub one, should read the same curve the engine
 // plays rather than reimplementing it a second time.

@@ -30,6 +30,7 @@ import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
+import { packHalf, type HdrImage } from "./hdr"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1670,6 +1671,8 @@ export class Engine {
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
   private backdropEquirectTexture: GPUTexture | null = null
   private backdropEquirectView: GPUTextureView | null = null
+  private backdropEquirectHDR = false
+  private backdropStrength = 1
   private fallbackEquirectTexture!: GPUTexture
   private fallbackEquirectView!: GPUTextureView
   // The scene's user WGSL effect (setEffect). ONE per scene, mounted under the
@@ -2014,16 +2017,20 @@ export class Engine {
     u[7] = effIntensity
     // Background composited UNDER the scene in display space (post-tonemap), so it
     // matches a CSS color of the same value exactly. Mode (u[11]): 0 = transparent
-    // (DOM shows), 1 = solid color, 2 = 360 equirect (sampled by view ray; the
-    // camera basis at u[12..23] is refreshed per frame by updateCameraUniforms).
+    // (DOM shows), 1 = solid color, 2 = LDR 360 equirect (display-space
+    // wallpaper), 3 = HDR equirect (scene-linear radiance through the SAME
+    // exposure and view transform as the scene — a sun rolls off like a sun).
+    // The camera basis at u[12..23] is refreshed per frame.
+    // In modes 2 and 3 the colour slot is dead, so mode 3 carries the world
+    // STRENGTH in u[8] — Blender's world-strength dial, default 1.
     const bg = this.backgroundColor
-    u[8] = bg?.x ?? 0
+    u[8] = this.backdropEquirectHDR ? this.backdropStrength : (bg?.x ?? 0)
     u[9] = bg?.y ?? 0
     u[10] = bg?.z ?? 0
     // Base-layer mode only. A user effect is a separate LAYER over whichever
     // base is active, and needs no flag of its own: the composite pipeline is
     // rebuilt per effect, so the compiled variant IS the flag.
-    u[11] = this.backdropEquirectView ? 2 : bg ? 1 : 0
+    u[11] = this.backdropEquirectView ? (this.backdropEquirectHDR ? 3 : 2) : bg ? 1 : 0
     // Which display transform forms the frame (see viewTransform in composite.ts).
     u[25] = v.transform === "agx" ? 2 : v.transform === "standard" ? 1 : 0
     u[26] = this.canvas.width
@@ -2502,11 +2509,43 @@ export class Engine {
    * affects lighting, bloom, or tonemapping. Pass null to remove (the background
    * color, or transparency, takes over again).
    */
-  setBackdropEquirect(source: ImageBitmap | HTMLImageElement | HTMLCanvasElement | null): void {
+  setBackdropEquirect(
+    source: ImageBitmap | HTMLImageElement | HTMLCanvasElement | HdrImage | null,
+    options?: {
+      /** World strength for an HDR source, Blender's dial. Default 1. */
+      strength?: number
+    },
+  ): void {
     this.backdropEquirectTexture?.destroy()
     this.backdropEquirectTexture = null
     this.backdropEquirectView = null
-    if (source && this.device) {
+    this.backdropEquirectHDR = false
+    this.backdropStrength = Math.max(options?.strength ?? 1, 0)
+    if (source && "data" in source) {
+      if (!this.device) return
+      // An HDRI (parseHDR's output): scene-linear radiance in rgba16float. It
+      // rides the SAME slot as the LDR path — one backdrop, two ingestions —
+      // and the composite treats it as light rather than wallpaper (mode 3).
+      const tex = this.device.createTexture({
+        label: "backdrop equirect (HDR)",
+        size: [source.width, source.height],
+        format: "rgba16float",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      this.device.queue.writeTexture(
+        { texture: tex },
+        packHalf(source.data),
+        { bytesPerRow: source.width * 8, rowsPerImage: source.height },
+        [source.width, source.height],
+      )
+      this.backdropEquirectTexture = tex
+      this.backdropEquirectView = tex.createView()
+      this.backdropEquirectHDR = true
+      this.rebuildCompositeBindGroup()
+      if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+      return
+    }
+    if (source && !("data" in source) && this.device) {
       let width = Math.max(1, "naturalWidth" in source ? source.naturalWidth : source.width)
       let height = Math.max(1, "naturalHeight" in source ? source.naturalHeight : source.height)
       let upload: ImageBitmap | HTMLImageElement | HTMLCanvasElement | OffscreenCanvas = source

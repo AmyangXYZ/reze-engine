@@ -541,6 +541,19 @@ const COMPOSITE_BODY = /* wgsl */ `
       let su = 0.5 + atan2(dir.x, dir.z) * 0.15915494309;  // 1/(2π)
       let sv = 0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988618;  // 1/π
       bgPm = textureSampleLevel(bgEquirect, bloomSamp, vec2f(su, sv), 0.0).rgb;
+      if (bg.w > 2.5) {
+        // Mode 3: the texels are scene-linear RADIANCE, not display wallpaper.
+        // Same exposure, same view transform, same user gamma as the scene —
+        // one film for everything in frame, which is what makes a sun roll off
+        // like a sun instead of clipping at texture white. bg.x carries the
+        // world STRENGTH (the colour slot is dead in equirect modes). The
+        // scene's grade stays scene-only, the documented rule above.
+        var sky = max(viewTransform(bgPm * bg.x * viewU[0].x), vec3f(0.0));
+        if (APPLY_GAMMA) {
+          sky = pow(sky, vec3f(viewU[0].y));
+        }
+        bgPm = sky;
+      }
     }
     BACKGROUND_CALL
   }
