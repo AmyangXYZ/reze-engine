@@ -187,5 +187,16 @@ fn rzLyricAspect(i: i32) -> f32 {
   let dim = vec2f(textureDimensions(_rzLyricTex));
   return ((r.z - r.x) * dim.x) / (h * dim.y);
 }
+
+/**
+ * Line i's box in ATLAS TEXELS. Divide by the size you draw it at to learn
+ * whether you are magnifying or minifying, which is what an edge-sharpening
+ * step needs to know — and the honest way to get it, since a derivative
+ * builtin is illegal after the branches an effect of this kind opens with.
+ */
+fn rzLyricPixels(i: i32) -> vec2f {
+  let r = rzLyricRect(i);
+  return vec2f(r.z - r.x, r.w - r.y) * vec2f(textureDimensions(_rzLyricTex));
+}
 `
 }

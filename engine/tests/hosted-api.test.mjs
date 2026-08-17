@@ -106,6 +106,7 @@ const EXCEPTIONS = {
   // module. Timing (rzLyric*) is universal; the words are a field concern.
   rzLyricText: "samples the lyric atlas, which only the field module binds",
   rzLyricAspect: "same",
+  rzLyricPixels: "same",
 }
 
 test("every author-facing name is in every module, or listed as an exception", () => {
