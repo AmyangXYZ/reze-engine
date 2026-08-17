@@ -24,15 +24,17 @@ npm install reze-engine
 
 **MMD fidelity**
 
-- PMX models and stages, VMD motion with MMD's own bezier packing, IK with per-chain enable, append-inherit bones and fixed-axis twist bones, VMD export
+- PMX models, VMD motion with MMD's own bezier packing, IK with per-chain enable, append-inherit bones and fixed-axis twist bones, VMD export
 - Vertex / group / bone / material morphs (multiply and add), vertex morphs on a GPU compute path
 - MMD draw disciplines reproduced: author-order transparency with depth write, per-mesh interleaved outline hulls, the eyes-through-bangs stencil pass, sphere maps as graph nodes
 - In-house sequential-impulse physics for PMX rigs — rigid bodies, joints, deterministic wind, a world floor
+- Stages as environments, not characters: a stage PMX takes the same materials, graphs and style groups a character does, and keeps the bone and material morphs its author rigged for doors, lifts and colour switches — while skipping physics, IK and idle pose work, and owning the floor so the built-in ground steps aside
 
 **Rendering**
 
 - Shader-graph materials: every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph; ungrouped materials render a Principled BSDF default
-- HDR pipeline end to end — bloom, 4× MSAA, three view transforms (Filmic, Standard, AgX from Blender's own LUT), ASC CDL grading, bladed-bokeh depth of field
+- HDR pipeline end to end — bloom, 4× MSAA, three view transforms (Filmic, Standard, AgX from Blender's own LUT), bladed-bokeh depth of field
+- Colour grading over the tonemapped image: ASC CDL slope / offset / power with contrast and saturation, uniforms-only so dragging a slider rebuilds no pipeline — and the background layer stays ungraded, so a grade shapes the scene without staining the sky behind it
 - Two concentric shadow cascades: crisp contact shadows on the cast, coverage for a full stage
 - Floor mirror: a planar reflection pass reusing the scene pipelines, with depth-proportional blur and the reflection composited as its own ground layer
 - HDRI worlds (`.hdr`): the sky renders through the same view transform as the scene and lights the cast via spherical-harmonic irradiance — the sun keeps the toon ramp
