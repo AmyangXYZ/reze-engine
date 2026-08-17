@@ -1,6 +1,7 @@
 import { sceneFsOutWgsl } from "../passes/scene-contract"
 import { lightsApi } from "../lights"
 import { SHADOW_CASCADES } from "../../shadow-cascades"
+import { WORLD_AMBIENT_WGSL } from "../lights"
 
 // Shared WGSL blocks concatenated by every material shader.
 // Splits the boilerplate (uniform structs, bind group layout, skinning VS, PCF shadow)
@@ -41,6 +42,8 @@ struct Light {
 struct LightUniforms {
   ambientColor: vec4f,
   lights: array<Light, 4>,
+  /** Irradiance SH of the HDRI world; [0].w is the on-flag. */
+  sh: array<vec4f, 9>,
 };
 
 // Per-material uniforms. Every material binds this layout even if it ignores fields;
@@ -265,4 +268,4 @@ export function commonFsOutWgsl(): string {
 // The FSOut struct is NOT in here any more — see commonFsOutWgsl above. Every
 // consumer of this constant appends it immediately, which is where it was.
 export const COMMON_MATERIAL_PRELUDE_WGSL =
-  COMMON_BINDINGS_WGSL + lightsApi(0, 6) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL
+  COMMON_BINDINGS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL

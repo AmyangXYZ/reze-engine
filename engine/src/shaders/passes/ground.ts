@@ -1,6 +1,7 @@
 import { sceneFsOutWgsl, sceneIdWriteWgsl } from "./scene-contract"
 import { lightsApi } from "../lights"
 import { SHADOW_CASCADES } from "../../shadow-cascades"
+import { WORLD_AMBIENT_WGSL } from "../lights"
 
 // Ground shadow-catcher: receives directional shadow, grid lines, frosted noise,
 // radial distance fade. Writes bloom mask = 0 (ground never bloom-bleeds).
@@ -13,7 +14,7 @@ export function groundShaderWgsl(): string {
   return /* wgsl */ `
 struct CameraUniforms { view: mat4x4f, projection: mat4x4f, viewPos: vec3f, _p: f32, };
 struct Light { direction: vec4f, color: vec4f, };
-struct LightUniforms { ambientColor: vec4f, lights: array<Light, 4>, };
+struct LightUniforms { ambientColor: vec4f, lights: array<Light, 4>, sh: array<vec4f, 9>, };
 struct GroundShadowMat {
   diffuseColor: vec3f, fadeStart: f32,
   fadeEnd: f32, shadowStrength: f32, pcfTexel: f32, gridSpacing: f32,
@@ -41,6 +42,7 @@ struct MirrorVP { viewProj: mat4x4f, params: vec4f, };
 @group(0) @binding(9) var mirrorTex: texture_2d<f32>;
 @group(0) @binding(10) var linearSampler: sampler;
 @group(0) @binding(11) var mirrorDepth: texture_depth_multisampled_2d;
+${WORLD_AMBIENT_WGSL}
 ${lightsApi(0, 6)}
 
 fn hash2(p: vec2f) -> f32 {
@@ -166,7 +168,7 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     smoothstep(halfLine - gridDeriv.x, halfLine + gridDeriv.x, gridFrac.x),
     smoothstep(halfLine - gridDeriv.y, halfLine + gridDeriv.y, gridFrac.y)
   );
-  let sun = light.ambientColor.xyz + light.lights[0].color.xyz * light.lights[0].color.w * max(dot(n, -light.lights[0].direction.xyz), 0.0);
+  let sun = rzWorldAmbient(n) + light.lights[0].color.xyz * light.lights[0].color.w * max(dot(n, -light.lights[0].direction.xyz), 0.0);
   // The positional layer reaches the floor too. A stage light that lit the
   // cast and not the ground under her would read as a sticker, which is the
   // same failure the shadow catcher exists to prevent.

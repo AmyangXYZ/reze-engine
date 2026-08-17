@@ -78,6 +78,30 @@ struct RzLight {
 }
 `
 
+/**
+ * The world's light at a surface facing n — the flat colour, or the installed
+ * HDRI's irradiance (sh[0].w = 1), evaluated from folded SH coefficients (see
+ * ibl.ts for the folding; the shader is a plain polynomial in the normal).
+ *
+ * One string included by every module that declares LightUniforms with the sh
+ * block — the hosted-api lesson: a helper defined in some modules and not
+ * others is a compile error waiting for the first file that crosses them.
+ */
+export const WORLD_AMBIENT_WGSL = /* wgsl */ `
+fn rzWorldAmbient(n: vec3f) -> vec3f {
+  if (light.sh[0].w < 0.5) { return light.ambientColor.xyz; }
+  let x = n.x;
+  let y = n.y;
+  let z = n.z;
+  let c = light.sh[0].xyz
+    + light.sh[1].xyz * y + light.sh[2].xyz * z + light.sh[3].xyz * x
+    + light.sh[4].xyz * (x * y) + light.sh[5].xyz * (y * z)
+    + light.sh[6].xyz * (3.0 * z * z - 1.0) + light.sh[7].xyz * (x * z)
+    + light.sh[8].xyz * (x * x - y * y);
+  return max(c, vec3f(0.0));
+}
+`
+
 /** Does this source define the emit mount? */
 export function hasLightEmit(wgsl: string): boolean {
   return /\bfn\s+lightEmit\s*\(/.test(wgsl)

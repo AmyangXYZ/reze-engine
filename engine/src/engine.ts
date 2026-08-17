@@ -31,6 +31,7 @@ import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import { packHalf, type HdrImage } from "./hdr"
+import { projectIrradianceSH } from "./ibl"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -1272,7 +1273,9 @@ export class Engine {
   private sun!: { color: Vec3; strength: number; direction: Vec3 }
   private cameraConfig!: { distance: number; target: Vec3; fov: number }
   private lightUniformBuffer!: GPUBuffer
-  private lightData = new Float32Array(64)
+  // ambient vec4 (4) + 4 lights x 2 vec4 (32) + 9 irradiance-SH vec4s (36),
+  // padded to 80. sh[0].w is the IBL flag: 0 = flat world colour, 1 = the sky.
+  private lightData = new Float32Array(80)
   private lightCount = 0
   private resizeObserver: ResizeObserver | null = null
   private resizePending = false
@@ -1673,6 +1676,8 @@ export class Engine {
   private backdropEquirectView: GPUTextureView | null = null
   private backdropEquirectHDR = false
   private backdropStrength = 1
+  /** The installed HDRI's folded irradiance SH (27 floats), or null. */
+  private worldSH: Float32Array | null = null
   private fallbackEquirectTexture!: GPUTexture
   private fallbackEquirectView!: GPUTextureView
   // The scene's user WGSL effect (setEffect). ONE per scene, mounted under the
@@ -2521,6 +2526,8 @@ export class Engine {
     this.backdropEquirectView = null
     this.backdropEquirectHDR = false
     this.backdropStrength = Math.max(options?.strength ?? 1, 0)
+    const hadSH = this.worldSH !== null
+    this.worldSH = null
     if (source && "data" in source) {
       if (!this.device) return
       // An HDRI (parseHDR's output): scene-linear radiance in rgba16float. It
@@ -2541,10 +2548,20 @@ export class Engine {
       this.backdropEquirectTexture = tex
       this.backdropEquirectView = tex.createView()
       this.backdropEquirectHDR = true
+      // The sky LIGHTS the scene, not only backs it: fold its irradiance to
+      // SH (display strength included, so what you see is what lights her)
+      // and hand it to the world seat. The sun keeps the toon ramp — this is
+      // the ambient term, exactly where the flat world colour used to sit.
+      this.worldSH = projectIrradianceSH({ ...source, data: source.data }, 4)
+      if (this.backdropStrength !== 1) {
+        for (let i = 0; i < this.worldSH.length; i++) this.worldSH[i] *= this.backdropStrength
+      }
+      this.writeWorld()
       this.rebuildCompositeBindGroup()
       if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
       return
     }
+    if (hadSH) this.writeWorld()
     if (source && !("data" in source) && this.device) {
       let width = Math.max(1, "naturalWidth" in source ? source.naturalWidth : source.width)
       let height = Math.max(1, "naturalHeight" in source ? source.naturalHeight : source.height)
@@ -6254,7 +6271,7 @@ export class Engine {
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
       label: "light uniforms",
-      size: 64 * 4, // ambientColor vec4f (4) + 4 lights * 2 vec4f each (32) = 36 f32 padded to 64
+      size: 80 * 4, // ambient (4) + 4 lights x 2 vec4 (32) + irradiance SH 9 x vec4 (36), padded to 80
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.lightData.fill(0)
@@ -6274,6 +6291,24 @@ export class Engine {
     this.lightData[1] = this.world.color.y * s
     this.lightData[2] = this.world.color.z * s
     this.lightData[3] = 0
+    // The sky's irradiance, when an HDRI world is installed — the world
+    // STRENGTH dial keeps its meaning by scaling it, and the world COLOUR is
+    // simply unread while the flag is up (Blender's own semantics: the image
+    // replaces the colour, strength applies to either).
+    for (let i = 0; i < 9; i++) {
+      const b = 36 + i * 4
+      if (this.worldSH) {
+        this.lightData[b] = this.worldSH[i * 3] * s
+        this.lightData[b + 1] = this.worldSH[i * 3 + 1] * s
+        this.lightData[b + 2] = this.worldSH[i * 3 + 2] * s
+      } else {
+        this.lightData[b] = 0
+        this.lightData[b + 1] = 0
+        this.lightData[b + 2] = 0
+      }
+      this.lightData[b + 3] = 0
+    }
+    this.lightData[39] = this.worldSH ? 1 : 0
     this.updateLightBuffer()
   }
 
@@ -9879,7 +9914,8 @@ export class Engine {
     let overEyesPipeline: GPURenderPipeline | undefined
     try {
       pipeline = await this.createRenderClassPipeline(renderClass, module, false)
-      // Dormant OIT twin — kept for a future order-independent-transparency path.
+      // The depth-write-off twin: stage transparency draws with it (see
+      // pipelineForDrawCall), and a future OIT path would too.
       pipelineNoDepthWrite = await this.createRenderClassPipeline(renderClass, module, false, false)
       if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true)
     } catch (e) {
@@ -10087,14 +10123,21 @@ export class Engine {
 
   // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
   // the neutral base (ungrouped materials render the default graph). Transparent-bucket
-  // draws use the SAME depth-write-on pipeline — babylon-mmd's forceDepthWrite
-  // blending (see renderModelTransparentPhase for the trade-off record).
+  // draws on the CAST use the SAME depth-write-on pipeline — babylon-mmd's
+  // forceDepthWrite blending (see renderModelTransparentPhase for the trade-off
+  // record). A STAGE's transparent draws are the exception: forceDepthWrite
+  // exists for fabric self-layering, and a stage does not self-fold — what its
+  // translucent shell's depth DID do was occlude every particle behind it, so
+  // rain vanished the instant the camera crossed a glass dome or a curtain
+  // (reported: binary vanish/recover with camera angle, stage loaded). Stage
+  // transparency blends and leaves depth alone.
   private pipelineForDrawCall(inst: ModelInstance, dc: DrawCall): GPURenderPipeline {
+    const stageGlass = inst.isStage && dc.type === "transparent"
     if (dc.groupId) {
       const install = inst.styleGroups.get(dc.groupId)
-      if (install) return install.pipeline
+      if (install) return stageGlass ? install.pipelineNoDepthWrite : install.pipeline
     }
-    return this.neutralPipeline
+    return stageGlass ? this.neutralPipelineNoDepthWrite : this.neutralPipeline
   }
 
   /**
