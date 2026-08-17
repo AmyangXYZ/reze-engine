@@ -1,4 +1,4 @@
-// Standard MIDI File → ScoreNote[], for setScore.
+// Standard MIDI File → MidiNote[], for setMidiNotes.
 //
 // The engine already parses PMX and VMD; this is the third loader and the
 // smallest, because a score needs four numbers per note and a .mid carries far
@@ -14,7 +14,7 @@
 // (format 1 puts them in track 0, but nothing requires that), then ticks are
 // integrated through them segment by segment.
 
-import type { ScoreNote } from "./engine"
+import type { MidiNote } from "./engine"
 
 /** A tempo change: from this tick onward, one quarter note lasts this long. */
 type Tempo = { tick: number; usPerQuarter: number }
@@ -71,7 +71,7 @@ type Pending = { tick: number; velocity: number }
  * unreadable track yields the notes it managed rather than nothing, because a
  * score that plays most of a piece is worth more than an exception.
  */
-export function parseMidi(data: ArrayBuffer): ScoreNote[] {
+export function parseMidi(data: ArrayBuffer): MidiNote[] {
   const r = new Reader(new DataView(data))
   if (r.remaining < 14 || r.tag() !== "MThd") throw new Error("not a MIDI file (no MThd header)")
   const headerLength = r.u32()
@@ -157,7 +157,7 @@ export function parseMidi(data: ArrayBuffer): ScoreNote[] {
    * OTHER tick really is stray and stays dropped.
    */
   const orphanOffs = new Map<number, number[]>()
-  const notes: ScoreNote[] = []
+  const notes: MidiNote[] = []
   for (const e of raw) {
     const key = e.channel * 128 + e.pitch
     if (e.on) {

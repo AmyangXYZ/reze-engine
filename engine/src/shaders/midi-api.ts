@@ -29,37 +29,37 @@
 // scan".
 
 /** Floats before the key map: count, pitch range, clock, duration, release. */
-export const SCORE_HEADER = 8
+export const MIDI_HEADER = 8
 /** One energy slot per MIDI pitch. 128 is the MIDI range, not a cap we chose. */
-export const SCORE_KEYS = 128
+export const MIDI_KEYS = 128
 /** Where the note records begin. */
-export const SCORE_NOTES = SCORE_HEADER + SCORE_KEYS
+export const MIDI_NOTES = MIDI_HEADER + MIDI_KEYS
 /** Floats per note: start, duration, pitch, velocity. */
-export const SCORE_STRIDE = 4
+export const MIDI_STRIDE = 4
 
 /** The rzNote*/ /* rzKey* accessors, with the buffer declared at the given binding. */
-export function scoreApi(group: number, binding: number): string {
+export function midiApi(group: number, binding: number): string {
   return /* wgsl */ `
-@group(${group}) @binding(${binding}) var<storage, read> _rzScore: array<f32>;
+@group(${group}) @binding(${binding}) var<storage, read> _rzMidi: array<f32>;
 
 /** Notes in the score; 0 when none is loaded, which every accessor below
  *  tolerates by returning zero rather than reading past the end. */
-fn rzNoteCount() -> i32 { return i32(_rzScore[0]); }
+fn rzNoteCount() -> i32 { return i32(_rzMidi[0]); }
 /** Where the score is NOW, in seconds — the clock every age below hangs from. */
-fn rzScoreTime() -> f32 { return _rzScore[3]; }
+fn rzMidiTime() -> f32 { return _rzMidi[3]; }
 /** 1 while the score is advancing, 0 paused or absent. */
-fn rzScorePlaying() -> f32 { return select(0.0, _rzScore[4], i32(_rzScore[0]) > 0); }
+fn rzMidiPlaying() -> f32 { return select(0.0, _rzMidi[4], i32(_rzMidi[0]) > 0); }
 /** Last note-off, in seconds — the length of the piece. */
-fn rzScoreDuration() -> f32 { return _rzScore[5]; }
+fn rzMidiDuration() -> f32 { return _rzMidi[5]; }
 /** Lowest and highest pitch the score actually uses. Lay a keyboard out against
  *  these rather than against 0..127 and a piano piece fills the screen instead
  *  of occupying its middle third. */
-fn rzPitchLow() -> f32 { return _rzScore[1]; }
-fn rzPitchHigh() -> f32 { return _rzScore[2]; }
+fn rzPitchLow() -> f32 { return _rzMidi[1]; }
+fn rzPitchHigh() -> f32 { return _rzMidi[2]; }
 
 fn _rzNoteAt(i: i32, field: i32) -> f32 {
-  if (i < 0 || i >= i32(_rzScore[0])) { return 0.0; }
-  return _rzScore[${SCORE_NOTES} + i * ${SCORE_STRIDE} + field];
+  if (i < 0 || i >= i32(_rzMidi[0])) { return 0.0; }
+  return _rzMidi[${MIDI_NOTES} + i * ${MIDI_STRIDE} + field];
 }
 
 /** When note i begins, in seconds. */
@@ -80,7 +80,7 @@ fn rzNoteVelocity(i: i32) -> f32 { return _rzNoteAt(i, 3); }
  * and keeps going. One expression, no state, no spawning — which is why one
  * particle per note is the natural mapping and the pool index IS the note index.
  */
-fn rzNoteAge(i: i32) -> f32 { return _rzScore[3] - rzNoteStart(i); }
+fn rzNoteAge(i: i32) -> f32 { return _rzMidi[3] - rzNoteStart(i); }
 
 /** 1 while note i is sounding, 0 either side of it. */
 fn rzNoteHeld(i: i32) -> f32 {
@@ -99,8 +99,8 @@ fn rzNoteHeld(i: i32) -> f32 {
  */
 fn rzKeyEnergy(pitch: f32) -> f32 {
   let k = i32(round(pitch));
-  if (k < 0 || k >= ${SCORE_KEYS}) { return 0.0; }
-  return _rzScore[${SCORE_HEADER} + k];
+  if (k < 0 || k >= ${MIDI_KEYS}) { return 0.0; }
+  return _rzMidi[${MIDI_HEADER} + k];
 }
 
 /**
@@ -108,8 +108,8 @@ fn rzKeyEnergy(pitch: f32) -> f32 {
  * and of the key it lands on, which have to agree or the effect is nonsense.
  */
 fn rzPitchX(pitch: f32) -> f32 {
-  let lo = _rzScore[1];
-  let hi = _rzScore[2];
+  let lo = _rzMidi[1];
+  let hi = _rzMidi[2];
   return select(0.5, (pitch - lo) / max(hi - lo, 1.0), hi > lo);
 }
 `

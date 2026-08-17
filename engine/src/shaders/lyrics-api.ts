@@ -25,9 +25,12 @@ export const LYRIC_HEADER = 4
 export const LYRIC_STRIDE = 8
 export const LYRICS_FLOATS = LYRIC_HEADER + LYRIC_LINES_MAX * LYRIC_STRIDE
 
-/** The line atlas the host packs rasterised lines into — one allocation, ever. */
-export const LYRIC_ATLAS_W = 2048
-export const LYRIC_ATLAS_H = 4096
+/** Bounds on the line atlas the host packs rasterised lines into. It is sized
+ *  to the track that arrives rather than allocated at the maximum: a scene with
+ *  no lyrics carries a 1×1 placeholder, and a song's atlas is as tall as its
+ *  own lines need. 8192 is the smallest texture dimension WebGPU guarantees. */
+export const LYRIC_ATLAS_MAX_W = 2048
+export const LYRIC_ATLAS_MAX_H = 8192
 
 export type LyricLine = {
   /** Seconds on the scene clock. */

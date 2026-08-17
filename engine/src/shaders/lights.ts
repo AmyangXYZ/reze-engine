@@ -26,7 +26,7 @@
 // switch with one case.
 
 import { audioApi } from "./audio-api"
-import { scoreApi } from "./score-api"
+import { midiApi } from "./midi-api"
 import { lyricsApi } from "./lyrics-api"
 import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
 
@@ -158,7 +158,7 @@ ${sceneApi}
 // point of a light an effect owns rather than one the document places, so this
 // is not compile-safety padding — it is the mount's reason to exist.
 ${audioApi(0, 4)}
-${scoreApi(0, 5)}
+${midiApi(0, 5)}
 ${lyricsApi(0, 6)}
 // The rest of the hosted API. Every one of these is here because the AUTHOR'S
 // WHOLE FILE lands below, not because lightEmit needs it: a trail effect that

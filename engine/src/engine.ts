@@ -6,7 +6,7 @@ import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
-import { SCORE_HEADER, SCORE_KEYS, SCORE_NOTES, SCORE_STRIDE } from "./shaders/score-api"
+import { MIDI_HEADER, MIDI_KEYS, MIDI_NOTES, MIDI_STRIDE } from "./shaders/midi-api"
 import { decodeTga } from "./tga-loader"
 import { VMDLoader } from "./vmd-loader"
 import { CameraAnimation } from "./camera-animation"
@@ -32,7 +32,7 @@ import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import { packHalf, type HdrImage } from "./hdr"
 import { evalIrradianceSH, projectIrradianceSH } from "./ibl"
-import { LYRIC_ATLAS_H, LYRIC_ATLAS_W, LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
+import { LYRIC_ATLAS_MAX_H, LYRIC_ATLAS_MAX_W, LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -292,7 +292,7 @@ export type WorldOptions = {
  * score is consumed against the scene clock, so anything the engine stores in
  * musical time would have to be resolved to seconds before every read.
  */
-export interface ScoreNote {
+export interface MidiNote {
   /** Seconds from the start of the piece. */
   start: number
   /** Seconds the note sounds for. */
@@ -1515,21 +1515,22 @@ export class Engine {
   private audioBuffer!: GPUBuffer
   private audioFallbackBuffer!: GPUBuffer
   // ── Score (note events) ──
-  private scoreBuffer!: GPUBuffer
-  private scoreFallbackBuffer!: GPUBuffer
+  private midiBuffer!: GPUBuffer
+  private midiFallbackBuffer!: GPUBuffer
   /** Fixed-size (LYRICS_FLOATS): setLyrics is a write, never a reallocation,
    *  so lyric data arriving after any effect reaches it with no re-binding. */
   private lyricsBuffer!: GPUBuffer
-  /** The rasterised lines, for rzLyricText. Fixed-size for the same reason
-   *  the buffer is: allocated once, written into, never re-bound. */
+  /** The rasterised lines, for rzLyricText. Sized to the track that arrives —
+   *  a 1×1 placeholder until one does, so a scene with no lyrics pays nothing
+   *  and a song's text is stored at the resolution it is drawn at. */
   private lyricsTexture!: GPUTexture
   private lyricsTextureView!: GPUTextureView
   /** The notes as installed, kept CPU-side because the per-pitch key map is
    *  rebuilt from them every time the clock moves. */
-  private scoreNotes: ScoreNote[] = []
+  private midiNotes: MidiNote[] = []
   /** Header + key map, re-uploaded per clock write. */
-  private scoreLiveScratch = new Float32Array(SCORE_KEYS + 2)
-  private scoreRelease = 0.35
+  private midiLiveScratch = new Float32Array(MIDI_KEYS + 2)
+  private midiRelease = 0.35
   private audioTimeScratch = new Float32Array(2)
   private renderPassDescriptor!: GPURenderPassDescriptor
   private compositePassDescriptor!: GPURenderPassDescriptor
@@ -2435,7 +2436,7 @@ export class Engine {
         { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
-        { binding: 19, resource: { buffer: this.scoreBuffer } },
+        { binding: 19, resource: { buffer: this.midiBuffer } },
         { binding: 24, resource: { buffer: this.lyricsBuffer } },
         { binding: 15, resource: this.fieldLayerView(this.fieldBgViews[0], 0) },
         { binding: 16, resource: this.fieldLayerView(this.fieldFgViews[0], 0) },
@@ -2520,7 +2521,7 @@ export class Engine {
           { binding: 9, resource: { buffer: this.dofUniformBuffer } },
           { binding: 11, resource: { buffer: this.castBuffer } },
           { binding: 13, resource: { buffer: this.audioBuffer } },
-          { binding: 19, resource: { buffer: this.scoreBuffer } },
+          { binding: 19, resource: { buffer: this.midiBuffer } },
           { binding: 24, resource: { buffer: this.lyricsBuffer } },
           { binding: 25, resource: this.lyricsTextureView },
           // The size uniform for the pair THIS effect draws into.
@@ -3270,7 +3271,7 @@ export class Engine {
           { binding: 2, resource: { buffer: camera } },
           { binding: 3, resource: { buffer: this.castBuffer } },
           { binding: 4, resource: { buffer: this.audioBuffer } },
-          { binding: 5, resource: { buffer: this.scoreBuffer } },
+          { binding: 5, resource: { buffer: this.midiBuffer } },
           { binding: 6, resource: { buffer: this.lyricsBuffer } },
         ],
       })
@@ -3409,7 +3410,7 @@ export class Engine {
         { binding: 2, resource: { buffer: this.compositeUniformBuffer } },
         { binding: 3, resource: { buffer: this.castBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
-        { binding: 5, resource: { buffer: this.scoreBuffer } },
+        { binding: 5, resource: { buffer: this.midiBuffer } },
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
@@ -3607,7 +3608,7 @@ export class Engine {
               { binding: 1, resource: { buffer: uniform } },
               { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
               { binding: 4, resource: { buffer: this.audioBuffer } },
-              { binding: 5, resource: { buffer: this.scoreBuffer } },
+              { binding: 5, resource: { buffer: this.midiBuffer } },
               { binding: 6, resource: { buffer: this.lyricsBuffer } },
             ],
           }),
@@ -3618,7 +3619,7 @@ export class Engine {
               { binding: 1, resource: { buffer: uniform } },
               { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
               { binding: 4, resource: { buffer: this.audioBuffer } },
-              { binding: 5, resource: { buffer: this.scoreBuffer } },
+              { binding: 5, resource: { buffer: this.midiBuffer } },
               { binding: 6, resource: { buffer: this.lyricsBuffer } },
             ],
           }),
@@ -3737,7 +3738,7 @@ export class Engine {
         { binding: 1, resource: { buffer: t.uniform } },
         { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
-        { binding: 5, resource: { buffer: this.scoreBuffer } },
+        { binding: 5, resource: { buffer: this.midiBuffer } },
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
@@ -3748,7 +3749,7 @@ export class Engine {
         { binding: 1, resource: { buffer: t.uniform } },
         { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
         { binding: 4, resource: { buffer: this.audioBuffer } },
-        { binding: 5, resource: { buffer: this.scoreBuffer } },
+        { binding: 5, resource: { buffer: this.midiBuffer } },
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
@@ -3860,7 +3861,7 @@ export class Engine {
             { binding: 4, resource: { buffer: this.castBuffer } },
             { binding: 5, resource: { buffer: this.audioBuffer } },
             { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
-            { binding: 7, resource: { buffer: this.scoreBuffer } },
+            { binding: 7, resource: { buffer: this.midiBuffer } },
             { binding: 8, resource: { buffer: this.lyricsBuffer } },
           ],
         })
@@ -4440,12 +4441,12 @@ export class Engine {
     // Header + key map even when empty: every rzNote*/rzKey* accessor reads the
     // header first, so an effect written against a score still compiles and runs
     // in a scene that has none — it simply sees no notes.
-    this.scoreFallbackBuffer = this.device.createBuffer({
+    this.midiFallbackBuffer = this.device.createBuffer({
       label: "score fallback (no notes)",
-      size: (SCORE_HEADER + SCORE_KEYS) * 4,
+      size: (MIDI_HEADER + MIDI_KEYS) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
-    this.scoreBuffer = this.scoreFallbackBuffer
+    this.midiBuffer = this.midiFallbackBuffer
 
     // One per resolution — see FIELD_SCALES.
     this.fieldUniformBuffers = Engine.FIELD_SCALES.map((scale) =>
@@ -4818,13 +4819,13 @@ export class Engine {
       size: LYRICS_FLOATS * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
-    // One channel is all a glyph mask is; textures clear to zero, which reads
-    // as "no text" until the first setLyrics with an atlas arrives.
+    // A placeholder until a track's lines arrive: one channel is all a glyph
+    // mask is, and a zero texel reads as "no text" everywhere.
     this.lyricsTexture = this.device.createTexture({
-      label: "lyric line atlas",
-      size: [LYRIC_ATLAS_W, LYRIC_ATLAS_H],
+      label: "lyric line atlas (placeholder)",
+      size: [1, 1],
       format: "r8unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     })
     this.lyricsTextureView = this.lyricsTexture.createView()
 
@@ -6159,7 +6160,7 @@ export class Engine {
    *
    * `release` is how long a key keeps glowing after its note ends, in seconds.
    * It belongs here rather than in the effect because the key map it feeds is
-   * computed on the CPU — see writeScoreClock.
+   * computed on the CPU — see writeMidiClock.
    */
   /**
    * Install the track's lyric lines for the rzLyric* effect functions — the
@@ -6175,53 +6176,64 @@ export class Engine {
     atlas?: { source: GPUCopyExternalImageSource; width: number; height: number; rects: LyricRect[] },
   ): void {
     this.device.queue.writeBuffer(this.lyricsBuffer, 0, packLyrics(lines ?? [], atlas?.rects))
-    if (atlas) {
-      this.device.queue.copyExternalImageToTexture(
-        { source: atlas.source },
-        { texture: this.lyricsTexture },
-        [Math.min(atlas.width, LYRIC_ATLAS_W), Math.min(atlas.height, LYRIC_ATLAS_H)],
-      )
+    if (!atlas) return
+    const w = Math.min(atlas.width, LYRIC_ATLAS_MAX_W)
+    const h = Math.min(atlas.height, LYRIC_ATLAS_MAX_H)
+    if (this.lyricsTexture.width !== w || this.lyricsTexture.height !== h) {
+      this.lyricsTexture.destroy()
+      this.lyricsTexture = this.device.createTexture({
+        label: "lyric line atlas",
+        size: [w, h],
+        format: "r8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.lyricsTextureView = this.lyricsTexture.createView()
+      // The one re-bind lyrics can cause, and only when the atlas changes SIZE
+      // — a new song, not a new line. The timing buffer never moves, so an
+      // effect reading rzLyric* is never interrupted by lyrics arriving.
+      this.rebuildFieldBindGroup()
     }
+    this.device.queue.copyExternalImageToTexture({ source: atlas.source }, { texture: this.lyricsTexture }, [w, h])
   }
 
-  setScore(notes: ScoreNote[] | null, release = 0.35): void {
-    if (this.scoreBuffer !== this.scoreFallbackBuffer) this.scoreBuffer.destroy()
-    this.scoreRelease = Math.max(0, release)
+  setMidiNotes(notes: MidiNote[] | null, release = 0.35): void {
+    if (this.midiBuffer !== this.midiFallbackBuffer) this.midiBuffer.destroy()
+    this.midiRelease = Math.max(0, release)
     // Sorted by onset. Nothing in the accessors requires it, but a caller
     // walking the list to spawn in time order is the obvious use and a score
     // arriving unsorted would make that silently wrong.
-    this.scoreNotes = notes ? [...notes].sort((a, b) => a.start - b.start) : []
-    if (this.scoreNotes.length === 0) {
-      this.scoreBuffer = this.scoreFallbackBuffer
+    this.midiNotes = notes ? [...notes].sort((a, b) => a.start - b.start) : []
+    if (this.midiNotes.length === 0) {
+      this.midiBuffer = this.midiFallbackBuffer
     } else {
       let lo = 127
       let hi = 0
       let end = 0
-      for (const n of this.scoreNotes) {
+      for (const n of this.midiNotes) {
         if (n.pitch < lo) lo = n.pitch
         if (n.pitch > hi) hi = n.pitch
         end = Math.max(end, n.start + n.duration)
       }
-      const payload = new Float32Array(SCORE_NOTES + this.scoreNotes.length * SCORE_STRIDE)
-      payload[0] = this.scoreNotes.length
+      const payload = new Float32Array(MIDI_NOTES + this.midiNotes.length * MIDI_STRIDE)
+      payload[0] = this.midiNotes.length
       payload[1] = lo
       payload[2] = hi
       payload[5] = end
-      payload[6] = this.scoreRelease
-      for (let i = 0; i < this.scoreNotes.length; i++) {
-        const n = this.scoreNotes[i]
-        const o = SCORE_NOTES + i * SCORE_STRIDE
+      payload[6] = this.midiRelease
+      for (let i = 0; i < this.midiNotes.length; i++) {
+        const n = this.midiNotes[i]
+        const o = MIDI_NOTES + i * MIDI_STRIDE
         payload[o] = n.start
         payload[o + 1] = n.duration
         payload[o + 2] = n.pitch
         payload[o + 3] = n.velocity ?? 1
       }
-      this.scoreBuffer = this.device.createBuffer({
+      this.midiBuffer = this.device.createBuffer({
         label: "score",
         size: payload.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       })
-      this.device.queue.writeBuffer(this.scoreBuffer, 0, payload)
+      this.device.queue.writeBuffer(this.midiBuffer, 0, payload)
     }
     // Same reason as setAudioData: every consumer holds the buffer by reference,
     // so all of them re-bind and a score arriving before or after an effect both
@@ -6253,17 +6265,17 @@ export class Engine {
    * exactly when a wrong answer is most visible. Ten thousand notes is ten
    * thousand comparisons, which is nothing beside the pose pass.
    */
-  setScoreTime(seconds: number, playing = true): void {
-    if (this.scoreBuffer === this.scoreFallbackBuffer) return
-    const keys = this.scoreLiveScratch
+  setMidiTime(seconds: number, playing = true): void {
+    if (this.midiBuffer === this.midiFallbackBuffer) return
+    const keys = this.midiLiveScratch
     keys.fill(0)
     keys[0] = seconds
     keys[1] = playing ? 1 : 0
-    const release = Math.max(this.scoreRelease, 1e-4)
-    for (const n of this.scoreNotes) {
+    const release = Math.max(this.midiRelease, 1e-4)
+    for (const n of this.midiNotes) {
       if (n.start > seconds) continue // sorted, but a later note may still be shorter
       const k = Math.round(n.pitch)
-      if (k < 0 || k >= SCORE_KEYS) continue
+      if (k < 0 || k >= MIDI_KEYS) continue
       const since = seconds - (n.start + n.duration)
       // Held reads 1; released decays linearly over the release window. Max,
       // not sum: two notes on one key is still one key, lit once.
@@ -6272,8 +6284,8 @@ export class Engine {
     }
     // One write covering the clock (floats 3–4) and the key map (8 onward);
     // scratch holds them adjacently so it stays a single upload.
-    this.device.queue.writeBuffer(this.scoreBuffer, 3 * 4, keys.buffer as ArrayBuffer, 0, 2 * 4)
-    this.device.queue.writeBuffer(this.scoreBuffer, SCORE_HEADER * 4, keys.buffer as ArrayBuffer, 2 * 4, SCORE_KEYS * 4)
+    this.device.queue.writeBuffer(this.midiBuffer, 3 * 4, keys.buffer as ArrayBuffer, 0, 2 * 4)
+    this.device.queue.writeBuffer(this.midiBuffer, MIDI_HEADER * 4, keys.buffer as ArrayBuffer, 2 * 4, MIDI_KEYS * 4)
   }
 
   /**

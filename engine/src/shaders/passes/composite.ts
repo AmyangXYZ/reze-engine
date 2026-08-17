@@ -5,7 +5,7 @@ import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewpor
 import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
 import { lyricsApi, lyricsTextApi } from "../lyrics-api"
-import { scoreApi } from "../score-api"
+import { midiApi } from "../midi-api"
 import { gridReadApi } from "./grid"
 // Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
@@ -631,7 +631,7 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
   // The composite is STATIC either way now: the user's code compiles in the
   // field module alone, and the composite only decides whether to sample it.
   return COMPOSITE_HEAD +
-    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + scoreApi(0, 19) + lyricsApi(0, 24) + body
+    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + midiApi(0, 19) + lyricsApi(0, 24) + body
 }
 
 /**
@@ -699,7 +699,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     EFFECT_SCENE_API +
     anchorAliasWgsl(effect.alias ?? []) +
     audioApi(0, 13) +
-    scoreApi(0, 19) +
+    midiApi(0, 19) +
     lyricsApi(0, 24) +
     // The words themselves — the atlas rides the grid's sampler, which is
     // declared just below and resolves module-wide.

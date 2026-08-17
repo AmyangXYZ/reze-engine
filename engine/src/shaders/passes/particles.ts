@@ -2,7 +2,7 @@ import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
-import { scoreApi } from "../score-api"
+import { midiApi } from "../midi-api"
 import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
@@ -184,7 +184,7 @@ export function buildParticleComputeShader(src: ParticleSource, cast: CastLayout
 ` +
     castApi(cast) +
     audioApi(0, 4) +
-    scoreApi(0, 5) +
+    midiApi(0, 5) +
     lyricsApi(0, 6) +
     PRELUDE +
     "\n// ── user effect ──\n" +
@@ -243,7 +243,7 @@ override ADDITIVE: bool = ${src.blend === "additive" ? "true" : "false"};\n` +
 ` +
     castApi(cast) +
     audioApi(0, 4) +
-    scoreApi(0, 5) +
+    midiApi(0, 5) +
     lyricsApi(0, 6) +
     PRELUDE +
     "\n// ── user effect ──\n" +

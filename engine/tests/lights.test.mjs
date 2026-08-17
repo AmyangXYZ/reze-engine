@@ -210,7 +210,7 @@ test("a lamp can pulse on the beat and light up on a note", () => {
   // On the same bindings the particle and trail modules use, so the layout in
   // engine.ts is one convention rather than three.
   assert.match(src, /@group\(0\) @binding\(4\) var<storage, read> _rzAudio/)
-  assert.match(src, /@group\(0\) @binding\(5\) var<storage, read> _rzScore/)
+  assert.match(src, /@group\(0\) @binding\(5\) var<storage, read> _rzMidi/)
 })
 
 test("the emit stage can read the cast, so a lamp can aim at someone", () => {

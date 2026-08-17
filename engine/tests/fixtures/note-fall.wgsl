@@ -383,7 +383,7 @@ fn lineY(x: f32, t: f32, ord0: i32, kw: f32, lo: f32, hi: f32) -> f32 {
 fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f {
   let res = rzResolution();
   let aspect = res.x / max(res.y, 1.0);
-  let t = rzScoreTime();
+  let t = rzMidiTime();
   var col = vec3f(0.0);
 
   // The keyboard's shape, read ONCE. Every one of these costs an integer divide

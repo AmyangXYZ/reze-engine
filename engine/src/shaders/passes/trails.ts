@@ -2,7 +2,7 @@ import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
-import { scoreApi } from "../score-api"
+import { midiApi } from "../midi-api"
 import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 // Ribbons along a bone's recorded path, drawn as geometry.
@@ -221,7 +221,7 @@ fn rzTurnRadius(a: vec3f, b: vec3f, c: vec3f) -> f32 {
 }
 ` +
     audioApi(0, 4) +
-    scoreApi(0, 5) +
+    midiApi(0, 5) +
     lyricsApi(0, 6) +
     "\n// ── user effect ──\n" +
     src.wgsl +
