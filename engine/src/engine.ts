@@ -262,7 +262,7 @@ type GroupInstall = {
   signature: string
 }
 
-export type RaycastCallback = (
+type RaycastCallback = (
   modelName: string,
   material: string | null,
   bone: string | null,
@@ -278,7 +278,7 @@ export type LoadModelFromFilesOptions = {
 
 // Blender-style scene config. World = environment lighting (ambient);
 // Sun = the single directional lamp; Camera = view framing.
-export type WorldOptions = {
+type WorldOptions = {
   /** Linear scene-referred color of the World Background (Blender: World > Surface > Color). */
   color?: Vec3
   /** Multiplier on world color (Blender: World > Surface > Strength). */
@@ -350,7 +350,7 @@ export type ModelTransform = {
   visible: boolean
 }
 
-export type SunOptions = {
+type SunOptions = {
   /** Linear color of the sun lamp (Blender: Light > Color). */
   color?: Vec3
   /** Lamp power in Blender units (Blender: Light > Strength). */
@@ -379,7 +379,7 @@ export type EffectResult = {
   mounts: { background: boolean; foreground: boolean }
 }
 
-export type CameraOptions = {
+type CameraOptions = {
   /** Orbit distance from target. */
   distance?: number
   /** World-space orbit center. */
@@ -543,7 +543,7 @@ export type EngineOptions = {
   onGizmoDrag?: GizmoDragCallback
 }
 
-export const DEFAULT_ENGINE_OPTIONS = {
+const DEFAULT_ENGINE_OPTIONS = {
   world: { color: new Vec3(0.4014, 0.4944, 0.647), strength: 0.3 },
   sun: { color: new Vec3(1.0, 1.0, 1.0), strength: 2.0, direction: new Vec3(-0.0873, -0.3844, 0.919) },
   camera: { distance: 26.6, target: new Vec3(0, 12.5, 0), fov: Math.PI / 4 },

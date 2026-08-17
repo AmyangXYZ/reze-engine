@@ -84,7 +84,7 @@ export function parseEffectAnchors(wgsl: string, max: number): { bone: string; t
 // engine imports them from this file and the constants did not move in meaning.
 export { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 
-export type CompositeEffectSource = {
+type CompositeEffectSource = {
   /** The user's WGSL verbatim: helpers plus whichever entry points it defines. */
   wgsl: string
   /** Codegen'd `struct EffectParams {...}` + binding decl; empty when no params. */

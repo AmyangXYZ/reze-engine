@@ -22,7 +22,7 @@ import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewpor
 // colour. Everything else — which bones, which characters, where the samples
 // are, how to face the camera — is the engine's.
 
-export type TrailSource = {
+type TrailSource = {
   /** The author's WGSL verbatim. */
   wgsl: string
   /** How many ribbons to draw — one per trailed anchor. */

@@ -1210,17 +1210,6 @@ export const scratchMat4Values: Float32Array[] = [
   new Float32Array(16),
 ]
 
-export const scratchVec3: Vec3[] = [
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-  new Vec3(0, 0, 0),
-]
-
 export const scratchQuat: Quat[] = [
   new Quat(0, 0, 0, 1),
   new Quat(0, 0, 0, 1),

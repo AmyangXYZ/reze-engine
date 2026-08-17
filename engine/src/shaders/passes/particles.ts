@@ -48,7 +48,7 @@ export type CastLayout = {
  */
 /** Shared with the grid pass, which reads the same buffer for the same reason:
  *  a kernel that displaces fog has to know where the dancer's feet are. */
-export function castApi(cast: CastLayout): string {
+function castApi(cast: CastLayout): string {
   return (
     // rzSubjectCount FIRST, because CAST_API is written against it and this
     // module has no view uniform to read the engine's count out of. Scanning
@@ -70,9 +70,9 @@ fn rzSubjectCount() -> i32 {
 }
 
 /** How the author's quads combine with the scene. */
-export type ParticleBlend = "alpha" | "additive"
+type ParticleBlend = "alpha" | "additive"
 
-export type ParticleSource = {
+type ParticleSource = {
   /** The author's WGSL verbatim. */
   wgsl: string
   /** Simultaneous particles. Fixed at install; the pool recycles rather than grows. */

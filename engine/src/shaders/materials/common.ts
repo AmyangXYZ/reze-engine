@@ -161,7 +161,7 @@ const pcf9 = (map: string, ts: string) => /* wgsl */ `
   return (s00 + s10 + s20 + s01 + s11 + s21 + s02 + s12 + s22) * (1.0 / 9.0);
 `
 
-export const SAMPLE_SHADOW_WGSL = /* wgsl */ `
+const SAMPLE_SHADOW_WGSL = /* wgsl */ `
 
 fn sampleShadowNear(ndc: vec3f) -> f32 {
 ${pcf9("shadowMap", `1.0 / ${SHADOW_CASCADES[0].mapSize}.0`)}
@@ -197,7 +197,7 @@ fn sampleShadow(worldPos: vec3f, n: vec3f) -> f32 {
 // VS normalize on the outgoing normal is skipped — interpolation denormalizes it
 // anyway and every fragment shader does `normalize(input.normal)` as its first line.
 
-export const COMMON_VS_WGSL = /* wgsl */ `
+const COMMON_VS_WGSL = /* wgsl */ `
 
 @vertex fn vs(
   @location(0) position: vec3f,

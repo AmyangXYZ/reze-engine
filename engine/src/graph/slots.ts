@@ -59,7 +59,7 @@ const EYE_REAR_GATE = `
 
 // ── Adjust-tier uniforms — fixed 16-vec4f block (256 B) shared by the single material
 // bind group layout; non-graph draws bind a zero buffer. ──
-export const STYLE_UNIFORMS_WGSL = `struct StyleUniforms { p: array<vec4f, 16> };
+const STYLE_UNIFORMS_WGSL = `struct StyleUniforms { p: array<vec4f, 16> };
 @group(2) @binding(4) var<uniform> style: StyleUniforms;
 
 `

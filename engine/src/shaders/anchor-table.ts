@@ -20,7 +20,7 @@
 //   · it is the same indirection the skeleton data interface needs later, so
 //     this is a bridge rather than a detour.
 
-export interface AnchorRequest {
+interface AnchorRequest {
   bone: string
   trail: boolean
 }

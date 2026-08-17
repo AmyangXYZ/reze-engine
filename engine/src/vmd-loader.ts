@@ -1,6 +1,6 @@
 import { Quat, Vec3 } from "./math"
 
-export interface BoneFrame {
+interface BoneFrame {
   boneName: string
   frame: number
   rotation: Quat
@@ -8,7 +8,7 @@ export interface BoneFrame {
   interpolation: Uint8Array // 64 bytes of interpolation parameters
 }
 
-export interface MorphFrame {
+interface MorphFrame {
   morphName: string
   frame: number
   weight: number // 0.0 to 1.0

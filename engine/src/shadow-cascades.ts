@@ -13,7 +13,7 @@
 
 import { Mat4, Vec3 } from "./math"
 
-export type ShadowCascade = {
+type ShadowCascade = {
   /** World units across the ortho box, both axes. */
   span: number
   /** How far behind the target the light's eye sits, along -sunDir. */

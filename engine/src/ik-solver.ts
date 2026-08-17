@@ -4,7 +4,7 @@ import { Mat4, Quat, Vec3, type EulerOrder } from "./math"
 import { Bone, IKLink, IKSolver, IKChainInfo } from "./model"
 
 // Callback type for updating world matrix (provided by model to handle append transformations)
-export type UpdateWorldMatrixFn = (boneIndex: number, applyIK: boolean) => void
+type UpdateWorldMatrixFn = (boneIndex: number, applyIK: boolean) => void
 
 const enum InternalEulerRotationOrder {
   YXZ = 0,

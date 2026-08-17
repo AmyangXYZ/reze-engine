@@ -8,7 +8,7 @@ import type { SocketValue } from "./schema"
 
 export type SockT = "float" | "color" | "vector" | "vec4"
 
-export type InputSpec = {
+type InputSpec = {
   type: SockT
   default?: SocketValue
   /** Socket is meaningless as a literal (e.g. the color being processed) — must be linked. */
@@ -32,7 +32,7 @@ export type NodeSpec = {
 // Deterministic: same graph JSON → byte-identical WGSL. String(x) is JS shortest
 // round-trip, so full-precision Blender constants (0.15000000596046448) survive.
 
-export function fmtFloat(x: number): string {
+function fmtFloat(x: number): string {
   if (!Number.isFinite(x)) throw new Error(`non-finite literal: ${x}`)
   const s = String(x)
   return /[.e]/.test(s) ? s : s + ".0"

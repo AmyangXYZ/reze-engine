@@ -75,7 +75,7 @@ export function mrtIdsEnabled(): boolean {
  * the draw's. A class here is a thing with a reason, not a pipeline name — two
  * pipelines that blend the same way share one.
  */
-export type SceneRenderClass =
+type SceneRenderClass =
   /** Models, opaque and transparent. Straight alpha over. */
   | "material"
   /** The shadow-catcher floor. Blends PREMULTIPLIED, not like a material: its

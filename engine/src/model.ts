@@ -207,7 +207,7 @@ export interface Morphing {
 }
 
 // CSR inversion of vertex-morph offsets for the GPU compute pass (built once at load).
-export interface MorphComputeData {
+interface MorphComputeData {
   basePositions: Float32Array // vertexCount * 3
   rowStart: Uint32Array // vertexCount + 1 (prefix offsets into the entry arrays)
   colMorph: Uint32Array // entryCount (morph index per entry)
@@ -218,7 +218,7 @@ export interface MorphComputeData {
 }
 
 // Runtime skeleton pose state (updated each frame)
-export interface SkeletonRuntime {
+interface SkeletonRuntime {
   nameIndex: Record<string, number> // Cached lookup: bone name -> bone index (built on initialization)
   localRotations: Quat[] // quat per bone
   localTranslations: Vec3[] // vec3 per bone
@@ -228,7 +228,7 @@ export interface SkeletonRuntime {
 }
 
 // Runtime morph state
-export interface MorphRuntime {
+interface MorphRuntime {
   nameIndex: Record<string, number> // Cached lookup: morph name -> morph index
   weights: Float32Array // One weight per morph (0.0 to 1.0)
 }
