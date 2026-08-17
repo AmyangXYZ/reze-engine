@@ -28,7 +28,7 @@ export { parseMidi } from "./midi-loader"
 // parsed image to setBackdropEquirect.
 export { parseHDR, type HdrImage } from "./hdr"
 // Lyrics timing (.lrc) — the host parses the file and hands the lines to setLyrics.
-export { parseLRC, type LyricLine } from "./shaders/lyrics-api"
+export { LYRIC_ATLAS_H, LYRIC_ATLAS_W, parseLRC, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
 // A material parameter over time. The sampler is exported too: a host that
 // wants to draw a track, or scrub one, should read the same curve the engine
 // plays rather than reimplementing it a second time.
