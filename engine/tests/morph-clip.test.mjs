@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { AnimationState } from "../dist/animation.js"
+import { AnimationState, retiredMorphs } from "../dist/animation.js"
 
 const key = (frame, weight) => ({ frame, weight })
 
@@ -70,4 +70,21 @@ test("a replacement reaches playback, because the evaluator re-reads the stored 
   state.play("dance")
   state.setMorphTracks("dance", new Map([["あ", [key(0, 1)]]]), 60)
   assert.deepEqual([...state.getCurrentClip().morphTracks.keys()], ["あ"])
+})
+
+test("the morphs a replaced track set leaves behind are named, so they can be zeroed", () => {
+  const prev = clip({ morphs: [["まばたき", [key(0, 1)]], ["笑い", [key(0, 1)]], ["あ", [key(0, 1)]]] })
+  // Only the ones the new set does NOT drive: a morph both name is still live,
+  // and zeroing it would fight the expression that owns it now.
+  assert.deepEqual(retiredMorphs(prev, new Map([["あ", [key(0, 1)]]])), ["まばたき", "笑い"])
+  assert.deepEqual(retiredMorphs(prev, new Map([["まばたき", []], ["笑い", []], ["あ", []]])), [])
+})
+
+test("nothing is retired when there was no clip to retire from", () => {
+  assert.deepEqual(retiredMorphs(null, new Map([["あ", [key(0, 1)]]])), [])
+})
+
+test("an empty expression retires the whole previous face", () => {
+  const prev = clip({ morphs: [["まばたき", [key(0, 1)]], ["笑い", [key(0, 1)]]] })
+  assert.deepEqual(retiredMorphs(prev, new Map()), ["まばたき", "笑い"])
 })

@@ -79,6 +79,22 @@ interface QueuedAnimationRequest {
 }
 
 // Priority-aware playback: higher priority preempts, otherwise latest request is queued.
+/**
+ * Morphs the OLD tracks drove that the new ones do not name.
+ *
+ * Nothing in the pose pass resets a morph weight — it writes only the morphs
+ * its clip names — so a morph left behind by a replaced track keeps its last
+ * value for the rest of the session. These are the ones a caller has to zero,
+ * or the old face stays frozen underneath the new one, which reads exactly
+ * like the new file having had no effect at all.
+ */
+export function retiredMorphs(prev: AnimationClip | null, next: Map<string, MorphKeyframe[]>): string[] {
+  if (!prev) return []
+  const out: string[] = []
+  for (const name of prev.morphTracks.keys()) if (!next.has(name)) out.push(name)
+  return out
+}
+
 export class AnimationState {
   private animations = new Map<string, AnimationClip>()
   private currentAnimationName: string | null = null

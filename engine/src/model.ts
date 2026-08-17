@@ -17,6 +17,7 @@ import {
   IkKeyframe,
   MorphKeyframe,
   interpolateControlPoints,
+  retiredMorphs,
   rawInterpolationToBoneInterpolation,
 } from "./animation"
 
@@ -1586,9 +1587,12 @@ export class Model {
       const vmdKeyFrames = VMDLoader.loadFromBuffer(buf)
       const clip = this.buildClipFromVmdKeyFrames(vmdKeyFrames)
       if (options?.tracks === "morphs") {
+        this.clearRetiredMorphs(name, clip.morphTracks)
         this.animationState.setMorphTracks(name, clip.morphTracks, clip.frameCount)
         return
       }
+      // A whole new clip retires the old one's morphs for the same reason.
+      this.clearRetiredMorphs(name, clip.morphTracks)
       // The IK block lives past every other section, so it is read separately
       // rather than threaded through the keyframe grouping.
       const ikFrames = VMDLoader.loadIkFromBuffer(buf)
@@ -1606,6 +1610,18 @@ export class Model {
       }
       this.animationState.loadAnimation(name, clip)
     })
+  }
+
+  /** Zero the morphs a replaced track set drove and the new one does not, so
+   *  the face it left behind does not sit frozen under the new expressions.
+   *  See retiredMorphs for why nothing else clears them. */
+  private clearRetiredMorphs(name: string, next: Map<string, MorphKeyframe[]>): void {
+    for (const morphName of retiredMorphs(this.animationState.getAnimationClip(name), next)) {
+      const idx = this.runtimeMorph.nameIndex[morphName]
+      if (idx === undefined) continue
+      this.runtimeMorph.weights[idx] = 0
+      this.morphsDirty = true
+    }
   }
 
   loadClip(name: string, clip: AnimationClip): void {
