@@ -24,6 +24,7 @@ const RIM = vec3f(0.04, 0.04, 0.12);    // the outline around both
 const LINE_H = 0.050;                   // line box height, fraction of screen height
 const RIM_R = 0.085;                    // outline reach, fraction of box height
 const SHADOW = 0.5;                     // drop shadow strength, 0 for none
+const SHADOW_DROP = 0.5;                // how far BELOW the words it sits, in rim radii
 const SHARP = 0.35;                     // edge contrast; 0.5 is raw coverage,
                                         // lower is harder — under ~0.2 it steps
 const RISE = 0.10;                      // how far the line rises as it appears, in box heights
@@ -103,16 +104,33 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   }
   let rim = max(glyph, smoothstep(0.5 - SHARP, 0.5 + SHARP, raw));
 
-  // A soft shadow below, from the same dilation at a wider reach — it is what
-  // keeps white-on-white readable when the stage behind blows out. Left
-  // unsharpened on purpose: a shadow with a crisp edge is a second outline.
+  // A soft shadow UNDER the words — what keeps them readable when the stage
+  // behind blows out. Both the direction and the softness are load-bearing.
+  //
+  // DIRECTION. A tap reads the line at lu + off and draws what it finds at lu,
+  // so the ink lands opposite the offset: to hang the shadow BELOW the glyphs
+  // the tap has to reach ABOVE them, and the other sign puts a second set of
+  // words over the line, which reads as the line drawn twice.
+  //
+  // SOFTNESS. The taps are AVERAGED across a disc rather than maxed at one
+  // radius. A max is a hard-edged copy of the glyph shifted bodily off its
+  // own position — the same duplicate by another route, and the reason this
+  // is a weighted sum with the outer ring turned half a step off the inner
+  // one, so no spoke is sampled twice.
   var shade = 0.0;
   if (SHADOW > 0.0) {
-    let off = vec2f(0.0, -r.y * 1.6);
-    for (var k = 0; k < 4; k = k + 1) {
-      let a = 6.2831853 * f32(k) / 4.0 + 0.7854;
-      shade = max(shade, rzLyricText(i, lu + off + vec2f(cos(a), sin(a)) * r * 1.9));
+    let drop = vec2f(0.0, r.y * SHADOW_DROP);
+    var wsum = 1.0;
+    shade = rzLyricText(i, lu + drop);
+    for (var k = 0; k < 6; k = k + 1) {
+      let a = 6.2831853 * f32(k) / 6.0;
+      let d = vec2f(cos(a), sin(a));
+      let e = vec2f(cos(a + 0.5235988), sin(a + 0.5235988));
+      shade = shade + 0.70 * rzLyricText(i, lu + drop + d * r * 0.60);
+      shade = shade + 0.40 * rzLyricText(i, lu + drop + e * r * 1.10);
+      wsum = wsum + 1.10;
     }
+    shade = shade / wsum;
   }
 
   // The sweep: everything left of the line's progress has been sung. Its edge
@@ -124,6 +142,6 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   // coverage is >= the one above it, so the mixes stack in that order and the
   // rim never darkens the glyph it surrounds.
   let color = mix(mix(vec3f(0.0), RIM, rim), ink, glyph);
-  let a = max(max(shade * SHADOW * 0.85, rim), glyph) * fade;
+  let a = max(max(shade * SHADOW, rim), glyph) * fade;
   return vec4f(color, clamp(a, 0.0, 1.0));
 }
