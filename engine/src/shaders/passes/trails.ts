@@ -353,9 +353,23 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   if (dot(perpA, perpB) < 0.0) { perpB = -perpB; }
   let clipP = select(clipA, clipB, atEnd);
   let perp = select(perpA, perpB, atEnd);
-  // trailWidth speaks PIXELS, like the original's constants; rzViewportHeight()
-  // lets the effect scale them to the frame.
-  let wPx = max(0.0, trailWidth(u, age));
+  // trailWidth speaks WORLD UNITS — the model's units, not the screen's.
+  //
+  // It spoke pixels, like the fullscreen original's constants, and that made
+  // the ribbon a screen ornament: zoom out and it grew relative to the hand
+  // that drew it, zoom in and it thinned to a thread. A ribbon is a thing in
+  // the scene, so its width belongs in the scene's units and should foreshorten
+  // like everything else.
+  //
+  // The EXTRUSION stays in 2D pixel space untouched — every 3D-extrusion
+  // artefact this ribbon ever had (fold-over wedges, bowties, twisted quads) is
+  // recorded above, and none of it comes back. Only the width's SOURCE changes:
+  // a world length L perpendicular to view at depth w projects to
+  // L * proj[1][1] / w in NDC y, so half the frame height converts it to the
+  // pixels the 2D offset wants. Per vertex, so a ribbon receding along its own
+  // length tapers with distance exactly as geometry would.
+  let wWorld = max(0.0, trailWidth(u, age));
+  let wPx = wWorld * cam.proj[1][1] * (H * 0.5) / max(clipP.w, 0.01);
   let ndc = clipP.xy / clipP.w + perp * (c.y * wPx) / toPx;
   out.clip = vec4f(ndc * clipP.w, clipP.z, clipP.w);
   out.slot = u32(slot);
