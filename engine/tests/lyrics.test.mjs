@@ -1,6 +1,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { parseLRC, packLyrics, LYRIC_HEADER, LYRIC_STRIDE, LYRIC_LINES_MAX, LYRICS_FLOATS } from "../src/shaders/lyrics-api.ts"
+// dist, like every other test here: node cannot load a .ts, so importing the
+// source made this the one file in the suite that could never run.
+import { parseLRC, packLyrics, LYRIC_HEADER, LYRIC_STRIDE, LYRIC_LINES_MAX, LYRICS_FLOATS } from "../dist/shaders/lyrics-api.js"
 
 test("parses timestamped lines, ends at the next line's start", () => {
   const lines = parseLRC("[00:12.00]first line\n[00:17.20]second line\n")

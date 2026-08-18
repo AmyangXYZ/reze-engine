@@ -1232,6 +1232,8 @@ interface EffectInstance {
   lights: {
     pipeline: GPUComputePipeline
     bind: GPUBindGroup
+    /** Kept so `bind` can be rebuilt when a shared buffer it names is replaced. */
+    layout: GPUBindGroupLayout
     uniform: GPUBuffer
     data: Float32Array<ArrayBuffer>
     /** How many slots it asked for. Its base is assigned by the engine and can
@@ -1387,6 +1389,24 @@ export class Engine {
   // the fragment shader and treats missing dst.a as 1, so the blend math is
   // unchanged).
   private hdrFormat: GPUTextureFormat = "rgba16float"
+  /**
+   * Force the HDR format instead of taking the device's answer. Null = probe,
+   * which is what ships.
+   *
+   * A diagnostic, and deliberately a coarse one. The choice above is the ONE
+   * render-target difference between a Safari device and a desktop Chrome that
+   * lacks the feature, which makes it the first thing to eliminate when
+   * something renders correctly on one and not the other — and specifically when
+   * the something involves alpha, because rg11b10ufloat is the path with no
+   * alpha channel to carry it. Setting this to "rgba16float" on the device puts
+   * Safari back on the desktop's path at the cost of the tile-memory win, so a
+   * symptom that survives is not about the format and a symptom that vanishes
+   * is.
+   *
+   * Static, like MRT_IDS: read once in init(), before any texture or pipeline
+   * exists, so there is no such thing as changing it on a live engine.
+   */
+  static HDR_FORMAT_OVERRIDE: GPUTextureFormat | null = null
   /** Main-pass depth. Float when the adapter offers depth32float-stencil8, which
    *  is also what makes reversed-Z worth switching on. */
   private depthFormat: GPUTextureFormat = "depth24plus-stencil8"
@@ -2542,6 +2562,72 @@ export class Engine {
   }
 
   /**
+   * The grid mount's bind group for one parity.
+   *
+   * A method rather than a closure at the creation site because the SET of
+   * buffers in here is a contract with two parties: the grid is built once, and
+   * rebuilt whenever a shared buffer it names is replaced (see
+   * rebindSharedBuffers). Written twice, the rebuild silently keeps a binding
+   * the creation grew — and a bind group that names a destroyed buffer does not
+   * fail where it was written, it fails at the next submit.
+   */
+  private gridBindGroup(
+    g: { layout: GPUBindGroupLayout; uniform: GPUBuffer; read: [GPUTextureView, GPUTextureView]; textures: [GPUTexture, GPUTexture] },
+    i: number,
+  ): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: g.layout,
+      entries: [
+        { binding: 0, resource: { buffer: g.uniform } },
+        { binding: 1, resource: g.read[i] },
+        { binding: 2, resource: this.simSampler },
+        { binding: 3, resource: g.textures[1 - i].createView() },
+        { binding: 4, resource: { buffer: this.castBuffer } },
+        { binding: 5, resource: { buffer: this.audioBuffer } },
+        { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
+        { binding: 7, resource: { buffer: this.midiBuffer } },
+        { binding: 8, resource: { buffer: this.lyricsBuffer } },
+      ],
+    })
+  }
+
+  /**
+   * Re-point EVERY bind group that names a shared scene buffer at the buffer
+   * that is there NOW.
+   *
+   * setAudioData and setMidiNotes do not write their buffer, they REPLACE it:
+   * the payload is a different length each time, so the old one is destroyed and
+   * a new one takes its place. Every bind group built before that moment still
+   * names the dead buffer, and a bind group is not re-read — it holds the
+   * resource it was given. The failure is therefore not at the swap but one
+   * frame later, as `[Buffer "score"] used in submit while destroyed`, with the
+   * scene dead and nothing pointing at the setter that did it.
+   *
+   * Both setters used to rebind three of the six families that hold these
+   * buffers — composite, ribbons, particles — and miss the field mount, the grid
+   * mount and the light emitter. Which is to say it worked for every effect that
+   * happened not to have a field, and a falling-note effect is exactly the kind
+   * that does. So the list lives HERE, once, and both setters call it: the
+   * question "who holds this buffer?" now has one place to be answered, and the
+   * next binding added is added to a list that everything already consults.
+   */
+  private rebindSharedBuffers(): void {
+    this.rebuildCompositeBindGroup()
+    this.rebindTrails()
+    this.rebuildFieldBindGroup()
+    for (const e of this.effects) {
+      if (e.particles) {
+        const b = e.particles.rebind()
+        e.particles.computeBind = b.computeBind
+        e.particles.renderBind = b.renderBind
+        e.particles.mirrorRenderBind = b.mirrorRenderBind
+      }
+      if (e.grid) e.grid.binds = [this.gridBindGroup(e.grid, 0), this.gridBindGroup(e.grid, 1)]
+      if (e.lights) e.lights.bind = this.lightEmitBindGroup(e.lights.layout, e.lights.uniform)
+    }
+  }
+
+  /**
    * Set a 360° backdrop from an equirectangular (2:1) image — a PhotoDome-style
    * skybox at infinity, sampled per-pixel by view direction so it follows the
    * camera. Display-only: composited in display space behind the scene, it never
@@ -3401,7 +3487,16 @@ export class Engine {
       uniform.destroy()
       return { ok: false, diagnostics: [scoped.message] }
     }
-    const bind = this.device.createBindGroup({
+    const bind = this.lightEmitBindGroup(layout, uniform)
+    // The layout travels with the state so the emitter can be rebound when a
+    // shared buffer under it is replaced — see rebindSharedBuffers.
+    return { ok: true, state: { pipeline, bind, layout, uniform, data, count } }
+  }
+
+  /** The light emitter's bind group. One author, for the reason gridBindGroup
+   *  gives: it is built once and rebuilt on every shared-buffer swap. */
+  private lightEmitBindGroup(layout: GPUBindGroupLayout, uniform: GPUBuffer): GPUBindGroup {
+    return this.device.createBindGroup({
       label: "light emit bind",
       layout,
       entries: [
@@ -3414,7 +3509,6 @@ export class Engine {
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
       ],
     })
-    return { ok: true, state: { pipeline, bind, uniform, data, count } }
   }
 
   /**
@@ -3850,21 +3944,7 @@ export class Engine {
         return { ok: false, diagnostics: [scoped.message] }
       }
       // One per parity: binds[i] READS textures[i] and WRITES the other.
-      const bindFor = (i: number) =>
-        this.device.createBindGroup({
-          layout,
-          entries: [
-            { binding: 0, resource: { buffer: uniform } },
-            { binding: 1, resource: read[i] },
-            { binding: 2, resource: this.simSampler },
-            { binding: 3, resource: textures[1 - i].createView() },
-            { binding: 4, resource: { buffer: this.castBuffer } },
-            { binding: 5, resource: { buffer: this.audioBuffer } },
-            { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
-            { binding: 7, resource: { buffer: this.midiBuffer } },
-            { binding: 8, resource: { buffer: this.lyricsBuffer } },
-          ],
-        })
+      const bindFor = (i: number) => this.gridBindGroup({ layout, uniform, read, textures }, i)
       return {
         ok: true,
         state: {
@@ -4108,6 +4188,16 @@ export class Engine {
     }
     this.device = device
     if (hasRg11b10) this.hdrFormat = "rg11b10ufloat"
+    // The override has the last word, including over a device that would have
+    // been left on the fallback anyway — asking for the format you are already
+    // getting is a no-op, not a contradiction. See HDR_FORMAT_OVERRIDE.
+    if (Engine.HDR_FORMAT_OVERRIDE) {
+      this.hdrFormat = Engine.HDR_FORMAT_OVERRIDE
+      // Only when forced. The probed answer is the normal one and does not need
+      // announcing on every boot; a forced one is a state someone set and will
+      // want confirmed, and is the state they will forget they left on.
+      console.info(`[reze] HDR target forced to ${this.hdrFormat}`)
+    }
     // The id attachment, if this device will multisample a uint texture at the
     // pass's sample count. Probed by ASKING — creating one inside an error
     // scope — rather than by reading a feature flag, because there is no
@@ -6136,17 +6226,7 @@ export class Engine {
     }
     // Every consumer holds the buffer by reference in a bind group; all of them
     // re-bind so audio arriving after an effect (or before one) both work.
-    this.rebuildCompositeBindGroup()
-    this.rebindTrails()
-    // EVERY effect: a buffer arriving after install must reach all of them, or
-    // the ones installed earlier keep reading the buffer this replaced.
-    for (const e of this.effects) {
-      if (!e.particles) continue
-      const b = e.particles.rebind()
-      e.particles.computeBind = b.computeBind
-      e.particles.renderBind = b.renderBind
-      e.particles.mirrorRenderBind = b.mirrorRenderBind
-    }
+    this.rebindSharedBuffers()
   }
 
   /**
@@ -6247,17 +6327,7 @@ export class Engine {
     // Same reason as setAudioData: every consumer holds the buffer by reference,
     // so all of them re-bind and a score arriving before or after an effect both
     // work.
-    this.rebuildCompositeBindGroup()
-    this.rebindTrails()
-    // EVERY effect: a buffer arriving after install must reach all of them, or
-    // the ones installed earlier keep reading the buffer this replaced.
-    for (const e of this.effects) {
-      if (!e.particles) continue
-      const b = e.particles.rebind()
-      e.particles.computeBind = b.computeBind
-      e.particles.renderBind = b.renderBind
-      e.particles.mirrorRenderBind = b.mirrorRenderBind
-    }
+    this.rebindSharedBuffers()
   }
 
   /**
