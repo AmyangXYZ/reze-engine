@@ -1,11 +1,22 @@
-// Depth-only prepass for the TRANSPARENT bucket. Transparent color draws keep
-// depth write OFF so self-overlapping sheer cloth blends both layers instead of
-// a triangle-order patchwork — but that leaves no depth record, so anything
-// drawn later (the outline hulls) shows straight through the fabric as black
-// shapes. This pass re-draws the transparent geometry depth-only AFTER its
-// color pass: solid-enough texels (alpha ≥ 0.5) write depth, so outlines get
-// occluded behind fabric exactly like they are behind opaque cloth, while
-// truly sheer texels (a veil) stay non-occluding.
+// The depth-only prime, one module behind four pipelines.
+//
+// The oldest fps complaint the engine had — zoom close and the frame drops, in
+// every material generation — was per-fragment shading TIMES layering: an MMD
+// model at close-up is cloth over body over face under hair, author-order drawn,
+// every buried layer fully shaded and then covered. This module lets depth go
+// down FIRST so the colour passes shade each pixel once:
+//
+//   · opaque prepass  (CUTOFF 0.5) — plain auto-class opaque draws, before the
+//     opaque colour walk. See drawOpaqueDepthPrepass for who is in and why.
+//   · hair prime      (CUTOFF 1.0, stencil not-equal) — between the non-hair and
+//     hair colour walks, fenced off the eye silhouette the see-through-hair
+//     stencil pass needs. See drawHairDepthPrime.
+//   · transparent solid prime (CUTOFF 1.0) — a translucent material's alpha-1
+//     texels, where over-blending is plain replacement and the buried work
+//     provably never shows. See drawTransparentSolidPrepass.
+//   · transparent depth prepass (CUTOFF 0.5, AFTER colour) — the original
+//     occupant, dormant: re-records sheer fabric's depth so outline hulls are
+//     occluded behind it. Kept for a future OIT path.
 //
 // Reuses mainPipelineLayout: camera g0b0, diffuseSampler g0b2, skinMats g1b0,
 // diffuse texture g2b0, material uniforms g2b1 — the same bind groups the
@@ -33,7 +44,9 @@ struct MaterialUniforms {
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
 
 struct VSOut {
-  @builtin(position) position: vec4f,
+  // @invariant, to the same end as the material VertexOutput: the colour pass
+  // must land on exactly the depths this wrote.
+  @builtin(position) @invariant position: vec4f,
   @location(0) uv: vec2f,
 };
 
@@ -66,9 +79,16 @@ struct VSOut {
 // per WRITTEN target. Costs one dead struct store on a fragment that already
 // runs, because the alpha test below needs it to.
 ${sceneFsOutWgsl({ name: "PrepassOut", aux: "mask" })}
+// The cutout threshold, per pipeline. 0.5 is the OPAQUE prime's "solid enough"
+// — safe there because opaque colour replaces rather than blends. The
+// TRANSPARENT prime overrides it to 1.0: a translucent fragment's blend reads
+// what is behind it, so only a texel at EXACTLY alpha 1 — where over-blending
+// collapses to plain replacement and the destination stops mattering — may
+// claim depth ahead of its buried layers without changing the pixel.
+override CUTOFF: f32 = 0.5;
 @fragment fn fs(in: VSOut) -> PrepassOut {
   let a = material.alpha * textureSample(diffuseTexture, diffuseSampler, in.uv).a;
-  if (a < 0.5) { discard; }
+  if (a < CUTOFF) { discard; }
   var out: PrepassOut;
   out.color = vec4f(0.0);
   out.mask = vec4f(0.0);

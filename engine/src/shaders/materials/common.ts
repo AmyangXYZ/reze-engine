@@ -73,7 +73,13 @@ struct MaterialUniforms {
 };
 
 struct VertexOutput {
-  @builtin(position) position: vec4f,
+  // @invariant: the opaque depth prepass rasterises this same skinned position
+  // through a DIFFERENT shader module, and the colour pass then depth-tests
+  // less-equal against what it wrote. Without invariance a backend is free to
+  // optimise the two position computations differently, and a one-ulp
+  // disagreement is a pixel of missing character. Invariance pins both to the
+  // same result; it costs only that freedom.
+  @builtin(position) @invariant position: vec4f,
   @location(0) normal: vec3f,
   @location(1) uv: vec2f,
   @location(2) worldPos: vec3f,

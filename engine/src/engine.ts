@@ -1342,7 +1342,9 @@ export class Engine {
   // Grouped materials use their group's own compiled pipeline.
   private neutralPipeline!: GPURenderPipeline
   private neutralPipelineNoDepthWrite!: GPURenderPipeline
-  private transparentDepthPrepassPipeline!: GPURenderPipeline
+  private depthPrepassPipeline!: GPURenderPipeline
+  private solidPrepassPipeline!: GPURenderPipeline
+  private hairPrimePipeline!: GPURenderPipeline
   // ── Style group runtime ──
   // Shared 256 B zero StyleUniforms buffer (group(2) binding(4)) bound by every ungrouped
   // material; grouped materials rebind to their group's own buffer (per-model, in the
@@ -5076,21 +5078,60 @@ export class Engine {
       label: "transparent depth prepass",
       code: transparentDepthPrepassWgsl(),
     })
-    this.transparentDepthPrepassPipeline = this.device.createRenderPipeline({
-      label: "transparent depth prepass",
+    const prepassDesc = {
       layout: mainPipelineLayout,
       vertex: { module: prepassModule, entryPoint: "vs", buffers: fullVertexBuffers as GPUVertexBufferLayout[] },
-      fragment: {
-        module: prepassModule,
-        entryPoint: "fs",
-        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
-      },
-      primitive: { cullMode: "none" },
+      primitive: { cullMode: "none" as GPUCullMode },
       multisample: { count: Engine.MULTISAMPLE_COUNT },
       depthStencil: {
         format: this.depthFormat,
         depthWriteEnabled: true,
         depthCompare: this.depthAhead,
+      },
+    }
+    this.depthPrepassPipeline = this.device.createRenderPipeline({
+      label: "opaque depth prepass",
+      ...prepassDesc,
+      fragment: {
+        module: prepassModule,
+        entryPoint: "fs",
+        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+      },
+    })
+    // The SOLID prime: same module, cutoff forced to exactly 1.0. Only texels
+    // whose blend ignores the destination may pre-claim depth in the
+    // transparent phase — see the override's note in depth-prepass.ts.
+    this.solidPrepassPipeline = this.device.createRenderPipeline({
+      label: "transparent solid prepass",
+      ...prepassDesc,
+      fragment: {
+        module: prepassModule,
+        entryPoint: "fs",
+        constants: { CUTOFF: 1.0 },
+        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+      },
+    })
+    // The HAIR prime: solid texels only, and stencil-fenced off the eye
+    // silhouette. It records after the non-hair opaque draws, so the eye has
+    // already written its stencil — not-equal here is what keeps the primed
+    // hair depth from ever claiming the pixels the see-through-hair pass needs
+    // the eye to survive on. (Bundle draws use the PASS's stencil reference;
+    // only pipeline/bind/vertex state resets across executeBundles.)
+    this.hairPrimePipeline = this.device.createRenderPipeline({
+      label: "hair depth prime",
+      ...prepassDesc,
+      depthStencil: {
+        ...prepassDesc.depthStencil,
+        stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: 0xff,
+        stencilWriteMask: 0,
+      },
+      fragment: {
+        module: prepassModule,
+        entryPoint: "fs",
+        constants: { CUTOFF: 1.0 },
+        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
       },
     })
 
@@ -10911,16 +10952,29 @@ export class Engine {
    * makes outlines compose like MMD: every material drawn later in the author's
    * order covers earlier hulls, and each hull sits over everything drawn before it.
    */
+  /** Is this draw's compiled class "hair"? Ungrouped draws never are — the
+   *  neutral pipeline is the auto class. */
+  private isHairDraw(inst: ModelInstance, dc: DrawCall): boolean {
+    if (!dc.groupId) return false
+    const install = inst.styleGroups.get(dc.groupId)
+    return install?.renderClass === "hair"
+  }
+
   private drawMaterials(
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
     type: "opaque" | "transparent",
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+    // The opaque phase walks its author order twice — non-hair, then hair — so
+    // the hair depth prime can sit between the eye's stencil write and the hair
+    // colour that must respect it. See renderModelOpaquePhase.
+    only?: "hair" | "non-hair",
   ): void {
     let currentPipeline: GPURenderPipeline | null = null
     let bound = false
     for (const draw of inst.drawCalls) {
       if (draw.type !== type) continue
+      if (only && (only === "hair") !== this.isHairDraw(inst, draw)) continue
       if (!bound) {
         pass.setBindGroup(0, view.perFrame)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
@@ -10991,8 +11045,144 @@ export class Engine {
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
     this.setModelDrawState(pass, inst)
-    this.drawMaterials(pass, inst, "opaque", view)
+    // Depth first, colour second — the close-up fix, and the oldest one there
+    // is. See drawOpaqueDepthPrepass.
+    this.drawOpaqueDepthPrepass(pass, inst, view)
+    // The opaque author order, in two walks with the hair prime between them.
+    //
+    // Hair could not join the plain prepass: primed hair depth would depth-
+    // reject the eye before it writes the stencil the see-through-hair pass
+    // needs. But the trick only needs the eye BEFORE hair, not before
+    // everything — so the non-hair walk runs first (the eye writes stencil
+    // against real face depth, exactly as it always did), the prime then lays
+    // hair depth down stencil-fenced off the eye silhouette, and the hair walk
+    // shades once per pixel instead of once per card.
+    //
+    // The one thing this reorders: hair now draws after any opaque material
+    // authored later than it. A soft hair edge over such a material blends
+    // over the material instead of over whatever the framebuffer held mid-
+    // order — deterministic where it used to be accidental, and only at
+    // sub-alpha edge texels over late-authored geometry.
+    this.drawMaterials(pass, inst, "opaque", view, "non-hair")
+    this.drawHairDepthPrime(pass, inst, view)
+    this.drawMaterials(pass, inst, "opaque", view, "hair")
     this.drawHairOverEyes(pass, inst, view)
+  }
+
+  /** Depth-only prime of the hair's alpha-1 texels, stencil-fenced off the eye
+   *  silhouette. See the note at its call site and hairPrimePipeline. */
+  private drawHairDepthPrime(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+  ): void {
+    let bound = false
+    for (const draw of inst.drawCalls) {
+      if (draw.type !== "opaque" || !this.isHairDraw(inst, draw)) continue
+      if (!bound) {
+        pass.setPipeline(this.hairPrimePipeline)
+        pass.setBindGroup(0, view.perFrame)
+        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        bound = true
+      }
+      pass.setBindGroup(2, draw.bindGroup)
+      this.issueDraw(pass, draw, view.args)
+    }
+  }
+
+  /**
+   * Depth-only prime of the plain opaque draws, so each covered pixel SHADES
+   * once instead of once per layer.
+   *
+   * The oldest fps complaint this engine has — zoom close and the frame drops,
+   * in every material generation back to the earliest — was never the vertices
+   * and never one shader's fault: with the fragment shaders flattened to a
+   * constant the close-up ran smooth with identical geometry, overdraw and
+   * MSAA. The cost is per-fragment shading TIMES how many times a pixel runs
+   * it, and an MMD model at close-up is layers all the way down: cloth over
+   * body, sleeves over cloth, hair over everything. Author-order drawing
+   * shades every layer and then buries all but one.
+   *
+   * So the plain opaque draws lay their depth down first, through the same
+   * depth-only pipeline the transparent bucket keeps for its dormant prepass —
+   * same skinned vertex path (position marked @invariant in both modules, so
+   * the colour pass lands on exactly these depths and its less-equal test
+   * keeps the visible surface and rejects the buried ones), same alpha-0.5
+   * cutout, writeMask 0 on every colour target. The pixels are identical by
+   * construction: this pass writes no colour, and the colour pass draws
+   * exactly what it always drew minus the fragments something opaque provably
+   * covers.
+   *
+   * WHO IS IN. Only render-class "auto" with alpha-mode "opaque" — the body,
+   * face and cloth materials that are the bulk of every model — plus every
+   * ungrouped material (the neutral pipeline is that same class). WHO IS OUT,
+   * each for a reason that would change pixels: EYE front-culls and gates on a
+   * bone read, and pre-filled hair depth over the socket would depth-reject
+   * the eye before it could write the stencil the see-through-hair pass needs
+   * — which is also why HAIR stays out entirely. HASHED alpha (stockings)
+   * discards by a position hash this pass does not run, so priming it would
+   * punch its cutout into the depth buffer at the wrong texels. They all still
+   * BENEFIT: their fragments early-z against the primed depth of whatever
+   * plain opaque surface sits in front of them.
+   */
+  private drawOpaqueDepthPrepass(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+  ): void {
+    let bound = false
+    for (const draw of inst.drawCalls) {
+      if (draw.type !== "opaque") continue
+      if (draw.groupId) {
+        const install = inst.styleGroups.get(draw.groupId)
+        if (install && !(install.renderClass === "auto" && install.alphaMode === "opaque")) continue
+      }
+      if (!bound) {
+        pass.setPipeline(this.depthPrepassPipeline)
+        pass.setBindGroup(0, view.perFrame)
+        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        bound = true
+      }
+      pass.setBindGroup(2, draw.bindGroup)
+      this.issueDraw(pass, draw, view.args)
+    }
+  }
+
+  /**
+   * Depth-only prime of the transparent bucket's FULLY SOLID texels.
+   *
+   * The dress problem. A "transparent" MMD material is mostly weave at alpha
+   * exactly 1 with sheer margins, and its layers draw in author order — so a
+   * close-up skirt shades every buried panel and then covers the work. The
+   * buried SHEER fragments must shade (their blend reads what is behind), but
+   * at alpha 1 over-blending is plain replacement: the destination cannot
+   * matter, so a fragment buried behind an alpha-1 texel contributes nothing.
+   * Priming depth for exactly those texels (CUTOFF 1.0) rejects the buried
+   * work and cannot move a pixel.
+   *
+   * A STAGE's transparent draws are excluded the way their colour path already
+   * is: stage glass deliberately leaves depth alone so rain and particles
+   * survive behind a dome (see pipelineForDrawCall), and a prime would put the
+   * occlusion right back.
+   */
+  private drawTransparentSolidPrepass(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+  ): void {
+    if (inst.isStage) return
+    let bound = false
+    for (const draw of inst.drawCalls) {
+      if (draw.type !== "transparent") continue
+      if (!bound) {
+        pass.setPipeline(this.solidPrepassPipeline)
+        pass.setBindGroup(0, view.perFrame)
+        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        bound = true
+      }
+      pass.setBindGroup(2, draw.bindGroup)
+      this.issueDraw(pass, draw, view.args)
+    }
   }
 
   private renderModelTransparentPhase(
@@ -11000,7 +11190,10 @@ export class Engine {
     inst: ModelInstance,
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
+    // Draw state FIRST — each phase records into its own bundle encoder, and a
+    // bundle starts with nothing bound.
     this.setModelDrawState(pass, inst)
+    this.drawTransparentSolidPrepass(pass, inst, view)
     // Transparent: babylon-mmd's forceDepthWrite blending — PMX author order
     // with depth write ON. The accepted trade-off after trying every variant:
     //   · depth-write ON (this): a fold hides its far side; rare view-dependent
@@ -11020,7 +11213,7 @@ export class Engine {
     for (const draw of inst.drawCalls) {
       if (draw.type !== "transparent") continue
       if (!bound) {
-        pass.setPipeline(this.transparentDepthPrepassPipeline)
+        pass.setPipeline(this.depthPrepassPipeline)
         pass.setBindGroup(0, this.perFrameBindGroup)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true

@@ -216,18 +216,26 @@ fn curve5(t0: f32, y0: f32, y1: f32, y2: f32, y3: f32, y4: f32) -> f32 {
   let t = clamp(t0, 0.0, 1.0) * 4.0;
   let i = min(floor(t), 3.0);
   let f = t - i;
-  // A var, not a let: WGSL only allows a dynamic index on a REFERENCE, and a
-  // let-bound array is a value. Indexing it with a runtime k is a compile error —
-  // and because this file is concatenated into every material shader, that error
-  // took every graph in the library down with it, not just curves.
-  var ys = array<f32, 5>(y0, y1, y2, y3, y4);
+  // NO local array, deliberately. This used to build array<f32, 5> and index it
+  // with the runtime k — and a dynamic index on function-local memory is the one
+  // construct this codebase has already caught Metal lowering to a
+  // per-invocation copy plus a switch (the filmic LUT note in composite.ts).
+  // rgb_curve calls this three times per node per pixel, so on a graph-heavy
+  // close-up that lowering was paid in the hottest loop the frame has. Four
+  // segments select cleanly: the values below are the SAME subtractions the
+  // array indexing produced, chosen by k instead of loaded through it —
+  // bit-identical results, no local memory, nothing for the backend to spill.
   let k = i32(i);
-  let pa = ys[k];
-  let pb = ys[k + 1];
+  let s0 = y1 - y0;
+  let s1 = y2 - y1;
+  let s2 = y3 - y2;
+  let s3 = y4 - y3;
+  let pa = select(select(y0, y1, k == 1), select(y2, y3, k == 3), k >= 2);
+  let pb = select(select(y1, y2, k == 1), select(y3, y4, k == 3), k >= 2);
   // Secants either side of each knot, clamped at the ends.
-  let dPrev = select(ys[max(k, 1)] - ys[max(k, 1) - 1], pb - pa, k == 0);
   let dHere = pb - pa;
-  let dNext = select(ys[min(k + 2, 4)] - ys[min(k + 1, 3)], pb - pa, k == 3);
+  let dPrev = select(s0, select(s1, s2, k == 3), k >= 2);
+  let dNext = select(select(s1, s2, k == 1), s3, k >= 2);
   let m0 = curve_slope(dPrev, dHere);
   let m1 = curve_slope(dHere, dNext);
   let f2 = f * f;
