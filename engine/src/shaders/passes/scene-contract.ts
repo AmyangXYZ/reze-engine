@@ -143,12 +143,14 @@ const ADD_PREMULTIPLIED: GPUBlendState = {
 }
 
 /**
- * Which classes actually WRITE an id, and so gain a fragment output for it.
+ * Which classes write a MEANINGFUL id.
  *
- * Everything else keeps its shader exactly as it is and takes the id target at
- * writeMask 0 — legal, specified, and free. The alternative (leaving the target
- * off those pipelines) is not available: every pipeline in a pass must agree
- * with the pass's attachments.
+ * Not the same question as which shaders declare the output — every scene-pass
+ * shader declares all three now (see sceneFsOutWgsl). This set decides only
+ * whose id survives: writeMask 0xf here, writeMask 0 for everyone else, so the
+ * others compute an id nothing stores. Leaving the target off those pipelines
+ * is not available: every pipeline in a pass must agree with the pass's
+ * attachments.
  *
  * The ground is in because a mark placed by id needs the floor to have one.
  * Transparent fabric writes ids too — dissolving a dress needs the dress's own
@@ -184,11 +186,10 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
 export function sceneTargets(cls: SceneRenderClass, formats: SceneFormats): GPUColorTargetState[] {
   const targets: GPUColorTargetState[] =
     cls === "depth-prepass"
-      ? // Format only, and writeMask 0. Note the asymmetry this leans on, which
-        // is the same one the id target leans on below: a target the shader has
-        // no output for is legal at writeMask 0 (gpuweb#1918), while an output
-        // with no target is NOT governed (gpuweb#5341). This is the specified
-        // direction, and it is the only one this file ever uses.
+      ? // Format only, and writeMask 0 — the pipeline writes no colour. It still
+        // DECLARES every output, which is the part that used to be missing; see
+        // the note on sceneFsOutWgsl about why writeMask 0 is not a licence to
+        // leave the output off.
         [
           { format: formats.hdr, writeMask: 0 },
           { format: formats.aux, writeMask: 0 },
@@ -226,12 +227,19 @@ export function sceneColorFormats(formats: SceneFormats): GPUTextureFormat[] {
  * author. The struct and the targets above have to agree on count and order,
  * and they now disagree in one file rather than in five.
  *
- * Only the shaders that will GAIN an output take this today — the materials
- * (hand-written and graph-generated alike, through COMMON_FS_OUT_WGSL) and the
- * ground. Outline, particles and ribbons keep their own declarations on
- * purpose: they never write the id, so they would take an `id: false` argument
- * forever, and their structs carry comments about their own blend that belong
- * where they are.
+ * EVERY scene-pass shader takes this — outline, particles, ribbons and the
+ * depth prepass included, none of which write a meaningful id (and the prepass
+ * no meaningful colour either). They did not, once. The reasoning was that a
+ * target at writeMask 0 needs no matching output: true of Dawn, and the reading
+ * of gpuweb#1918 this file used to assert. It is not a reading every browser
+ * shares, and the failure mode when a browser disagrees is the worst kind —
+ * createRenderPipeline does not throw, it returns a pipeline that is already
+ * invalid, and the pass that binds it is dropped whole. Missing geometry, clean
+ * console, and a bug that reproduces on one vendor's browser only.
+ *
+ * So the rule is now the strict one, and it costs nothing to hold: declare
+ * every output the pass has attachments for, and let writeMask decide what is
+ * kept. A shader with no id to write pads it — see sceneIdPadWgsl.
  */
 export function sceneFsOutWgsl(opts?: { name?: string; aux?: string }): string {
   const name = opts?.name ?? "FSOut"
@@ -263,4 +271,35 @@ ${id}};
  */
 export function sceneIdWriteWgsl(out: string, material: string, object: string): string {
   return mrtIds ? `  ${out}.id = vec2u(${material}, ${object});\n` : ""
+}
+
+/**
+ * Just the id FIELD, for a shader that keeps its own struct.
+ *
+ * Particles and ribbons declare their outputs by hand because the comments on
+ * their aux field are about their own blend and belong beside it — taking the
+ * whole struct from sceneFsOutWgsl would move that prose away from what it
+ * explains. They still need the id output when the pass has the attachment, so
+ * they splice this in and pad it with sceneIdPadWgsl.
+ */
+export function sceneIdFieldWgsl(): string {
+  return mrtIds ? `  @location(2) id: vec2u,\n` : ""
+}
+
+/**
+ * The id assignment for a shader that has no id to give.
+ *
+ * The counterpart to the strict rule on sceneFsOutWgsl: outline hulls,
+ * particles, ribbons and the depth prepass all declare the output because the
+ * pass has the attachment, and all of them take writeMask 0, so what they
+ * assign is never stored. Zero, which is the reserved "nothing" id the pass
+ * clears to — so if one of these ever did reach the target, it would read as
+ * absence rather than as a plausible wrong answer pointing at material 0.
+ *
+ * A separate function from sceneIdWriteWgsl rather than a call to it with "0u"
+ * twice, because the two say different things: that one records an identity,
+ * this one satisfies a declaration.
+ */
+export function sceneIdPadWgsl(out: string): string {
+  return mrtIds ? `  ${out}.id = vec2u(0u, 0u);\n` : ""
 }

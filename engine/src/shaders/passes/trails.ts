@@ -5,6 +5,7 @@ import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
 import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
+import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 // Ribbons along a bone's recorded path, drawn as geometry.
 //
 // This is the effect the whole geometry path was built for. As a fullscreen
@@ -123,7 +124,14 @@ struct CameraU {
 }
 struct TrailU {
   time: f32,
-  _pad0: f32,
+  // How many subjects the cast ACTUALLY holds this frame, not the four the
+  // layout has room for. The instance count is sized by this on the CPU and
+  // decoded by it here, and the two must use the same number or the flattened
+  // [ribbon][subject][segment] index lands on the wrong ribbon. It is a uniform
+  // rather than the RZ_SUBJECTS constant precisely because it changes when a
+  // model is added or removed, and recompiling every trail shader for that
+  // would be absurd.
+  subjects: f32,
   _pad1: f32,
   _pad2: f32,
 }
@@ -244,11 +252,14 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   let rest = ii / subs;
   let seg = k / SUB;
   let sub = k % SUB;
-  let subject = i32(rest % u32(RZ_SUBJECTS));
+  // The LIVE subject count, floored at one so a cast that is momentarily empty
+  // divides by something. See TrailU.subjects.
+  let live = max(1u, u32(tu.subjects));
+  let subject = i32(rest % live);
   // Instance index counts RIBBONS; the cast buffer is addressed by anchor slot.
   // One ribbon per trailed anchor, so these are the same number only when every
   // anchor is trailed — _rzRibbonSlot is what bridges them.
-  let ribbon = i32(rest / u32(RZ_SUBJECTS));
+  let ribbon = i32(rest / live);
   let slot = _rzRibbonSlot(ribbon);
 
   let n = rzTrailCount(subject, slot);
@@ -364,7 +375,10 @@ struct TrailFSOut {
   // The scene's aux target: (bloom mask, coverage). Writing mask 1 is what
   // makes a ribbon BLOOM — it is light, and the gate is what says so.
   @location(1) aux: vec4f,
-}
+  // Declared whenever the pass carries the attachment, and padded rather than
+  // written: a ribbon is not a thing you would address by id, so its pipeline
+  // takes this target at writeMask 0. Declared anyway — see sceneFsOutWgsl.
+${sceneIdFieldWgsl()}}
 
 @fragment
 fn fs(in: VSOut) -> TrailFSOut {
@@ -383,7 +397,7 @@ fn fs(in: VSOut) -> TrailFSOut {
   // mapper is what keeps the sum from clipping.
   o.color = vec4f(c.rgb, c.a);
   o.aux = vec4f(${src.bloom ? "1.0" : "0.0"}, 1.0, 0.0, c.a);
-  return o;
+${sceneIdPadWgsl("o")}  return o;
 }
 `
   )

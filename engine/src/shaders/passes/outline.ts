@@ -12,7 +12,14 @@
 //      margins) — sheer fabric gets a proportional rim, never a solid black
 //      hull, without dropping the author's edge flag.
 
-export const OUTLINE_SHADER_WGSL = /* wgsl */ `
+// A FUNCTION rather than a constant, for the reason commonFsOutWgsl is one: the
+// fragment outputs depend on whether the device carries the id attachment, and
+// a string baked at import cannot know what the device said.
+
+import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
+
+export function outlineShaderWgsl(): string {
+  return /* wgsl */ `
 struct CameraUniforms {
   view: mat4x4f,
   projection: mat4x4f,
@@ -91,7 +98,10 @@ struct VertexOutput {
   return output;
 }
 
-struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
+// The id output is declared and padded, never written for real: a hull would
+// overwrite the id of the body it traces, so the pipeline takes the id target at
+// writeMask 0. Declared all the same — see sceneFsOutWgsl.
+${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
 @fragment fn fs(input: VertexOutput) -> FSOut {
   // Rim alpha FOLLOWS the fabric's texture alpha instead of a hard alpha test:
   // MMD draws blend-material edges solid (only cutout materials alpha-test), so
@@ -106,6 +116,7 @@ struct FSOut { @location(0) color: vec4f, @location(1) mask: vec4f };
   var out: FSOut;
   out.color = vec4f(material.edgeColor.rgb, material.edgeColor.a * texA);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
-  return out;
+${sceneIdPadWgsl("out")}  return out;
 }
 `
+}

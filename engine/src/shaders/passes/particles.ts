@@ -5,6 +5,7 @@ import { anchorAliasWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
 import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
+import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
 // Its own shader MODULE rather than more source spliced into composite.ts, for
@@ -307,7 +308,10 @@ struct FSOut {
   // rejected outright — "reading alpha but it is missing from fragment output".
   // The material shaders declare vec4f here for the same reason.
   @location(1) mask: vec4f,
-}
+  // Declared whenever the pass carries the attachment, and padded rather than
+  // written: a particle is not a thing you would address by id, so its pipeline
+  // takes this target at writeMask 0. Declared anyway — see sceneFsOutWgsl.
+${sceneIdFieldWgsl()}}
 
 @fragment
 fn fs(in: VSOut) -> FSOut {
@@ -333,7 +337,7 @@ fn fs(in: VSOut) -> FSOut {
   // not geometry, was the banding that survived every geometry fix.
   let mg = select(vec2f(select(0.0, 1.0, BLOOM), 1.0), vec2f(select(0.0, c.a, BLOOM), c.a), ADDITIVE);
   out.mask = vec4f(mg.x, mg.y, 0.0, c.a);
-  return out;
+${sceneIdPadWgsl("out")}  return out;
 }
 `
   )

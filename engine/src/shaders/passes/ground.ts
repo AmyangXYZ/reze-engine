@@ -20,7 +20,13 @@ struct GroundShadowMat {
   fadeEnd: f32, shadowStrength: f32, pcfTexel: f32, gridSpacing: f32,
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, mirror: f32,
-  mirrorBlur: f32, _mb0: f32, _mb1: f32, _mb2: f32,
+  // farCascade: 1 while a stage is loaded, 0 otherwise. See the branch below —
+  // with no stage the far map is never drawn into, so its taps are known.
+  mirrorBlur: f32, farCascade: f32, _mb1: f32, _mb2: f32,
+  // Every shadow caster in one sphere, refreshed per frame. w = radius; 0 means
+  // nothing casts, negative means "do not use this" (a rigid caster has no
+  // sphere, so a scene with a stage keeps the taps). See rzShadowPossible.
+  casterSphere: vec4f,
 };
 // One view-projection per shadow cascade, inner to outer — same buffer and
 // same order the materials read.
@@ -42,32 +48,11 @@ struct MirrorVP { viewProj: mat4x4f, params: vec4f, };
 @group(0) @binding(9) var mirrorTex: texture_2d<f32>;
 @group(0) @binding(10) var linearSampler: sampler;
 @group(0) @binding(11) var mirrorDepth: texture_depth_multisampled_2d;
+// The frost noise, PRE-BAKED — see GROUND_NOISE_BAKE_WGSL below. Sampled with
+// the repeat sampler already at binding 10.
+@group(0) @binding(12) var noiseTex: texture_2d<f32>;
 ${WORLD_AMBIENT_WGSL}
 ${lightsApi(0, 6)}
-
-fn hash2(p: vec2f) -> f32 {
-  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
-  p3 += dot(p3, vec3f(p3.y + 33.33, p3.z + 33.33, p3.x + 33.33));
-  return fract((p3.x + p3.y) * p3.z);
-}
-fn valueNoise(p: vec2f) -> f32 {
-  let i = floor(p);
-  let f = fract(p);
-  let u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash2(i), hash2(i + vec2f(1.0, 0.0)), u.x),
-             mix(hash2(i + vec2f(0.0, 1.0)), hash2(i + vec2f(1.0, 1.0)), u.x), u.y);
-}
-fn fbmNoise(p: vec2f) -> f32 {
-  var v = 0.0;
-  var a = 0.5;
-  var pp = p;
-  for (var i = 0; i < 4; i++) {
-    v += a * valueNoise(pp);
-    pp *= 2.0;
-    a *= 0.5;
-  }
-  return v;
-}
 
 struct VO { @builtin(position) position: vec4f, @location(0) worldPos: vec3f, @location(1) normal: vec3f, };
 @vertex fn vs(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f) -> VO {
@@ -121,8 +106,63 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // The far cascade's taps run ONLY where the near one is fading or absent
   // (frustum < 1), so a pixel in the near core costs exactly what it did with
   // one cascade — and that core is where the camera usually looks.
+  // Can anything cast a shadow ONTO this point at all?
+  //
+  // The ground is vastly larger than what stands on it, and the answer for most
+  // of it is no. A point is shadowed only if the ray from it toward the light
+  // meets a caster, so testing that ray against one bounding sphere decides in a
+  // few ALU ops what nine hardware-bilinear depth comparisons would otherwise be
+  // spent discovering. Same pixels: outside the sphere vis stays 1.0, which is
+  // exactly what the taps return.
+  //
+  // Conservative in all three directions that matter. The sphere is a union of
+  // per-model bounds built from POSED bones plus the skin margin, so a jump or a
+  // flying skirt is inside it. A negative radius disables the test outright. And
+  // the halfspace check uses -R rather than 0, so a caster the point is standing
+  // inside still counts.
+  var shadowPossible = material.casterSphere.w > 0.0;
+  if (shadowPossible) {
+    let toLight = normalize(-light.lights[0].direction.xyz);
+    let toCaster = material.casterSphere.xyz - i.worldPos;
+    let along = dot(toCaster, toLight);
+    let perp = length(toCaster - toLight * along);
+    shadowPossible = along > -material.casterSphere.w && perp <= material.casterSphere.w;
+  } else {
+    // Negative radius is the opt-out, not "nothing casts".
+    shadowPossible = material.casterSphere.w < 0.0;
+  }
+
   var vis = 1.0;
-  if (frustum < 1.0 && frustum1 > 0.0) {
+  // The whole cascade lookup, behind the strength dial.
+  //
+  // This is a FULL-COVERAGE draw and each branch below is nine comparison-sampler
+  // taps per pixel — eighteen where the cascades overlap — so on a retina canvas
+  // it is tens of millions of shadow-map fetches a frame. All of it was computed
+  // and then multiplied by material.shadowStrength, which is ZERO whenever the
+  // host turns the ground's shadow catcher off. Turning shadows off in the UI
+  // therefore cost exactly what leaving them on cost, which is what a report of
+  // "no fps gain from disabling shadows" looks like from the outside.
+  //
+  // shadowStrength is a uniform, so this branch is uniform across the draw:
+  // every invocation takes the same side and the taps are genuinely skipped
+  // rather than merely masked. The dark term below is (1.0 - vis) * strength, so
+  // with strength at zero the result is identical either way — a pure
+  // deletion of work, not a change of look.
+  //
+  // The same reasoning the noise tint below already got, applied to the term
+  // that costs a hundred times more.
+  if (material.shadowStrength > 0.0 && shadowPossible) {
+  // The far cascade's taps, skipped entirely when nothing ever drew into it.
+  //
+  // This branch is the expensive one on a wide floor: it runs wherever the NEAR
+  // cascade does not reach, and the near cascade is a 64-unit box around the
+  // camera target, so a floor receding to the horizon takes it almost
+  // everywhere. Nine comparison taps, per pixel, on the largest draw in the
+  // frame — against a map that is cleared unless a stage is in the scene.
+  //
+  // Cleared depth compares as "no occluder", so the skipped path leaves vis at
+  // 1.0, which is exactly what the taps returned. Free, not cheaper.
+  if (material.farCascade > 0.0 && frustum < 1.0 && frustum1 > 0.0) {
     let suv1 = vec2f(ndc1.x * 0.5 + 0.5, 0.5 - ndc1.y * 0.5);
     let suv1_c = clamp(suv1, vec2f(0.02), vec2f(0.98));
     let st1 = ${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize} * 2.0;
@@ -152,12 +192,27 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     // cascade to cascade rather than snapping to lit mid-floor.
     vis = mix(vis, acc * (1.0 / 9.0), frustum);
   }
+  }
 
   // Frosted/matte micro-texture. Scenes leaving it at zero were still paying
   // sixteen hash rounds a pixel for a tint of exactly 1.
   var noiseTint = 1.0;
   if (material.noiseStrength != 0.0) {
-    let noiseVal = fbmNoise(i.worldPos.xz * 3.0);
+    // One texture sample where four octaves of value noise used to be
+    // EVALUATED — sixteen hash rounds per pixel, on the largest draw in the
+    // frame. Bisection on the device that was slow pinned the ground's whole
+    // cost here: flat colour was smooth, the shader minus its shadow taps was
+    // still slow, and the shader minus only this was smooth. (0.33.2 built
+    // this same bake and measured no win — the cost then was the PCF. The
+    // instrument was right both times; the term changed.)
+    //
+    // The tile is the SAME fbm, baked once at init over a 64-p-unit period
+    // (~21 world units before it repeats — invisible at frost strengths), and
+    // the interior of the tile is bit-identical to the old evaluation because
+    // only lattice cells on the seam are wrapped. Sampled at level 0 with the
+    // repeat sampler: the old evaluation had no filtering either, so distant
+    // sparkle is unchanged rather than quietly "improved".
+    let noiseVal = textureSampleLevel(noiseTex, linearSampler, i.worldPos.xz * ${3 / 64}, 0.0).r;
     noiseTint = 1.0 + (noiseVal - 0.5) * material.noiseStrength;
   }
 
@@ -291,3 +346,54 @@ ${sceneIdWriteWgsl("out", `${GROUND_MATERIAL_ID}u`, `${GROUND_OBJECT_ID}u`)}  re
  */
 export const GROUND_MATERIAL_ID = 0xffff
 export const GROUND_OBJECT_ID = 0xffff
+
+/** Texel edge of the baked frost tile. 1024 over a 64-p-unit period is two
+ *  texels per finest-octave noise cell — the bake resolves everything the
+ *  evaluation produced. r8unorm: the value lives in [0,1] and feeds a 0.05
+ *  tint; eight bits is already 5x below what that tint can show. */
+export const GROUND_NOISE_SIZE = 1024
+
+/**
+ * The frost fbm as a bake: identical math, periodic lattice.
+ *
+ * hash2/valueNoise/fbm are the ground's old helpers verbatim, with one change —
+ * each octave's lattice wraps at its own period (64 p-units at octave 0,
+ * doubling with frequency), so the tile is seamless under the repeat sampler.
+ * Wrapping only renames lattice cells on the seam; every interior cell hashes
+ * exactly as before, which is what makes the bake a relocation of the old
+ * pixels rather than a new look.
+ */
+export const GROUND_NOISE_BAKE_WGSL = /* wgsl */ `
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let x = f32((vi & 1u) << 2u) - 1.0;
+  let y = f32((vi & 2u) << 1u) - 1.0;
+  return vec4f(x, y, 0.0, 1.0);
+}
+fn hash2(p: vec2f) -> f32 {
+  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
+  p3 += dot(p3, vec3f(p3.y + 33.33, p3.z + 33.33, p3.x + 33.33));
+  return fract((p3.x + p3.y) * p3.z);
+}
+fn wrapCell(i: vec2f, period: f32) -> vec2f { return i - period * floor(i / period); }
+fn valueNoiseP(p: vec2f, period: f32) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash2(wrapCell(i, period)), hash2(wrapCell(i + vec2f(1.0, 0.0), period)), u.x),
+             mix(hash2(wrapCell(i + vec2f(0.0, 1.0), period)), hash2(wrapCell(i + vec2f(1.0, 1.0), period)), u.x), u.y);
+}
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let p = pos.xy * (64.0 / ${GROUND_NOISE_SIZE}.0);
+  var v = 0.0;
+  var a = 0.5;
+  var pp = p;
+  var period = 64.0;
+  for (var o = 0; o < 4; o++) {
+    v += a * valueNoiseP(pp, period);
+    pp *= 2.0;
+    period *= 2.0;
+    a *= 0.5;
+  }
+  return vec4f(v, 0.0, 0.0, 1.0);
+}
+`

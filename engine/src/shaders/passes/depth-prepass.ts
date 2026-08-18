@@ -10,8 +10,16 @@
 // Reuses mainPipelineLayout: camera g0b0, diffuseSampler g0b2, skinMats g1b0,
 // diffuse texture g2b0, material uniforms g2b1 — the same bind groups the
 // color draws already set, so drawing it costs no extra binding work.
+//
+// A FUNCTION rather than the constant it was, for the reason commonFsOutWgsl is
+// one: the fragment outputs below depend on whether the device carries the id
+// attachment, and that answer does not exist at import time. The constant could
+// not have taken the outputs at all, which is most of why it did not have them.
 
-export const TRANSPARENT_DEPTH_PREPASS_WGSL = /* wgsl */ `
+import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
+
+export function transparentDepthPrepassWgsl(): string {
+  return /* wgsl */ `
 struct CameraUniforms { view: mat4x4f, projection: mat4x4f, viewPos: vec3f, _p: f32, };
 struct MaterialUniforms {
   diffuseColor: vec3f,
@@ -50,8 +58,21 @@ struct VSOut {
   return o;
 }
 
-@fragment fn fs(in: VSOut) {
+// Every attachment the pass carries, declared and then not written: the
+// pipeline takes all of them at writeMask 0 (see sceneTargets), so what this
+// returns is discarded by the hardware and only the depth write survives — which
+// is the entire purpose of the pass. Declaring them anyway is what keeps the
+// pipeline valid on a browser that requires an output per target rather than
+// per WRITTEN target. Costs one dead struct store on a fragment that already
+// runs, because the alpha test below needs it to.
+${sceneFsOutWgsl({ name: "PrepassOut", aux: "mask" })}
+@fragment fn fs(in: VSOut) -> PrepassOut {
   let a = material.alpha * textureSample(diffuseTexture, diffuseSampler, in.uv).a;
   if (a < 0.5) { discard; }
+  var out: PrepassOut;
+  out.color = vec4f(0.0);
+  out.mask = vec4f(0.0);
+${sceneIdPadWgsl("out")}  return out;
 }
 `
+}

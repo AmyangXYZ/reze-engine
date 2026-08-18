@@ -50,9 +50,9 @@ import {
   hasLightEmit,
   parseLightCount,
 } from "./shaders/lights"
-import { groundShaderWgsl } from "./shaders/passes/ground"
-import { OUTLINE_SHADER_WGSL } from "./shaders/passes/outline"
-import { TRANSPARENT_DEPTH_PREPASS_WGSL } from "./shaders/passes/depth-prepass"
+import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
+import { outlineShaderWgsl } from "./shaders/passes/outline"
+import { transparentDepthPrepassWgsl } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
 import { GIZMO_SHADER_WGSL } from "./shaders/passes/gizmo"
 import {
@@ -779,6 +779,28 @@ interface GpuMorph {
 // vertex sampling would misclassify hair (which must stay opaque-bucket for
 // stencil interplay and shadows).
 
+/**
+ * A 2D context for the alpha readback, from whichever canvas this browser has.
+ *
+ * OffscreenCanvas's 2D context is not universal — Safari only gained it in
+ * 16.4, and a worker-less fallback has to be a DOM canvas. This used to be an
+ * unguarded `new OffscreenCanvas`, so a browser without it took the catch below
+ * and every material on the model was classified opaque. That is a rendering
+ * difference produced by a feature probe failing, which is the kind of thing
+ * that must never be silent.
+ */
+function alphaReadbackContext(w: number, h: number): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null {
+  if (typeof OffscreenCanvas !== "undefined") {
+    const cx = new OffscreenCanvas(w, h).getContext("2d", { willReadFrequently: true })
+    if (cx) return cx
+  }
+  if (typeof document === "undefined") return null
+  const el = document.createElement("canvas")
+  el.width = w
+  el.height = h
+  return el.getContext("2d", { willReadFrequently: true })
+}
+
 /** Downsampled alpha plane of a decoded texture (≤128², nearest-sampled). */
 function buildAlphaSampler(
   source: ImageBitmap | null,
@@ -789,20 +811,37 @@ function buildAlphaSampler(
   try {
     const w = Math.max(1, Math.min(128, width))
     const h = Math.max(1, Math.min(128, height))
-    const canvas = new OffscreenCanvas(w, h)
-    const cx = canvas.getContext("2d", { willReadFrequently: true })
-    if (!cx) return null
-    if (source) {
-      cx.drawImage(source, 0, 0, w, h)
-    } else if (rgba) {
-      const tmp = new OffscreenCanvas(width, height)
-      const tcx = tmp.getContext("2d")
-      if (!tcx) return null
-      tcx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0)
-      cx.drawImage(tmp, 0, 0, w, h)
-    } else {
-      return null
+    // Raw RGBA needs no canvas at all, and must not use one. It arrives from the
+    // TGA/DDS/PSD decoders as exact, straight-alpha bytes; the old path pushed it
+    // through putImageData → drawImage → getImageData, which is two premultiply
+    // round-trips and a resample to learn what was already in hand. Box-filtered
+    // straight off the array instead: same ≤128² plane, exact values, no canvas
+    // to be unavailable and no alpha to lose.
+    if (rgba) {
+      const a = new Uint8ClampedArray(w * h)
+      for (let y = 0; y < h; y++) {
+        const y0 = Math.floor((y * height) / h)
+        const y1 = Math.max(y0 + 1, Math.floor(((y + 1) * height) / h))
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.floor((x * width) / w)
+          const x1 = Math.max(x0 + 1, Math.floor(((x + 1) * width) / w))
+          let sum = 0
+          let n = 0
+          for (let sy = y0; sy < y1; sy++) {
+            for (let sx = x0; sx < x1; sx++) {
+              sum += rgba[(sy * width + sx) * 4 + 3]
+              n++
+            }
+          }
+          a[y * w + x] = n > 0 ? sum / n : 255
+        }
+      }
+      return { a, w, h }
     }
+    if (!source) return null
+    const cx = alphaReadbackContext(w, h)
+    if (!cx) return null
+    cx.drawImage(source, 0, 0, w, h)
     const img = cx.getImageData(0, 0, w, h).data
     const a = new Uint8ClampedArray(w * h)
     for (let i = 0; i < w * h; i++) a[i] = img[i * 4 + 3]
@@ -1152,7 +1191,10 @@ interface EffectGrid {
  * ribbon read through rzTrail, so a trail costs one draw and nothing recorded.
  */
 interface EffectTrails {
-  instances: number
+  /** Ribbons this effect declared — one per trailed anchor. The instance count
+   *  is derived from it per draw, against the live subject count, rather than
+   *  baked here against the four-subject cap. See drawTrails. */
+  slots: number
   uniform: GPUBuffer
   data: Float32Array
   pipeline: GPURenderPipeline
@@ -1216,6 +1258,19 @@ interface EffectInstance {
   /** Mounted over the finished frame — and the reason the scene pass has to
    *  STORE its depth, which it otherwise discards into tile memory. */
   hasForeground: boolean
+  /** Does this source actually call rzObjectAt / rzMaterialAt?
+   *
+   *  The exact sibling of hasForeground above, for the exact same reason. The id
+   *  attachment is the pass's most expensive STORE — rg16uint at the pass's
+   *  sample count, around 33MB a frame at 1080p — and it is written out for
+   *  every scene whether or not a single effect ever reads it. Declaring
+   *  the attachment is what keeps the pipelines agreeing; STORING it is what
+   *  costs, and only a reader can justify that.
+   *
+   *  Parsed once at install rather than tested per frame: the answer cannot
+   *  change while an effect is installed, and the frame path should not be
+   *  running regexes. */
+  readsIds: boolean
   /** Bones this source asked for, in ITS OWN declaration order. The scene table
    *  maps these onto shared addresses; this list is what it is rebuilt from. */
   anchors: { bone: string; trail: boolean }[]
@@ -1372,6 +1427,23 @@ export class Engine {
   private multisampleTexture!: GPUTexture
   private hdrResolveTexture!: GPUTexture
   private static readonly MULTISAMPLE_COUNT = 4
+  /**
+   * Shadow map depth format — 16-bit, deliberately.
+   *
+   * The maps are ORTHOGRAPHIC, so depth is linear across the box: 65,536 steps
+   * over the near cascade's 140-unit range is 0.002 units per step, and every
+   * bias in play dwarfs it — the samplers subtract 0.0035 ndc (~229 of these
+   * steps) and the materials offset along the normal by 0.08 units (~37 steps)
+   * before the compare ever runs. Quantisation cannot flip an answer the biases
+   * have already moved that far, so the pixels are identical to depth32float's.
+   *
+   * What is NOT identical is the bandwidth, which is the term WebKit pays
+   * hardest: every PCF tap is a hardware-bilinear compare reading four texels,
+   * so nine taps read half the bytes at 2 B/texel — 72 B/pixel instead of 144
+   * across every shadowed surface on screen — and the 4096² map's clear+store
+   * each frame drops from 64 MB to 32.
+   */
+  private static readonly SHADOW_DEPTH_FORMAT: GPUTextureFormat = "depth16unorm"
   // HDR intermediate format. rg11b10ufloat when the adapter exposes the
   // `rg11b10ufloat-renderable` feature (Chrome + Safari on Apple Silicon both
   // do), else fall back to rgba16float.
@@ -1593,7 +1665,6 @@ export class Engine {
   private cullRebuilds = 0
   // ── Render bundles ──
   private opaqueBundle: GPURenderBundle | null = null
-  private transparentBundle: GPURenderBundle | null = null
   private shadowBundles: GPURenderBundle[] = []
   /** Set by scene STRUCTURE only. Every frame of animation, every physics step
    *  and every camera move must leave this alone — re-recording constantly is
@@ -1617,7 +1688,34 @@ export class Engine {
    *  field restructure moves. Restructuring it while it was the only untimed
    *  pass in the frame would have meant reasoning about the cost instead of
    *  reading it. */
-  private static readonly TIMED_PASSES = ["cull", "shadow", "scene", "field", "composite"] as const
+  /**
+   * The passes worth a number, in the order the frame runs them.
+   *
+   * These ARE the boxes on the architecture figure, deliberately: a reading that
+   * cannot be pointed at a component is a reading nobody acts on. Three were
+   * missing and each is a real per-frame cost a report of "it feels slower"
+   * could have been about — the morph compute, the mirror's second pass over the
+   * whole cast, and the bloom pyramid, which is NINE render passes and was the
+   * largest unmeasured thing in the frame.
+   *
+   * The per-effect computes (particles, grids, lights) are deliberately absent:
+   * they are a loop of one pass per effect, so there is no single span to stamp
+   * and a number attributed to the wrong one is worse than no number. They fall
+   * into the "rest" the readout derives from the frame time.
+   *
+   * Adding one costs two query slots and nothing else; the query set is sized
+   * from this array's length.
+   */
+  private static readonly TIMED_PASSES = [
+    "cull",
+    "morph",
+    "shadow",
+    "mirror",
+    "scene",
+    "field",
+    "bloom",
+    "composite",
+  ] as const
   private timestampQuerySet: GPUQuerySet | null = null
   private timestampResolve: GPUBuffer | null = null
   private timestampRead: GPUBuffer | null = null
@@ -1721,6 +1819,9 @@ export class Engine {
    * the plural is the whole point of this step and a singleton that has to be
    * "generalised later" is a singleton that shapes every call site against it.
    */
+  /** Subjects the cast actually holds, set while it is filled. The ribbons size
+   *  their instance count by this rather than by the four-subject cap. */
+  private castSubjectCount = 0
   private effects: EffectInstance[] = []
   /** The first installed effect, for the many places that legitimately want
    *  "is anything installed" or the singleton API's one effect. */
@@ -2033,6 +2134,27 @@ export class Engine {
     }
   }
 
+  /**
+   * Whether bloom will actually reach the frame this frame.
+   *
+   * The composite multiplies the pyramid by this same effective intensity, so a
+   * zero here means every pass that BUILDS the pyramid is work whose result is
+   * multiplied by nothing. That was the state of it: `enabled` reached exactly
+   * one line — the intensity uniform below — and the nine render passes that
+   * fill the pyramid ran regardless, on every frame, of every scene, whether or
+   * not anyone had asked for bloom.
+   *
+   * Nine passes is the number that matters rather than the pixels: on a
+   * tile-based GPU a render pass is a tile load and store whatever it draws, so
+   * this is paid in full on Apple hardware and largely hidden on a desktop
+   * immediate-mode one. It is the same asymmetry as the bundle bug — cheap where
+   * it was written, expensive where it was reported.
+   */
+  private bloomContributes(): boolean {
+    const b = this.bloomSettings
+    return b.enabled && b.intensity > 0
+  }
+
   private writeCompositeViewUniforms(): void {
     const v = this.viewTransform
     const b = this.bloomSettings
@@ -2343,6 +2465,9 @@ export class Engine {
     const lin = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4))
     const atts = this.mirrorPassDescriptor.colorAttachments as GPURenderPassColorAttachment[]
     atts[0].clearValue = bg ? { r: lin(bg.x), g: lin(bg.y), b: lin(bg.z), a: 1 } : { r: 0, g: 0, b: 0, a: 0 }
+    // The descriptor is reused every frame, so the stamp is set on it rather
+    // than passed — same as the scene pass, which is built once too.
+    this.mirrorPassDescriptor.timestampWrites = this.stamps("mirror")
     const pass = encoder.beginRenderPass(this.mirrorPassDescriptor)
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
     const bundles: GPURenderBundle[] = []
@@ -2428,6 +2553,67 @@ export class Engine {
     const err = await this.device.popErrorScope()
     probe?.destroy()
     return probe !== null && !err
+  }
+
+  /**
+   * Record an uncaptured validation error, once per distinct message.
+   *
+   * Distinct, because the interesting property of these is WHICH ones happened,
+   * not how many times — a pass that fails validation fails identically every
+   * frame, so the second occurrence carries no information the first did not.
+   * The count is kept anyway: "1×" and "94000×" distinguish a one-off at init
+   * from something the render loop is doing, and that distinction is the first
+   * question anyone reading the report will have.
+   */
+  private noteGpuError(message: string): void {
+    const seen = this.gpuErrors.get(message)
+    if (seen !== undefined) {
+      this.gpuErrors.set(message, seen + 1)
+      return
+    }
+    // The cap is on DISTINCT messages, so it is reached only by a device
+    // disagreeing about many different things — at which point the first 32
+    // have said what the device is, and the rest are noise.
+    if (this.gpuErrors.size >= 32) return
+    this.gpuErrors.set(message, 1)
+    // First occurrence only, and console.error rather than a silent buffer: a
+    // validation error means something did not draw, and a developer with the
+    // console open should not have to know this report exists to find out.
+    console.error(`[reze] WebGPU validation: ${message}`)
+  }
+
+  /** Distinct uncaptured validation messages → how many times each arrived. */
+  private readonly gpuErrors = new Map<string, number>()
+
+  /**
+   * What this device actually gave us, and what it refused.
+   *
+   * The report exists because the three answers below are the ones that differ
+   * between two browsers on the same machine, and a scene that renders wrong on
+   * one of them is otherwise indistinguishable from a scene that is wrong. It is
+   * meant to be read off a phone that cannot be attached to a debugger, which is
+   * why it returns a value rather than logging: the host decides where to put it.
+   */
+  gpuReport(): {
+    hdrFormat: GPUTextureFormat
+    depthFormat: GPUTextureFormat
+    reversedZ: boolean
+    ids: boolean
+    sampleCount: number
+    presentationFormat: GPUTextureFormat
+    features: string[]
+    errors: { message: string; count: number }[]
+  } {
+    return {
+      hdrFormat: this.hdrFormat,
+      depthFormat: this.depthFormat,
+      reversedZ: this.reversedZ,
+      ids: mrtIdsEnabled(),
+      sampleCount: Engine.MULTISAMPLE_COUNT,
+      presentationFormat: this.presentationFormat,
+      features: this.device ? [...this.device.features].sort() : [],
+      errors: [...this.gpuErrors].map(([message, count]) => ({ message, count })),
+    }
   }
 
   private rebuildCompositeBindGroup(): void {
@@ -3091,6 +3277,11 @@ export class Engine {
         paramsData,
         hasBackground,
         hasForeground,
+        // The author's OWN source, not the assembled module: the assembled one
+        // always carries the accessors (as real readers or as the zero stubs),
+        // so matching against it would report every effect as a reader and the
+        // attachment would be stored exactly as often as before.
+        readsIds: /\brz(?:ObjectAt|MaterialAt)\s*\(/.test(wgsl),
         anchors,
         // The effect's own clock starts now. Per effect so that one installed
         // later still gets a frame where rzGridFrame() is 0 and can seed.
@@ -3690,7 +3881,10 @@ export class Engine {
       return {
         ok: true,
         state: {
-          instances: slots * MAX_EFFECT_SUBJECTS * (TRAIL_SAMPLES - 1) * TRAIL_SUBDIVISIONS,
+          // Ribbons declared by this effect. The INSTANCE count is no longer
+          // baked here — it follows the live subject count and is computed per
+          // draw (see drawTrails).
+          slots,
           uniform,
           data: new Float32Array(4),
           pipeline,
@@ -3752,13 +3946,27 @@ export class Engine {
       // The clock upload happens once, on the camera draw: queue writes land
       // before the encoder submits, so both passes read the same value — the
       // mirror draw writing it again would only write it twice.
+      // Instances follow the LIVE subject count, not MAX_EFFECT_SUBJECTS.
+      //
+      // This used to be baked at install as slots x 4 x (samples-1) x subs, so a
+      // scene with ONE character issued four characters' worth of ribbon quads
+      // and threw three quarters of them away as degenerate — every frame, at
+      // every sample length. Vertex invocations with no fragments are cheap, not
+      // free, and they scale with the sample count, which is what made a longer
+      // trail expensive.
+      //
+      // The shader decodes [ribbon][subject][segment] with the same number out
+      // of its uniform, so the two cannot drift: change one without the other
+      // and ribbons land on the wrong subject rather than merely costing more.
+      const live = Math.max(1, this.castSubjectCount)
       if (view === "camera") {
         t.data[0] = this.sceneClock - e.epochScene
+        t.data[1] = live
         this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
       }
       pass.setPipeline(t.pipeline)
       pass.setBindGroup(0, view === "mirror" ? t.mirrorBind : t.bind)
-      pass.draw(6, t.instances)
+      pass.draw(6, t.slots * live * (TRAIL_SAMPLES - 1) * TRAIL_SUBDIVISIONS)
     }
   }
 
@@ -4187,6 +4395,26 @@ export class Engine {
       throw new Error("WebGPU is not supported in this browser.")
     }
     this.device = device
+    // Every validation error this device ever raises, kept.
+    //
+    // WebGPU does not throw for a bad pipeline: createRenderPipeline hands back
+    // an object that is already invalid, and the complaint arrives here instead
+    // — or nowhere, if nobody is listening. Nobody was. That is why a device
+    // that disagrees with this engine has, until now, had no way to say so: the
+    // pipeline is built, setPipeline poisons the pass that uses it, and the
+    // symptom reaches the user as geometry that is simply absent, with a clean
+    // console. A browser is not obliged to agree with Dawn about what is legal,
+    // and the two places this engine knowingly leans on Dawn's reading are both
+    // in the scene pass (see scene-contract's writeMask-0 note).
+    //
+    // Bounded, and not on the console by default: a pass that fails validation
+    // fails it again every frame, so an unbounded log is a memory leak with a
+    // frame counter and an unconditional console.error is a browser tab that
+    // stops responding. First N distinct messages, counted thereafter.
+    device.addEventListener("uncapturederror", (e) => {
+      const message = (e as GPUUncapturedErrorEvent).error.message
+      this.noteGpuError(message)
+    })
     if (hasRg11b10) this.hdrFormat = "rg11b10ufloat"
     // The override has the last word, including over a device that would have
     // been left on the fallback anyway — asking for the format you are already
@@ -4252,6 +4480,15 @@ export class Engine {
     this.createPipelines()
     this.setupResize()
     Engine.instance = this
+    // One line, at init, naming the three answers that differ between two
+    // browsers on the same machine. Not a debug flag and not a readout — it is
+    // the identity of the renderer that was actually built, and on a device that
+    // cannot be attached to a debugger it is the only way to know which of the
+    // three paths is running. Every graphics application prints this.
+    const r = this.gpuReport()
+    console.info(
+      `[reze] hdr=${r.hdrFormat} depth=${r.depthFormat} reversedZ=${r.reversedZ} ids=${r.ids} msaa=${r.sampleCount}`,
+    )
   }
 
   // One-shot bake of EEVEE's combined BRDF LUT — DFG (bsdf_lut_frag.glsl) packed
@@ -4260,6 +4497,45 @@ export class Engine {
   //   .ba = LTC magnitude   → ltc_brdf_scale_from_lut
   // One texture fetch per fragment replaces the previous 2–3 taps. rgba8unorm
   // (vs rgba16float) halves sample bandwidth; DFG/LTC values fit [0,1] cleanly.
+  /** The frost tile the ground samples instead of evaluating fbm per pixel. */
+  private groundNoiseTexture!: GPUTexture
+  private groundNoiseView!: GPUTextureView
+
+  /**
+   * Bake the ground's frost noise once — the same fbm the shader used to run
+   * per pixel, rendered to a seamless 1024² r8unorm tile at init.
+   *
+   * Why this exists is measured, not argued: on WebKit the ground's whole cost
+   * was this evaluation (see the note at the sample site in ground.ts). The
+   * bake is one fullscreen pass at init — under a millisecond, once — and the
+   * per-pixel cost becomes a single level-0 texture read.
+   */
+  private bakeGroundNoise() {
+    this.groundNoiseTexture = this.device.createTexture({
+      label: "ground frost noise (baked)",
+      size: [GROUND_NOISE_SIZE, GROUND_NOISE_SIZE],
+      format: "r8unorm",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.groundNoiseView = this.groundNoiseTexture.createView()
+    const module = this.device.createShaderModule({ label: "ground noise bake", code: GROUND_NOISE_BAKE_WGSL })
+    const pipeline = this.device.createRenderPipeline({
+      label: "ground noise bake",
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: [{ format: "r8unorm" }] },
+      primitive: { topology: "triangle-list" },
+    })
+    const encoder = this.device.createCommandEncoder({ label: "ground noise bake" })
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: this.groundNoiseView, loadOp: "clear", storeOp: "store" }],
+    })
+    pass.setPipeline(pipeline)
+    pass.draw(3)
+    pass.end()
+    this.device.queue.submit([encoder.finish()])
+  }
+
   private bakeBrdfLut() {
     if (BRDF_LUT_SIZE !== LTC_MAG_LUT_SIZE) {
       throw new Error("BRDF LUT bake requires DFG size == LTC size (both 64).")
@@ -4798,7 +5074,7 @@ export class Engine {
     // occluded behind it. Color targets kept for pass compatibility, writeMask 0.
     const prepassModule = this.device.createShaderModule({
       label: "transparent depth prepass",
-      code: TRANSPARENT_DEPTH_PREPASS_WGSL,
+      code: transparentDepthPrepassWgsl(),
     })
     this.transparentDepthPrepassPipeline = this.device.createRenderPipeline({
       label: "transparent depth prepass",
@@ -4852,7 +5128,7 @@ export class Engine {
       fragment: { module: shadowShader, entryPoint: "fs", targets: [] },
       primitive: { cullMode: "none" },
       depthStencil: {
-        format: "depth32float",
+        format: Engine.SHADOW_DEPTH_FORMAT,
         depthWriteEnabled: true,
         depthCompare: "less-equal",
         // The shadow map keeps the NON-reversed convention (orthographicLh maps
@@ -4874,7 +5150,7 @@ export class Engine {
       this.device.createTexture({
         label: `shadow map cascade ${i}`,
         size: [c.mapSize, c.mapSize],
-        format: "depth32float",
+        format: Engine.SHADOW_DEPTH_FORMAT,
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       }),
     )
@@ -4882,6 +5158,7 @@ export class Engine {
 
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
     this.bakeBrdfLut()
+    this.bakeGroundNoise()
     this.agxFallbackTexture = this.device.createTexture({
       label: "AgX LUT fallback",
       size: [1, 1, 1],
@@ -4974,6 +5251,9 @@ export class Engine {
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth", multisampled: true } },
+        // The baked frost tile — see bakeGroundNoise. Sampled with binding 10's
+        // repeat sampler, so it brings no sampler of its own.
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
     const groundShadowShader = this.device.createShaderModule({
@@ -5030,7 +5310,7 @@ export class Engine {
 
     const outlineShaderModule = this.device.createShaderModule({
       label: "outline shaders",
-      code: OUTLINE_SHADER_WGSL,
+      code: outlineShaderWgsl(),
     })
 
     this.outlinePipeline = this.createRenderPipeline({
@@ -5518,6 +5798,21 @@ export class Engine {
   }
 
   private handleResize() {
+    // No device, nothing to size.
+    //
+    // Three callers reach this, and two of them can arrive before init() has a
+    // device or after teardown has released one: setRenderSize is PUBLIC and
+    // unordered with respect to init, and the ResizeObserver keeps firing across
+    // a hot reload while the replaced engine is still mounted. Both landed on
+    // `this.device.createTexture` and threw — which is why this only shows up
+    // during development, and why 0.43 never saw it: setRenderSize did not exist
+    // to be called early.
+    //
+    // Returning is correct rather than merely quiet. fixedRenderSize has already
+    // been recorded by the time we get here, and init() ends with its own
+    // handleResize — so the size asked for before the device existed is applied
+    // in full the moment there is something to apply it to.
+    if (!this.device) return
     // Fixed override (offline/video rendering) wins; otherwise track CSS size × dpr.
     const dpr = window.devicePixelRatio || 1
     const width = this.fixedRenderSize ? this.fixedRenderSize.width : Math.floor(this.canvas.clientWidth * dpr)
@@ -6836,12 +7131,24 @@ export class Engine {
     return key
   }
 
-  /** True while a stage is in the scene, which is when the built-in ground plane
-   *  must not draw. */
-  groundIsSuppressed(): boolean {
+  /** True while a stage is in the scene. Two things turn on it: the built-in
+   *  ground plane must not draw, and the far shadow cascade has nothing to
+   *  cover without one (see the cascade loop). */
+  hasStage(): boolean {
     for (const inst of this.modelInstances.values()) if (inst.isStage) return true
     return false
   }
+
+  /** True while a stage is in the scene, which is when the built-in ground plane
+   *  must not draw. */
+  groundIsSuppressed(): boolean {
+    return this.hasStage()
+  }
+
+  /** Per cascade: does its map currently hold nothing but the cleared far plane?
+   *  Set by the cascade loop, which skips a cascade that is unwanted and already
+   *  cleared rather than re-clearing it every frame. */
+  private shadowCascadeCleared: boolean[] = []
 
   removeModel(name: string): void {
     const inst = this.modelInstances.get(name)
@@ -7205,7 +7512,7 @@ export class Engine {
       const gm = inst.gpuMorph
       if (!gm || !gm.dispatchNeeded) continue
       if (!pass) {
-        pass = encoder.beginComputePass({ label: "morph compute" })
+        pass = encoder.beginComputePass({ label: "morph compute", timestampWrites: this.stamps("morph") })
         pass.setPipeline(this.morphComputePipeline)
       }
       pass.setBindGroup(0, gm.bindGroup)
@@ -7458,6 +7765,111 @@ export class Engine {
       flags[o + 20] = f
     }
     if (this.cullModelBuffer) this.device.queue.writeBuffer(this.cullModelBuffer, 0, data.buffer as ArrayBuffer)
+    this.updateCasterSphere(data)
+  }
+
+  /**
+   * One sphere containing every shadow caster in the scene, for the ground.
+   *
+   * The ground's PCF is the most expensive thing in the frame on a tile-based
+   * GPU — nine hardware-bilinear comparisons per pixel on a full-coverage draw,
+   * which is what 0.33.2 was about and what a second cascade quietly undid. But
+   * the floor is vastly larger than the thing standing on it, and a pixel the
+   * character cannot possibly shadow does not need to ask the shadow map: the
+   * answer is lit, and nine taps is an expensive way to spell it.
+   *
+   * So the ground gets a bound and tests against it in ALU. This reuses the
+   * spheres the cull already builds every frame — an AABB over POSED bone
+   * positions grown by the skin margin, which its own note calls a bound rather
+   * than an estimate, so a jump or a physics-driven skirt is inside it by
+   * construction. Union, not per model: one sphere is one test, and the ground
+   * shader must not loop over the cast.
+   *
+   * A RIGID caster (a stage) leaves its cull sphere zeroed deliberately — the
+   * cull reads its boxes instead — so any rigid model disables this entirely by
+   * setting radius to -1. Wrong here is a missing shadow, and a scene with a
+   * stage keeps the taps rather than risk one.
+   */
+  private updateCasterSphere(data: Float32Array): void {
+    const out = this.casterSphere
+    out[3] = 0
+    let cx = 0
+    let cy = 0
+    let cz = 0
+    let r = 0
+    let any = false
+    for (let i = 0; i < this.cullModels.length; i++) {
+      const inst = this.cullModels[i]
+      if (!inst.model.visible || inst.shadowDrawCalls.length === 0) continue
+      if (inst.rigid) {
+        // No sphere to read. Bail out of the whole optimisation.
+        out[3] = -1
+        return
+      }
+      const o = i * Engine.CULL_MODEL_FLOATS + 16
+      const x = data[o]
+      const y = data[o + 1]
+      const z = data[o + 2]
+      const rad = data[o + 3]
+      if (rad <= 0) continue
+      if (!any) {
+        cx = x
+        cy = y
+        cz = z
+        r = rad
+        any = true
+        continue
+      }
+      // Union of two spheres, the standard construction: if one already contains
+      // the other keep it, else grow along the line between the centres.
+      const dx = x - cx
+      const dy = y - cy
+      const dz = z - cz
+      const d = Math.hypot(dx, dy, dz)
+      if (d + rad <= r) continue
+      if (d + r <= rad) {
+        cx = x
+        cy = y
+        cz = z
+        r = rad
+        continue
+      }
+      const nr = (d + r + rad) * 0.5
+      const t = (nr - r) / d
+      cx += dx * t
+      cy += dy * t
+      cz += dz * t
+      r = nr
+    }
+    out[0] = cx
+    out[1] = cy
+    out[2] = cz
+    out[3] = any ? r : 0
+  }
+
+  /** Every shadow caster in one sphere: (x, y, z, radius). radius 0 = nothing
+   *  casts, -1 = do not use (a rigid caster has no sphere). See updateCasterSphere. */
+  private casterSphere = new Float32Array(4)
+
+  /** The ground's uniform block, kept so the caster sphere can be refreshed in
+   *  it every frame rather than rebuilding the buffer (addGround allocates). */
+  private groundMaterialData: Float32Array | null = null
+
+  /**
+   * Push this frame's caster sphere into the ground's uniform.
+   *
+   * Four floats, one writeBuffer, and only while a ground exists. Rebuilding the
+   * block the way addGround does would allocate a buffer and a bind group per
+   * frame, which is the cost this is trying to remove rather than a way to pay
+   * it somewhere else.
+   */
+  private writeGroundCasterSphere(): void {
+    const gb = this.groundMaterialData
+    if (!gb || !this.groundShadowMaterialBuffer) return
+    if (gb[20] === this.casterSphere[0] && gb[21] === this.casterSphere[1] &&
+        gb[22] === this.casterSphere[2] && gb[23] === this.casterSphere[3]) return
+    gb.set(this.casterSphere, 20)
+    this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 80, this.casterSphere as Float32Array<ArrayBuffer>)
   }
 
   /**
@@ -7594,7 +8006,6 @@ export class Engine {
     }
     if (this.modelInstances.size === 0) {
       this.opaqueBundle = null
-      this.transparentBundle = null
       this.mirrorOpaqueBundle = null
       this.mirrorTransparentBundle = null
       this.shadowBundles = []
@@ -7606,14 +8017,15 @@ export class Engine {
     this.forEachInstance((inst) => this.renderModelOpaquePhase(opaque, inst, camView))
     this.opaqueBundle = opaque.finish({ label: "opaque phase" })
 
-    const transparent = this.device.createRenderBundleEncoder({ label: "transparent phase", ...scene })
-    this.forEachInstance((inst) => this.renderModelTransparentPhase(transparent, inst, camView))
-    this.transparentBundle = transparent.finish({ label: "transparent phase" })
-
-    // The mirror pair: the same draws against the same formats, with the
-    // mirrored camera baked into bind group 0 and the mirror cull args baked
-    // into the indirect draws. Recorded whether or not a mirror is active —
-    // recording is cheap, and the bundles only execute when the pass runs.
+    // NO camera transparent bundle. The camera pass draws that phase directly —
+    // see the note at the executeBundles call for what recording one cost on
+    // WebKit. Recording it anyway "in case" is not free and not harmless: it is
+    // work on every rebuild, and a live bundle beside a direct draw of the same
+    // phase is an invitation to execute it again.
+    //
+    // The MIRROR pair below keeps both bundles, and is allowed to: that pass
+    // hands them to a single executeBundles with nothing direct in between,
+    // which is the pattern that works.
     const mirrorView = this.sceneView("mirror")
     const mo = this.device.createRenderBundleEncoder({ label: "mirror opaque phase", ...scene })
     this.forEachInstance((inst) => this.renderModelOpaquePhase(mo, inst, mirrorView))
@@ -7631,7 +8043,7 @@ export class Engine {
       const shadow = this.device.createRenderBundleEncoder({
         label: `shadow pass, cascade ${ci}`,
         colorFormats: [],
-        depthStencilFormat: "depth32float",
+        depthStencilFormat: Engine.SHADOW_DEPTH_FORMAT,
       })
       shadow.setPipeline(this.shadowDepthPipeline)
       this.forEachInstance((inst) => this.drawInstanceShadow(shadow, inst, ci))
@@ -7649,6 +8061,25 @@ export class Engine {
   }
 
   /**
+   * Half a stamp, for a component that is several passes rather than one.
+   *
+   * Bloom is nine render passes — a prefilter blit, a downsample chain and an
+   * upsample chain — and what anyone wants to know is what the PYRAMID cost, not
+   * what its fourth mip cost. Both fields of GPURenderPassTimestampWrites are
+   * optional, so the opening query goes on the first pass and the closing one on
+   * the last, and the pair reads as one span across everything between.
+   */
+  private stampOpen(pass: (typeof Engine.TIMED_PASSES)[number]): GPURenderPassTimestampWrites | undefined {
+    if (!this.timestampQuerySet) return undefined
+    return { querySet: this.timestampQuerySet, beginningOfPassWriteIndex: Engine.TIMED_PASSES.indexOf(pass) * 2 }
+  }
+
+  private stampClose(pass: (typeof Engine.TIMED_PASSES)[number]): GPURenderPassTimestampWrites | undefined {
+    if (!this.timestampQuerySet) return undefined
+    return { querySet: this.timestampQuerySet, endOfPassWriteIndex: Engine.TIMED_PASSES.indexOf(pass) * 2 + 1 }
+  }
+
+  /**
    * Resolve this frame's timings and start a readback, at most one in flight.
    *
    * Deliberately not awaited anywhere in the frame: a timing that costs a stall
@@ -7659,6 +8090,8 @@ export class Engine {
   private resolveTimestamps(encoder: GPUCommandEncoder): void {
     const qs = this.timestampQuerySet
     if (!qs || !this.timestampResolve || !this.timestampRead) return
+    // Nobody has asked. See getGpuTimings — the read is what enrols.
+    if (!this.timestampsWanted) return
     const count = Engine.TIMED_PASSES.length * 2
     encoder.resolveQuerySet(qs, 0, count, this.timestampResolve, 0)
     if (this.timestampBusy) return
@@ -7698,10 +8131,26 @@ export class Engine {
    * The regression guard for the draw-path work: these are the numbers that say
    * whether restructuring cost anything, which is the claim being made — not
    * whether it made the scene faster, which was never the goal.
+   *
+   * ASKING IS WHAT TURNS IT ON. The first call to this enrols the engine in the
+   * per-frame readback; until then resolveTimestamps does nothing. That is why
+   * the first call returns null even on a device that can measure — the answer
+   * arrives a frame or two later, which is already true of these numbers and
+   * documented on resolveTimestamps.
+   *
+   * The alternative was what this used to do: resolve the query set, copy it to
+   * a staging buffer and map that buffer, every frame, on every device, for a
+   * reader that in this codebase did not exist. A map is a synchronisation point
+   * and the whole path is instrumentation — paying for it unasked is the same
+   * mistake as shipping a debug flag, only invisible.
    */
   getGpuTimings(): Record<string, number> | null {
+    this.timestampsWanted = true
     return this.gpuPassMs
   }
+
+  /** Set by the first getGpuTimings() call. See it for why asking is the switch. */
+  private timestampsWanted = false
 
   private dispatchCull(encoder: GPUCommandEncoder): void {
     if (this.cullListDirty) this.rebuildCullList()
@@ -8297,7 +8746,8 @@ export class Engine {
     // Shadow map is already created in setupPipelines()
     // 20 floats: 16 for the original block, then (mirrorBlur, pad, pad, pad)
     // keeping the uniform vec4-aligned.
-    const gb = new Float32Array(20)
+    const gb = new Float32Array(24)
+    this.groundMaterialData = gb
     gb[0] = diffuseColor.x
     gb[1] = diffuseColor.y
     gb[2] = diffuseColor.z
@@ -8317,6 +8767,23 @@ export class Engine {
     this.groundMirror = gb[15]
     gb[16] = Math.min(Math.max(mirrorBlur, 0), 1)
     this.groundMirrorBlur = gb[16]
+    // gb[17] — does the FAR cascade hold anything?
+    //
+    // It holds something only when a stage is loaded; that is what it exists for
+    // and the cascade loop already skips drawing into it otherwise, leaving it
+    // cleared. A cleared depth map compares as "no occluder", so the ground's far
+    // branch is nine comparison taps whose answer is known in advance.
+    //
+    // That branch runs wherever the NEAR cascade does not reach, and the near one
+    // is a 64-unit box around the camera target — so on a floor receding to the
+    // horizon it is most of the visible pixels, on the most expensive
+    // full-coverage draw in the frame. Skipping it is free in the exact sense:
+    // the shader takes vis = 1.0, which is what the taps would have returned.
+    gb[17] = this.hasStage() ? 1 : 0
+    // gb[20..23] — the caster sphere, refreshed every frame by
+    // writeGroundCasterSphere. Zero here so a frame that renders before the
+    // first cull (there is one) reads "nothing casts" and skips the taps, which
+    // is true: no model has been posed yet.
     this.groundShadowMaterialBuffer = this.device.createBuffer({
       size: gb.byteLength,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -8351,6 +8818,7 @@ export class Engine {
         { binding: 9, resource: this.mirrorColorView! },
         { binding: 10, resource: this.materialSampler },
         { binding: 11, resource: this.mirrorDepthReadView! },
+        { binding: 12, resource: this.groundNoiseView },
       ],
     })
     if (this.groundDrawCall) this.groundDrawCall.bindGroup = this.groundShadowBindGroup
@@ -8873,7 +9341,19 @@ export class Engine {
 
     // CPU alpha sampler for sheerness classification (see textureAlphaCache).
     // Canvas 2D premultiplies RGB on readback, but the ALPHA channel is exact.
-    this.textureAlphaCache.set(cacheKey, buildAlphaSampler(source, rgba, width, height))
+    const alphaPlane = buildAlphaSampler(source, rgba, width, height)
+    // Loud, because the fallback is WRONG rather than merely absent: a material
+    // with no alpha plane scores avg 1 / translucentFrac 0, which routes sheer
+    // fabric into the OPAQUE bucket and changes what the frame looks like. A
+    // readback that fails is therefore a rendering bug, not a missing nicety,
+    // and it must not reach the user as "the dress looks different on my phone".
+    if (!alphaPlane) {
+      console.warn(
+        `[reze] alpha readback failed for ${cacheKey} — this material will be classified OPAQUE, ` +
+          `so sheer fabric will not blend. The canvas 2D readback is what failed.`,
+      )
+    }
+    this.textureAlphaCache.set(cacheKey, alphaPlane)
 
     const mipLevelCount = Math.floor(Math.log2(Math.max(width, height))) + 1
     const texture = this.device.createTexture({
@@ -9634,10 +10114,49 @@ export class Engine {
     const dofOn = this.depthOfField.enabled
     // ANY effect: one foreground mount anywhere in the scene, or one ribbon,
     // is enough to make the pass store its depth instead of discarding it.
-    const depthRead =
-      dofOn || this.effects.some((e) => e.hasForeground) || this.effects.some((e) => e.trails !== null)
+    // Ribbons are NOT in this list, and removing them is the single largest
+    // bandwidth saving in the frame on a tile-based GPU.
+    //
+    // They were, from when a ribbon was its own layer drawn after the scene and
+    // depth-tested BY HAND against the stored buffer. That layer is gone —
+    // ribbons draw inside this pass and the hardware depth test replaced what
+    // they read it for (see trails.ts, "Binding 3 is GONE"). The clause outlived
+    // the change by about twelve hours and then sat here.
+    //
+    // What it cost: this flag decides whether the pass STORES its depth or
+    // discards it into tile memory, and the buffer is depth32float-stencil8 at
+    // the pass's sample count — on a retina canvas that is a nine-figure number
+    // of bytes written to RAM every frame, for a texture nothing then sampled.
+    // Chrome hides it (an immediate-mode GPU has depth in memory regardless);
+    // Apple's TBDR does not, which is exactly the reported shape: adding a hand
+    // ribbon costs a lot of fps on Safari and almost nothing on Chrome.
+    //
+    // The two real readers are both in the composite and both have their own
+    // flag above: linearDepth() feeds the DoF gather and the depth handed to a
+    // foreground mount. Nothing else binds depthTex at all.
+    const depthRead = dofOn || this.effects.some((e) => e.hasForeground)
     this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
     if (depthRead) this.writeDepthOfFieldUniforms()
+
+    // The id attachment, on exactly the same terms as the depth above it.
+    //
+    // It is the most expensive STORE in the pass — rg16uint at the pass's sample
+    // count, ~33MB a frame at 1080p — and a uint target cannot be resolved, so
+    // storing is the only way to get it out. It was stored unconditionally, for
+    // every scene, whether or not anything read it. Nothing usually does: the
+    // readers are rzObjectAt / rzMaterialAt in an effect that masks itself to one
+    // character, and the id-buffer debug view.
+    //
+    // Discarding is not the same as removing. Every pipeline still declares the
+    // attachment and the pass still carries it, so nothing is rebuilt and no
+    // shader changes — the frame is bit-identical either way, because the only
+    // difference is whether tile memory is written back to RAM after a pass
+    // whose result no one is going to read.
+    const idAtt = (this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[2]
+    if (idAtt) {
+      const idsRead = this.idDebug || this.effects.some((e) => e.readsIds)
+      idAtt.storeOp = idsRead ? "store" : "discard"
+    }
 
     const encoder = this.device.createCommandEncoder()
 
@@ -9649,6 +10168,8 @@ export class Engine {
     // are settled, before the passes that draw from them.
     if (this.reflectionActive) this.updateMirrorCamera()
     if (hasModels) this.dispatchCull(encoder)
+    // After the cull, which is what recomputes the spheres it unions.
+    this.writeGroundCasterSphere()
 
     // After the cull, because a rebuild there can reallocate the argument
     // buffers and a bundle captures the buffer it recorded against.
@@ -9660,7 +10181,25 @@ export class Engine {
     // keeps PCF-sampling a character that is no longer in the scene. One clearing
     // pass on the transition to empty, then it stops.
     if (hasModels || this.shadowMapPopulated) {
+      // The far cascade is the STAGE cascade, and it costs a full pass over the
+      // whole cast every frame to say so. Its own spec explains what it is for —
+      // "a set piece 100 units out still throws" — and a scene with no stage has
+      // no set piece: every caster sits inside the near cascade's 64-unit box,
+      // which follows the camera target, and the far map's only readers are
+      // ground pixels beyond that box, where nothing is casting.
+      //
+      // So when no stage is loaded it is drawn ONCE, cleared, and then skipped —
+      // the same shape as shadowMapPopulated above, and for the same reason. A
+      // cleared depth map reads as "no occluder", which is the correct answer
+      // here rather than a missing one. Load a stage and it comes straight back.
+      //
+      // 0.43 had ONE shadow map. This is half of what the second one costs.
+      const stage = this.hasStage()
       for (let ci = 0; ci < SHADOW_CASCADES.length; ci++) {
+        const wanted = ci === 0 || stage
+        // Already cleared and still unwanted — nothing to do, and the map still
+        // holds the far plane from the pass that cleared it.
+        if (!wanted && this.shadowCascadeCleared[ci]) continue
         const sp = encoder.beginRenderPass({
           // One timestamp pair exists for "shadow"; the near cascade wears it.
           timestampWrites: ci === 0 ? this.stamps("shadow") : undefined,
@@ -9676,8 +10215,9 @@ export class Engine {
         // per-frame boolean, and baking it into a bundle would make toggling a
         // model re-record. It lives in the cull compute now, which zeroes the
         // instance count of an invisible model's draws.
-        if (this.shadowBundles[ci]) sp.executeBundles([this.shadowBundles[ci]])
+        if (wanted && this.shadowBundles[ci]) sp.executeBundles([this.shadowBundles[ci]])
         sp.end()
+        this.shadowCascadeCleared[ci] = !wanted
       }
       this.shadowMapPopulated = hasModels
     }
@@ -9708,8 +10248,44 @@ export class Engine {
     // anyway — eye writes it, hair tests not-equal, hairOverEyes tests equal.
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
     if (this.opaqueBundle) pass.executeBundles([this.opaqueBundle])
+    // Re-asserted after the bundle, not merely set once before it.
+    //
+    // Stencil reference is pass state a bundle cannot carry — GPURenderBundleEncoder
+    // has no setStencilReference — which is why it was hoisted above the bundle in
+    // the first place. But "cannot carry" and "cannot disturb" are different
+    // claims, and only the first is specified. Everything below this line that
+    // stencil-tests (hair at not-equal, outline hulls at not-equal) reads a
+    // reference of 0 instead of 1 if a replay resets it, and not-equal against 0
+    // is FALSE for the cleared buffer — every such fragment silently rejected.
+    // One redundant word against a whole class of invisible failure.
+    pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
     if (this.hasGround) this.renderGround(pass)
-    if (this.transparentBundle) pass.executeBundles([this.transparentBundle])
+    // The transparent phase is drawn DIRECTLY, and must stay that way. It is the
+    // one part of this pass that is not bundled, so the reason is worth keeping.
+    //
+    // It WAS a bundle, and on WebKit the entire transparent bucket vanished while
+    // the opaque bucket and the ground rendered perfectly — sheer fabric simply
+    // absent, with no validation error anywhere. It was not the fragments: with
+    // alpha forced to 1 they still never appeared, the cull reported every draw
+    // visible with its GPU and CPU halves agreeing, and a cast model's
+    // transparent draws use the SAME pipeline, bind groups and depth state as its
+    // opaque ones (pipelineForDrawCall, forceDepthWrite). Identical draws,
+    // identical state, one bucket rendering.
+    //
+    // What differed was only how they reached the pass: the opaque bundle is the
+    // FIRST executeBundles here, and the transparent one was the SECOND, issued
+    // after direct commands (the ground). Legal, and correct on Dawn. Not
+    // replayed on WebKit. The mirror pass is the counter-example that pins the
+    // shape of it — it passes BOTH bundles to a single executeBundles with
+    // nothing direct in between, and has never lost a draw.
+    //
+    // So the rule this pass now keeps: at most one executeBundles, and nothing
+    // direct before it. Bundling this phase again means first moving the ground
+    // into the opaque bundle so the two can go in one call, the way the mirror
+    // does it. The saving that buys is CPU encode time over a handful of draws,
+    // which was never this renderer's bottleneck.
+    const camView = this.sceneView("camera")
+    this.forEachInstance((inst) => this.renderModelTransparentPhase(pass, inst, camView))
     // Last in the pass: depth-tested against everything drawn above, so a
     // particle behind the character is simply hidden, and still inside the HDR
     // target so an `@bloom` effect reaches the pyramid below.
@@ -9730,11 +10306,18 @@ export class Engine {
     //   3. Upsample (top-down): bloomUp[N-2] = tent(bloomDown[N-1]) + bloomDown[N-2],
     //      then bloomUp[i] = tent(bloomUp[i+1]) + bloomDown[i] until i=0 (9-tap tent)
     //   Composite reads bloomUp[0] and adds tint * intensity * bloom before Filmic.
-    if (this.bloomBlitBindGroup && this.compositeBindGroup && this.bloomMipCount > 0) {
+    // bloomContributes() gates the whole pyramid, not just its intensity. The
+    // composite still SAMPLES bloomUp[0] unconditionally, which is safe and
+    // deliberate: it scales what it reads by the same effective intensity, so a
+    // stale or never-written pyramid is multiplied by zero. Skipping the build
+    // is therefore invisible in the frame and nine render passes cheaper.
+    if (this.bloomContributes() && this.bloomBlitBindGroup && this.compositeBindGroup && this.bloomMipCount > 0) {
       const bloomAtt = this.bloomPassDescriptor.colorAttachments as GPURenderPassColorAttachment[]
 
-      // 1. Blit
+      // 1. Blit — opens the pyramid's timing span. See stampOpen: the nine
+      // passes below read as ONE component, which is the only useful grain.
       bloomAtt[0].view = this.bloomDownMipViews[0]
+      this.bloomPassDescriptor.timestampWrites = this.stampOpen("bloom")
       const pBlit = encoder.beginRenderPass(this.bloomPassDescriptor)
       pBlit.setPipeline(this.bloomBlitPipeline)
       pBlit.setBindGroup(0, this.bloomBlitBindGroup)
@@ -9742,6 +10325,7 @@ export class Engine {
       pBlit.end()
 
       // 2. Downsample chain
+      this.bloomPassDescriptor.timestampWrites = undefined
       for (let i = 1; i < this.bloomMipCount; i++) {
         bloomAtt[0].view = this.bloomDownMipViews[i]
         const p = encoder.beginRenderPass(this.bloomPassDescriptor)
@@ -9757,6 +10341,8 @@ export class Engine {
       for (let k = 0; k < upSteps; k++) {
         const levelIdx = topIdx - k // writes bloomUp[levelIdx]
         bloomAtt[0].view = this.bloomUpMipViews[levelIdx]
+        // The LAST upsample closes the span opened on the blit.
+        this.bloomPassDescriptor.timestampWrites = k === upSteps - 1 ? this.stampClose("bloom") : undefined
         const p = encoder.beginRenderPass(this.bloomPassDescriptor)
         p.setPipeline(this.bloomUpsamplePipeline)
         p.setBindGroup(0, this.bloomUpsampleBindGroups[k])
@@ -10584,6 +11170,10 @@ export class Engine {
         n++
       })
       u[43] = n
+      // The same number the ribbons size their instance count by — see
+      // drawTrails. Recorded rather than recomputed: this loop is the one place
+      // that knows how many subjects the cast actually ended up holding.
+      this.castSubjectCount = n
       this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
       // Only what an effect declared, and only while one is installed. A scene
       // with no effect writes nothing here at all.

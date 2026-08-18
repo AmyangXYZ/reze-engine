@@ -6,11 +6,18 @@
 // creation, and a shader writing @location(2) with only two targets declared is
 // a WGSL file that is valid on its own.
 //
-// Two directions, because they fail differently and the spec treats them
-// differently (see scene-contract.ts):
-//   target with no matching output   -> legal at writeMask 0 (gpuweb#1918)
+// Two directions, and this file now refuses BOTH:
 //   output with no matching target   -> ungoverned, disputed (gpuweb#5341)
-// So the second is what this file refuses to let happen.
+//   target with no matching output   -> legal at writeMask 0 (gpuweb#1918),
+//                                       and legal is not the same as portable
+//
+// The second used to be allowed here, on the strength of that reading of 1918.
+// Dawn agrees with it. The reason it is refused now is that a browser which does
+// not agree gives the worst possible failure: createRenderPipeline does not
+// throw, it hands back a pipeline that is already invalid, the pass that binds
+// it is dropped whole, and the symptom is missing geometry with a clean console
+// — on one vendor's browser only. Declaring the output costs nothing and the
+// writeMask still decides what is kept, so there is no reason to be clever here.
 //
 // Source rather than dist for the pipelines, because what is being checked is
 // what the code SAYS to build; dist for the contract module, because what is
@@ -27,6 +34,7 @@ import * as ground from "../dist/shaders/passes/ground.js"
 import * as outline from "../dist/shaders/passes/outline.js"
 import * as particles from "../dist/shaders/passes/particles.js"
 import * as trails from "../dist/shaders/passes/trails.js"
+import * as depthPrepass from "../dist/shaders/passes/depth-prepass.js"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const read = (p) => readFileSync(join(here, p), "utf8")
@@ -308,7 +316,12 @@ const CAST = { subjects: 4, samples: 128, base: 12, trailBase: 108, slots: 8, re
 const SHADERS = [
   ["materials (shared prelude)", () => materials.commonFsOutWgsl(), "FSOut", "material"],
   ["ground", () => ground.groundShaderWgsl(), "FSOut", "ground"],
-  ["outline", () => outline.OUTLINE_SHADER_WGSL, "FSOut", "outline"],
+  ["outline", () => outline.outlineShaderWgsl(), "FSOut", "outline"],
+  // The prepass writes no colour at all and takes every target at writeMask 0.
+  // It is in this list precisely BECAUSE of that: it is the shader with the most
+  // reason to skip its outputs and the one where skipping them costs most, since
+  // an invalid prepass pipeline takes the transparent bucket's whole pass with it.
+  ["depth prepass", () => depthPrepass.transparentDepthPrepassWgsl(), "PrepassOut", "depth-prepass"],
   [
     "particles",
     () =>
@@ -331,22 +344,47 @@ const SHADERS = [
   ],
 ]
 
-for (const [label, emit, structName, cls] of SHADERS) {
-  test(`${label}: every @location it writes has a target`, () => {
-    const locations = outputLocations(emit(), structName)
-    assert.ok(locations, `struct ${structName} not found in the emitted ${label} shader`)
-    const targets = sceneTargets(cls, FORMATS)
-    for (const loc of locations) {
-      assert.ok(
-        loc < targets.length,
-        `${label} writes @location(${loc}) but the ${cls} class declares ${targets.length} targets — ` +
-          `a fragment output with no target is the direction the spec does NOT govern (gpuweb#5341)`,
-      )
-    }
-    // Contiguous from 0: a gap means a location nothing fills, which is the
-    // same hazard wearing a different hat.
-    assert.deepEqual(locations, [...locations.keys()], `${label} output locations are not 0..n`)
-  })
+// Both settings of the id attachment, because the two are different shaders and
+// only one of them is the one a given device compiles. The bug this file now
+// guards was invisible with ids OFF and present with them ON, which is to say it
+// was invisible on exactly the machines it was written on.
+for (const ids of [false, true]) {
+  for (const [label, emit, structName, cls] of SHADERS) {
+    test(`${label}: outputs and targets agree exactly (ids=${ids})`, () => {
+      const was = mrtIdsEnabled()
+      try {
+        setMrtIds(ids)
+        const locations = outputLocations(emit(), structName)
+        assert.ok(locations, `struct ${structName} not found in the emitted ${label} shader`)
+        const targets = sceneTargets(cls, FORMATS)
+        // Direction one: an output with no target (gpuweb#5341, ungoverned).
+        for (const loc of locations) {
+          assert.ok(
+            loc < targets.length,
+            `${label} writes @location(${loc}) but the ${cls} class declares ${targets.length} targets — ` +
+              `a fragment output with no target is the direction the spec does NOT govern (gpuweb#5341)`,
+          )
+        }
+        // Direction two: a target with no output. Legal at writeMask 0 by
+        // gpuweb#1918, and refused here anyway — see this file's header. This is
+        // the assertion that was missing, and the shape of the Safari bug: four
+        // shaders declared two outputs against three targets, every one of them
+        // at writeMask 0, and nothing in the build said a word about it.
+        assert.equal(
+          locations.length,
+          targets.length,
+          `${label} declares ${locations.length} fragment outputs but the ${cls} class declares ` +
+            `${targets.length} targets — a target with no output is legal at writeMask 0 and NOT portable; ` +
+            `declare the output and let writeMask decide what is kept`,
+        )
+        // Contiguous from 0: a gap means a location nothing fills, which is the
+        // same hazard wearing a different hat.
+        assert.deepEqual(locations, [...locations.keys()], `${label} output locations are not 0..n`)
+      } finally {
+        setMrtIds(was)
+      }
+    })
+  }
 }
 
 // ── The id CONSUMER: what the whole MRT phase was built for ──
@@ -421,4 +459,33 @@ test("only the ground blends premultiplied, and only because it premultiplies", 
     const [c] = sceneTargets(cls, FORMATS)
     assert.equal(c.blend.color.srcFactor, "src-alpha", `${cls} writes straight colour and must be premultiplied by the blend`)
   }
+})
+
+// ── The scene pass's bundle rule ──
+
+test("the camera scene pass issues at most one executeBundles, with nothing direct before it", () => {
+  // WebKit does not replay a SECOND executeBundles in a pass once direct
+  // commands have been encoded into it. The camera pass used to do exactly
+  // that — opaque bundle, then the ground direct, then a transparent bundle —
+  // and the entire transparent bucket vanished on Safari with no validation
+  // error: sheer fabric absent, opaque fabric and floor perfect.
+  //
+  // Checked against the SOURCE because there is no API to ask a pass how many
+  // times it was handed bundles, and because the failure is silent everywhere
+  // it does not happen. The mirror pass is the shape that is allowed: both
+  // bundles into ONE call, nothing direct in between.
+  const at = engine.indexOf("const pass = encoder.beginRenderPass(this.renderPassDescriptor)")
+  assert.ok(at > 0, "camera scene pass not found")
+  const body = engine.slice(at, engine.indexOf("pass.end()", at))
+  const calls = [...body.matchAll(/\bpass\.executeBundles\(/g)]
+  assert.ok(
+    calls.length <= 1,
+    `the camera scene pass issues executeBundles ${calls.length} times — WebKit replays only the first. ` +
+      `Put every bundle in ONE call with nothing direct before it (see renderMirrorPass), or draw the phase directly.`,
+  )
+  assert.doesNotMatch(
+    body,
+    /this\.transparentBundle/,
+    "the camera transparent phase must be drawn directly, not replayed from a bundle",
+  )
 })

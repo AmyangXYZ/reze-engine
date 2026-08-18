@@ -17,6 +17,7 @@ import assert from "node:assert/strict"
 import { buildCompositeShader, buildFieldShader } from "../dist/shaders/passes/composite.js"
 import { buildParticleComputeShader, buildParticleRenderShader } from "../dist/shaders/passes/particles.js"
 import { buildTrailShader } from "../dist/shaders/passes/trails.js"
+import { EFFECT_ANCHORS } from "../dist/shaders/cast-layout.js"
 
 const effect = {
   wgsl: "fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f { return vec4f(0.0); }",
@@ -94,10 +95,19 @@ test("RZ_TRAIL_SLOTS is defined wherever trails are reachable, and means trail C
   }
 })
 
-test("RZ_MAX_ANCHORS is the address space and is 8, not the trail count", () => {
+test("RZ_MAX_ANCHORS is the address space, not the trail count", () => {
+  // Against the CONSTANT, never a literal. These caps are documented as
+  // minimums that may be raised — pinning the number here made raising one a
+  // test failure, which is the opposite of what this file is protecting. What
+  // matters is that every module agrees on the address space and that it is not
+  // being confused with RZ_TRAIL_SLOTS.
   for (const [name, src] of MODULES) {
     const code = code_only(src)
     if (!/RZ_MAX_ANCHORS/.test(code)) continue
-    assert.match(code, /const RZ_MAX_ANCHORS: i32 = 8;/, `${name} has the wrong anchor address space`)
+    assert.match(
+      code,
+      new RegExp(`const RZ_MAX_ANCHORS: i32 = ${EFFECT_ANCHORS};`),
+      `${name} disagrees with EFFECT_ANCHORS about the anchor address space`,
+    )
   }
 })
