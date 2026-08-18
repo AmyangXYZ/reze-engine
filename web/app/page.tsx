@@ -557,7 +557,7 @@ export default function Home() {
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
-      <Header stats={stats} />
+      <Header stats={stats} engineRef={engineRef} />
 
       {engineError && (
         <div className="absolute inset-0 w-full h-full flex items-center justify-center text-white p-6 z-50 text-lg font-medium">
