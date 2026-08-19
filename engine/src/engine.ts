@@ -1525,6 +1525,16 @@ export class Engine {
    * this line, and the accessors then answer 0 rather than failing to compile.
    */
   private static readonly MRT_IDS = true
+  /**
+   * What fraction of its authored damping a chest rig's body keeps.
+   *
+   * The whole tuning surface for how long those rigs swing: lower rings
+   * longer, 1 restores the authored value exactly. It does NOT change where
+   * they hang at rest — that is the property that made damping the right knob
+   * (see RezePhysics.setJiggleDamping). Judge it against the models that
+   * motivated it; it is a starting point, not a measurement.
+   */
+  private static readonly JIGGLE_DAMPING_SCALE = 0.5
   /** The id attachment. Multisampled with the pass and NEVER resolved: an
    *  averaged id belongs to nothing, so consumers textureLoad sample 0. */
   private idTexture: GPUTexture | null = null
@@ -7505,6 +7515,10 @@ export class Engine {
       if (inst.physics && this.physicsEnabled && inst.model.visible) {
         const tPhys = performance.now()
         inst.physics.step(deltaTime, inst.model.getWorldMatrices(), inst.model.getBoneInverseBindMatrices())
+        // The step published new world matrices for the simulated bones; the
+        // bones that INHERIT from them are still wearing the animated pose.
+        // Returns immediately unless this rig actually has such a bone.
+        inst.model.applyPhysicsAppend()
         physicsMs += performance.now() - tPhys
       }
       if (inst.vertexBufferNeedsUpdate) this.updateVertexBuffer(inst)
@@ -8522,6 +8536,20 @@ export class Engine {
     // solver for the heaviest mesh in the scene and dropping it afterwards was
     // both wasted work and an invariant maintained in the wrong place.
     const physics = !isStage && rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
+    // Which bones the simulation will overwrite, handed to the pose pipeline so
+    // the append (付与) pass can consume the simulated result instead of the
+    // animated one. Precomputed here, once, because the answer is topology —
+    // see Model.setPhysicsDrivenBones for what it costs when a rig needs it and
+    // why it costs nothing when none does.
+    if (physics) {
+      model.setPhysicsDrivenBones(physics.getPhysicsDrivenBones())
+      // The bodies an inherited-from bone rides on are damped less than the
+      // rest, so they swing longer WITHOUT hanging lower — see
+      // RezePhysics.setJiggleDamping for why damping is the separable knob and
+      // solver iterations are not.
+      const appendSources = model.getAppendSourceBones()
+      if (appendSources.length > 0) physics.setJiggleDamping(appendSources, Engine.JIGGLE_DAMPING_SCALE)
+    }
     // Adopt the scene's air, or a model added mid-session would fall under
     // different gravity from the ones already on stage.
     if (physics) {

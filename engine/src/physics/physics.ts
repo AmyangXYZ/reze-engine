@@ -706,6 +706,69 @@ export class RezePhysics {
   //   boneWorld = bodyWorld × bodyOffsetInverse.
   // The body pose is the render-interpolated pose between the previous and current
   // substep states (alpha = fraction into the next step), which removes fixed-step judder.
+  /**
+   * Let the bodies carrying these bones swing longer, by damping them less.
+   *
+   * DAMPING, and not solver iterations, and the difference is the whole point.
+   * Under-converging a joint does make it swing further — it also stops it ever
+   * reaching equilibrium, so the body hangs visibly low at rest. Sag and swing
+   * come as a pair there and no amount of tuning separates them. Damping does
+   * separate them: for m·x″ + c·x′ + k·x = mg the rest position is mg/k, which
+   * c does not appear in. Less damping is a longer, larger oscillation about
+   * exactly the same resting height.
+   *
+   * Scoped to the bones asked for, because it is a look and not a correction —
+   * rigs whose visible bones inherit from a simulated one (付与親) are authored
+   * against an MMD that lets them move more than a faithfully damped
+   * simulation does. Hair and skirt keep their authored damping.
+   *
+   * `scale` multiplies the AUTHORED damping: 1 restores it, 0.5 halves it,
+   * 0 leaves the body undamped and ringing. Idempotent — the authored values
+   * are snapshotted on first use, so repeated calls set rather than compound.
+   */
+  setJiggleDamping(boneIndices: number[], scale: number): void {
+    const wanted = new Set(boneIndices.filter((b) => b >= 0))
+    if (wanted.size === 0) return
+    if (!this.authoredLinDamp || !this.authoredAngDamp) {
+      this.authoredLinDamp = Float32Array.from(this.store.linearDamping)
+      this.authoredAngDamp = Float32Array.from(this.store.angularDamping)
+    }
+    const s = Math.max(0, Math.min(1, scale))
+    const boneOf = this.store.boneIndex
+    for (let i = 0; i < this.store.count; i++) {
+      const b = boneOf[i]
+      if (b < 0 || !wanted.has(b)) continue
+      this.store.linearDamping[i] = this.authoredLinDamp[i] * s
+      this.store.angularDamping[i] = this.authoredAngDamp[i] * s
+    }
+    // The factors are cached against dt, which has not changed.
+    this.world.invalidateDampingCache()
+  }
+
+  /** Authored damping, kept so setJiggleDamping sets rather than compounds. */
+  private authoredLinDamp: Float32Array | null = null
+  private authoredAngDamp: Float32Array | null = null
+
+  /**
+   * Bones whose world matrix this simulation OVERWRITES each step.
+   *
+   * The same test applyDynamicsToBones runs — a Dynamic body bound to a real
+   * bone — exposed because the pose pipeline has to know. PMX lets a bone
+   * inherit rotation from an 付与親 (append parent), and when that parent is
+   * simulated the inheritance has to consume the SIMULATED result, not the
+   * animated pose the frame started with. Nothing else can answer which bones
+   * those are: the mapping lives in this store.
+   */
+  getPhysicsDrivenBones(): number[] {
+    const out: number[] = []
+    for (let i = 0; i < this.store.count; i++) {
+      if (this.store.type[i] !== RigidbodyType.Dynamic) continue
+      const b = this.store.boneIndex[i]
+      if (b >= 0) out.push(b)
+    }
+    return out
+  }
+
   private applyDynamicsToBones(boneWorldMatrices: Mat4[], alpha: number): void {
     const N = this.store.count
     const inv = this.store.bodyOffsetInverse

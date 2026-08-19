@@ -45,6 +45,13 @@ export class World {
   // Per-body damping factors pow(1−damping, dt), cached because damping and
   // the fixed dt never change — two Math.pow per body per substep otherwise.
   private dampCacheDt = -1
+
+  /** Drop the cached damping factors. The cache is keyed on dt alone, because
+   *  authored damping never changed — until a rig asked for softer jiggle (see
+   *  RezePhysics.setJiggleDamping), which rewrites the store's values. */
+  invalidateDampingCache(): void {
+    this.dampCacheDt = -1
+  }
   private linDampFactor: Float32Array | null = null
   private angDampFactor: Float32Array | null = null
 

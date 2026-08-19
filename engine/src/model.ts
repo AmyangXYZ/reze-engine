@@ -30,6 +30,10 @@ const _animSlerp = new Quat(0, 0, 0, 1)
 const _animInterpT = new Vec3(0, 0, 0)
 const _convOut = new Vec3(0, 0, 0)
 const _convMat = new Float32Array(16)
+// Scratch for the post-physics append recovery — see applyPhysicsAppend.
+const _appendBasisX = new Vec3(0, 0, 0)
+const _appendBasisY = new Vec3(0, 0, 0)
+const _appendBasisZ = new Vec3(0, 0, 0)
 // Blend-path scratch: per-entry sample target and the crossfade's two fixed entries.
 const _blendQ = new Quat(0, 0, 0, 1)
 const _blendT = new Vec3(0, 0, 0)
@@ -388,6 +392,15 @@ export class Model {
   // visited-array + closure. Order depends only on parentIndex (static), so this
   // reproduces the old recursion's finishing order exactly. See buildDeformOrder.
   private deformOrder!: Int32Array
+  /** 1 where the simulation overwrites the bone's world matrix. See setPhysicsDrivenBones. */
+  private physicsDriven: Uint8Array | null = null
+  /** Bones to recompute after a step, in deform order — null when no rig needs it. */
+  private physicsAppendOrder: Int32Array | null = null
+  /** Simulated bones something inherits from; their local rotation is recovered. */
+  private physicsAppendSources: Int32Array | null = null
+  /** Recovered post-step local rotations, kept OUT of localRotations on purpose. */
+  private appendRotOverride: Quat[] | null = null
+  private appendRotOverrideSet: Uint8Array | null = null
 
   // Bind-pose absolute (world) position per bone, xyz packed. Static (bindTranslation
   // accumulated down the hierarchy). Precomputed once so convertVMDTranslationToLocal
@@ -2612,7 +2625,141 @@ export class Model {
     }
   }
 
-  computeWorldMatrices(): void {
+  /**
+   * Which bones the physics simulation overwrites, and what that costs the
+   * append (付与) pass — the 胸 problem.
+   *
+   * PMX lets a bone inherit a fraction of another bone's rotation (付与親 /
+   * append parent). The pipeline computes that inheritance inside
+   * computeWorldMatrices, which runs BEFORE physics — and it reads the
+   * parent's LOCAL rotation, which physics never writes: the simulation
+   * publishes world matrices only. So when a rig hangs a bone off a simulated
+   * one, the inheritance saw the animated pose and nothing else, and the
+   * dependent bone sat still no matter how much the parent swung. Rigs that
+   * drive a chest this way — a simulated bone with the visible bones
+   * appending from it — produced no motion at all.
+   *
+   * The engine calls this once, after building the simulation, and it
+   * precomputes the whole answer: WHICH bones need revisiting after a step,
+   * in deform order. Everything downstream is a walk over that list.
+   */
+  setPhysicsDrivenBones(boneIndices: number[]): void {
+    const bones = this.skeleton.bones
+    const n = bones.length
+    this.physicsDriven = new Uint8Array(n)
+    for (const b of boneIndices) if (b >= 0 && b < n) this.physicsDriven[b] = 1
+
+    // Bones to recompute after a step: anything that INHERITS from a simulated
+    // bone, everything under it, and anything inheriting from those in turn.
+    // Simulated bones themselves are deliberately excluded — their world matrix
+    // IS the simulation's output, and recomputing it from a local pose the
+    // simulation never wrote would throw the step away.
+    const affected = new Uint8Array(n)
+    let changed = true
+    while (changed) {
+      changed = false
+      for (let k = 0; k < n; k++) {
+        const i = this.deformOrder[k]
+        if (affected[i] || this.physicsDriven[i]) continue
+        const b = bones[i]
+        const ap = b.appendParentIndex
+        const inheritsAffected =
+          (b.appendRotate || b.appendMove) && ap !== undefined && ap >= 0 && ap < n && (this.physicsDriven[ap] || affected[ap])
+        const parentAffected = b.parentIndex >= 0 && affected[b.parentIndex]
+        if (inheritsAffected || parentAffected) {
+          affected[i] = 1
+          changed = true
+        }
+      }
+    }
+
+    const order: number[] = []
+    for (let k = 0; k < n; k++) {
+      const i = this.deformOrder[k]
+      if (affected[i]) order.push(i)
+    }
+    this.physicsAppendOrder = order.length > 0 ? Int32Array.from(order) : null
+    // The simulated bones something actually inherits from — the only ones
+    // whose post-step local rotation has to be recovered below.
+    const sources = new Set<number>()
+    for (const i of order) {
+      const ap = bones[i].appendParentIndex
+      if (ap !== undefined && ap >= 0 && ap < n && this.physicsDriven[ap]) sources.add(ap)
+    }
+    this.physicsAppendSources = sources.size > 0 ? Int32Array.from(sources) : null
+    if (this.appendRotOverride === null && this.physicsAppendOrder) {
+      this.appendRotOverride = Array.from({ length: n }, () => Quat.identity())
+      this.appendRotOverrideSet = new Uint8Array(n)
+    }
+  }
+
+  /** The simulated bones that visible bones INHERIT from — the chest rig, in
+   *  one list. Empty unless setPhysicsDrivenBones found such a relationship. */
+  getAppendSourceBones(): number[] {
+    return this.physicsAppendSources ? Array.from(this.physicsAppendSources) : []
+  }
+
+  /**
+   * Re-run the append pass against the simulation's result. Call after a step.
+   *
+   * Two halves. First the simulated bones an append parent list names get their
+   * post-step LOCAL rotation recovered — physics published only world matrices,
+   * and the append math speaks local. The recovery is the ordinary change of
+   * basis: local = parentWorld⁻¹ · world, read back as a quaternion off the
+   * relative basis, which is exact for the rigid transforms these are.
+   *
+   * Then the dependent bones recompute, in deform order, reading that recovered
+   * rotation instead of the animated one. The recovered value lives in its OWN
+   * array rather than in localRotations, deliberately: localRotations is what
+   * next frame's pose blends against and what the simulation reads to build
+   * kinematic targets, and writing a simulation result back into it would make
+   * the animation chase its own tail.
+   */
+  applyPhysicsAppend(): void {
+    const order = this.physicsAppendOrder
+    const sources = this.physicsAppendSources
+    if (!order || !sources || !this.appendRotOverride || !this.appendRotOverrideSet) return
+    const bones = this.skeleton.bones
+    const worldMats = this.runtimeSkeleton.worldMatrices
+
+    this.appendRotOverrideSet.fill(0)
+    for (let s = 0; s < sources.length; s++) {
+      const i = sources[s]
+      const w = worldMats[i].values
+      const p = bones[i].parentIndex
+      // Columns of the bone's own basis, expressed in its parent's frame. With
+      // no parent the world basis already IS the local one.
+      let bx0 = w[0], bx1 = w[1], bx2 = w[2]
+      let by0 = w[4], by1 = w[5], by2 = w[6]
+      let bz0 = w[8], bz1 = w[9], bz2 = w[10]
+      if (p >= 0) {
+        const pm = worldMats[p].values
+        // parentᵀ · child, the rotation half of parentWorld⁻¹ · world: the
+        // parent basis is orthonormal, so its inverse is its transpose.
+        const r0 = bx0, r1 = bx1, r2 = bx2
+        bx0 = pm[0] * r0 + pm[1] * r1 + pm[2] * r2
+        bx1 = pm[4] * r0 + pm[5] * r1 + pm[6] * r2
+        bx2 = pm[8] * r0 + pm[9] * r1 + pm[10] * r2
+        const g0 = by0, g1 = by1, g2 = by2
+        by0 = pm[0] * g0 + pm[1] * g1 + pm[2] * g2
+        by1 = pm[4] * g0 + pm[5] * g1 + pm[6] * g2
+        by2 = pm[8] * g0 + pm[9] * g1 + pm[10] * g2
+        const b0 = bz0, b1 = bz1, b2 = bz2
+        bz0 = pm[0] * b0 + pm[1] * b1 + pm[2] * b2
+        bz1 = pm[4] * b0 + pm[5] * b1 + pm[6] * b2
+        bz2 = pm[8] * b0 + pm[9] * b1 + pm[10] * b2
+      }
+      _appendBasisX.setXYZ(bx0, bx1, bx2)
+      _appendBasisY.setXYZ(by0, by1, by2)
+      _appendBasisZ.setXYZ(bz0, bz1, bz2)
+      Quat.fromBasisInto(_appendBasisX, _appendBasisY, _appendBasisZ, this.appendRotOverride[i])
+      this.appendRotOverrideSet[i] = 1
+    }
+
+    this.computeWorldMatrices(order)
+  }
+
+  computeWorldMatrices(subset?: Int32Array): void {
     const bones = this.skeleton.bones
     const localRot = this.runtimeSkeleton.localRotations
     const localTrans = this.runtimeSkeleton.localTranslations
@@ -2624,8 +2771,15 @@ export class Model {
     // Flat traversal in precomputed order: every bone's parent is already done, so no
     // per-bone visited check, no recursion, and no per-call allocation. Same per-bone
     // math as before. Scratch slots are safe to reuse since there's no reentrancy now.
-    const order = this.deformOrder
-    for (let k = 0; k < boneCount; k++) {
+    //
+    // A SUBSET is the post-physics pass (applyPhysicsAppend): the same walk over
+    // the bones that inherit from a simulated one, in the same relative order,
+    // leaving every other bone — the simulated ones above all — untouched.
+    const order = subset ?? this.deformOrder
+    const count = subset ? subset.length : boneCount
+    const override = this.appendRotOverride
+    const overrideSet = this.appendRotOverrideSet
+    for (let k = 0; k < count; k++) {
       const i = order[k]
       const b = bones[i]
 
@@ -2643,7 +2797,12 @@ export class Model {
 
         if (hasRatio) {
           if (b.appendRotate) {
-            const appendRot = localRot[appendParentIdx]
+            // The simulated parent's RECOVERED rotation when there is one — the
+            // whole point of the post-physics pass. localRotations still holds
+            // the animated pose for that bone, which is exactly what must not
+            // be inherited here.
+            const appendRot =
+              override && overrideSet && overrideSet[appendParentIdx] ? override[appendParentIdx] : localRot[appendParentIdx]
             let ax = appendRot.x, ay = appendRot.y, az = appendRot.z
             const aw = appendRot.w
             const absRatio = ratio < 0 ? -ratio : ratio
