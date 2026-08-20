@@ -4,7 +4,7 @@ import { joinAssetPath, type AssetReader } from "./asset-reader"
 import { Rigidbody, Joint } from "./physics"
 import { IKSolverSystem } from "./ik-solver"
 import { VMDLoader, type VMDKeyFrame } from "./vmd-loader"
-import { VMDWriter } from "./vmd-writer"
+import { VMDWriter, type VmdTrackSelection } from "./vmd-writer"
 import {
   AnimationClip,
   AnimationPlayOptions,
@@ -1720,10 +1720,20 @@ export class Model {
     return values[i - 1] + (values[i] - values[i - 1]) * t
   }
 
-  exportVmd(name: string): ArrayBuffer {
+  /**
+   * The clip called `name` as VMD bytes.
+   *
+   * `tracks` splits the file the same way `loadVmd`'s option splits what it
+   * reads: "motion" is the dance (bones + IK), "morphs" is the expression file
+   * to lay over one, "all" (the default) is both in one file as MMD exports it.
+   * A clip missing the half you asked for still writes — an empty motion or an
+   * empty expression file is a valid VMD, and is the honest answer to "export
+   * the morphs" for a clip that has none.
+   */
+  exportVmd(name: string, options?: { tracks?: VmdTrackSelection }): ArrayBuffer {
     const clip = this.animationState.getAnimationClip(name)
     if (!clip) throw new Error(`Animation clip "${name}" not found`)
-    return new VMDWriter().write(clip)
+    return new VMDWriter().write(clip, options)
   }
 
   play(): void

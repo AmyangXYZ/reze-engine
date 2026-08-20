@@ -8,7 +8,8 @@ import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
 import { MIDI_HEADER, MIDI_KEYS, MIDI_NOTES, MIDI_STRIDE } from "./shaders/midi-api"
 import { decodeTga } from "./tga-loader"
-import { VMDLoader } from "./vmd-loader"
+import { VMDLoader, type CameraKeyframe } from "./vmd-loader"
+import { VMDWriter } from "./vmd-writer"
 import { CameraAnimation } from "./camera-animation"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
@@ -6508,6 +6509,39 @@ export class Engine {
     const frames = VMDLoader.loadCameraFromBuffer(buffer)
     this.cameraAnimation = frames.length ? new CameraAnimation(frames) : null
     this.camera.setVmdDriven(this.cameraAnimation !== null)
+  }
+
+  /**
+   * Drive the shot from camera keyframes built in JS — the camera's answer to
+   * `Model.loadClip`.
+   *
+   * The two loadCameraVmd* methods take FILE BYTES, which is all a viewer ever
+   * needs. An editor needs the other direction: hold the track as data, change
+   * a keyframe, and see the result immediately. Going through the writer and
+   * back through the parser for every edit would work and would be absurd.
+   *
+   * Empty (or an empty array) clears the track and returns the camera to orbit,
+   * same as clearCameraVmd — a track with no keyframes cannot drive anything,
+   * and silently keeping the previous one would be worse than saying so.
+   */
+  loadCameraClip(frames: CameraKeyframe[]): void {
+    this.cameraAnimation = frames.length ? new CameraAnimation([...frames]) : null
+    this.camera.setVmdDriven(this.cameraAnimation !== null)
+  }
+
+  /** The loaded camera track as editable keyframes, or [] with none loaded.
+   *  Copies — mutating them does not reach the track being sampled. */
+  getCameraClip(): CameraKeyframe[] {
+    return this.cameraAnimation?.keyframes() ?? []
+  }
+
+  /** The loaded camera track as camera-VMD bytes. Throws with none loaded:
+   *  writing an empty camera file is a mistake worth hearing about, not a
+   *  30-byte header to hand someone as a download. */
+  exportCameraVmd(): ArrayBuffer {
+    const frames = this.cameraAnimation?.keyframes()
+    if (!frames?.length) throw new Error("No camera track loaded")
+    return new VMDWriter().writeCamera(frames)
   }
 
   /** Turn the loaded camera VMD on/off (falls back to orbit when off). No-op if none loaded. */

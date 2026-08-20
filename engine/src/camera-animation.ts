@@ -4,7 +4,7 @@
 
 import { Vec3 } from "./math"
 import { bezierInterpolate } from "./animation"
-import type { CameraKeyframe } from "./vmd-loader"
+import { DEFAULT_CAMERA_INTERPOLATION, type CameraKeyframe } from "./vmd-loader"
 
 const FPS = 30
 const DEG2RAD = Math.PI / 180
@@ -53,6 +53,19 @@ export class CameraAnimation {
     return this.frames.map((f) => f.frame)
   }
 
+  /**
+   * Every keyframe, in full — the track as an editable document.
+   *
+   * The counterpart to keyframeIndices(), which deliberately withholds the
+   * poses because a timeline only wants the rhythm. An EDITOR wants the poses:
+   * it has to show what the shot does at a cut, let it be changed, and write
+   * the result back out. Shallow copies, so a host mutating what it gets back
+   * cannot reach into the track this is sampling from mid-playback.
+   */
+  keyframes(): CameraKeyframe[] {
+    return this.frames.map((f) => ({ ...f }))
+  }
+
   /** Sample the camera pose at time `t` (seconds). Clamps to the track ends; null if empty. */
   sample(t: number): CameraPose | null {
     const frames = this.frames
@@ -76,7 +89,7 @@ export class CameraAnimation {
     const span = b.frame - a.frame
     const localT = span > 0 ? (frame - a.frame) / span : 0
     // The incoming interpolation curve is stored on the segment's end keyframe (b).
-    const ip = b.interpolation
+    const ip = b.interpolation ?? DEFAULT_CAMERA_INTERPOLATION
 
     return {
       target: new Vec3(

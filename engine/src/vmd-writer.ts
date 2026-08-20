@@ -1,4 +1,5 @@
 import { AnimationClip, BoneInterpolation, ControlPoint } from "./animation"
+import { DEFAULT_CAMERA_INTERPOLATION, type CameraKeyframe } from "./vmd-loader"
 
 const VMD_HEADER = "Vocaloid Motion Data 0002"
 const HEADER_SIZE = 30
@@ -9,6 +10,11 @@ const BONE_FRAME_SIZE = BONE_NAME_SIZE + 4 + 12 + 16 + 64 // 111 bytes
 const MORPH_FRAME_SIZE = MORPH_NAME_SIZE + 4 + 4 // 23 bytes
 /** IK bone names get 20 bytes in the IK block, not the 15 bones get elsewhere. */
 const IK_NAME_SIZE = 20
+/** frame + distance + target(3) + rotation(3) + interpolation(24) + fov + perspective. */
+const CAMERA_FRAME_SIZE = 4 + 4 + 12 + 12 + 24 + 4 + 1 // 61 bytes
+/** What MMD stamps in the model-name field of a camera VMD. Tools sniff it to
+ *  tell a camera file from a motion at a glance, so write what they expect. */
+const CAMERA_MODEL_NAME = "\u30ab\u30e1\u30e9\u30fb\u7167\u660e"
 
 // Build a Unicode-to-Shift-JIS lookup by inverting the TextDecoder mapping.
 let shiftJISTable: Map<string, number[]> | null = null
@@ -47,22 +53,41 @@ function encodeShiftJIS(str: string): Uint8Array {
   return new Uint8Array(bytes)
 }
 
+/** Which half of a clip to write. Mirrors `Model.loadVmd`'s `tracks` option, so
+ *  a file this writer splits out is one the loader can read straight back:
+ *
+ *    "all"    bone + morph (+ IK) — one file, what MMD itself exports
+ *    "motion" bone (+ IK) only — the dance, no expressions
+ *    "morphs" morph only — an expression file (\u8868\u60c5\u30e2\u30fc\u30b7\u30e7\u30f3) to lay over a motion
+ *
+ *  IK rides with "motion" rather than "morphs" because it is bone state: which
+ *  chains solve says nothing about a face. */
+export type VmdTrackSelection = "all" | "motion" | "morphs"
+
 export class VMDWriter {
-  write(clip: AnimationClip): ArrayBuffer {
+  write(clip: AnimationClip, options?: { tracks?: VmdTrackSelection }): ArrayBuffer {
+    const tracks = options?.tracks ?? "all"
+    const wantBones = tracks !== "morphs"
+    const wantMorphs = tracks !== "motion"
+
     let totalBoneFrames = 0
-    for (const frames of clip.boneTracks.values()) {
-      totalBoneFrames += frames.length
+    if (wantBones) {
+      for (const frames of clip.boneTracks.values()) {
+        totalBoneFrames += frames.length
+      }
     }
     let totalMorphFrames = 0
-    for (const frames of clip.morphTracks.values()) {
-      totalMorphFrames += frames.length
+    if (wantMorphs) {
+      for (const frames of clip.morphTracks.values()) {
+        totalMorphFrames += frames.length
+      }
     }
 
     // IK state is stored per MOMENT, not per bone: one record lists every chain
     // and its state at that frame. So the tracks are transposed back into the
     // frames they were flattened from.
     const ikByFrame = new Map<number, { boneName: string; enabled: boolean }[]>()
-    for (const [boneName, keys] of clip.ikTracks ?? []) {
+    for (const [boneName, keys] of (wantBones ? clip.ikTracks : undefined) ?? []) {
       for (const key of keys) {
         const at = ikByFrame.get(key.frame)
         if (at) at.push({ boneName, enabled: key.enabled })
@@ -98,7 +123,7 @@ export class VMDWriter {
     offset += 4
 
     // Bone frames
-    for (const frames of clip.boneTracks.values()) {
+    for (const frames of wantBones ? clip.boneTracks.values() : []) {
       for (const kf of frames) {
         // Bone name (15 bytes, Shift-JIS)
         offset = writeFixedShiftJIS(buffer, offset, kf.boneName, BONE_NAME_SIZE)
@@ -130,7 +155,7 @@ export class VMDWriter {
     offset += 4
 
     // Morph frames
-    for (const frames of clip.morphTracks.values()) {
+    for (const frames of wantMorphs ? clip.morphTracks.values() : []) {
       for (const kf of frames) {
         // Morph name (15 bytes, Shift-JIS)
         offset = writeFixedShiftJIS(buffer, offset, kf.morphName, MORPH_NAME_SIZE)
@@ -168,7 +193,66 @@ export class VMDWriter {
 
     return buffer
   }
+
+  /**
+   * A camera VMD: the shot's own file, with no model motion in it.
+   *
+   * Bone and morph counts are written as zero rather than omitted — the camera
+   * block sits after them in the format, so a reader walking the file in order
+   * (including this package's own parseCamera) has to pass through both to
+   * reach it. Light, self-shadow and IK blocks are left off entirely; every
+   * reader bounds-checks past the camera block, and MMD is happy with a file
+   * that simply ends there.
+   *
+   * `frames` is sorted by frame on the way out: CameraAnimation binary-searches
+   * the track it loads, and an out-of-order file would sample wrong rather than
+   * fail loudly.
+   */
+  writeCamera(frames: CameraKeyframe[]): ArrayBuffer {
+    const sorted = [...frames].sort((a, b) => a.frame - b.frame)
+    const size = HEADER_SIZE + MODEL_NAME_SIZE + 4 + 4 + 4 + sorted.length * CAMERA_FRAME_SIZE
+    const buffer = new ArrayBuffer(size)
+    const view = new DataView(buffer)
+    let offset = 0
+
+    offset = writeFixedString(buffer, offset, VMD_HEADER, HEADER_SIZE)
+    offset = writeFixedShiftJIS(buffer, offset, CAMERA_MODEL_NAME, MODEL_NAME_SIZE)
+
+    view.setUint32(offset, 0, true) // bone frame count
+    offset += 4
+    view.setUint32(offset, 0, true) // morph frame count
+    offset += 4
+    view.setUint32(offset, sorted.length, true)
+    offset += 4
+
+    for (const kf of sorted) {
+      view.setUint32(offset, kf.frame, true); offset += 4
+      view.setFloat32(offset, kf.distance, true); offset += 4
+      view.setFloat32(offset, kf.target.x, true); offset += 4
+      view.setFloat32(offset, kf.target.y, true); offset += 4
+      view.setFloat32(offset, kf.target.z, true); offset += 4
+      // Euler radians, as the loader reads them.
+      view.setFloat32(offset, kf.rotation.x, true); offset += 4
+      view.setFloat32(offset, kf.rotation.y, true); offset += 4
+      view.setFloat32(offset, kf.rotation.z, true); offset += 4
+      // 24 bytes, contiguous per channel — see camera-animation.ts's `bez`.
+      // Short or missing tables are padded with a linear default rather than
+      // writing junk: a hand-built keyframe should not have to know the layout.
+      const ip = new Uint8Array(24)
+      ip.set(DEFAULT_CAMERA_INTERPOLATION)
+      if (kf.interpolation) ip.set(kf.interpolation.subarray(0, 24))
+      new Uint8Array(buffer, offset, 24).set(ip)
+      offset += 24
+      // fov is degrees, and an integer in the file — MMD's own field is u32.
+      view.setUint32(offset, Math.max(0, Math.round(kf.fov)), true); offset += 4
+      view.setUint8(offset, 0) // 0 = perspective
+      offset += 1
+    }
+
+    return buffer
+  }
 }
+
 
 function writeFixedString(buffer: ArrayBuffer, offset: number, str: string, maxBytes: number): number {
   const bytes = new Uint8Array(buffer, offset, maxBytes)

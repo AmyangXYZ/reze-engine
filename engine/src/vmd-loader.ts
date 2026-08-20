@@ -29,8 +29,27 @@ export interface CameraKeyframe {
   target: Vec3
   rotation: Vec3 // euler radians
   fov: number // degrees
-  interpolation: Uint8Array // 24 bytes
+  /** 24 bytes, contiguous per channel — see camera-animation.ts's `bez`.
+   *  Optional so a hand-authored keyframe does not have to know the layout;
+   *  both the sampler and the writer fall back to DEFAULT_CAMERA_INTERPOLATION.
+   *  A parsed file always carries its own. */
+  interpolation?: Uint8Array
 }
+
+/** Linear in, linear out on all six channels. 20/107 is MMD's own linear pair
+ *  (its bezier bytes run 0-127), so a keyframe written with this reads back as
+ *  a straight line in MMD rather than an ease nobody asked for. */
+export const DEFAULT_CAMERA_INTERPOLATION: Uint8Array = (() => {
+  const ip = new Uint8Array(24)
+  for (let c = 0; c < 6; c++) {
+    const b = c * 4
+    ip[b] = 20 // x1
+    ip[b + 1] = 107 // x2
+    ip[b + 2] = 20 // y1
+    ip[b + 3] = 107 // y2
+  }
+  return ip
+})()
 
 /** A VMD "IK/display" record: one moment at which chains are switched. */
 export interface IkFrame {

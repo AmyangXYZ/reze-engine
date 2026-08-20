@@ -109,8 +109,8 @@ export {
   interpolateControlPoints,
   rawInterpolationToBoneInterpolation,
 } from "./animation"
-export { VMDLoader, type CameraKeyframe, type IkFrame } from "./vmd-loader"
-export { VMDWriter } from "./vmd-writer"
+export { VMDLoader, DEFAULT_CAMERA_INTERPOLATION, type CameraKeyframe, type IkFrame } from "./vmd-loader"
+export { VMDWriter, type VmdTrackSelection } from "./vmd-writer"
 export { PmxLoader } from "./pmx-loader"
 export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"
