@@ -103,10 +103,17 @@ export class VMDWriter {
       MODEL_NAME_SIZE +
       4 + totalBoneFrames * BONE_FRAME_SIZE +
       4 + totalMorphFrames * MORPH_FRAME_SIZE +
-      // Camera, light and self-shadow counts, then the IK block. Written only
-      // when there is IK state to carry: a plain motion stays byte-identical to
-      // what this writer produced before.
-      (ikFrames.length > 0 ? 4 * 4 + ikSize : 0)
+      // Camera, light, self-shadow and IK counts, ALWAYS — 16 bytes even when
+      // every one of them is zero.
+      //
+      // A VMD's sections are positional: a reader reaches each block by walking
+      // every count before it. Writing these only when there was IK state to
+      // carry left an ordinary motion ending right after the morph block, so
+      // anything looking for the sections that follow read past the end of the
+      // file and took whatever it found. MMD's own motion files carry all five
+      // counts unconditionally; so do ours now.
+      4 * 4 +
+      ikSize
 
     const buffer = new ArrayBuffer(size)
     const view = new DataView(buffer)
@@ -170,12 +177,14 @@ export class VMDWriter {
       }
     }
 
+    // Empty camera, light and self-shadow blocks, then the IK count — written
+    // whether or not there is IK state, so the file always ends on a complete
+    // section table.
+    for (let i = 0; i < 3; i++, offset += 4) view.setUint32(offset, 0, true)
+    view.setUint32(offset, ikFrames.length, true)
+    offset += 4
+
     if (ikFrames.length > 0) {
-      // Empty camera, light and self-shadow blocks — a reader walking the file
-      // in order has to pass through them to reach the IK block.
-      for (let i = 0; i < 3; i++, offset += 4) view.setUint32(offset, 0, true)
-      view.setUint32(offset, ikFrames.length, true)
-      offset += 4
       for (const [frame, states] of ikFrames) {
         view.setUint32(offset, frame, true)
         offset += 4
@@ -197,12 +206,17 @@ export class VMDWriter {
   /**
    * A camera VMD: the shot's own file, with no model motion in it.
    *
-   * Bone and morph counts are written as zero rather than omitted — the camera
-   * block sits after them in the format, so a reader walking the file in order
-   * (including this package's own parseCamera) has to pass through both to
-   * reach it. Light, self-shadow and IK blocks are left off entirely; every
-   * reader bounds-checks past the camera block, and MMD is happy with a file
-   * that simply ends there.
+   * Every section count is written, including the empty ones. The format is
+   * positional, so a reader reaches each block by walking the counts before it —
+   * bone and morph to arrive at the camera block, and light, self-shadow and IK
+   * to leave it cleanly.
+   *
+   * The trailing three used to be omitted, on the theory that every reader
+   * bounds-checks past the camera block. They do not. This file type is
+   * カメラ・照明 — camera AND lighting — so MMD looks for the light block exactly
+   * where the file used to stop, read past the end, and lit the scene from
+   * whatever it found there. It reached users as a stray coloured light on a
+   * camera-only export.
    *
    * `frames` is sorted by frame on the way out: CameraAnimation binary-searches
    * the track it loads, and an out-of-order file would sample wrong rather than
@@ -210,7 +224,8 @@ export class VMDWriter {
    */
   writeCamera(frames: CameraKeyframe[]): ArrayBuffer {
     const sorted = [...frames].sort((a, b) => a.frame - b.frame)
-    const size = HEADER_SIZE + MODEL_NAME_SIZE + 4 + 4 + 4 + sorted.length * CAMERA_FRAME_SIZE
+    const size =
+      HEADER_SIZE + MODEL_NAME_SIZE + 4 + 4 + 4 + sorted.length * CAMERA_FRAME_SIZE + 4 * 3
     const buffer = new ArrayBuffer(size)
     const view = new DataView(buffer)
     let offset = 0
@@ -248,6 +263,11 @@ export class VMDWriter {
       view.setUint8(offset, 0) // 0 = perspective
       offset += 1
     }
+
+    // Light, self-shadow and IK/display counts. See the note above: the light
+    // block begins here, and leaving it off is what lit MMD from past the end
+    // of the file.
+    for (let i = 0; i < 3; i++, offset += 4) view.setUint32(offset, 0, true)
 
     return buffer
   }

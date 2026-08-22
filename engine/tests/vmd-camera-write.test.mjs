@@ -79,5 +79,13 @@ test("camera bytes carry no bone or morph frames", () => {
   assert.equal(view.getUint32(50, true), 0, "bone count")
   assert.equal(view.getUint32(54, true), 0, "morph count")
   assert.equal(view.getUint32(58, true), 1, "camera count")
-  assert.equal(buf.byteLength, 30 + 20 + 4 + 4 + 4 + 61)
+  // The three trailing counts — light, self-shadow, IK — are part of the file.
+  // This assertion used to stop at the camera block, and so locked in the bug it
+  // looked like it was guarding: MMD reads the light block from exactly there in
+  // a カメラ・照明 file, ran off the end, and lit the scene from whatever it
+  // found. See vmd-section-table.test.mjs.
+  assert.equal(buf.byteLength, 30 + 20 + 4 + 4 + 4 + 61 + 4 * 3)
+  assert.equal(view.getUint32(62 + 61, true), 0, "light count")
+  assert.equal(view.getUint32(62 + 61 + 4, true), 0, "self-shadow count")
+  assert.equal(view.getUint32(62 + 61 + 8, true), 0, "IK count")
 })
