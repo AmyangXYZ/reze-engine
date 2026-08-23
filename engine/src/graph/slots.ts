@@ -8,7 +8,7 @@
 // See docs/style-groups-spec.md §5, §7.
 
 import { NODES_WGSL } from "../shaders/materials/nodes"
-import { COMMON_MATERIAL_PRELUDE_WGSL, commonFsOutWgsl } from "../shaders/materials/common"
+import { COMMON_MATERIAL_PRELUDE_WGSL, DISSOLVE_WGSL, commonFsOutWgsl } from "../shaders/materials/common"
 import { sceneIdWriteWgsl } from "../shaders/passes/scene-contract"
 import type { AlphaMode, RenderClass } from "./render-class"
 
@@ -65,7 +65,16 @@ const STYLE_UNIFORMS_WGSL = `struct StyleUniforms { p: array<vec4f, 16> };
 `
 
 function decls(renderClass: RenderClass, alphaMode: AlphaMode): string {
-  return (alphaMode === "hashed" ? HASHED_ALPHA_DECLS : "") + (renderClass === "hair" ? HAIR_OVER_EYES_DECL : "")
+  // The dissolve helpers are ALWAYS declared, unlike the hashed-alpha ones.
+  // They cost nothing on a material that never dissolves — the branch that
+  // calls them is uniform across a draw and folds away — and making them
+  // conditional would mean deciding at COMPILE time which materials may ever
+  // come apart, which is the one thing a runtime value must not need.
+  return (
+    DISSOLVE_WGSL +
+    (alphaMode === "hashed" ? HASHED_ALPHA_DECLS : "") +
+    (renderClass === "hair" ? HAIR_OVER_EYES_DECL : "")
+  )
 }
 
 // fs() header up to and including the graph body's context locals. Composed so the
@@ -91,6 +100,31 @@ function prelude(renderClass: RenderClass, alphaMode: AlphaMode): string {
   // MMD alpha semantics: material alpha × texture alpha.
   let alpha = material.alpha * tex_s.a;
 ${discard}
+
+  // ── Dissolve ──
+  //
+  // A fragment is either THERE or it is not: the flake is thrown away rather
+  // than faded. A fade would be an opacity slider — she would go see-through
+  // and you would read the wall through her hair — while a threshold takes her
+  // apart in pieces, which is the thing being asked for. The depth prepass runs
+  // this identical test (rz_dissolve_threshold, shared), so depth and colour
+  // agree about which pieces are gone.
+  //
+  // The surviving edge glows: fragments within RZ_DISSOLVE_EDGE of the front
+  // are the ones about to go, and lighting them is what makes the boundary read
+  // as burning away rather than as a stencil moving over her.
+  var rz_burn = 0.0;
+  if (material.dissolve < 0.9995) {
+    let rz_t = rz_dissolve_threshold(input.restPos);
+    if (rz_t > material.dissolve) { discard; }
+    // Put OUT as the last of her goes. Near zero the front is wider than what
+    // is left of the surface, so every surviving fragment sits inside it and
+    // the final scraps are pure glow — a body that ends as a handful of white
+    // specks rather than as a body. The taper costs nothing while she is mostly
+    // there, because it is already 1 by a fifth of the way in.
+    rz_burn = smoothstep(material.dissolve - RZ_DISSOLVE_EDGE, material.dissolve, rz_t)
+            * smoothstep(0.0, 0.22, material.dissolve);
+  }
 
   var n = safe_normal(input.normal);
   let v = normalize(camera.viewPos - input.worldPos);${flip}
@@ -132,18 +166,23 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
   const LIT = ` + rzLightsDiffuse(input.worldPos, n) * albedo`
   const ALBEDO = `  let albedo = tex_color;
 `
+  // The dissolve's burning edge, ADDED after the graph and after the lights —
+  // it is emission, not a surface colour, so nothing may ramp or shadow it. Zero
+  // on every fragment of every material that is not dissolving, which is what
+  // keeps this out of the way of a scene that never uses it.
+  const BURN = ` + RZ_BURN_COLOR * rz_burn`
   if (renderClass === "hair") {
     return `${ALBEDO}  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
 
   var out: FSOut;
-  out.color = vec4f(final_color${LIT}, outAlpha);
+  out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `${ALBEDO}  var out: FSOut;
-  out.color = vec4f(final_color${LIT}, ${alphaBase});
+  out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;
 `

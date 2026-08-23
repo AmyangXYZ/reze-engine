@@ -17,6 +17,7 @@ export {
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,
+  type DissolveCycle,
   type EffectParamValue,
   type EffectResult,
   type CullDiagnostics,

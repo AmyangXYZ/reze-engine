@@ -164,10 +164,13 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
   // Slot-owned behaviors: Wyman hash gate replaces the alpha threshold; alpha out = 1.
   assert.ok(r.wgsl.includes("if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"))
   // The ALPHA is what this test is about — hashed forces it to 1. The colour
-  // carries the positional-light layer beside final_color; that term is zero
-  // with no lights, and pinning the whole expression here would make this test
-  // fail for anything ever added to the epilogue.
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo, 1.0);"))
+  // carries the positional-light layer beside final_color, and the dissolve's
+  // burning edge after it; both are zero in a scene using neither. Asserted as
+  // the two ENDS of the expression rather than the whole of it, because pinning
+  // the whole of it is what made this test fail the first time anything was
+  // added to the epilogue — which the note it replaces predicted.
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo"))
+  assert.ok(r.wgsl.includes(", 1.0);"))
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
 })
 
@@ -186,7 +189,8 @@ test("eye graph: default Principled + emission, rear-gate from renderClass", () 
   )
   // Slot-owned: rear-view gate in the prelude, standard alpha epilogue.
   assert.ok(r.wgsl.includes("if (dot(faceDir, v) < -0.15) { discard; }"))
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo, alpha);"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo"))
+  assert.ok(r.wgsl.includes(", alpha);"))
 })
 
 test("face graph matches the hand-written shader (key terms)", () => {

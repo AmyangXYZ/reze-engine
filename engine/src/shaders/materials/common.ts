@@ -69,7 +69,16 @@ struct MaterialUniforms {
   // just empty. f32 because the buffer is written as floats; the shader casts.
   materialId: f32,
   objectId: f32,
-  _pad2: f32,
+  // How much of this material is still THERE: 1 whole, 0 gone. Rides the last
+  // of the padding this struct already carried, for the same reason the ids do
+  // — the buffer's size and layout are untouched, so the indirect-draw path and
+  // every existing pipeline keep working, and a material that never dissolves
+  // pays one float it was already paying.
+  //
+  // A material morph rebuilds this block from its base copy, which is why the
+  // engine writes the value into that copy as well as into the live buffer: a
+  // face morphing while she dissolves must not come back solid for those frames.
+  dissolve: f32,
 };
 
 struct VertexOutput {
@@ -266,6 +275,136 @@ const COMMON_VS_WGSL = /* wgsl */ `
 export function commonFsOutWgsl(): string {
   return `\n\n${sceneFsOutWgsl()}\n`;
 }
+
+// ─── Dissolve ───────────────────────────────────────────────────────
+/**
+ * Whether a fragment survives the dissolve, and how close it is to the front.
+ *
+ * ONE implementation, shared by the colour pass and the depth prepass, and that
+ * is the whole reason it lives here rather than in either of them. The prepass
+ * claims depth for fragments the colour pass will shade; if the two disagreed
+ * about which flakes are gone, the model would keep writing depth where it no
+ * longer draws — holes that occlude the floor behind her and read as sky.
+ *
+ * OBJECT SPACE, off the bind-pose position, for the same reason the procedural
+ * texture nodes use restPos: a world-space field would let the flakes swim
+ * through her as she moves, and a screen-space one would leave them hanging in
+ * the air while she turns. In object space the pattern is painted ON the
+ * surface — the flakes stay where they were on her arm as the arm moves.
+ *
+ * The hash is value noise rather than a bare hash so the flakes come apart in
+ * clumps of a few millimetres rather than as single-pixel snow, which at any
+ * distance is just a fade.
+ */
+export const DISSOLVE_WGSL = /* wgsl */ `
+/** Clump size, in object-space units — MMD's are roughly centimetres. */
+const RZ_DISSOLVE_GRAIN: f32 = 0.42;
+/** How much the clumps pull a fragment off its own grit value — the whole of
+ *  the LOOK, and none of the rate. See rz_dissolve_threshold. */
+const RZ_DISSOLVE_CLUMP: f32 = 0.6;
+/** Grit cell, as a fraction of a clump. See rz_dissolve_threshold: this is what
+ *  keeps a material SMALLER than a clump from having one threshold for all of
+ *  it, and it has to be smaller than the SMALLEST material a model carries —
+ *  an eye highlight, a button, a buckle — not merely small. Two and a half
+ *  millimetres on a normal model, which is under all of them. */
+const RZ_DISSOLVE_GRIT: f32 = 0.06;
+/** How wide the glowing front is, in threshold units. Thin: the front is a
+ *  rim, and a wide one lights whole limbs at once. */
+const RZ_DISSOLVE_EDGE: f32 = 0.11;
+/** What the front burns with. Emission, added after lighting and after the
+ *  graph — a colour that ramps or takes a shadow reads as paint, not as heat.
+ *  Above 1 on purpose: it is meant to reach the bloom pyramid. Blue-violet,
+ *  the same light the motes leaving her are drawn and lit with. */
+const RZ_BURN_COLOR: vec3f = vec3f(0.45, 0.62, 2.40);
+
+fn rz_dissolve_hash(p: vec3f) -> f32 {
+  // INTEGER, for exactly the reason _hash33 in nodes.ts is, and its comment
+  // says it: above 24 bits an f32 loses the low ones. The float hash this
+  // replaces multiplied three terms into the hundreds of millions and took
+  // fract() of the product — which past 2^24 is not noise, it is a quantised
+  // staircase, and wherever that staircase landed on zero the threshold was
+  // zero. A surface whose threshold is zero never crosses it: it stays behind
+  // while the rest of her leaves, and it sits inside the burning front the
+  // whole time she is gone. Those were the white pieces that would not go.
+  //
+  // Floored first, unlike _hash33: vec3i() truncates toward zero, so -0.5 and
+  // +0.5 are the same cell, and half this model is at negative x.
+  var h = vec3u(vec3i(floor(p)) + vec3i(32768));
+  h = h * vec3u(1664525u, 1013904223u, 2654435761u);
+  h = (h.yzx ^ h) * vec3u(2246822519u, 3266489917u, 668265263u);
+  h = h ^ (h >> vec3u(16u));
+  return f32((h.x ^ h.y ^ h.z) & 16777215u) * (1.0 / 16777216.0);
+}
+
+/** Value noise over that hash — smooth within a flake, uncorrelated between. */
+fn rz_dissolve_field(p: vec3f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let c000 = rz_dissolve_hash(i);
+  let c100 = rz_dissolve_hash(i + vec3f(1.0, 0.0, 0.0));
+  let c010 = rz_dissolve_hash(i + vec3f(0.0, 1.0, 0.0));
+  let c110 = rz_dissolve_hash(i + vec3f(1.0, 1.0, 0.0));
+  let c001 = rz_dissolve_hash(i + vec3f(0.0, 0.0, 1.0));
+  let c101 = rz_dissolve_hash(i + vec3f(1.0, 0.0, 1.0));
+  let c011 = rz_dissolve_hash(i + vec3f(0.0, 1.0, 1.0));
+  let c111 = rz_dissolve_hash(i + vec3f(1.0, 1.0, 1.0));
+  let x00 = mix(c000, c100, u.x);
+  let x10 = mix(c010, c110, u.x);
+  let x01 = mix(c001, c101, u.x);
+  let x11 = mix(c011, c111, u.x);
+  return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
+/**
+ * The threshold this fragment is measured against.
+ *
+ * NOISE ALONE, so the whole body comes apart at once — a hand, a shoulder and
+ * an ankle all thinning together rather than a line travelling up her. It was
+ * tilted by height at first, on the argument that a sweep reads as something
+ * happening TO her; what it actually reads as is a wipe, and a wipe has a
+ * direction, an edge and a speed the rest of the effect knows nothing about.
+ * Everywhere at once is also the honest match for what leaves: the motes are
+ * shed from every limb in the same breath.
+ *
+ * TWO SCALES. Clumps alone meant every fragment of a material SMALLER than one
+ * cell shared a single threshold: an eye highlight, a brow, a button, a hair
+ * clip. All of it sat inside the glowing front at once, so the piece flashed
+ * white as a whole and then popped — the two things a disintegration must never
+ * do. The grit is a per-cell hash at a fraction of the clump, so a part a few
+ * millimetres across still comes apart in pieces.
+ *
+ * THE GRIT IS THE BASE, though, and the clumps only push a fragment off it.
+ * That ordering is what makes the dissolve smooth, and it is not obvious: the
+ * two used to be WEIGHTED AND ADDED, and a sum is not uniformly distributed
+ * however uniform each half is. It piles up in the middle, so most of the
+ * surface had a threshold near a half — all of it went as the dissolve swept
+ * through the middle, and what remained was the thin tail near zero. That tail
+ * was the second stage everyone could see: a body that mostly vanished, then a
+ * scatter of glowing scraps, then nothing.
+ *
+ * WRAPPED, not added. Offsetting a uniform value and taking fract() leaves it
+ * EXACTLY uniform, where scaling a sum back into range only flattens the middle
+ * — measured over four hundred thousand samples, the sum removed 12% of her per
+ * step at the halfway mark and 0.1% at each end (a 110x swing), the scaled sum
+ * still swung 89x, and the wrap is flat: 5.0% per step from the first flake to
+ * the last, a ratio of 1.0.
+ *
+ * That flatness IS the smoothness. An uneven rate is what produced the two
+ * stages you could see — a body that mostly vanished at once, then a scatter of
+ * scraps that took as long again to follow.
+ *
+ * The clumping survives the wrap: neighbouring fragments share a clump value,
+ * so the offset moves them together. What wraps past 1 comes back at 0 and goes
+ * at the other end instead, which costs a little speckle in a region and buys
+ * an even rate everywhere.
+ */
+fn rz_dissolve_threshold(restPos: vec3f) -> f32 {
+  let grit = rz_dissolve_hash(floor(restPos / (RZ_DISSOLVE_GRAIN * RZ_DISSOLVE_GRIT)));
+  let clump = rz_dissolve_field(restPos / RZ_DISSOLVE_GRAIN) - 0.5;
+  return fract(grit + clump * RZ_DISSOLVE_CLUMP);
+}
+`
 
 // ─── Convenience: full shared prelude ───────────────────────────────
 // Material files compose this as `${NODES_WGSL}${COMMON_MATERIAL_PRELUDE_WGSL}` to

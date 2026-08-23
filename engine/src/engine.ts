@@ -666,12 +666,40 @@ interface PickDrawCall {
   bindGroup: GPUBindGroup
 }
 
+/**
+ * A repeating dissolve, in seconds within one cycle.
+ *
+ * Four moments rather than a duration and a delay: every one of them is a thing
+ * you can see happen, and an author tuning this is watching for exactly those
+ * four frames.
+ */
+export interface DissolveCycle {
+  period: number
+  /** She starts to come apart. */
+  breakAt: number
+  /** Fully gone. */
+  hiddenAt: number
+  /** She starts to come back. */
+  backAt: number
+  /** Whole again. */
+  doneAt: number
+}
+
 interface ModelInstance {
   name: string
   /** This model's id in the id attachment — 1-based, so 0 stays "nothing".
    *  The pick pass has always minted it; the cast carries it now too, so an
    *  effect can compare what it reads out of the id buffer against a subject. */
   objectId: number
+  /** How much of this model is still THERE: 1 whole, 0 gone. Written into every
+   *  material's uniform (see setModelDissolve) and mirrored into the cast, so
+   *  the material shell can take her apart and an effect can draw what is
+   *  leaving — both from one number rather than two clocks that must agree. */
+  dissolve: number
+  /** Every material's uniform buffer, in draw order. Kept because a dissolve
+   *  writes ONE float into each of them and needs no other reason to hold a
+   *  block: the whole 16-float copy exists only for materials that morph. */
+  materialUniformBuffers: GPUBuffer[]
   model: Model
   basePath: string
   assetReader: AssetReader
@@ -1595,6 +1623,8 @@ export class Engine {
    *  every frame. */
   private fieldClockScratch = new Float32Array(4)
   /** Material parameters driven by the scene clock — see setStyleParamTrack. */
+  /** Repeating dissolves, by model name — see setModelDissolveCycle. */
+  private dissolveCycles = new Map<string, DissolveCycle>()
   private paramTracks = new Map<
     string,
     { modelName: string; groupId: string; paramId: string; keys: ParamKey[]; last: ParamValue | null }
@@ -8662,6 +8692,8 @@ export class Engine {
       materialToGroup: new Map(),
       styleGroupGen: new Map(),
       objectId: this.modelInstances.size + 1,
+      dissolve: 1,
+      materialUniformBuffers: [],
       cullModelIndex: 0,
       // Seeded false: the first skin-matrix upload decides it, and until then the
       // sphere path is the safe answer (it never culls something it should not).
@@ -9069,6 +9101,7 @@ export class Engine {
         modelId,
       )
       inst.gpuBuffers.push(materialUniformBuffer)
+      inst.materialUniformBuffers.push(materialUniformBuffer)
       if (morphedMaterials.has(pmxMaterialIndex)) {
         const base = this.materialUniformData(mat, sphereMode, headBoneIndex, materialId, modelId)
         morphTargets.push({
@@ -9225,6 +9258,10 @@ export class Engine {
     // bound and the indirect-draw path is untouched.
     data[13] = materialId
     data[14] = objectId
+    // 15 is the last of that padding: how much of this material is there. ONE,
+    // not zero — the default has to be "whole", or every model would load
+    // already gone.
+    data[15] = 1
     return data
   }
 
@@ -10329,6 +10366,7 @@ export class Engine {
     // and a grid stepped after them is one frame stale in everything that used it.
     // Material parameters on the scene clock, before anything reads their
     // uniforms this frame.
+    this.evaluateDissolveCycles()
     this.evaluateParamTracks()
     this.stepSim(encoder, deltaTime)
     this.stepParticles(encoder, deltaTime)
@@ -10728,6 +10766,102 @@ export class Engine {
       this.device.queue.writeBuffer(install.uniformBuffer, styleSlot.vec4Index * 16, new Float32Array(value))
     }
     return true
+  }
+
+  /**
+   * How much of a model is still THERE: 1 whole, 0 gone.
+   *
+   * The instant tier, like setStyleParam — one float per material, no recompile,
+   * no pipeline touched. What it drives is a THRESHOLD, not an opacity: the
+   * material shell throws away every flake whose object-space threshold has
+   * passed, and lights the ones about to go. So a model at 0.5 is not
+   * half-transparent, it is half GONE, which is the difference between a fade
+   * and a disintegration.
+   *
+   * Written into the depth prepass's copy of the same test as well, so the
+   * flakes stop claiming depth the moment they stop being drawn — see
+   * DISSOLVE_WGSL for why that has to be one implementation.
+   *
+   * Mirrored into the cast, so an effect can read rzSubject(i).dissolve and draw
+   * the sparks that leave her in step with the body they came off. That is the
+   * whole reason this lives on the model rather than in an effect's uniform: the
+   * material pass runs long before any effect, and only the engine sees both.
+   */
+  setModelDissolve(modelName: string, value: number): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    const v = Math.min(1, Math.max(0, value))
+    if (inst.dissolve === v) return true
+    inst.dissolve = v
+    // Offset 60: the sixteenth float of MaterialUniforms. One four-byte write
+    // per material rather than the whole block — the block only exists as a
+    // copy for materials that morph.
+    const one = new Float32Array([v])
+    for (const buffer of inst.materialUniformBuffers) {
+      this.device.queue.writeBuffer(buffer, 60, one)
+    }
+    // The morph path rebuilds a material's block from its `base` copy and
+    // uploads it whole, which would put the old value straight back. Patching
+    // `base` is what keeps a face that is morphing while she dissolves from
+    // coming back solid for those frames; `last` is cleared so the next
+    // comparison genuinely re-uploads rather than deciding nothing moved.
+    if (inst.materialMorphTargets) {
+      for (const t of inst.materialMorphTargets) {
+        t.base[15] = v
+        t.last[15] = Number.NaN
+      }
+    }
+    return true
+  }
+
+  /**
+   * A repeating dissolve, on the scene clock.
+   *
+   * The alternative was a host calling setModelDissolve every frame, and it is
+   * the wrong shape twice: an exported take stepped at another rate would land
+   * on different values than the preview did, and the effect drawing the sparks
+   * would be reading a number some other clock wrote. Here the engine samples it
+   * where it samples everything else time-driven, so a take reproduces exactly
+   * and rzSubject().dissolve is the same value the material shell used on that
+   * very frame.
+   *
+   * The five numbers are seconds within one cycle: when she starts to go, when
+   * she is fully gone, when she starts to come back, and when she is whole. The
+   * gaps between them are the timing, and the hold between the middle two is how
+   * long she is away.
+   */
+  setModelDissolveCycle(modelName: string, cycle: DissolveCycle | null): boolean {
+    if (!this.modelInstances.has(modelName)) return false
+    if (!cycle) {
+      if (this.dissolveCycles.delete(modelName)) this.setModelDissolve(modelName, 1)
+      return true
+    }
+    this.dissolveCycles.set(modelName, cycle)
+    return true
+  }
+
+  /** Every dissolve cycle, at the current scene clock. Once per frame, before
+   *  the cast is written and long before any effect reads it. */
+  private evaluateDissolveCycles(): void {
+    if (this.dissolveCycles.size === 0) return
+    for (const [name, c] of this.dissolveCycles) {
+      const period = Math.max(c.period, 1e-3)
+      const t = this.sceneClock - Math.floor(this.sceneClock / period) * period
+      let v = 1
+      if (t >= c.breakAt && t < c.hiddenAt) {
+        v = 1 - (t - c.breakAt) / Math.max(c.hiddenAt - c.breakAt, 1e-4)
+      } else if (t >= c.hiddenAt && t < c.backAt) {
+        v = 0
+      } else if (t >= c.backAt && t < c.doneAt) {
+        v = (t - c.backAt) / Math.max(c.doneAt - c.backAt, 1e-4)
+      }
+      this.setModelDissolve(name, v)
+    }
+  }
+
+  /** What setModelDissolve last set, or 1 for a model that has never dissolved. */
+  getModelDissolve(modelName: string): number {
+    return this.modelInstances.get(modelName)?.dissolve ?? 1
   }
 
   // Materials claimed by the model's currently-installed groups (for upsert/remove paths;
@@ -11494,7 +11628,11 @@ export class Engine {
     cd[b] = px
     cd[b + 1] = floorY
     cd[b + 2] = pz
-    cd[b + 3] = 1
+    // The root vec4's w, a constant 1 until now: how much of this subject is
+    // still there. An effect that draws what is LEAVING her needs to know how
+    // far along she is, and reading it here is what keeps the sparks in step
+    // with the body without a second clock to agree with.
+    cd[b + 3] = inst.dissolve
     cd[b + 4] = px
     cd[b + 5] = py
     cd[b + 6] = pz

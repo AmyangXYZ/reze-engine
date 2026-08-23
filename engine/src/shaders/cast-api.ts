@@ -45,6 +45,16 @@ struct RzSubject {
   center: vec3f,
   /** Bounding sphere: xyz centre, w radius. Deliberately generous — cull with it. */
   bounds: vec4f,
+  /**
+   * How much of this character is still THERE: 1 whole, 0 gone.
+   *
+   * What setModelDissolve last set on them, which the material pass has already
+   * acted on by the time an effect runs — so an effect drawing what LEAVES a
+   * dissolving body (sparks, ash, a ghost) reads the same number the body was
+   * taken apart with, rather than keeping a clock of its own and hoping the two
+   * agree. 1 on a scene that never dissolves anybody.
+   */
+  dissolve: f32,
   /** False past the end of the cast, and every field is then zero. */
   valid: bool,
 }
@@ -73,6 +83,7 @@ fn rzSubject(i: i32) -> RzSubject {
   if (!s.valid) { return s; }
   let b = i * 3;
   s.root = _rzCast[b].xyz;
+  s.dissolve = _rzCast[b].w;
   s.center = _rzCast[b + 1].xyz;
   s.bounds = _rzCast[b + 2];
   return s;

@@ -27,14 +27,25 @@
 // attachment, and that answer does not exist at import time. The constant could
 // not have taken the outputs at all, which is most of why it did not have them.
 
+import { DISSOLVE_WGSL } from "../materials/common"
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
 
 export function transparentDepthPrepassWgsl(): string {
   return /* wgsl */ `
+${DISSOLVE_WGSL}
 struct CameraUniforms { view: mat4x4f, projection: mat4x4f, viewPos: vec3f, _p: f32, };
+// The head of the material block, plus the one field at its tail. The middle is
+// skipped rather than named: this pass shades nothing, and every field it
+// declares is a field that must stay in step with the real struct for no gain.
+// The padding is explicit so the offsets are checkable by eye — vec4 at 16 and
+// 32, vec3 at 48, and dissolve last at 60.
 struct MaterialUniforms {
   diffuseColor: vec3f,
   alpha: f32,
+  _skip0: vec4f,
+  _skip1: vec4f,
+  _skip2: vec3f,
+  dissolve: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -48,6 +59,9 @@ struct VSOut {
   // must land on exactly the depths this wrote.
   @builtin(position) @invariant position: vec4f,
   @location(0) uv: vec2f,
+  // The bind-pose position, carried for one reason: the dissolve test below has
+  // to be the SAME test the colour pass runs, and that one is in object space.
+  @location(1) restPos: vec3f,
 };
 
 @vertex fn vs(
@@ -68,6 +82,7 @@ struct VSOut {
   var o: VSOut;
   o.position = camera.projection * camera.view * vec4f(skinned.xyz, 1.0);
   o.uv = uv;
+  o.restPos = position;
   return o;
 }
 
@@ -89,6 +104,12 @@ override CUTOFF: f32 = 0.5;
 @fragment fn fs(in: VSOut) -> PrepassOut {
   let a = material.alpha * textureSample(diffuseTexture, diffuseSampler, in.uv).a;
   if (a < CUTOFF) { discard; }
+  // The dissolve, run identically to the colour pass — shared code, not a
+  // second copy of the same idea. A prepass that kept claiming depth for flakes
+  // the colour pass throws away would punch holes that occlude the floor behind
+  // her: you would see sky through her, which is the failure this line exists
+  // to prevent.
+  if (material.dissolve < 0.9995 && rz_dissolve_threshold(in.restPos) > material.dissolve) { discard; }
   var out: PrepassOut;
   out.color = vec4f(0.0);
   out.mask = vec4f(0.0);
