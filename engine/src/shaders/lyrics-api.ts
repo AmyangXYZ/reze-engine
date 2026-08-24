@@ -28,8 +28,17 @@ export const LYRICS_FLOATS = LYRIC_HEADER + LYRIC_LINES_MAX * LYRIC_STRIDE
 /** Bounds on the line atlas the host packs rasterised lines into. It is sized
  *  to the track that arrives rather than allocated at the maximum: a scene with
  *  no lyrics carries a 1×1 placeholder, and a song's atlas is as tall as its
- *  own lines need. 8192 is the smallest texture dimension WebGPU guarantees. */
-export const LYRIC_ATLAS_MAX_W = 2048
+ *  own lines need. 8192 is the smallest texture dimension WebGPU guarantees.
+ *
+ *  WIDTH IS WHAT DECIDES SHARPNESS on a long line. A lyric spans most of the
+ *  frame — the shipped effect leaves 6% a side — so at 4K it is drawn across
+ *  some 3400 pixels, and 2048 could only ever be stretched to cover them. That
+ *  is the stair-stepped text on a 4K render, and no row height fixes it: the
+ *  line is already as wide as the sheet. 1080p never showed it, because 1690
+ *  pixels of line fit inside 2048. The atlas is r8unorm, one byte a texel, and
+ *  only ever as wide as its own longest line — so this ceiling costs nothing
+ *  until a song actually needs it. */
+export const LYRIC_ATLAS_MAX_W = 4096
 export const LYRIC_ATLAS_MAX_H = 8192
 
 export type LyricLine = {

@@ -69,6 +69,7 @@ export { BODY_GRAPH } from "./graph/presets/body"
 export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 export { EYE_GRAPH } from "./graph/presets/eye"
 export { FACE_GRAPH } from "./graph/presets/face"
+export { UNLIT_GRAPH } from "./graph/presets/unlit"
 export {
   Model,
   MATERIAL_MORPH_MULTIPLY,

@@ -2,7 +2,7 @@ import { Camera } from "./camera"
 import { decodeDds, isDds } from "./dds-loader"
 import { Mat4, Quat, Vec3 } from "./math"
 import { decodePsd, isPsd } from "./psd-loader"
-import { Model, MATERIAL_MORPH_MULTIPLY, type Material } from "./model"
+import { Model, MATERIAL_MORPH_MULTIPLY, type Material, type Skeleton } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
@@ -101,6 +101,7 @@ import type {
   StyleGroup,
 } from "./graph/style-group"
 import { DEFAULT_GRAPH } from "./graph/presets/default"
+import { UNLIT_GRAPH } from "./graph/presets/unlit"
 import { FACE_GRAPH } from "./graph/presets/face"
 import { HAIR_GRAPH } from "./graph/presets/hair"
 import { BODY_GRAPH } from "./graph/presets/body"
@@ -719,6 +720,21 @@ interface ModelInstance {
   /** Environment geometry added via addStage — no physics, no IK, and it
    *  suppresses the built-in ground. See addStage for why each of those. */
   isStage: boolean
+  /**
+   * A media plane: a flat card carrying a picture.
+   *
+   * Its OWN flag rather than a shade of isStage. The two overlap in what they
+   * skip — neither performs, so neither wants physics, IK, the cast buffer or
+   * the camera clock — but they disagree on the thing a stage exists for: a
+   * stage IS the floor and suppresses the built-in ground, while a card is
+   * scenery standing in the scene and must leave the floor alone. Folding a
+   * plane into isStage would have made adding a title graphic delete the ground.
+   */
+  isPlane: boolean
+  /** This card's texture is rewritten every frame, so it is allocated with no
+   *  mip chain — rebuilding one per frame is a pass per level per card, and is
+   *  what a moving card was mostly costing. See setPlaneFrame. */
+  dynamicTexture: boolean
   /** A pose pass ran since the last skin-matrix upload. Always true for cast
    *  members; false for an idle stage, which is the point. */
   skinMatricesDirty: boolean
@@ -2994,6 +3010,32 @@ export class Engine {
    * is KEPT and diagnostics are returned with line numbers relative to the
    * user's WGSL. Pass null to remove the effect.
    */
+  /**
+   * Every directive an effect may declare — used ONLY to tell an author that
+   * the line they wrote is not doing what they think. See compileEffect.
+   *
+   * It has to be complete, including the ones this engine does not read itself:
+   * `@dissolve` is parsed by the host, and warning about it would be worse than
+   * the silence this replaced — a false alarm on a working line teaches authors
+   * to ignore the channel.
+   */
+  private static readonly KNOWN = new Set([
+    "@anchor",
+    "@layer",
+    "@blend",
+    "@bloom",
+    "@lights",
+    "@grid",
+    "@particles",
+    "@halfres",
+    // Accepted and inert: full resolution is the default now, and an effect
+    // that still says so is right about what it wants. Warning about it would
+    // be telling authors off for the thing that used to be necessary.
+    "@fullres",
+    // The HOST's, not this engine's — see the note above.
+    "@dissolve",
+  ])
+
   private async compileEffect(
     wgsl: string,
     params: Record<string, EffectParamValue> | undefined,
@@ -3093,6 +3135,29 @@ export class Engine {
     // pinning an effect that declares this has to keep installing; saying so is
     // all that was ever missing.
     const warnings: string[] = []
+    // A DIRECTIVE THAT PARSED AS NOTHING.
+    //
+    // Every pragma is matched with `\s*$` after it, so a line that carries a
+    // note as well — `// @fullres — glyph edges are sub-pixel detail` — matches
+    // none of them and is read as an ordinary comment. Nothing failed, nothing
+    // said anything, and the effect simply ran without the property it asked
+    // for: three shipped effects were silently half-res and a fourth silently
+    // stopped being additive, each one's first line explaining why it needed
+    // the thing it was not getting.
+    //
+    // Every directive this engine knows, so an unrecognised one is named rather
+    // than ignored. Cheap: it runs once per install, over a file a human wrote.
+    for (const m of wgsl.matchAll(/^[ \t]*\/\/[ \t]*(@[a-zA-Z]+)(.*)$/gm)) {
+      const [, tag, rest] = m
+      if (!Engine.KNOWN.has(tag)) {
+        warnings.push(`${tag} is not a directive this engine knows — it will be ignored.`)
+      } else if (rest.trim() && !/^\s*[\w.\-+]+(\s+[\w.\-+]+)*\s*$/.test(rest)) {
+        warnings.push(
+          `${tag} has a note on the same line, so it does not parse and is being IGNORED. ` +
+            `A directive must be alone on its line — put the note on the next one.`,
+        )
+      }
+    }
     if (parseParticleBloom(wgsl) && !wantsParticles && !wantsTrails) {
       warnings.push(
         "// @bloom does nothing here. A field effect (background/foreground) composites after tone " +
@@ -3331,7 +3396,22 @@ export class Engine {
         epochScene: this.sceneClock,
         // Its OWN resolution, no longer the scene's: an effect that never asked
         // for full res is not promoted because a neighbour did.
-        fieldLayer: /^\s*\/\/\s*@fullres\s*$/m.test(wgsl) ? 0 : 1,
+        // FULL RESOLUTION UNLESS TOLD OTHERWISE.
+        //
+        // It was the other way round, and the default was the bug. An author
+        // who has never heard of the flag writes an effect with an edge in it
+        // and gets a soft one — nothing fails, nothing warns, because nothing
+        // was declared to fail. Three shipped effects DID declare it and were
+        // half-res anyway on a parsing technicality, which is the same bug
+        // wearing a different hat: the safe answer has to be the one you get
+        // for saying nothing.
+        //
+        // The cost is real and is why the half layer stays: `@halfres` is worth
+        // about 3.7x on a full-screen effect (Footprints, measured, 1.2ms
+        // against 4.5ms). It is the right call for a soft additive glow, which
+        // upsamples invisibly — and it is now a claim an author makes about
+        // their own effect rather than a fate that befalls one.
+        fieldLayer: /^\s*\/\/\s*@halfres\s*$/m.test(wgsl) ? 1 : 0,
         fieldPipeline,
         fieldClock,
         // Filled by rebuildFieldBindGroup below, which needs the instance to
@@ -4305,7 +4385,9 @@ export class Engine {
     if (!this.camera) return null
     const view = this.camera.getViewMatrix().values
     for (const inst of this.modelInstances.values()) {
-      if (!inst.model.visible || inst.isStage) continue
+      // Neither a stage nor a plane is a performer, so neither is a subject an
+      // effect can follow.
+      if (!inst.model.visible || inst.isStage || inst.isPlane) continue
       const model = inst.model
       const matrices = model.getWorldMatrices()
       if (matrices.length === 0) continue
@@ -6833,7 +6915,7 @@ export class Engine {
       // is first in insertion order and was seeding this clock with its own
       // permanent zero. In a scene with a stage, a camera VMD therefore sampled
       // frame 0 forever and the shot never moved.
-      if (inst.isStage) continue
+      if (inst.isStage || inst.isPlane) continue
       const p = inst.model.getAnimationProgress()
       if (p.playing || p.paused) return p.current
       // Otherwise the first cast member that actually HAS a clip: one still at
@@ -7223,7 +7305,7 @@ export class Engine {
     pmxPath: string,
     name?: string,
     assetReader?: AssetReader,
-    options?: { stage?: boolean },
+    options?: { stage?: boolean; plane?: boolean; dynamic?: boolean },
   ): Promise<string> {
     const requested = name ?? model.name
     let key = requested
@@ -7234,7 +7316,15 @@ export class Engine {
     const reader = assetReader ?? createFetchAssetReader()
     const basePath = deriveBasePathFromPmxPath(pmxPath)
     model.setAssetContext(reader, basePath)
-    await this.setupModelInstance(key, model, basePath, reader, options?.stage ?? false)
+    await this.setupModelInstance(
+      key,
+      model,
+      basePath,
+      reader,
+      options?.stage ?? false,
+      options?.plane ?? false,
+      options?.dynamic ?? false,
+    )
     return key
   }
 
@@ -7267,6 +7357,191 @@ export class Engine {
     return key
   }
 
+  /**
+   * Put a picture in the scene as a flat card.
+   *
+   * The thing compositors arrange in a post tool's fake 3D space — Nuke calls
+   * it a Card, After Effects a 3D layer, MMD 板ポリ — except the space here is
+   * the real one. A card is occluded by anything in front of it, occludes what
+   * is behind it, takes perspective when turned, and is caught by depth of
+   * field like everything else, because it is ordinary geometry rather than a
+   * layer composited afterwards.
+   *
+   * It is a MODEL, deliberately. Not a new kind of scene object with its own
+   * list, its own persistence and its own selection: a card wants a position,
+   * a rotation and a size, which is exactly what a model already has, and
+   * everything built around models — the transform, the shadow settings, the
+   * material editor, the asset bundle — works on it the day it exists. It is
+   * not a STAGE, though: it skips the same machinery for the same reasons, and
+   * leaves the floor alone. See ModelInstance.isPlane.
+   *
+   * @returns the model key, for setModelTransform and removeModel.
+   */
+  async addPlane(options: {
+    /** The picture's own bytes, exactly as uploaded. The name's extension picks
+     *  the decoder, so this never re-encodes anything. */
+    image: ArrayBuffer
+    /** File name — decides the decoder, names the model and keys its texture. */
+    name: string
+    /** World size of the card. The caller owns the aspect: it knows the
+     *  picture's own proportions, and a card is free to disagree with them. */
+    width: number
+    height: number
+    transform?: Partial<ModelTransform>
+    /** Drawn from behind as well. Off by default — a card turned away from the
+     *  camera vanishing is the same thing a sheet of paper does. */
+    doubleSided?: boolean
+    /** The picture will be replaced every frame (see setPlaneFrame). Allocates
+     *  the texture without a mip chain, which is what makes that affordable. */
+    dynamic?: boolean
+  }): Promise<string> {
+    const { image, name, width, height } = options
+    const hw = Math.max(width, 1e-4) / 2
+    const hh = Math.max(height, 1e-4) / 2
+
+    // A quad on the XY plane, facing +Z, centred on its own origin — so a
+    // rotation turns it about its middle and a position places its centre,
+    // which is what a handle in the viewport implies.
+    //
+    // V IS FLIPPED, and this is the whole of it: a picture's rows run downward
+    // from its top-left, a UV runs upward from the bottom-left, and a card that
+    // renders its image upside down looks like a bug in everything else.
+    // prettier-ignore
+    const vertexData = new Float32Array([
+      // x     y     z    nx   ny   nz   u    v
+      -hw,  -hh,  0.0,  0.0, 0.0, 1.0,  0.0, 1.0,
+       hw,  -hh,  0.0,  0.0, 0.0, 1.0,  1.0, 1.0,
+       hw,   hh,  0.0,  0.0, 0.0, 1.0,  1.0, 0.0,
+      -hw,   hh,  0.0,  0.0, 0.0, 1.0,  0.0, 0.0,
+    ])
+    // Two triangles, counter-clockwise seen from +Z. A second pair wound the
+    // other way is how "visible from behind" is done here, rather than a
+    // per-material cull flag the rest of the engine has no concept of.
+    const indices = options.doubleSided ? [0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2] : [0, 1, 2, 0, 2, 3]
+    const indexData = new Uint32Array(indices)
+
+    // The texture table's one entry. The path is a key, not a location — the
+    // reader below answers it from memory, so nothing is fetched and nothing is
+    // written to disk.
+    //
+    // A PLAIN RELATIVE NAME under a plain directory, because the loader treats
+    // this exactly as it treats a PMX's: it takes the model path's directory
+    // and JOINS the texture entry onto it. A scheme-looking path went through
+    // that as `plane://` + `plane://name` and matched nothing, so every card
+    // came out with the untextured fallback. `plane/<name>` joins to
+    // `plane/<name>` and stays unique per card, which the engine-wide texture
+    // cache needs it to be.
+    const texturePath = `plane/${name}`
+    const material: Material = {
+      name,
+      diffuse: [1, 1, 1, 1],
+      specular: [0, 0, 0],
+      ambient: [0, 0, 0],
+      shininess: 0,
+      diffuseTextureIndex: 0,
+      normalTextureIndex: -1,
+      sphereTextureIndex: -1,
+      sphereMode: 0,
+      toonTextureIndex: -1,
+      sharedToon: false,
+      // 0 CARRIES TWO DECISIONS, both wanted, and both silent if changed.
+      //
+      // No inverted-hull outline (bit 0x10): a card is not a character, and a
+      // black rim around a light leak is the opposite of what it is for.
+      //
+      // AND NO SHADOW (bit 0x04, which is what castsShadow reads). A card is
+      // usually light or artwork rather than an object, and a rectangle of hard
+      // shadow thrown across the stage by a gradient reads as the renderer
+      // being broken. Set geometry that SHOULD cast one is the rarer case, and
+      // it can say so.
+      edgeFlag: 0,
+      edgeColor: [0, 0, 0, 1],
+      edgeSize: 0,
+      vertexCount: indices.length,
+    }
+
+    // ONE BONE, because Model requires one — it throws on an empty skeleton,
+    // every vertex has to be skinned to something, and a card has nothing to
+    // articulate. It is never posed; the model transform is what moves a card.
+    const skeleton: Skeleton = {
+      bones: [{ name: "全ての親", parentIndex: -1, bindTranslation: [0, 0, 0], children: [] }],
+      inverseBindMatrices: new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]),
+    }
+    const vertexCount = 4
+    const joints = new Uint16Array(vertexCount * 4)
+    const weights = new Uint8Array(vertexCount * 4)
+    for (let i = 0; i < vertexCount; i++) weights[i * 4] = 255
+
+    const model = new Model(
+      vertexData,
+      indexData,
+      [{ path: name, name }],
+      [material],
+      skeleton,
+      { joints, weights },
+      { morphs: [] },
+    )
+
+    // ITS OWN PATH, not addStage's. A plane and a stage skip the same machinery
+    // and mean different things, and routing one through the other is how the
+    // ground came to be suppressed by adding a picture.
+    // The picture answers from memory, whatever it is asked for: a card has
+    // exactly ONE texture, so there is nothing to disambiguate and no way for a
+    // path to be wrong. Matching the string instead is what silently produced
+    // untextured cards, because the loader composes that string itself.
+    const reader: AssetReader = { readBinary: async () => image }
+    const key = await this.addModel(model, texturePath, name, reader, { plane: true, dynamic: options.dynamic })
+
+    // UNLIT, because a card is FOOTAGE and not a surface.
+    //
+    // Its pixels were finished somewhere else — a gradient painted in
+    // Photoshop, a title, a rendered element — so its brightness is the artwork
+    // rather than a response to anything. Shading it means the sun dimming one
+    // side of a thing that has no sides, and the world colour tinting a picture
+    // whose colour was the point. Left ungrouped it would take the neutral
+    // Principled base, which is exactly that mistake.
+    //
+    // A group, not a hard-coded pipeline: a card used as SET geometry — a photo
+    // of a wall, a poster standing in the room — genuinely does want the light,
+    // and this is the same control every other material is changed through, so
+    // that case is a graph swap rather than a feature request.
+    await this.applyStyleGroups(key, [
+      { id: "plane", label: "Plane", materials: [name], graph: UNLIT_GRAPH, alphaMode: "hashed" },
+    ])
+
+    if (options.transform) this.setModelTransform(key, options.transform)
+    // Kept so a moving card can push frames into it. The cache is keyed by the
+    // texture's logical path, which is derived rather than stored anywhere the
+    // caller can see — and deriving it twice is how the two would drift.
+    const tex = this.textureCache.get(texturePath)
+    if (tex) this.planeTextures.set(key, tex)
+    return key
+  }
+
+  /**
+   * Replace what a card is showing, in place.
+   *
+   * For a moving card: a video element, a decoded frame, a canvas — anything
+   * copyExternalImageToTexture accepts. Nothing is reallocated and no bind group
+   * is rebuilt, so this is a per-frame call rather than a per-clip one; the
+   * texture is written where it stands and the material keeps pointing at it.
+   *
+   * The frame must be the size the card was created at. A card is a fixed
+   * rectangle of texels and resizing one mid-clip would mean rebuilding the
+   * material behind it — so the caller allocates the card at its video's size
+   * and this refuses anything else rather than stretching it silently.
+   */
+  setPlaneFrame(id: string, source: GPUCopyExternalImageSource, width: number, height: number): boolean {
+    const tex = this.planeTextures.get(id)
+    if (!tex || !this.device) return false
+    if (tex.width !== width || tex.height !== height) return false
+    this.device.queue.copyExternalImageToTexture({ source }, { texture: tex }, [width, height])
+    // A moving card is allocated with one level precisely so this is never
+    // reached: rebuilding a mip pyramid per frame is a pass per level per card.
+    if (tex.mipLevelCount > 1) this.generateMipmaps(tex, tex.mipLevelCount)
+    return true
+  }
+
   /** True while a stage is in the scene. Two things turn on it: the built-in
    *  ground plane must not draw, and the far shadow cascade has nothing to
    *  cover without one (see the cascade loop). */
@@ -7289,6 +7564,9 @@ export class Engine {
   removeModel(name: string): void {
     const inst = this.modelInstances.get(name)
     if (!inst) return
+    // Before the texture cache below frees it: a stale entry here would hand a
+    // destroyed texture to the next setPlaneFrame.
+    this.planeTextures.delete(name)
     inst.model.stop()
     for (const path of inst.textureCacheKeys) {
       const tex = this.textureCache.get(path)
@@ -7563,10 +7841,10 @@ export class Engine {
       // A stage never solves IK — nothing drives its chains — and skips the pose
       // pass entirely while it is idle. Morph changes still come through, since
       // that is the one thing a stage's controls do move.
-      const stageIdle = inst.isStage && inst.model.isIdle()
+      const stageIdle = (inst.isStage || inst.isPlane) && inst.model.isIdle()
       let verticesChanged = false
       if (!stageIdle) {
-        verticesChanged = inst.model.update(deltaTime, inst.isStage ? false : this.ikEnabled)
+        verticesChanged = inst.model.update(deltaTime, inst.isStage || inst.isPlane ? false : this.ikEnabled)
         inst.skinMatricesDirty = true
       }
       animMs += performance.now() - tAnim
@@ -7989,6 +8267,8 @@ export class Engine {
 
   /** Every shadow caster in one sphere: (x, y, z, radius). radius 0 = nothing
    *  casts, -1 = do not use (a rigid caster has no sphere). See updateCasterSphere. */
+  /** A card's own texture, by model key — see setPlaneFrame. */
+  private planeTextures = new Map<string, GPUTexture>()
   private casterSphere = new Float32Array(4)
 
   /** The ground's uniform block, kept so the caster sphere can be refreshed in
@@ -8560,6 +8840,8 @@ export class Engine {
     basePath: string,
     assetReader: AssetReader,
     isStage = false,
+    isPlane = false,
+    dynamicTexture = false,
   ): Promise<void> {
     const vertices = model.getVertices()
     const skinning = model.getSkinning()
@@ -8620,7 +8902,7 @@ export class Engine {
     // A stage never simulates, so its bodies are never built — constructing the
     // solver for the heaviest mesh in the scene and dropping it afterwards was
     // both wasted work and an invariant maintained in the wrong place.
-    const physics = !isStage && rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
+    const physics = !isStage && !isPlane && rbs.length > 0 ? new RezePhysics(rbs, model.getJoints()) : null
     // Which bones the simulation will overwrite, handed to the pose pipeline so
     // the append (付与) pass can consume the simulated result instead of the
     // animated one. Precomputed here, once, because the answer is topology —
@@ -8700,6 +8982,8 @@ export class Engine {
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
       isStage,
+      isPlane,
+      dynamicTexture,
       // Seeded true: the bind pose has to reach the GPU once before any frame.
       skinMatricesDirty: true,
       hiddenMaterials: new Set(),
@@ -9200,7 +9484,21 @@ export class Engine {
       bounds[4] += grow
       bounds[5] += grow
 
-      const type: DrawCallType = isTransparent ? "transparent" : "opaque"
+      // A CARD IS ALWAYS OPAQUE-PHASE, whatever its alpha says.
+      //
+      // The scene pass runs opaque -> ground -> transparent, and the ground
+      // writes depth at every opacity (effects locate the floor by it). Every
+      // card qualifies as transparent — a cutout has translucent texels, and a
+      // video card starts from a blank sheet that is nothing but — so cards
+      // drew after the ground and an INVISIBLE floor rejected them. Turning the
+      // ground down for the shadow catcher made pictures disappear into it.
+      //
+      // Not a workaround: alphaMode "hashed" is alpha-to-coverage, which is the
+      // transparency technique built for this phase, and addPlane already sets
+      // it. The cost is dithering on a large soft gradient, where MSAA has four
+      // coverage levels to spend — a cutout edge, which is what a card usually
+      // has, resolves exactly.
+      const type: DrawCallType = inst.isPlane ? "opaque" : isTransparent ? "transparent" : "opaque"
       inst.drawCalls.push({
         type,
         count: indexCount,
@@ -9516,7 +9814,13 @@ export class Engine {
     }
     this.textureAlphaCache.set(cacheKey, alphaPlane)
 
-    const mipLevelCount = Math.floor(Math.log2(Math.max(width, height))) + 1
+    // NO MIPS FOR A MOVING CARD. The chain would have to be rebuilt on every
+    // frame written into it — a full pyramid of render passes per video plane
+    // per frame, which is most of what a moving card was costing. Level 0 is
+    // the only level a card in frame reads anyway; the price is aliasing on one
+    // shrunk far into the distance, which is the case a video card is least
+    // often in.
+    const mipLevelCount = inst.dynamicTexture ? 1 : Math.floor(Math.log2(Math.max(width, height))) + 1
     const texture = this.device.createTexture({
       label: `texture: ${cacheKey}`,
       size: [width, height],
