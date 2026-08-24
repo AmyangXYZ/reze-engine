@@ -112,3 +112,23 @@ test("a scene of four effects sharing two bones allocates two slots", () => {
   assert.deepEqual(t.alias, [[0], [1], [0, 1], []])
   assert.equal(t.dropped.length, 0)
 })
+
+test("an effect that declares no @anchor maps every slot to -1", () => {
+  // rzAnchor() guards on `g < 0`, so an unmapped slot is what makes .valid
+  // false — the documented behaviour for a bone this rig does not have.
+  //
+  // This used to fall through to the identity branch, because [].every() is
+  // true: an effect with no @anchor calling rzAnchor(c, 0) got slot 0 of the
+  // SCENE's table, i.e. whichever bone the first effect that DID declare one
+  // happened to name. Alone in a scene it read a zeroed buffer and looked
+  // right; add a second effect and it silently anchored to that effect's wrist.
+  const wgsl = anchorAliasWgsl([])
+  assert.match(wgsl, /fn _rzSlot\(/, "must still define the helper every module references")
+  assert.match(wgsl, /return -1/, "no declaration means no slot, not slot 0")
+  assert.doesNotMatch(wgsl, /return local/, "the identity mapping reads another effect's table")
+})
+
+test("an effect that owns its table still gets the identity mapping", () => {
+  // The cheap path is worth keeping: with one effect this folds to `return local`.
+  assert.match(anchorAliasWgsl([0, 1, 2]), /return local/)
+})

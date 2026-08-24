@@ -127,6 +127,23 @@ ${cases}
  * folds away.
  */
 export function anchorAliasWgsl(alias: number[]): string {
+  // NO @anchor AT ALL. Every slot is unmapped, and rzAnchor() must report
+  // .valid false for all of them.
+  //
+  // This used to fall through to the identity branch below — `[].every()` is
+  // true — so an effect that declared no bone and called rzAnchor(c, 0) got
+  // slot 0 of the SCENE's table: whichever bone the first effect that did
+  // declare one happened to name. Alone in a scene it read a zeroed buffer and
+  // looked correct; add a second effect and it silently anchored to that
+  // effect's wrist. Cross-effect bleed, and invisible from the file you were
+  // reading.
+  if (alias.length === 0) {
+    return `
+/** No @anchor in this effect: every slot is unmapped, so rzAnchor() is invalid
+ *  rather than reading whichever bone another effect declared first. */
+fn _rzSlot(local: i32) -> i32 { return -1; }
+`
+  }
   const identity = alias.every((g, i) => g === i)
   if (identity) {
     return `

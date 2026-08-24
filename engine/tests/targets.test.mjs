@@ -489,3 +489,37 @@ test("the camera scene pass issues at most one executeBundles, with nothing dire
     "the camera transparent phase must be drawn directly, not replayed from a bundle",
   )
 })
+
+test("every render target handleResize replaces is released first", () => {
+  // WebGPU does not free a texture when its last JS reference drops — it waits
+  // for GC, which cannot see that a small object owns a 253 MB MSAA attachment.
+  //
+  // A video export is what made this bite: it resizes UP to the output size and
+  // back DOWN on the way out, so one 4K render orphaned the whole target set
+  // twice — roughly 1.3 GB of GPU memory per export, held until GC felt like
+  // it. Several exports into a session the tab is starved, and the symptom is
+  // "the browser got slow and reloading is hard", which points at everything
+  // except a texture nobody destroyed.
+  //
+  // idTexture and the five mirror targets already did this. These seven did not.
+  const at = engine.indexOf("private handleResize()")
+  assert.ok(at > 0, "handleResize not found")
+  const body = engine.slice(at, engine.indexOf("\n  private ", at + 10))
+  for (const name of [
+    "multisampleTexture",
+    "hdrResolveTexture",
+    "multisampleMaskTexture",
+    "maskResolveTexture",
+    "bloomDownTexture",
+    "bloomUpTexture",
+    "depthTexture",
+  ]) {
+    const assign = body.indexOf(`this.${name} = this.device.createTexture(`)
+    assert.ok(assign > 0, `${name} is not allocated in handleResize`)
+    assert.match(
+      body.slice(Math.max(0, assign - 200), assign),
+      new RegExp(`this\\.${name}\\?\\.destroy\\(\\)`),
+      `${name} is replaced without releasing the one it replaces`,
+    )
+  }
+})

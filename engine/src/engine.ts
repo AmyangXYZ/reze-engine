@@ -5907,6 +5907,21 @@ export class Engine {
       // refresh on resize or effects aspect-correct against the stale size.
       if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
 
+      // RELEASED BEFORE REPLACING. WebGPU does not free a texture when the last
+      // JS reference drops — it waits for GC, which has no idea a 130 MB MSAA
+      // target is riding on a small object. The id and mirror targets below
+      // already did this; the seven main scene targets did not, so every resize
+      // orphaned the whole set.
+      //
+      // A video export is what made it hurt: it resizes UP to the output size
+      // and back DOWN on the way out, so one 4K render orphaned roughly a third
+      // of a gigabyte, twice. A few exports in one session and the tab is
+      // starved — slow, then slow to reload.
+      //
+      // destroy() is safe against work already submitted: the implementation
+      // defers the free until the GPU is done. What it forbids is USING a
+      // destroyed texture in a new command, and every view is rebuilt below.
+      this.multisampleTexture?.destroy()
       this.multisampleTexture = this.device.createTexture({
         label: "multisample HDR render target",
         size: [width, height],
@@ -5915,6 +5930,7 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
 
+      this.hdrResolveTexture?.destroy()
       this.hdrResolveTexture = this.device.createTexture({
         label: "HDR resolve target",
         size: [width, height],
@@ -5929,6 +5945,7 @@ export class Engine {
 
       // Bloom-mask MRT attachments — same dims + MSAA as HDR so they share the render pass.
       // MS buffer gets resolved into maskResolveTexture, which the bloom blit pass samples.
+      this.multisampleMaskTexture?.destroy()
       this.multisampleMaskTexture = this.device.createTexture({
         label: "multisample bloom mask",
         size: [width, height],
@@ -5936,6 +5953,7 @@ export class Engine {
         format: Engine.BLOOM_MASK_FORMAT,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       })
+      this.maskResolveTexture?.destroy()
       this.maskResolveTexture = this.device.createTexture({
         label: "bloom mask resolve",
         size: [width, height],
@@ -6078,6 +6096,7 @@ export class Engine {
       const bh = Math.max(1, Math.floor(height / 2))
       const shortSide = Math.max(1, Math.min(bw, bh))
       this.bloomMipCount = Math.max(1, Math.min(Engine.BLOOM_MAX_LEVELS, Math.floor(Math.log2(shortSide)) - 1))
+      this.bloomDownTexture?.destroy()
       this.bloomDownTexture = this.device.createTexture({
         label: "bloom down pyramid",
         size: [bw, bh],
@@ -6085,6 +6104,7 @@ export class Engine {
         format: this.hdrFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
+      this.bloomUpTexture?.destroy()
       this.bloomUpTexture = this.device.createTexture({
         label: "bloom up pyramid",
         size: [bw, bh],
@@ -6102,6 +6122,7 @@ export class Engine {
         this.bloomUpMipViews.push(this.bloomUpTexture.createView({ baseMipLevel: i, mipLevelCount: 1 }))
       }
 
+      this.depthTexture?.destroy()
       this.depthTexture = this.device.createTexture({
         label: "depth texture",
         size: [width, height],
