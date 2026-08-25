@@ -4,6 +4,7 @@ import Header from "@/components/header"
 import { Engine, EngineStats, LocomotionController, Model, Vec3, type StrafeClipEntry } from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
+import { ASSETS } from "@/lib/assets"
 
 const VMD_ROOT = "/unity-fbx-locomotion"
 const VMD_BASE = `${VMD_ROOT}/vmd`
@@ -13,7 +14,7 @@ const VMD_BASE = `${VMD_ROOT}/vmd`
 // pack's authored root speeds at that conversion's scale.
 const PLAYER = {
   id: "thoth",
-  pmx: "/models/托特/托特.pmx",
+  pmx: `${ASSETS}/models/托特/托特.pmx`,
   vmdDir: VMD_BASE,
   runSpeed: 62.7,
   sprintSpeed: 86.3,
@@ -21,7 +22,7 @@ const PLAYER = {
 const COMPANIONS = [
   {
     id: "izanami",
-    pmx: "/models/深空之眼—伊邪那美「初雪千华」/伊邪那美誓约2.0.pmx",
+    pmx: `${ASSETS}/models/深空之眼—伊邪那美「初雪千华」/伊邪那美誓约2.0.pmx`,
     vmdDir: `${VMD_ROOT}/vmd-izanami`,
     runSpeed: 61.3,
     sprintSpeed: 84.5,
@@ -30,7 +31,7 @@ const COMPANIONS = [
   },
   {
     id: "skuld",
-    pmx: "/models/深空之眼—诗蔻蒂/诗蔻蒂3.0.pmx",
+    pmx: `${ASSETS}/models/深空之眼—诗蔻蒂/诗蔻蒂3.0.pmx`,
     vmdDir: `${VMD_ROOT}/vmd-skuld`,
     runSpeed: 61.7,
     sprintSpeed: 85.0,
@@ -198,7 +199,7 @@ export default function Home() {
   // loading on one) triggers the actual buffering — so pressing dance starts
   // sound with the motion instead of paying a 3MB fetch mid-dance.
   const danceAudio = () => {
-    const a = new Audio("/audios/One More Last Time.m4a") // AAC: a third of the WAV, same song
+    const a = new Audio(`${ASSETS}/audios/One More Last Time.m4a`) // AAC: a third of the WAV, same song
     a.preload = "auto"
     return a
   }
@@ -449,7 +450,7 @@ export default function Home() {
         model.loadVmd("idle", `${PLAYER.vmdDir}/Idle.vmd`),
         model.loadVmd("run", `${PLAYER.vmdDir}/Run_Lfoot.vmd`),
         model.loadVmd("sprint", `${PLAYER.vmdDir}/Sprint_Lfoot.vmd`),
-        model.loadVmd("dance", "/animations/One More Last Time.vmd"),
+        model.loadVmd("dance", `${ASSETS}/animations/One More Last Time.vmd`),
         ...[...STRAFE_RUN, ...STRAFE_SPRINT].map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
         ...STOP_CLIPS.map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
       ])
@@ -482,7 +483,7 @@ export default function Home() {
             m.loadVmd("idle", `${def.vmdDir}/Idle.vmd`),
             m.loadVmd("run", `${def.vmdDir}/Run_Lfoot.vmd`),
             m.loadVmd("sprint", `${def.vmdDir}/Sprint_Lfoot.vmd`),
-            m.loadVmd("dance", "/animations/One More Last Time.vmd"),
+            m.loadVmd("dance", `${ASSETS}/animations/One More Last Time.vmd`),
           ])
           const c = new LocomotionController(
             m,

@@ -1,6 +1,7 @@
 import { Vec3 } from "../lib/math"
 import { Camera } from "../lib/camera"
 import modelData from "../model.json"
+import { ASSETS } from "@/lib/assets"
 
 interface Model {
   vertices: Float32Array
@@ -253,7 +254,7 @@ export class EngineV3_2 {
         textureIndices.add(material.diffuseTextureIndex)
       }
     }
-    const textureDir = "/models/塞尔凯特"
+    const textureDir = `${ASSETS}/models/塞尔凯特`
     // Load all textures referenced by materials
     const textureLoadPromises = Array.from(textureIndices).map(async (textureIndex) => {
       const texturePath = `${textureDir}/${this.model.textures[textureIndex].path}`
