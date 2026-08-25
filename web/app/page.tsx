@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import Loading from "@/components/loading"
 import { ASSETS } from "@/lib/assets"
 
-const VMD_ROOT = "/unity-fbx-locomotion"
+const VMD_ROOT = `${ASSETS}/unity-fbx-locomotion`
 const VMD_BASE = `${VMD_ROOT}/vmd`
 
 // ai同屏连携: the player character plus two AI companions in follow formation.
