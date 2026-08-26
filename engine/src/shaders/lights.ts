@@ -29,6 +29,7 @@ import { audioApi } from "./audio-api"
 import { midiApi } from "./midi-api"
 import { lyricsApi } from "./lyrics-api"
 import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
+import { idApi } from "./id-api"
 
 /** Floats before the first record. One is the count; the rest keep the records
  *  vec4-aligned, which is what lets a future pass read them as vec4s. */
@@ -157,6 +158,9 @@ ${clockApi("_rzLightU.x", "0.0")}
 // and viewU[6].w have the same source.
 ${viewportApi("viewU[6].w")}
 ${trailSlotsApi(cast.trailCount)}
+// The id accessors, stubbed: this module cannot read an attachment the
+// scene pass writes. See id-api.ts — the author's whole file compiles here.
+${idApi(false, 0, 0)}
 ${wgsl}
 
 @compute @workgroup_size(64)

@@ -79,8 +79,6 @@ const EXCEPTIONS = {
   rzGridTexel: "same",
   rzGridFrame: "same",
   // The id attachment exists only where the scene pass wrote it.
-  rzObjectAt: "reads the id attachment, which only the field module binds",
-  rzMaterialAt: "same",
   rzFieldMerge: "composites the two field layers; nothing else has them",
   // The particle and trail modules keep a camera STRUCT rather than the view
   // uniform, so anything derived from the full uniform is missing there. The

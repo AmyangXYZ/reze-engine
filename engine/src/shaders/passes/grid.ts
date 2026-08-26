@@ -5,6 +5,7 @@ import { midiApi } from "../midi-api"
 import { EFFECT_SCENE_API } from "./composite"
 import { type CastLayout } from "./particles"
 import { clockApi, trailSlotsApi, viewportApi } from "./hosted-api"
+import { idApi } from "../id-api"
 
 // A persistent grid an effect can step and read: the one thing an effect could
 // not have before, which is MEMORY.
@@ -150,6 +151,9 @@ fn rzGridPrev(uv: vec2f) -> vec4f {
     /* wgsl */ `
 fn rzGrid(uv: vec2f) -> vec4f { return rzGridPrev(uv); }
 ` +
+    // Stubbed: this module cannot read an attachment the scene pass writes — see
+    // id-api.ts. The author's whole file compiles here, so the names must exist.
+    idApi(false, 0, 0) +
     "\n// ── user effect (setEffect) ──\n" +
     wgsl +
     /* wgsl */ `

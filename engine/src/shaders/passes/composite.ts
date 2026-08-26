@@ -4,6 +4,7 @@ import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
+import { idApi } from "../id-api"
 import { lyricsApi, lyricsTextApi } from "../lyrics-api"
 import { midiApi } from "../midi-api"
 import { gridReadApi } from "./grid"
@@ -643,50 +644,6 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
  * read — so an effect cannot tell it moved; it is simply asked half as often
  * in each direction.
  */
-/**
- * Reading the scene's id attachment from a field effect — the consumer the MRT
- * work exists for.
- *
- * A field effect covers the whole screen and has no idea what it is drawing
- * over. These make it addressable: mask a glow to one character, dissolve one
- * material, outline the thing someone selected. Without them the id buffer is
- * written every frame and read by nobody.
- *
- * MULTISAMPLED AND UNRESOLVED, so it is read the way it is written —
- * textureLoad of sample 0, the same rule linearDepth already follows. An
- * averaged id belongs to nothing.
- *
- * When ids are OFF the buffer does not exist, so the accessors are still
- * DECLARED and answer 0 — the reserved nothing. An effect that masks by id then
- * masks nothing at all, which is a scene that renders rather than a shader that
- * will not compile.
- */
-function idApi(on: boolean, group: number, binding: number): string {
-  if (!on) {
-    return /* wgsl */ `
-fn rzObjectAt(uv: vec2f) -> u32 { return 0u; }
-fn rzMaterialAt(uv: vec2f) -> u32 { return 0u; }
-`
-  }
-  return /* wgsl */ `
-@group(${group}) @binding(${binding}) var _rzIdTex: texture_multisampled_2d<u32>;
-
-/** Which OBJECT drew this pixel — compare against rzSubjectId(i). 0 = nothing. */
-fn rzObjectAt(uv: vec2f) -> u32 {
-  let sz = vec2f(textureDimensions(_rzIdTex));
-  let p = vec2<i32>(clamp(uv, vec2f(0.0), vec2f(1.0)) * sz);
-  return textureLoad(_rzIdTex, clamp(p, vec2<i32>(0), vec2<i32>(sz) - vec2<i32>(1)), 0).y;
-}
-
-/** Which MATERIAL drew it, within that object. 0 = nothing. */
-fn rzMaterialAt(uv: vec2f) -> u32 {
-  let sz = vec2f(textureDimensions(_rzIdTex));
-  let p = vec2<i32>(clamp(uv, vec2f(0.0), vec2f(1.0)) * sz);
-  return textureLoad(_rzIdTex, clamp(p, vec2<i32>(0), vec2<i32>(sz) - vec2<i32>(1)), 0).x;
-}
-`
-}
-
 export function buildFieldShader(effect: CompositeEffectSource): string {
   const bgLine = effect.hasBackground
     ? "out.bg = clamp(background(dir, uv, _rzFieldClock.x), vec4f(0.0), vec4f(1.0));"

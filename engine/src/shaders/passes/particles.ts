@@ -6,6 +6,7 @@ import { midiApi } from "../midi-api"
 import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
+import { idApi } from "../id-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
 // Its own shader MODULE rather than more source spliced into composite.ts, for
@@ -173,6 +174,9 @@ export function buildParticleComputeShader(src: ParticleSource, cast: CastLayout
     midiApi(0, 5) +
     lyricsApi(0, 6) +
     PRELUDE +
+    // Stubbed: this module cannot read an attachment the scene pass writes — see
+    // id-api.ts. The author's whole file compiles here, so the names must exist.
+    idApi(false, 0, 0) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `
@@ -232,6 +236,9 @@ override ADDITIVE: bool = ${src.blend === "additive" ? "true" : "false"};\n` +
     midiApi(0, 5) +
     lyricsApi(0, 6) +
     PRELUDE +
+    // Stubbed: this module cannot read an attachment the scene pass writes — see
+    // id-api.ts. The author's whole file compiles here, so the names must exist.
+    idApi(false, 0, 0) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `
