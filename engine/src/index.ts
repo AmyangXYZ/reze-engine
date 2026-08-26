@@ -26,7 +26,8 @@ export {
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export { parseMidi } from "./midi-loader"
 // Radiance .hdr, for HDRI worlds — the host fetches the file and hands the
-// parsed image to setBackdropEquirect.
+// parsed image to setWorldEquirect. Not setBackdropEquirect: that one is the
+// 360 picture you SEE, and an HDRI is what LIGHTS the scene.
 export { parseHDR, type HdrImage } from "./hdr"
 // Lyrics timing (.lrc) — the host parses the file and hands the lines to setLyrics.
 export { LYRIC_ATLAS_MAX_H, LYRIC_ATLAS_MAX_W, parseLRC, type LyricLine, type LyricRect } from "./shaders/lyrics-api"

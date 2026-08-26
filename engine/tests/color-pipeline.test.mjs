@@ -20,6 +20,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 
 // ── The scene pass's blend equations, from scene-contract's classes ──────────
 
@@ -235,4 +236,32 @@ test("AgX desaturates saturated colour — why field effects stay in display spa
   // And dimming does not rescue it — the hue loss is the transform's, not a
   // matter of exposure.
   assert.ok(saturation(agx(glow.map((c) => c * 0.5))) < 0.6, "still washed at half the magnitude")
+})
+
+test("the world and the backdrop are separate seats", () => {
+  // WHAT LIGHTS and WHAT YOU SEE are different questions, and they shared one
+  // slot — so lighting with a studio HDRI while showing a different sky could
+  // not be said at all. Pinned as source: there is no device here to install
+  // an equirect on, and the rules below are decisions rather than pixels.
+  const src = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
+  const body = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "")
+
+  // Two installers, each owning one question.
+  assert.match(body, /setWorldEquirect\(source: HdrImage \| null/)
+  assert.match(body, /setBackdropEquirect\(\s*source: ImageBitmap \| HTMLImageElement \| HTMLCanvasElement \| null/)
+  // The backdrop no longer takes an HDR — a picture that silently changed the
+  // lighting because of its file extension is the surprise this removes.
+  const bd = body.slice(body.indexOf("setBackdropEquirect(source"))
+  assert.doesNotMatch(bd.slice(0, 2000), /projectIrradianceSH/)
+
+  // Only the world projects irradiance, and only it carries the strength dial.
+  const wd = body.slice(body.indexOf("setWorldEquirect(source"), body.indexOf("setBackdropEquirect(source"))
+  assert.match(wd, /this\.worldSH = projectIrradianceSH/)
+  assert.match(wd, /this\.worldStrength = Math\.max\(options\?\.strength \?\? 1, 0\)/)
+
+  // THE BACKDROP WINS WHAT YOU SEE; the world lights regardless. With only a
+  // world installed it is also the sky, which is what an HDRI alone always did.
+  assert.match(body, /const showingWorld = this\.backdropEquirectView === null && this\.worldEquirectView !== null/)
+  assert.match(body, /u\[11\] = this\.backdropEquirectView \? 2 : showingWorld \? 3 : bg \? 1 : 0/)
+  assert.match(body, /binding: 6, resource: this\.backdropEquirectView \?\? this\.worldEquirectView \?\? this\.fallbackEquirectView/)
 })

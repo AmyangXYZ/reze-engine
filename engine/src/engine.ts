@@ -1894,8 +1894,21 @@ export class Engine {
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
   private backdropEquirectTexture: GPUTexture | null = null
   private backdropEquirectView: GPUTextureView | null = null
-  private backdropEquirectHDR = false
-  private backdropStrength = 1
+  /**
+   * The HDRI WORLD — what lights the scene, and what you see when nothing else
+   * is behind it.
+   *
+   * Separate from the backdrop because they answer different questions. An
+   * HDRI is a measurement of light: it drives the ambient term through
+   * `worldSH` whether or not it is the thing on screen. A 360 picture is
+   * wallpaper: it is what you see and it lights nothing. They shared one slot
+   * and so were mutually exclusive, which made "light her with a studio HDRI
+   * and put a different sky behind her" impossible to say — the ordinary split
+   * every renderer draws between a world and a film backdrop.
+   */
+  private worldEquirectTexture: GPUTexture | null = null
+  private worldEquirectView: GPUTextureView | null = null
+  private worldStrength = 1
   /** The installed HDRI's folded irradiance SH (27 floats), or null. */
   private worldSH: Float32Array | null = null
   private fallbackEquirectTexture!: GPUTexture
@@ -2273,13 +2286,17 @@ export class Engine {
     // In modes 2 and 3 the colour slot is dead, so mode 3 carries the world
     // STRENGTH in u[8] — Blender's world-strength dial, default 1.
     const bg = this.backgroundColor
-    u[8] = this.backdropEquirectHDR ? this.backdropStrength : (bg?.x ?? 0)
+    // THE BACKDROP WINS WHAT YOU SEE; the world lights regardless. With only a
+    // world installed it is also the sky, which is what an HDRI alone has
+    // always done.
+    const showingWorld = this.backdropEquirectView === null && this.worldEquirectView !== null
+    u[8] = showingWorld ? this.worldStrength : (bg?.x ?? 0)
     u[9] = bg?.y ?? 0
     u[10] = bg?.z ?? 0
     // Base-layer mode only. A user effect is a separate LAYER over whichever
     // base is active, and needs no flag of its own: the composite pipeline is
     // rebuilt per effect, so the compiled variant IS the flag.
-    u[11] = this.backdropEquirectView ? (this.backdropEquirectHDR ? 3 : 2) : bg ? 1 : 0
+    u[11] = this.backdropEquirectView ? 2 : showingWorld ? 3 : bg ? 1 : 0
     // Which display transform forms the frame (see viewTransform in composite.ts).
     u[25] = v.transform === "agx" ? 2 : v.transform === "standard" ? 1 : 0
     u[26] = this.canvas.width
@@ -2728,7 +2745,10 @@ export class Engine {
         { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
         { binding: 4, resource: this.maskResolveView },
         { binding: 5, resource: this.filmicLutView },
-        { binding: 6, resource: this.backdropEquirectView ?? this.fallbackEquirectView },
+        // Whichever equirect is SHOWING — the backdrop if there is one, the
+        // world otherwise. The world's light does not come through here; it
+        // rides worldSH into the material shells.
+        { binding: 6, resource: this.backdropEquirectView ?? this.worldEquirectView ?? this.fallbackEquirectView },
         { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
@@ -2913,27 +2933,29 @@ export class Engine {
    * affects lighting, bloom, or tonemapping. Pass null to remove (the background
    * color, or transparency, takes over again).
    */
-  setBackdropEquirect(
-    source: ImageBitmap | HTMLImageElement | HTMLCanvasElement | HdrImage | null,
-    options?: {
-      /** World strength for an HDR source, Blender's dial. Default 1. */
-      strength?: number
-    },
-  ): void {
-    this.backdropEquirectTexture?.destroy()
-    this.backdropEquirectTexture = null
-    this.backdropEquirectView = null
-    this.backdropEquirectHDR = false
-    this.backdropStrength = Math.max(options?.strength ?? 1, 0)
+  /**
+   * The HDRI world: what LIGHTS the scene.
+   *
+   * Its irradiance goes to the world seat as spherical harmonics, so it lights
+   * whether or not it is the thing you see — and it IS the thing you see until
+   * a backdrop is set, which is what an HDRI on its own has always done.
+   *
+   * `strength` is Blender's world-strength dial and is folded into the
+   * coefficients, so what lights her is what you see.
+   */
+  setWorldEquirect(source: HdrImage | null, options?: { strength?: number }): void {
+    this.worldEquirectTexture?.destroy()
+    this.worldEquirectTexture = null
+    this.worldEquirectView = null
+    this.worldStrength = Math.max(options?.strength ?? 1, 0)
     const hadSH = this.worldSH !== null
     this.worldSH = null
-    if (source && "data" in source) {
-      if (!this.device) return
-      // An HDRI (parseHDR's output): scene-linear radiance in rgba16float. It
-      // rides the SAME slot as the LDR path — one backdrop, two ingestions —
-      // and the composite treats it as light rather than wallpaper (mode 3).
+    if (source && this.device) {
+      // Scene-linear radiance in rgba16float. The composite treats it as light
+      // rather than wallpaper (mode 3) — a sun in it rolls off like a sun,
+      // through the same exposure and view transform as the scene.
       const tex = this.device.createTexture({
-        label: "backdrop equirect (HDR)",
+        label: "world equirect (HDR)",
         size: [source.width, source.height],
         format: "rgba16float",
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
@@ -2944,28 +2966,42 @@ export class Engine {
         { bytesPerRow: source.width * 8, rowsPerImage: source.height },
         [source.width, source.height],
       )
-      this.backdropEquirectTexture = tex
-      this.backdropEquirectView = tex.createView()
-      this.backdropEquirectHDR = true
-      // The sky LIGHTS the scene, not only backs it: fold its irradiance to
-      // SH (display strength included, so what you see is what lights her)
-      // and hand it to the world seat. The sun keeps the toon ramp — this is
-      // the ambient term, exactly where the flat world colour used to sit.
+      this.worldEquirectTexture = tex
+      this.worldEquirectView = tex.createView()
+      // The sky lights the scene, not only backs it. The sun keeps the toon
+      // ramp — this is the ambient term, exactly where the flat world colour
+      // used to sit.
       this.worldSH = projectIrradianceSH({ ...source, data: source.data }, 4)
-      if (this.backdropStrength !== 1) {
-        for (let i = 0; i < this.worldSH.length; i++) this.worldSH[i] *= this.backdropStrength
+      if (this.worldStrength !== 1) {
+        for (let i = 0; i < this.worldSH.length; i++) this.worldSH[i] *= this.worldStrength
       }
-      this.writeWorld()
-      this.rebuildCompositeBindGroup()
-      if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
-      return
     }
-    if (hadSH) this.writeWorld()
-    if (source && !("data" in source) && this.device) {
+    if (this.worldSH || hadSH) this.writeWorld()
+    this.rebuildCompositeBindGroup()
+    if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
+  /**
+   * The 360 backdrop: what you SEE behind the scene.
+   *
+   * Wallpaper, and only wallpaper — it lights nothing. An HDRI belongs in
+   * setWorldEquirect, which is why this no longer takes one: the two shared a
+   * slot and were therefore mutually exclusive, and a picture that silently
+   * changed the lighting because of its file format was a surprise nobody
+   * asked for.
+   *
+   * Set alongside a world and this is what shows while the world goes on
+   * lighting. Cleared, the world's own sky comes back.
+   */
+  setBackdropEquirect(source: ImageBitmap | HTMLImageElement | HTMLCanvasElement | null): void {
+    this.backdropEquirectTexture?.destroy()
+    this.backdropEquirectTexture = null
+    this.backdropEquirectView = null
+    if (source && this.device) {
       let width = Math.max(1, "naturalWidth" in source ? source.naturalWidth : source.width)
       let height = Math.max(1, "naturalHeight" in source ? source.naturalHeight : source.height)
       let upload: ImageBitmap | HTMLImageElement | HTMLCanvasElement | OffscreenCanvas = source
-      // Panoramas routinely exceed maxTextureDimension2D (e.g. 10000×5000 vs the
+      // Panoramas routinely exceed maxTextureDimension2D (e.g. 10000x5000 vs the
       // default 8192) — quietly downscale to fit rather than surfacing an error.
       const limit = this.device.limits.maxTextureDimension2D
       if (width > limit || height > limit) {
