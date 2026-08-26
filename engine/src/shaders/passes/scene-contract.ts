@@ -86,7 +86,7 @@ type SceneRenderClass =
   | "outline"
   /** Particles and ribbons in their default, non-additive mode. */
   | "particle"
-  /** Particles declaring `// @blend additive` — LIGHT rather than matter, so
+  /** Particles declaring `#blend additive` — LIGHT rather than matter, so
    *  colour sums and alpha is left alone: a glow must not claim coverage it
    *  never occluded. The aux target sums with it, which is what lets an
    *  additive effect reach the bloom gate at all. */

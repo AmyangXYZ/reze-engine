@@ -12,13 +12,13 @@
 // pass drew. A test asserting the composite calls background() was asserting the
 // old architecture, and stayed red for it.
 
+import { parseDirectives } from "../dist/shaders/directives.js"
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   buildCompositeShader,
   buildFieldShader,
   COMPOSITE_SHADER_WGSL,
-  parseEffectAnchors,
 } from "../dist/shaders/passes/composite.js"
 
 const BACKGROUND = "fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f { return vec4f(0.0); }"
@@ -175,29 +175,29 @@ test("the rz* API is what the aliases delegate to", () => {
   assert.match(src, /fn bgSubjectPos\(i: i32\) -> vec3f \{ return rzSubjectHip\(i\); \}/)
 })
 
-// The pragma is a CONTRACT with effect authors: slot N is the Nth declaration.
-// Anything that quietly adds or drops one shifts every slot after it, so an
-// effect that was reading a hand starts reading a head.
-test("@anchor declares slots in order, and only at the start of a line", () => {
+// The directive is a CONTRACT with effect authors: slot N is the Nth
+// declaration. Anything that quietly adds or drops one shifts every slot after
+// it, so an effect that was reading a hand starts reading a head.
+test("#anchor declares slots in order, and only when the line is one", () => {
   const src = [
-    "// @anchor 左手首 trail",
-    "  //  @anchor 頭",
-    "// mentioning @anchor 右手首 mid-sentence must not add a slot",
+    "#anchor 左手首 trail",
+    "  #anchor 頭 — she nods on the chorus",
+    "// mentioning #anchor 右手首 in prose must not add a slot",
     "fn foreground(r: vec3f, uv: vec2f, t: f32, d: f32) -> vec4f {",
-    "  // @anchor 右足ＩＫ",
+    "  #anchor 右足ＩＫ",
     "  return vec4f(0.0);",
     "}",
   ].join("\n")
-  assert.deepEqual(parseEffectAnchors(src, 8), [
+  assert.deepEqual(parseDirectives(src).directives.anchors.slice(0, 8), [
     { bone: "左手首", trail: true },
     { bone: "頭", trail: false },
     { bone: "右足ＩＫ", trail: false },
   ])
   // Past the cap the extras are dropped, never wrapped: the slots that DID fit
   // keep the meaning the author gave them.
-  assert.deepEqual(parseEffectAnchors(src, 2), [
+  assert.deepEqual(parseDirectives(src).directives.anchors.slice(0, 2), [
     { bone: "左手首", trail: true },
     { bone: "頭", trail: false },
   ])
-  assert.deepEqual(parseEffectAnchors("fn background() {}", 8), [])
+  assert.deepEqual(parseDirectives("fn background() {}").directives.anchors.slice(0, 8), [])
 })

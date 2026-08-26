@@ -136,19 +136,3 @@ test("a card draws in the opaque phase, before the ground", () => {
   assert.match(engine, /const type: DrawCallType = inst\.isPlane \? "opaque"/)
 })
 
-test("every directive the shipped effects use is one the engine knows", () => {
-  // The warning exists because a directive that fails to parse is SILENT — it
-  // cost three effects their resolution and a fourth its blend mode. A list
-  // missing a real directive inverts that: a false alarm on a working line
-  // teaches authors to ignore the channel, which is worse than no channel.
-  const at = engine.indexOf("private static readonly KNOWN = new Set([")
-  const known = new Set([...engine.slice(at, engine.indexOf("])", at)).matchAll(/"(@[a-z]+)"/g)].map((m) => m[1]))
-  // Everything the effects library ships with, as of the pragma repair.
-  for (const tag of [
-    "@anchor", "@layer", "@blend", "@bloom", "@lights",
-    "@grid", "@particles", "@halfres", "@fullres", "@dissolve",
-  ]) {
-    assert.ok(known.has(tag), `${tag} is in use and would be warned about as unknown`)
-  }
-  assert.ok(!known.has("@param"), "@param is not a directive — params come from the host")
-})

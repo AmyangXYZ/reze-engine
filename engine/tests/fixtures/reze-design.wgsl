@@ -1,4 +1,4 @@
-// @fullres — this effect draws scanlines and glyph edges: sub-pixel detail the half-res field
+// this effect draws scanlines and glyph edges: sub-pixel detail the half-res field
 // pass cannot carry, so it opts out and pays its own full price.
 // Tunables — edit and ⌘⏎.
 const NEON_COLOR = vec3f(0.96, 0.45, 0.71);  // tube color (brand pink)

@@ -1,4 +1,4 @@
-// @fullres — glyph edges are sub-pixel detail the half-res field pass cannot carry.
+// glyph edges are sub-pixel detail the half-res field pass cannot carry.
 //
 // The maker's mark: REZE DESIGN with 黯灭小羊 beneath it, one neon sign. The
 // title row is the shipped REZE DESIGN lettering; the handle row is the four

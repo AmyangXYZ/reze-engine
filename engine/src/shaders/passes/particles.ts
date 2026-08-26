@@ -102,6 +102,11 @@ struct ParticleU {
   dt: f32,
   count: u32,
   frame: u32,
+  /** The effect's evaluated influence, applied at the one output site below. */
+  weight: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 }
 `
 
@@ -133,26 +138,6 @@ fn rzProject(p: vec3f) -> vec3f {
 }
 fn rzCamPos() -> vec3f { return cam.camPos; }
 `
-
-/** `// @particles 4096` — how many live at once. */
-export function parseParticleCount(wgsl: string, max: number): number {
-  const m = /^\s*\/\/\s*@particles\s+(\d+)\s*$/m.exec(wgsl)
-  if (!m) return 0
-  // Clamped rather than rejected: an author asking for a million gets the most
-  // the engine will give and a scene that still runs, which is a better failure
-  // than a compile error naming a number they had no way to know.
-  return Math.max(1, Math.min(max, parseInt(m[1], 10)))
-}
-
-/** `// @bloom` — opt in to the bloom pyramid. Sparks want it; rain does not. */
-export function parseParticleBloom(wgsl: string): boolean {
-  return /^\s*\/\/\s*@bloom\s*$/m.test(wgsl)
-}
-
-/** `// @blend additive` — default is straight alpha. */
-export function parseParticleBlend(wgsl: string): ParticleBlend {
-  return /^\s*\/\/\s*@blend\s+additive\s*$/m.test(wgsl) ? "additive" : "alpha"
-}
 
 /** Does the source define the particle contract? All three are required together. */
 export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean } {
@@ -316,7 +301,16 @@ ${sceneIdFieldWgsl()}}
 @fragment
 fn fs(in: VSOut) -> FSOut {
   let p = particles[in.id];
-  let c = particleShade(p, in.uv);
+  // WEIGHT IS APPLIED HERE, on the author's result, before anything reads it.
+  //
+  // Alpha alone, and that is not a shortcut: this fragment is premultiplied
+  // two lines down, so scaling alpha scales the colour with it — and where the
+  // target blends additively the premultiply is what carries the fade. One
+  // multiply is the correct fade for both particle targets.
+  var c = particleShade(p, in.uv);
+  c.a *= pu.weight;
+  // Weight 0 therefore discards every fragment, so an effect faded out costs
+  // nothing past the vertex stage even on the frame the draw is still issued.
   if (c.a <= 0.0) { discard; }
   var out: FSOut;
   // PREMULTIPLIED: the scene's colour target blends with srcFactor \"one\", so a

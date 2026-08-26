@@ -58,7 +58,7 @@ function contrastRetained(lo, hi) {
   return b - a
 }
 
-// ── What the field layer hands over, per @layer mode ─────────────────────────
+// ── What the field layer hands over, per #layer mode ─────────────────────────
 //
 // The two field blends, verbatim from engine.ts. The additive one is the
 // whole story of the reverted attempt: its ALPHA factors are (zero, one), so

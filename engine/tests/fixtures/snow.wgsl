@@ -1,4 +1,4 @@
-// @particles 8000
+#particles 8000
 
 // Snow — the first effect drawn as geometry rather than marched per pixel.
 //

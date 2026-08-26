@@ -46,7 +46,7 @@ for (const [name, code] of [
   // the cautionary tale: absent from this list, its missing _rzSlot shipped and
   // every gridStep effect failed to install until the WGSL validator caught it.
   ["grid step", buildSimShader("fn gridStep(uv: vec2f) -> vec4f { return vec4f(rzAnchor(0, 0).pos, 0.0); }", 256, { ...cast, trailCount: 0 })],
-  ["light emit", buildLightEmitShader("// @lights 1\nfn lightEmit(i: u32, t: f32) -> RzLight { var l: RzLight; return l; }", EFFECT_SCENE_API + anchorAliasWgsl([0]), { trailCount: 0 })],
+  ["light emit", buildLightEmitShader("#lights 1\nfn lightEmit(i: u32, t: f32) -> RzLight { var l: RzLight; return l; }", EFFECT_SCENE_API + anchorAliasWgsl([0]), { trailCount: 0 })],
 ]) {
   test(`${name}: _rzSlot is defined exactly once wherever it is called`, () => {
     assert.ok(refs(code) > 0, "the accessors should route through the alias — if this fails, the aliasing was removed")
@@ -67,12 +67,12 @@ test("ribbons draw as scene geometry: bloom mask written, no hand-rolled depth",
   const src = buildTrailShader(trailSrc, cast)
   assert.doesNotMatch(src, /textureLoad\(sceneDepth/, "hardware depth replaced the hand-rolled compare")
   assert.match(src, /@location\(1\) aux/, "ribbons must write the scene's aux target")
-  // And the mask is the AUTHOR's call, as it already is for particles: @bloom
+  // And the mask is the AUTHOR's call, as it already is for particles: #bloom
   // opts in. A ribbon that never asked to bloom must not start blooming just
   // because it moved into the scene pass.
-  assert.match(src, /o\.aux = vec4f\(0\.0/, "no @bloom means no bloom mask")
+  assert.match(src, /o\.aux = vec4f\(0\.0/, "no #bloom means no bloom mask")
   const lit = buildTrailShader({ ...trailSrc, bloom: true }, cast)
-  assert.match(lit, /o\.aux = vec4f\(1\.0/, "@bloom is what puts a ribbon through the gate")
+  assert.match(lit, /o\.aux = vec4f\(1\.0/, "#bloom is what puts a ribbon through the gate")
 })
 
 test("a FIELD effect's _rzSlot carries its real alias, not the identity", () => {

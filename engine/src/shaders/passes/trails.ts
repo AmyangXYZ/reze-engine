@@ -132,7 +132,8 @@ struct TrailU {
   // model is added or removed, and recompiling every trail shader for that
   // would be absurd.
   subjects: f32,
-  _pad1: f32,
+  /** The effect's evaluated influence, applied at the one output site below. */
+  weight: f32,
   _pad2: f32,
 }
 @group(0) @binding(0) var<storage, read> _rzCast: array<vec4f>;
@@ -402,15 +403,19 @@ fn fs(in: VSOut) -> TrailFSOut {
   // hardware does it, correctly and for free, and the reversed-Z trap that
   // needed its own regression test goes with it.
   let c = trailShade(in.uv.x, in.uv.y, in.age, in.weight, i32(in.slot));
-  if (c.a <= 0.0) { discard; }
+  // THE EFFECT'S weight, not the ribbon's — in.weight above is the strand's
+  // own taper and belongs to the author. This one is the scheduler's, and it
+  // scales alpha because the target below multiplies colour by src-alpha.
+  let a = c.a * tu.weight;
+  if (a <= 0.0) { discard; }
   var o: TrailFSOut;
   // STRAIGHT colour into an ADDITIVE target, which reverses the old MAX rule
   // deliberately: max existed so parallel strands could not double into bright
   // dashes on a layer composited after tone mapping. In HDR before bloom,
   // overlapping light SHOULD sum — that is what neon does — and the tone
   // mapper is what keeps the sum from clipping.
-  o.color = vec4f(c.rgb, c.a);
-  o.aux = vec4f(${src.bloom ? "1.0" : "0.0"}, 1.0, 0.0, c.a);
+  o.color = vec4f(c.rgb, a);
+  o.aux = vec4f(${src.bloom ? "1.0" : "0.0"}, 1.0, 0.0, a);
 ${sceneIdPadWgsl("o")}  return o;
 }
 `

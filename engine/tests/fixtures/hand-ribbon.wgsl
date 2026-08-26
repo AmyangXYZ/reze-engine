@@ -1,8 +1,8 @@
-// @anchor 左手首 trail
-// @anchor 右手首 trail
-// @particles 320
-// @blend additive
-// @bloom
+#anchor 左手首 trail
+#anchor 右手首 trail
+#particles 320
+#blend additive
+#bloom
 
 // A neon ribbon along the path each hand actually took — with the sparks it
 // sheds living as real GPU particles.
@@ -193,7 +193,7 @@ fn particleShade(p: Particle, uv: vec2f) -> vec4f {
 // One light per wrist, at the anchors the ribbons are already drawn from, so
 // the light is where the band is by construction rather than by a second guess
 // at where her hands are.
-// @lights 2
+#lights 2
 const RIBBON_LIGHT_I = 1.4;   // brightness at the wrist
 const RIBBON_LIGHT_R = 7.0;   // world units — a band lights what it passes,
                               // not the room; this is about an arm's length

@@ -1,7 +1,7 @@
-// @grid 768
-// @fullres
-// @anchor 左足首
-// @anchor 右足首
+#grid 768
+
+#anchor 左足首
+#anchor 右足首
 
 // Dry Ice — David Gallardo (xjorma)'s heightfield fog, ported whole.
 // CC BY-NC-SA 3.0. Common + Buffer A + B/C/D + Image, all four.

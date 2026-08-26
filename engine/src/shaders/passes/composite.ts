@@ -58,13 +58,13 @@ import { gridReadApi } from "./grid"
 /**
  * The bones an effect asked for, in declaration order — the slots rzAnchor reads.
  *
- *     // @anchor 左手首 trail
- *     // @anchor 頭
+ *     #anchor 左手首 trail
+ *     #anchor 頭
  *
  * A declaration in the source, like the mounts: what a file names is what gets
  * resolved and uploaded, so naming none costs nothing and nobody pays for a
  * rig's other five hundred bones. Anchored to the start of a line so that
- * writing the word @anchor in ordinary prose does not silently add a slot —
+ * writing the word #anchor in ordinary prose does not silently add a slot —
  * which would shift every slot after it.
  *
  * `trail` additionally keeps that bone's recent PATH, for rzTrail. Opt-in
@@ -75,7 +75,7 @@ import { gridReadApi } from "./grid"
  * not have simply reports invalid.
  */
 export function parseEffectAnchors(wgsl: string, max: number): { bone: string; trail: boolean }[] {
-  return [...wgsl.matchAll(/^[ \t]*\/\/[ \t]*@anchor[ \t]+(\S+)([ \t]+trail)?[ \t]*$/gm)]
+  return [...wgsl.matchAll(/^[ \t]*\/\/[ \t]*#anchor[ \t]+(\S+)([ \t]+trail)?[ \t]*$/gm)]
     .map((m) => ({ bone: m[1], trail: m[2] !== undefined }))
     .slice(0, max)
 }
@@ -93,7 +93,7 @@ type CompositeEffectSource = {
   hasBackground: boolean
   /** Defines `fn foreground(...)` — mount over the finished frame. */
   hasForeground: boolean
-  /** Grid resolution when the effect declared `// @grid`, else 0. */
+  /** Grid resolution when the effect declared `#grid`, else 0. */
   gridSize: number
   /** Whether the scene pass carries the id attachment, so the field module can
    *  bind it. False emits accessors that answer 0 rather than nothing at all. */
@@ -728,7 +728,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
  * whose lightEmit read its own epoch disagreed with its own background()
  * about what time it was. One buffer per effect, one answer.
  */
-@group(0) @binding(22) var<uniform> _rzFieldClock: vec4f;
+@group(0) @binding(22) var<uniform> _rzFieldClock: vec4f;   // (time, weight, _, _)
 
 @vertex fn fieldVs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let x = f32((vi & 1u) << 2u) - 1.0;
@@ -752,6 +752,13 @@ struct FieldOut {
   out.fg = vec4f(0.0);
   ${bgLine}
   ${fgLine}
+  // WEIGHT, applied where the author cannot decline it.
+  //
+  // Alpha only: both field blends multiply the fragment's colour by src-alpha,
+  // so this is the fade for the alpha-over layer and the additive one alike.
+  // Scaling colour as well would fade as the square.
+  out.bg.a *= _rzFieldClock.y;
+  out.fg.a *= _rzFieldClock.y;
   return out;
 }
 `

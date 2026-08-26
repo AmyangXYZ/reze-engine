@@ -76,7 +76,7 @@ test("ribbon index maps to local anchor slot, skipping untrailed anchors", () =>
   // All-trailed (every library effect today): identity, folds away.
   assert.match(ribbonSlotWgsl([0, 1]), /return ribbon;/)
 
-  // The latent bug: @anchor 頭 (0, no trail) then @anchor 左手首 trail (1).
+  // The latent bug: #anchor 頭 (0, no trail) then #anchor 左手首 trail (1).
   // One ribbon, and it must resolve to anchor slot 1 — as slot 0 it asked 頭
   // for a trail it never recorded and drew nothing at all.
   const mixed = ribbonSlotWgsl([1])
@@ -113,12 +113,12 @@ test("a scene of four effects sharing two bones allocates two slots", () => {
   assert.equal(t.dropped.length, 0)
 })
 
-test("an effect that declares no @anchor maps every slot to -1", () => {
+test("an effect that declares no #anchor maps every slot to -1", () => {
   // rzAnchor() guards on `g < 0`, so an unmapped slot is what makes .valid
   // false — the documented behaviour for a bone this rig does not have.
   //
   // This used to fall through to the identity branch, because [].every() is
-  // true: an effect with no @anchor calling rzAnchor(c, 0) got slot 0 of the
+  // true: an effect with no #anchor calling rzAnchor(c, 0) got slot 0 of the
   // SCENE's table, i.e. whichever bone the first effect that DID declare one
   // happened to name. Alone in a scene it read a zeroed buffer and looked
   // right; add a second effect and it silently anchored to that effect's wrist.

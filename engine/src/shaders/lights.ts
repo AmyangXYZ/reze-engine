@@ -46,21 +46,6 @@ export const MAX_LIGHTS = 16
 export const LIGHTS_FLOATS = LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE
 
 /**
- * `// @lights 3` — how many lights this effect emits.
- *
- * Declared, like every other mount: what the file says is what gets allocated,
- * so an effect that emits none costs no slots and nobody pays for a cap they
- * did not ask for. Clamped rather than rejected, the same choice `@particles`
- * makes — an author asking for a hundred gets the most the engine will give and
- * a scene that still runs.
- */
-export function parseLightCount(wgsl: string, max: number): number {
-  const m = /^\s*\/\/\s*@lights\s+(\d+)\s*$/m.exec(wgsl)
-  if (!m) return 0
-  return Math.max(1, Math.min(max, parseInt(m[1], 10)))
-}
-
-/**
  * The RzLight struct, declared in EVERY module a user's source is spliced into.
  *
  * One effect file goes into every module it has a mount in, so a foreground
@@ -144,8 +129,8 @@ export function buildLightEmitShader(
 // read_write HERE and read-only in the material shaders. Different passes, so
 // the two never coexist: this compute runs before the scene pass that reads it.
 @group(0) @binding(0) var<storage, read_write> _rzLightsOut: array<f32>;
-// (time, base slot, count, _) — see buildLightEmitShader on why the base is
-// here and not in the text.
+// (time, base slot, count, weight) — see buildLightEmitShader on why the base
+// is here and not in the text.
 @group(0) @binding(1) var<uniform> _rzLightU: vec4f;
 // The camera block and the cast — the two buffers the scene API reads. Same
 // contents the field and grid modules bind, so an effect's lightEmit sees the
@@ -195,12 +180,19 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   let finite = l.pos.x == l.pos.x && l.pos.y == l.pos.y && l.pos.z == l.pos.z &&
     l.radius == l.radius && l.intensity == l.intensity &&
     l.color.x == l.color.x && l.color.y == l.color.y && l.color.z == l.color.z;
-  let c = select(vec3f(0.0), max(l.color * l.intensity, vec3f(0.0)), finite);
+  // Weight rides along with the sanitisation, which is already the one place
+  // this buffer is written: a lamp at half weight is half as bright, and one
+  // at zero never reaches here because the dispatch is skipped.
+  let c = select(vec3f(0.0), max(l.color * l.intensity, vec3f(0.0)), finite) * _rzLightU.w;
   let b = ${LIGHT_HEADER}u + (u32(_rzLightU.y) + i) * ${LIGHT_STRIDE}u;
   _rzLightsOut[b] = select(0.0, l.pos.x, finite);
   _rzLightsOut[b + 1u] = select(0.0, l.pos.y, finite);
   _rzLightsOut[b + 2u] = select(0.0, l.pos.z, finite);
-  _rzLightsOut[b + 3u] = select(0.0, max(l.radius, 0.0), finite);
+  // Radius goes to zero when the effect is OFF, and is left alone at every
+  // weight above it. Scaling it with the fade would shrink a dimming lamp's
+  // reach, which is a different thing than dimming it; zeroing it at nothing
+  // is what lets a material's distance cull drop the slot entirely.
+  _rzLightsOut[b + 3u] = select(0.0, max(l.radius, 0.0), finite && _rzLightU.w > 0.0);
   // Colour carries intensity, exactly as the CPU writer stores it — one product,
   // one place, so the two producers cannot disagree about what a slot means.
   _rzLightsOut[b + 4u] = c.x;

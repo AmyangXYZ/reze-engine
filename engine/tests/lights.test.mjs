@@ -121,7 +121,8 @@ test("intensity is usable at the scale a scene is actually built at", () => {
 
 // ── The lightEmit mount ──
 
-import { RZ_LIGHT_STRUCT_WGSL, buildLightEmitShader, hasLightEmit, parseLightCount } from "../dist/shaders/lights.js"
+import { RZ_LIGHT_STRUCT_WGSL, buildLightEmitShader, hasLightEmit } from "../dist/shaders/lights.js"
+import { parseDirectives } from "../dist/shaders/directives.js"
 import { EFFECT_SCENE_API, buildFieldShader } from "../dist/shaders/passes/composite.js"
 import { anchorAliasWgsl } from "../dist/shaders/anchor-table.js"
 
@@ -133,7 +134,7 @@ const CAST = { trailCount: 2 }
 import { buildParticleComputeShader, buildParticleRenderShader } from "../dist/shaders/passes/particles.js"
 import { buildTrailShader } from "../dist/shaders/passes/trails.js"
 
-const EMIT = `// @lights 3
+const EMIT = `#lights 3
 fn lightEmit(i: u32, time: f32) -> RzLight {
   var l: RzLight;
   l.pos = vec3f(f32(i) * 2.0, 10.0 + time, 0.0);
@@ -144,12 +145,13 @@ fn lightEmit(i: u32, time: f32) -> RzLight {
 }`
 
 test("an effect declares how many lights it emits", () => {
-  assert.equal(parseLightCount(EMIT, MAX_LIGHTS), 3)
-  assert.equal(parseLightCount("// nothing here", MAX_LIGHTS), 0)
-  // Clamped, not rejected: the same choice @particles makes.
-  assert.equal(parseLightCount("// @lights 999", MAX_LIGHTS), MAX_LIGHTS)
-  // Mid-sentence prose must not declare anything, the @anchor rule.
-  assert.equal(parseLightCount("// mentioning @lights 4 in a sentence", MAX_LIGHTS), 0)
+  assert.equal(Math.min(parseDirectives(EMIT).directives.lights, MAX_LIGHTS), 3)
+  const lights = (src) => Math.min(parseDirectives(src).directives.lights, MAX_LIGHTS)
+  assert.equal(lights("// nothing here"), 0)
+  // Clamped, not rejected: the same choice #particles makes.
+  assert.equal(lights("#lights 999"), MAX_LIGHTS)
+  // Prose mentioning one must not declare anything, the #anchor rule.
+  assert.equal(lights("// mentioning #lights 4 in a sentence"), 0)
   assert.equal(hasLightEmit(EMIT), true)
   assert.equal(hasLightEmit("fn background() {}"), false)
 })
@@ -159,7 +161,7 @@ test("the emit shader writes the slots the material shader reads", () => {
   // Same stride and header on both sides of the buffer, expressed against the
   // same constants — this is the seam where a writer and a reader drift.
   assert.match(src, new RegExp(`let b = ${LIGHT_HEADER}u \\+ \\(u32\\(_rzLightU\\.y\\) \\+ i\\) \\* ${LIGHT_STRIDE}u;`))
-  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite\);/)
+  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\.w > 0\.0\);/)
   // Colour x intensity, the same product the CPU writer stores — through the
   // sanitized local, since the raw product is what the guard exists to check.
   assert.match(src, /_rzLightsOut\[b \+ 4u\] = c\.x;/)
@@ -269,7 +271,7 @@ test("the emit write is sanitized: hosted code cannot poison the frame", () => {
   assert.match(src, /let finite = l\.pos\.x == l\.pos\.x/, "the NaN self-equality check must guard the write")
   assert.match(src, /select\(vec3f\(0\.0\), max\(l\.color \* l\.intensity, vec3f\(0\.0\)\), finite\)/,
     "colour must be clamped at zero — this layer is additive, and negative light darkens")
-  assert.match(src, /select\(0\.0, max\(l\.radius, 0\.0\), finite\)/)
+  assert.match(src, /select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\.w > 0\.0\)/)
 })
 
 test("the header has exactly one writer", () => {

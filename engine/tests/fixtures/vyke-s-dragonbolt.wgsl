@@ -1,13 +1,13 @@
-// @layer additive
-// @anchor 頭
-// @anchor 上半身2
-// @anchor 左ひじ
-// @anchor 右ひじ
-// @anchor 左手首
-// @anchor 右手首
-// @anchor 左ひざ
-// @anchor 右ひざ
-// @fullres
+#layer additive
+#anchor 頭
+#anchor 上半身2
+#anchor 左ひじ
+#anchor 右ひじ
+#anchor 左手首
+#anchor 右手首
+#anchor 左ひざ
+#anchor 右ひざ
+
 
 // Vyke's Dragonbolt — the red fire-lightning of Elden Ring, clinging to a body.
 //

@@ -1,4 +1,4 @@
-// @fullres — glyph edges are sub-pixel detail the half-res field pass cannot carry.
+// glyph edges are sub-pixel detail the half-res field pass cannot carry.
 //
 // The words of the track, drawn the way anison broadcasts drew them: a line
 // low on the screen, white glyphs inside a heavy dark rim, a soft shadow under

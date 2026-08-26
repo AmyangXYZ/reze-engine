@@ -1,8 +1,8 @@
-// @layer additive
-// @anchor 左足ＩＫ trail
-// @anchor 右足ＩＫ trail
-// @anchor 左足首 trail
-// @anchor 右足首 trail
+#layer additive
+#anchor 左足ＩＫ trail
+#anchor 右足ＩＫ trail
+#anchor 左足首 trail
+#anchor 右足首 trail
 
 // Tunables — edit and ⌘⏎.
 // Colour comes from INTENSITY, not from a single tint. A disc filled with one

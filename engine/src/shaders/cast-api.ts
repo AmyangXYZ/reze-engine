@@ -92,7 +92,7 @@ fn rzSubject(i: i32) -> RzSubject {
 /**
  * Where a named bone is, this frame.
  *
- * The slot is the author's own: the Nth @anchor in their file, in the order
+ * The slot is the author's own: the Nth #anchor in their file, in the order
  * they wrote them. _rzSlot turns that into the scene's address, which is what
  * keeps two effects that both anchor to a wrist from reading each other's.
  */
@@ -115,7 +115,7 @@ fn rzAnchor(subject: i32, slot: i32) -> RzAnchor {
  *
  * Bounded by the anchor cap, NOT by how many anchors asked for a trail. Those
  * are different index spaces: storage is addressed by anchor slot, so an
- * untrailed @anchor followed by a trailed one put the trail at index 1 with a
+ * untrailed #anchor followed by a trailed one put the trail at index 1 with a
  * bound of 1 and rzTrail returned zero — a ribbon that silently did not draw.
  */
 fn rzTrailCount(subject: i32, slot: i32) -> i32 {

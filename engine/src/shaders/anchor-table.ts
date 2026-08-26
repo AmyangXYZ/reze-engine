@@ -91,7 +91,7 @@ export function buildAnchorTable(requests: AnchorRequest[][], max: number): Anch
  * TRAILED anchor, so its instance index counts 0,1,2… over trailed anchors only
  * — while the cast buffer is addressed by DECLARATION slot. Those coincide
  * exactly when every anchor is trailed, which is true of all 14 library effects
- * and is why this stayed latent: declare `@anchor 頭` then `@anchor 左手首 trail`
+ * and is why this stayed latent: declare `#anchor 頭` then `#anchor 左手首 trail`
  * and ribbon 0 asked for the trail of 頭, which has none, so the ribbon silently
  * did not draw.
  *
@@ -127,7 +127,7 @@ ${cases}
  * folds away.
  */
 export function anchorAliasWgsl(alias: number[]): string {
-  // NO @anchor AT ALL. Every slot is unmapped, and rzAnchor() must report
+  // NO #anchor AT ALL. Every slot is unmapped, and rzAnchor() must report
   // .valid false for all of them.
   //
   // This used to fall through to the identity branch below — `[].every()` is
@@ -139,7 +139,7 @@ export function anchorAliasWgsl(alias: number[]): string {
   // reading.
   if (alias.length === 0) {
     return `
-/** No @anchor in this effect: every slot is unmapped, so rzAnchor() is invalid
+/** No #anchor in this effect: every slot is unmapped, so rzAnchor() is invalid
  *  rather than reading whichever bone another effect declared first. */
 fn _rzSlot(local: i32) -> i32 { return -1; }
 `

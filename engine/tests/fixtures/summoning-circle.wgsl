@@ -1,5 +1,5 @@
-// @layer additive
-// @fullres
+#layer additive
+
 
 // Summoning Circle — a sigil on the ground under the cast, and the light
 // standing on it.
@@ -248,7 +248,7 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
 // One light, following the first subject, because that is the character the
 // sigil is drawn under. A scene with two summoners is two instances of this
 // effect, not one light budget split.
-// @lights 1
+#lights 1
 const LIGHT_UP = 0.35;     // how far above the plane the source sits, in hip
                            // heights — a light ON the floor grazes it and lights
                            // nothing, since every floor normal is perpendicular

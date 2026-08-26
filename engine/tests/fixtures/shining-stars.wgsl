@@ -1,4 +1,4 @@
-// @layer additive
+#layer additive
 // Tunables — edit a value and hit ⌘⏎ to see it live.
 const TINT = vec3f(1.0, 0.96, 0.88);  // star color
 const DENSITY = 0.5;                  // 0..1 — how crowded the sky is

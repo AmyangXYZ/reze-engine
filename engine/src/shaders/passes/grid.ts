@@ -40,15 +40,6 @@ export const GRID_MAX = 1024
 /** rgba16float, ping-ponged. Two of these is the whole memory cost. */
 export const SIM_FORMAT: GPUTextureFormat = "rgba16float"
 
-/** `// @grid 256` — the grid's resolution, in texels per side. */
-export function parseGridSize(wgsl: string, max: number): number {
-  const m = /^\s*\/\/\s*@grid\s+(\d+)\s*$/m.exec(wgsl)
-  if (!m) return 0
-  // Clamped rather than rejected, as the particle count is: an author asking for
-  // 4096 gets the most the engine will give and a scene that still runs.
-  return Math.max(8, Math.min(max, parseInt(m[1], 10)))
-}
-
 /** Whether this effect drives a grid at all. */
 export function gridEntryPoint(wgsl: string): boolean {
   return /\bfn\s+gridStep\s*\(/.test(wgsl)

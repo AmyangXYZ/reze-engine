@@ -437,7 +437,7 @@ fn fwHash(p0: vec2f) -> f32 {
 // The climb throws nothing. A rocket is a spark against the sky; it is the
 // burst that lights a field, and spending a slot on the climb would keep a
 // light alive for the two-thirds of the sequence when it is doing nothing.
-// @lights 4
+#lights 4
 const FLASH_PEAK = 2.2;    // brightness at the burst itself
 const FLASH_REACH = 90.0;  // world units. The shells sit WORLD_Z behind the
                            // stage and WORLD_LOW..HIGH up, so the stage is ~50

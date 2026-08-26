@@ -29,6 +29,7 @@ import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
+import { effectState, type EffectWindow } from "./effect-schedule"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera } from "./reflection"
 import { packHalf, type HdrImage } from "./hdr"
@@ -49,7 +50,6 @@ import {
   MAX_LIGHTS,
   buildLightEmitShader,
   hasLightEmit,
-  parseLightCount,
 } from "./shaders/lights"
 import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
 import { outlineShaderWgsl } from "./shaders/passes/outline"
@@ -66,7 +66,6 @@ import {
   buildCompositeShader,
   EFFECT_SCENE_API,
   buildFieldShader,
-  parseEffectAnchors,
   EFFECT_ANCHORS,
   EFFECT_SUBJECTS,
   EFFECT_TRAIL_BASE,
@@ -75,9 +74,6 @@ import {
 import {
   buildParticleComputeShader,
   buildParticleRenderShader,
-  parseParticleBlend,
-  parseParticleBloom,
-  parseParticleCount,
   particleEntryPoints,
   PARTICLE_STRIDE,
 } from "./shaders/passes/particles"
@@ -85,7 +81,6 @@ import {
   SIM_FORMAT,
   GRID_MAX,
   buildSimShader,
-  parseGridSize,
   gridEntryPoint,
 } from "./shaders/passes/grid"
 import { buildTrailShader, trailEntryPoints, TRAIL_SUBDIVISIONS } from "./shaders/passes/trails"
@@ -101,6 +96,7 @@ import type {
   StyleGroup,
 } from "./graph/style-group"
 import { DEFAULT_GRAPH } from "./graph/presets/default"
+import { parseDirectives, stripDirectives, type EffectDirectives, type EffectParamDecl } from "./shaders/directives"
 import { UNLIT_GRAPH } from "./graph/presets/unlit"
 import { FACE_GRAPH } from "./graph/presets/face"
 import { HAIR_GRAPH } from "./graph/presets/hair"
@@ -379,6 +375,18 @@ export type EffectResult = {
   /** Which mounts the WGSL declared — `fn background` / `fn foreground`. Both
    *  false only on a failed compile, since defining neither IS the failure. */
   mounts: { background: boolean; foreground: boolean }
+  /** The knobs this effect exposes, from its own `#param` lines — name, type,
+   *  default and any range. A host builds controls from THIS rather than from
+   *  a second parse of the source, so what the panel offers and what the shader
+   *  reads cannot come apart. Empty when the effect declares none. */
+  params: EffectParamDecl[]
+  /** How long ONE firing lasts, seconds, from `#duration`. 0 = the effect
+   *  declared none and is AMBIENT — a condition the scene is in rather than
+   *  something that happens at a moment. A host places a hit at its own length
+   *  and spans an ambient one, which is the same reason `params` is here: what
+   *  the host does with an effect should come from the effect, not from a
+   *  second parse that can drift from it. */
+  duration: number
 }
 
 type CameraOptions = {
@@ -1260,13 +1268,13 @@ const FIELD_LAYER_BLEND: GPUBlendState = {
 }
 
 /**
- * `// @layer additive` — for LIGHT rather than matter.
+ * `#layer additive` — for LIGHT rather than matter.
  *
  * Alpha-over is right for anything with mass: smoke, fog, a backdrop. It is
  * wrong for a glow, and visibly so the moment two of them cross — the later
  * bolt occludes the earlier one in proportion to its own brightness, when what
  * light does is get brighter. Unity and Unreal both ship exactly this split,
- * and the particle path here already has it as `@blend additive`.
+ * and the particle path here already has it as `#blend additive`.
  *
  * Colour still scales by the author's alpha, so alpha keeps meaning "how much
  * of this is here" and an effect fades out the way it always did. What changes
@@ -1295,6 +1303,12 @@ const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
  */
 interface EffectInstance {
   wgsl: string
+  /** What this instance's source declared — kept so setEffectParam can refuse a
+   *  name the effect never offered instead of writing nowhere. */
+  paramDecls: EffectParamDecl[]
+  /** One firing's length in seconds, from `#duration`. 0 = ambient. Reported
+   *  back at install so a host can place the effect at its own length. */
+  duration: number
   paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
   paramsBuffer: GPUBuffer | null
   paramsData: Float32Array<ArrayBuffer>
@@ -1321,6 +1335,26 @@ interface EffectInstance {
   anchors: { bone: string; trail: boolean }[]
   /** Where this effect's own clock started, in scene seconds. */
   epochScene: number
+  /**
+   * The level this effect reaches, 0..1 — Blender's `influence`, and its
+   * meaning: a strip's blends ramp toward THIS rather than toward 1, so a
+   * permanently half-strength effect and a scheduled one are the same dial.
+   */
+  influence: number
+  /** Its strips, in scene seconds — a LANE, so one effect can fire more than
+   *  once. Null or empty = on for the whole scene, which is what applying an
+   *  effect does until someone places it. */
+  window: readonly EffectWindow[] | null
+  /**
+   * What the mounts actually read this frame: `influence` shaped by the strip.
+   *
+   * Applied by ENGINE-GENERATED code at each mount's one output site, never by
+   * the author's — an effect that had to honour its own weight would be an
+   * effect that could forget to, and a scheduler cannot be built on a promise
+   * every author has to keep. At 0 the mount's draw is skipped outright, which
+   * is what makes a scheduled effect cost nothing outside its window.
+   */
+  weight: number
   /** This effect's OWN clock, as a uniform the field shader reads. Per effect
    *  because the shared one (viewU[6].x) is measured from the first installed
    *  effect's epoch, so everything later started mid-stream. Null when the
@@ -1328,7 +1362,7 @@ interface EffectInstance {
   fieldClock: GPUBuffer | null
   /** The lightEmit mount: a compute stage that writes this effect's own slots
    *  in the shared lights buffer, once per light per frame. Null unless the
-   *  source declares `// @lights n` AND defines fn lightEmit. */
+   *  source declares `#lights n` AND defines fn lightEmit. */
   lights: {
     pipeline: GPUComputePipeline
     bind: GPUBindGroup
@@ -1600,7 +1634,7 @@ export class Engine {
    * cost a degenerate quad the rasteriser rejects, which is cheaper than the
    * prefix sum and readback a compacted draw list would need every frame.
    */
-  /** Ceiling for `// @particles`. Past this an author is asking for a stall. */
+  /** Ceiling for `#particles`. Past this an author is asking for a stall. */
   private static readonly MAX_PARTICLES = 65536
   private particleFrame = 0
   /**
@@ -1620,7 +1654,7 @@ export class Engine {
    * RESOLUTION. Index 0 is full, index 1 is half — coarsest last, so the
    * composite reads them full-over-half.
    *
-   * `@fullres` used to be a property of the shared targets: one effect
+   * `#fullres` used to be a property of the shared targets: one effect
    * declaring it promoted the pass for every effect installed, so a starfield
    * that upsamples perfectly paid four times the pixels because a keyboard
    * beside it needed crisp edges. Measured, that was the largest avoidable cost
@@ -1742,7 +1776,7 @@ export class Engine {
    *
    *  `field` earns its place now that a scene runs SEVERAL field effects at
    *  once: it is one pass with N draws, its resolution is a property of the
-   *  shared targets rather than of any one effect — so a single `@fullres`
+   *  shared targets rather than of any one effect — so a single `#fullres`
    *  effect quadruples the pixel count for all of them — and it is the pass the
    *  field restructure moves. Restructuring it while it was the only untimed
    *  pass in the frame would have meant reasoning about the cost instead of
@@ -3010,34 +3044,10 @@ export class Engine {
    * is KEPT and diagnostics are returned with line numbers relative to the
    * user's WGSL. Pass null to remove the effect.
    */
-  /**
-   * Every directive an effect may declare — used ONLY to tell an author that
-   * the line they wrote is not doing what they think. See compileEffect.
-   *
-   * It has to be complete, including the ones this engine does not read itself:
-   * `@dissolve` is parsed by the host, and warning about it would be worse than
-   * the silence this replaced — a false alarm on a working line teaches authors
-   * to ignore the channel.
-   */
-  private static readonly KNOWN = new Set([
-    "@anchor",
-    "@layer",
-    "@blend",
-    "@bloom",
-    "@lights",
-    "@grid",
-    "@particles",
-    "@halfres",
-    // Accepted and inert: full resolution is the default now, and an effect
-    // that still says so is right about what it wants. Warning about it would
-    // be telling authors off for the thing that used to be necessary.
-    "@fullres",
-    // The HOST's, not this engine's — see the note above.
-    "@dissolve",
-  ])
 
   private async compileEffect(
-    wgsl: string,
+    /** The author's file, directives included — parsed here and nowhere else. */
+    authored: string,
     params: Record<string, EffectParamValue> | undefined,
     /** This effect's own declarations, already parsed by the caller — which had
      *  to read them anyway to build the scene table. */
@@ -3046,7 +3056,22 @@ export class Engine {
     alias: number[],
   ): Promise<{ ok: true; instance: EffectInstance; warnings: string[] } | EffectResult> {
     const noMounts = { background: false, foreground: false }
-    if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts }
+    if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts, params: [], duration: 0 }
+
+    // WHAT THE FILE DECLARES, read once. Everything below takes it from `d`
+    // rather than running a regex of its own — eight parsers over one file was
+    // eight chances to disagree about what it said, and they did.
+    //
+    // An unrecognised or malformed directive is an ERROR. `#` is not WGSL
+    // syntax, so a line starting with one is unambiguously ours and there is
+    // nothing to be lenient about; the old spelling lived in comments, where a
+    // typo was indistinguishable from prose and could only ever be warned about.
+    const parsed = parseDirectives(authored)
+    if (parsed.errors.length) return { ok: false, diagnostics: parsed.errors, mounts: noMounts, params: [], duration: 0 }
+    const d = parsed.directives
+    // The compiler sees the file with its directive lines BLANKED, so every
+    // diagnostic below still names the line the author is looking at.
+    const wgsl = stripDirectives(authored)
 
     // ── Which mounts did the author ask for? A declaration, not a setting: the
     // entry points present in the source are the ones compiled in. Matching the
@@ -3063,14 +3088,10 @@ export class Engine {
     const te = trailEntryPoints(wgsl)
     const wantsTrails = te.width || te.shade
     if (wantsTrails && !(te.width && te.shade)) {
-      return {
-        ok: false,
-        diagnostics: [
+      return { ok: false, diagnostics: [
           `a ribbon effect needs both fn trailWidth(u: f32, age: f32) -> f32 and ` +
             `fn trailShade(u: f32, v: f32, age: f32, weight: f32, slot: i32) -> vec4f`,
-        ],
-        mounts: noMounts,
-      }
+        ], mounts: noMounts, params: [], duration: 0 }
     }
     if (wantsParticles && !(pe.init && pe.step && pe.shade)) {
       const missing = [
@@ -3078,7 +3099,7 @@ export class Engine {
         pe.step ? null : "fn particleStep(p: Particle, dt: f32) -> Particle",
         pe.shade ? null : "fn particleShade(p: Particle, uv: vec2f) -> vec4f",
       ].filter(Boolean)
-      return { ok: false, diagnostics: [`a particle effect also needs ${missing.join(" and ")}`], mounts: noMounts }
+      return { ok: false, diagnostics: [`a particle effect also needs ${missing.join(" and ")}`], mounts: noMounts, params: [], duration: 0 }
     }
     // One file, one kind — for now.
     //
@@ -3093,36 +3114,28 @@ export class Engine {
     // says so plainly instead of failing with "unresolved type Particle" from a
     // pass they did not know they were compiling into.
     if ((wantsParticles || wantsTrails) && (hasBackground || hasForeground)) {
-      return {
-        ok: false,
-        diagnostics: [
+      return { ok: false, diagnostics: [
           "an effect declares field mounts (background/foreground) or particles, not both — " +
             "split them into two effects",
-        ],
-        mounts: noMounts,
-      }
+        ], mounts: noMounts, params: [], duration: 0 }
     }
     // lightEmit counts as a mount on its own: a pure lighting rig draws nothing
     // and is still an effect — it is how a scene gets stage lights without also
     // getting geometry it did not ask for.
     if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails && !hasLightEmit(wgsl)) {
-      return {
-        ok: false,
-        diagnostics: [
+      return { ok: false, diagnostics: [
           "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f, " +
             "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f, " +
             "the particle trio (particleInit/particleStep/particleShade), " +
             "the ribbon pair (trailWidth/trailShade), " +
-            "or fn lightEmit(i: u32) -> RzLight with // @lights <n>",
-        ],
-        mounts: noMounts,
-      }
+            "or fn lightEmit(i: u32) -> RzLight with #lights <n>",
+        ], mounts: noMounts, params: [], duration: 0 }
     }
     const mounts = { background: hasBackground, foreground: hasForeground }
 
     // ── Directives only some mounts honour ──
     //
-    // @bloom sets the aux mask, and only the particle and ribbon modules write
+    // #bloom sets the aux mask, and only the particle and ribbon modules write
     // that mask: they draw inside the scene pass, in HDR, while the bloom
     // pyramid can still see them. A field effect composites in DISPLAY space
     // after tone mapping, so there is nothing left to pick it up and the
@@ -3135,32 +3148,9 @@ export class Engine {
     // pinning an effect that declares this has to keep installing; saying so is
     // all that was ever missing.
     const warnings: string[] = []
-    // A DIRECTIVE THAT PARSED AS NOTHING.
-    //
-    // Every pragma is matched with `\s*$` after it, so a line that carries a
-    // note as well — `// @fullres — glyph edges are sub-pixel detail` — matches
-    // none of them and is read as an ordinary comment. Nothing failed, nothing
-    // said anything, and the effect simply ran without the property it asked
-    // for: three shipped effects were silently half-res and a fourth silently
-    // stopped being additive, each one's first line explaining why it needed
-    // the thing it was not getting.
-    //
-    // Every directive this engine knows, so an unrecognised one is named rather
-    // than ignored. Cheap: it runs once per install, over a file a human wrote.
-    for (const m of wgsl.matchAll(/^[ \t]*\/\/[ \t]*(@[a-zA-Z]+)(.*)$/gm)) {
-      const [, tag, rest] = m
-      if (!Engine.KNOWN.has(tag)) {
-        warnings.push(`${tag} is not a directive this engine knows — it will be ignored.`)
-      } else if (rest.trim() && !/^\s*[\w.\-+]+(\s+[\w.\-+]+)*\s*$/.test(rest)) {
-        warnings.push(
-          `${tag} has a note on the same line, so it does not parse and is being IGNORED. ` +
-            `A directive must be alone on its line — put the note on the next one.`,
-        )
-      }
-    }
-    if (parseParticleBloom(wgsl) && !wantsParticles && !wantsTrails) {
+    if (d.bloom && !wantsParticles && !wantsTrails) {
       warnings.push(
-        "// @bloom does nothing here. A field effect (background/foreground) composites after tone " +
+        "#bloom does nothing here. A field effect (background/foreground) composites after tone " +
           "mapping, past the bloom pyramid — the directive applies to particles and ribbons, which draw " +
           "in HDR inside the scene pass. Make the effect's own falloff brighter instead.",
       )
@@ -3183,7 +3173,7 @@ export class Engine {
     let cursor = 0
     for (const [name, value] of entries) {
       if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
-        return { ok: false, diagnostics: [`invalid param name "${name}" (must be a WGSL identifier)`], mounts }
+        return { ok: false, diagnostics: [`invalid param name "${name}" (must be a WGSL identifier)`], mounts, params: d.params, duration: d.duration }
       }
       const isVec = typeof value !== "number"
       const align = isVec ? 16 : 4
@@ -3212,7 +3202,7 @@ export class Engine {
     // module (buildFieldShader), so a bad effect can no longer produce errors at
     // line numbers in a shader the author never wrote — and installing one no
     // longer recompiles the composite's tone-mapping half at all.
-    const gridSize = gridEntryPoint(wgsl) ? parseGridSize(wgsl, GRID_MAX) || 256 : 0
+    const gridSize = gridEntryPoint(wgsl) ? Math.min(d.grid || 256, GRID_MAX) : 0
     // `alias` goes in: a field effect reads bones through _rzSlot exactly as a
     // particle one does, and it was the only module never handed the mapping.
     const fieldEffect =
@@ -3221,11 +3211,11 @@ export class Engine {
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
     const scopeErr = await this.device.popErrorScope()
-    if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts }
+    if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts, params: d.params, duration: d.duration }
 
     // Declared like every other mount property: by what the source says, not by
     // a setting somewhere else that an author cannot see from the file.
-    const layerBlend = /^\s*\/\/\s*@layer\s+additive\s*$/m.test(wgsl)
+    const layerBlend = d.additiveLayer
       ? FIELD_LAYER_BLEND_ADDITIVE
       : FIELD_LAYER_BLEND
     let fieldPipeline: GPURenderPipeline | null = null
@@ -3240,7 +3230,7 @@ export class Engine {
         .filter((m) => m.type === "error")
         .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
       if (diagnostics.length === 0 && fieldScopeErr) diagnostics.push(fieldScopeErr.message)
-      if (diagnostics.length > 0) return { ok: false, diagnostics, mounts }
+      if (diagnostics.length > 0) return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration }
       try {
         fieldPipeline = await this.device.createRenderPipelineAsync({
           label: "field layer pipeline",
@@ -3266,7 +3256,7 @@ export class Engine {
           multisample: { count: 1 },
         })
       } catch (e) {
-        return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts }
+        return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration }
       }
     }
     let identity: GPURenderPipeline
@@ -3290,7 +3280,7 @@ export class Engine {
         make(true, "composite pipeline (effect, gamma!=1)"),
       ])
     } catch (e) {
-      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts }
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration }
     }
 
     // Built BEFORE the swap: a particle stage that fails to compile has to leave
@@ -3306,17 +3296,17 @@ export class Engine {
       grid?.textures[1].destroy()
       grid?.uniform.destroy()
       trails?.uniform.destroy()
-      return { ok: false, diagnostics, mounts }
+      return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration }
     }
     let particles: EffectParticles | null = null
     if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, anchors, alias)
+      const built = await this.buildParticles(wgsl, d, anchors, alias)
       if (!built.ok) return abandon(built.diagnostics)
       particles = built.state
     }
     let grid: EffectGrid | null = null
     if (gridEntryPoint(wgsl)) {
-      const built = await this.buildSim(wgsl, anchors, alias)
+      const built = await this.buildSim(wgsl, d, anchors, alias)
       if (!built.ok) return abandon(built.diagnostics)
       grid = built.state
     }
@@ -3326,13 +3316,9 @@ export class Engine {
       // bone recorded without one would read zeroes and paint a line to the origin.
       const trailSlots = anchors.filter((a) => a.trail).length
       if (trailSlots === 0) {
-        return {
-          ok: false,
-          diagnostics: ["a ribbon effect needs at least one // @anchor <bone> trail"],
-          mounts,
-        }
+        return { ok: false, diagnostics: ["a ribbon effect needs at least one #anchor <bone> trail"], mounts, params: d.params, duration: d.duration }
       }
-      const built = await this.buildTrails(wgsl, anchors, alias)
+      const built = await this.buildTrails(wgsl, d, anchors, alias)
       if (!built.ok) return abandon(built.diagnostics)
       trails = built.state
     }
@@ -3345,13 +3331,13 @@ export class Engine {
     // count is a function nothing calls. Either alone is a silent blank, which
     // is the worst way for an effect to fail.
     let lights: EffectInstance["lights"] = null
-    const declaredLights = parseLightCount(wgsl, MAX_LIGHTS)
+    const declaredLights = Math.min(d.lights, MAX_LIGHTS)
     const emits = hasLightEmit(wgsl)
     if (declaredLights > 0 !== emits) {
       return abandon([
         emits
-          ? "an effect defining fn lightEmit(i: u32) -> RzLight must also declare how many with // @lights <n>"
-          : "// @lights <n> needs fn lightEmit(i: u32) -> RzLight to fill those slots",
+          ? "an effect defining fn lightEmit(i: u32) -> RzLight must also declare how many with #lights <n>"
+          : "#lights <n> needs fn lightEmit(i: u32) -> RzLight to fill those slots",
       ])
     }
     if (declaredLights > 0) {
@@ -3380,6 +3366,8 @@ export class Engine {
     }
     const instance: EffectInstance = {
         wgsl,
+        paramDecls: d.params,
+        duration: d.duration,
         paramLayout: layout,
         paramsBuffer,
         paramsData,
@@ -3394,6 +3382,12 @@ export class Engine {
         // The effect's own clock starts now. Per effect so that one installed
         // later still gets a frame where rzGridFrame() is 0 and can seed.
         epochScene: this.sceneClock,
+        // Fully on, unscheduled. An effect that is installed is showing;
+        // scheduling it is something a caller does afterwards, and an install
+        // that silently began at zero would look like a compile that failed.
+        influence: 1,
+        window: null,
+        weight: 1,
         // Its OWN resolution, no longer the scene's: an effect that never asked
         // for full res is not promoted because a neighbour did.
         // FULL RESOLUTION UNLESS TOLD OTHERWISE.
@@ -3406,12 +3400,12 @@ export class Engine {
         // wearing a different hat: the safe answer has to be the one you get
         // for saying nothing.
         //
-        // The cost is real and is why the half layer stays: `@halfres` is worth
+        // The cost is real and is why the half layer stays: `#halfres` is worth
         // about 3.7x on a full-screen effect (Footprints, measured, 1.2ms
         // against 4.5ms). It is the right call for a soft additive glow, which
         // upsamples invisibly — and it is now a claim an author makes about
         // their own effect rather than a fate that befalls one.
-        fieldLayer: /^\s*\/\/\s*@halfres\s*$/m.test(wgsl) ? 1 : 0,
+        fieldLayer: d.fieldLayer,
         fieldPipeline,
         fieldClock,
         // Filled by rebuildFieldBindGroup below, which needs the instance to
@@ -3453,7 +3447,7 @@ export class Engine {
     list: { wgsl: string; params?: Record<string, EffectParamValue> }[] | null,
   ): Promise<EffectResult[]> {
     const noMounts = { background: false, foreground: false }
-    if (!this.device) return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts }]
+    if (!this.device) return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts, params: [], duration: 0 }]
 
     const requested = list ?? []
     if (requested.length === 0) {
@@ -3479,7 +3473,14 @@ export class Engine {
 
     // One table for the whole scene, built before anything compiles: an effect's
     // alias is its row, and a bone two effects both name is allocated once.
-    const perEffectAnchors = requested.map((e) => parseEffectAnchors(e.wgsl, MAX_EFFECT_ANCHORS))
+    // The table needs every effect's anchors before any of them compiles, so
+    // this is the one place a source is read twice — compileEffect parses it
+    // again for everything else. A malformed file yields no anchors here and
+    // fails with its real diagnostics there, which is the right order: the
+    // error names the line, not the table.
+    const perEffectAnchors = requested.map((e) =>
+      parseDirectives(e.wgsl).directives.anchors.slice(0, MAX_EFFECT_ANCHORS),
+    )
     const table = buildAnchorTable(perEffectAnchors, MAX_EFFECT_ANCHORS)
 
     const results: EffectResult[] = []
@@ -3499,6 +3500,8 @@ export class Engine {
       instances.push(built.instance)
       results.push({
         ok: true,
+        params: built.instance.paramDecls,
+        duration: built.instance.duration,
         // Installed, and still with something to say — a directive that parsed
         // but will never fire. Same channel as the dropped-anchor note below.
         diagnostics: built.warnings,
@@ -3563,7 +3566,7 @@ export class Engine {
     this.compositePipelineIdentity = this.makeCompositePipeline(compositeModule, false, "composite pipeline (gamma=1)")
     this.compositePipelineGamma = this.makeCompositePipeline(compositeModule, true, "composite pipeline (gamma!=1)")
 
-    // Nothing to promote any more: `@fullres` is per effect, read into
+    // Nothing to promote any more: `#fullres` is per effect, read into
     // fieldLayer when the instance is built, and both target pairs exist for
     // the life of the surface. What used to be a scene-wide decision made here
     // is now each effect's own.
@@ -3581,14 +3584,18 @@ export class Engine {
     const noMounts = { background: false, foreground: false }
     if (wgsl === null) {
       await this.setEffects(null)
-      return { ok: true, diagnostics: [], mounts: noMounts }
+      return { ok: true, diagnostics: [], mounts: noMounts, params: [], duration: 0 }
     }
     const [result] = await this.setEffects([{ wgsl, params }])
-    return result ?? { ok: false, diagnostics: ["effect failed to install"], mounts: noMounts }
+    return result ?? { ok: false, diagnostics: ["effect failed to install"], mounts: noMounts, params: [], duration: 0 }
   }
 
   private async buildParticles(
+    /** Already stripped of directives — see compileEffect. */
     wgsl: string,
+    /** What the file declared. Read here rather than re-parsed: the source no
+     *  longer carries the lines, and two readers is how they drift. */
+    d: EffectDirectives,
     anchors: { bone: string; trail: boolean }[],
     /** This effect's local→scene slot map. Passed rather than read off the
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
@@ -3597,8 +3604,8 @@ export class Engine {
   ): Promise<{ ok: true; state: EffectParticles } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
-    const count = parseParticleCount(wgsl, Engine.MAX_PARTICLES) || 1024
-    const src = { wgsl, count, blend: parseParticleBlend(wgsl), bloom: parseParticleBloom(wgsl) }
+    const count = Math.min(d.particles || 1024, Engine.MAX_PARTICLES)
+    const src = { wgsl, count, blend: d.particleBlend, bloom: d.bloom }
     // Sparks want to spawn where a trail is, so the particle stages see the same
     // cast buffer the trail draw reads.
     const cast = {
@@ -3636,10 +3643,13 @@ export class Engine {
     })
     const uniform = this.device.createBuffer({
       label: "particle uniforms",
-      size: 16,
+      // Two vec4-sized rows: (time, dt, count, frame) and (weight, _, _, _).
+      // The first was exactly full, and weight has to live in the same buffer
+      // as the clock or a frame could draw one without the other.
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
-    const uniformBytes = new ArrayBuffer(16)
+    const uniformBytes = new ArrayBuffer(32)
     const uniformView = { floats: new Float32Array(uniformBytes), uints: new Uint32Array(uniformBytes) }
 
     // Visibility is per LAYOUT, not shared: a read_write storage buffer may not be
@@ -3856,12 +3866,18 @@ export class Engine {
   private emitLights(encoder: GPUCommandEncoder): void {
     for (const e of this.effects) {
       const l = e.lights
+      // NOT skipped at weight 0, unlike every other mount. Each effect writes
+      // its OWN slots in a shared buffer that is never cleared, so a skipped
+      // dispatch leaves last frame's lights burning — the one place where not
+      // running is the wrong answer. The shader zeroes them instead, and the
+      // dispatch it costs is a single workgroup.
       if (!l || l.data[2] === 0) continue
       // The effect's OWN epoch — the same one its field, particle, ribbon and
       // grid halves now read. This was briefly conditional, to match a field
       // clock that was shared from the first installed effect; that clock is
       // per effect now, so every mount in one file agrees by construction.
       l.data[0] = this.sceneClock - e.epochScene
+      l.data[3] = e.weight
       this.device.queue.writeBuffer(l.uniform, 0, l.data.buffer as ArrayBuffer)
       const cp = encoder.beginComputePass({ label: "light emit" })
       cp.setPipeline(l.pipeline)
@@ -3876,6 +3892,11 @@ export class Engine {
       const p = e.particles
       if (!p) continue
       p.data[0] = this.sceneClock - e.epochScene
+      // The SIMULATION runs at every weight, 0 included — only the draw stops.
+      // A scheduled effect that froze while faded out would resume from the
+      // state it left rather than the one it would have reached, so fading one
+      // back in would rewind it.
+      p.data[4] = e.weight
       // Clamped: a backgrounded tab returns with a delta of whole seconds, and an
       // unclamped step flings every particle out of the scene in one frame.
       p.data[1] = Math.min(0.1, Math.max(0, deltaTime))
@@ -3894,7 +3915,7 @@ export class Engine {
   private renderParticles(pass: GPURenderPassEncoder, view: "camera" | "mirror"): void {
     for (const e of this.effects) {
       const p = e.particles
-      if (!p) continue
+      if (!p || e.weight === 0) continue
       pass.setPipeline(p.render)
       pass.setBindGroup(0, view === "mirror" ? p.mirrorRenderBind : p.renderBind)
       pass.draw(6, p.count)
@@ -3909,7 +3930,11 @@ export class Engine {
    * frame on the CPU.
    */
   private async buildTrails(
+    /** Already stripped of directives — see compileEffect. */
     wgsl: string,
+    /** What the file declared. Read here rather than re-parsed: the source no
+     *  longer carries the lines, and two readers is how they drift. */
+    d: EffectDirectives,
     anchors: { bone: string; trail: boolean }[],
     /** This effect's local→scene slot map. Passed rather than read off the
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
@@ -3925,7 +3950,7 @@ export class Engine {
     // nothing before: ribbon i was read as anchor slot i.
     const ribbonSlots = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
     const slots = ribbonSlots.length
-    const src = { wgsl, slots, ribbonSlots, blend: parseParticleBlend(wgsl), bloom: parseParticleBloom(wgsl) }
+    const src = { wgsl, slots, ribbonSlots, blend: d.particleBlend, bloom: d.bloom }
     const code = buildTrailShader(src, {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
@@ -4062,7 +4087,7 @@ export class Engine {
    * Takes the pass rather than opening one: that IS the change.
    */
   private drawTrails(pass: GPURenderPassEncoder, view: "camera" | "mirror"): void {
-    const drawn = this.effects.filter((e) => e.trails)
+    const drawn = this.effects.filter((e) => e.trails && e.weight > 0)
     if (drawn.length === 0) return
     for (const e of drawn) {
       const t = e.trails!
@@ -4085,6 +4110,7 @@ export class Engine {
       if (view === "camera") {
         t.data[0] = this.sceneClock - e.epochScene
         t.data[1] = live
+        t.data[2] = e.weight
         this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
       }
       pass.setPipeline(t.pipeline)
@@ -4097,14 +4123,31 @@ export class Engine {
    *  upsample. Runs the whole quad — uniform control flow, so effects may use
    *  derivatives freely, which the old inline path had to forbid. */
   private renderFieldPass(encoder: GPUCommandEncoder): void {
-    const drawn = this.effects.filter((e) => e.fieldPipeline && e.fieldBindGroups)
-    if (drawn.length === 0) return
+    // TWO PREDICATES, deliberately, and they are not interchangeable.
+    //
+    // MOUNTED decides whether the pass runs, and it must agree exactly with
+    // fieldPairUsed — that is what the composite's bind group was built against,
+    // at install, and it is not rebuilt per frame. A pass skipped under a
+    // binding that still points at its target leaves the last frame it drew
+    // sitting there, so an effect faded to nothing would freeze on screen
+    // instead of disappearing.
+    //
+    // DRAWN decides what is drawn into it, and this is where weight is worth
+    // something: a field mount is a full-screen quad however little of the frame
+    // it ends up touching, so an effect that is scheduled off would otherwise
+    // shade every pixel to multiply it out to nothing. The pass still clears —
+    // which is what makes the layer transparent rather than stale — and shades
+    // nothing.
+    const mounted = this.effects.filter((e) => e.fieldPipeline && e.fieldBindGroups)
+    if (mounted.length === 0) return
+    const drawn = mounted.filter((e) => e.weight > 0)
     // Each effect's own clock, before the pass that reads it. Seconds since
     // THIS effect was installed — so an effect added to a running scene starts
     // at zero and can seed, rather than joining whatever the first one is up to.
     for (const e of drawn) {
       if (!e.fieldClock) continue
       this.fieldClockScratch[0] = this.sceneClock - e.epochScene
+      this.fieldClockScratch[1] = e.weight
       this.device.queue.writeBuffer(e.fieldClock, 0, this.fieldClockScratch.buffer as ArrayBuffer)
     }
     // ONE PASS PER RESOLUTION, N draws each, in document order — a pair is
@@ -4119,7 +4162,7 @@ export class Engine {
     // (fieldLayerView). Clearing and storing an empty full-res rgba16f pair is
     // two 16MB writes a frame to produce the transparent black the fallback
     // already is. Most scenes leave the full-res pair empty, since an effect only
-    // lands there by declaring @fullres.
+    // lands there by declaring #fullres.
     let stamped = false
     for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
       const bg = this.fieldBgViews[i]
@@ -4132,7 +4175,7 @@ export class Engine {
           { view: fg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
         ],
         // One query pair is reserved for "field", and it goes to the first pair
-        // that actually runs — full res when something declared @fullres, half
+        // that actually runs — full res when something declared #fullres, half
         // otherwise. Pinning it to i === 0 would have measured a pass that, now
         // that empty pairs are skipped, usually does not happen.
         timestampWrites: stamped ? undefined : this.stamps("field"),
@@ -4197,14 +4240,18 @@ export class Engine {
    * zero, so seeding is just "if frame is 0, return the initial state".
    */
   private async buildSim(
+    /** Already stripped of directives — see compileEffect. */
     wgsl: string,
+    /** What the file declared. Read here rather than re-parsed: the source no
+     *  longer carries the lines, and two readers is how they drift. */
+    d: EffectDirectives,
     anchors: { bone: string; trail: boolean }[],
     /** This effect's local→scene slot map. Passed rather than read off the
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
   ): Promise<{ ok: true; state: EffectGrid } | { ok: false; diagnostics: string[] }> {
-    const size = parseGridSize(wgsl, GRID_MAX) || 256
+    const size = Math.min(d.grid || 256, GRID_MAX)
     const cast = {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
@@ -4343,10 +4390,19 @@ export class Engine {
     return { background: this.effect?.hasBackground ?? false, foreground: this.effect?.hasForeground ?? false }
   }
 
-  /** Write one effect param (declared at setEffect) — a uniform write, no
-   *  recompile; the instant tier, like setStyleParam. */
-  setEffectParam(name: string, value: EffectParamValue): void {
-    const fx = this.effect
+  /**
+   * Set one parameter on one INSTANCE.
+   *
+   * By index, because the scene holds a list and the same effect may appear in
+   * it twice with different values — which is the whole point of an instance
+   * and was impossible while this addressed `this.effect`, a singular left over
+   * from when a scene could wear exactly one.
+   *
+   * A write, not a recompile: parameters live in their own uniform buffer, so
+   * dragging a slider costs a 16-byte upload rather than a shader build.
+   */
+  setEffectParam(index: number, name: string, value: EffectParamValue): void {
+    const fx = this.effects[index]
     if (!fx || !fx.paramsBuffer) return
     const slot = fx.paramLayout.get(name)
     if (!slot) return
@@ -4357,6 +4413,119 @@ export class Engine {
       fx.paramsData[slot.offset + 2] = value.z
     }
     this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+  }
+
+  /**
+   * How much of one instance is showing, 0..1.
+   *
+   * The third of the three things an instance has — parameters, weight, time —
+   * and the one a scheduler drives. Weight is not a parameter: a parameter is
+   * whatever the author decided to expose and means only what their source
+   * makes it mean, while weight means the same thing for every effect ever
+   * written, including one whose author never heard of it. That is why it is
+   * applied by engine-generated code at each mount's output rather than handed
+   * to the source as a uniform to respect.
+   *
+   * At 0 nothing is drawn: no field quad, no particle draw, no ribbon, no light
+   * dispatch. A scheduled effect outside its window costs its simulation and
+   * nothing else — and a particle effect keeps simulating on purpose, so that
+   * fading one back in continues rather than rewinds.
+   *
+   * Instant, and free: a float in a uniform every mount already uploads once a
+   * frame. Nothing recompiles, so this is safe to drive per frame from a
+   * timeline.
+   */
+  setEffectInfluence(index: number, influence: number): void {
+    const fx = this.effects[index]
+    if (!fx) return
+    // Clamped rather than trusted: above 1 the field's own clamp would swallow
+    // it while an additive particle would happily keep getting brighter, so the
+    // same number would mean two things.
+    fx.influence = Math.min(1, Math.max(0, influence))
+  }
+
+  getEffectInfluence(index: number): number {
+    return this.effects[index]?.influence ?? 0
+  }
+
+  /**
+   * Schedule one instance: when it is alive, and how it enters and leaves.
+   *
+   * Null is the unscheduled case — on for the whole scene, on the scene's own
+   * clock — and is what an effect starts as.
+   *
+   * The engine evaluates this every frame rather than taking a weight from a
+   * caller, because every loop that renders would otherwise have to remember to
+   * drive it. The offline export loop already carries a scar about exactly that
+   * shape of bug. Evaluating where the scene clock advances means playback and
+   * export cannot disagree, and neither can forget.
+   *
+   * A caller that wants to drive an effect from something OTHER than the scene
+   * clock — an animation's progress, a skill firing — leaves this null and
+   * writes setEffectInfluence and setEffectTime itself, per frame. Both paths
+   * exist on purpose; this one is what a timeline wants.
+   */
+  setEffectSchedule(index: number, windows: readonly EffectWindow[] | null): void {
+    const fx = this.effects[index]
+    if (!fx) return
+    fx.window = windows && windows.length ? windows : null
+  }
+
+  getEffectSchedule(index: number): readonly EffectWindow[] | null {
+    return this.effects[index]?.window ?? null
+  }
+
+  /**
+   * Every scheduled effect, at the current scene clock.
+   *
+   * Called once a frame, BEFORE anything reads a weight or a clock. An effect
+   * with no window keeps whatever a caller last set, which is what makes the
+   * manual path above work — evaluating it would fight the caller for the field
+   * every frame.
+   */
+  private evaluateEffectSchedules(): void {
+    // Read ONCE: it walks the cast, and every effect wants the same answer.
+    const transport = this.transportTime()
+    for (const fx of this.effects) {
+      if (!fx.window || fx.window.length === 0) {
+        fx.weight = fx.influence
+        continue
+      }
+      const at = effectState(fx.window, fx.influence, transport)
+      fx.weight = at.weight
+      // Its own clock, expressed the way the mounts read it. Every mount
+      // derives time from the epoch against sceneClock, so this one write moves
+      // the field, the particles, the ribbons, lightEmit and the grid together
+      // — and hands them the STRIP's local time while they keep running on the
+      // smooth monotonic clock a particle integrator needs.
+      fx.epochScene = this.sceneClock - at.time
+    }
+  }
+
+  /**
+   * Move one instance's own clock to a given second.
+   *
+   * Everything an effect can animate is derived from its epoch — the field
+   * clock, the particle and ribbon clocks, lightEmit's time argument, the grid's
+   * frame counter — so moving the epoch moves all of them together and there is
+   * no mount that can be left reading last frame's time.
+   *
+   * This is what lets an effect be SCHEDULED rather than merely switched on: an
+   * instance that enters at bar 33 is handed a time that starts at zero there,
+   * so it plays its own opening instead of joining whatever the scene clock had
+   * reached. Feeding it the transport's time instead gives the other reading —
+   * an effect that runs in lockstep with the music — and both are one call.
+   */
+  setEffectTime(index: number, time: number): void {
+    const fx = this.effects[index]
+    if (!fx) return
+    fx.epochScene = this.sceneClock - time
+  }
+
+
+  getEffectTime(index: number): number {
+    const fx = this.effects[index]
+    return fx ? this.sceneClock - fx.epochScene : 0
   }
 
   /** Patch bloom; GPU uniforms update immediately if `init()` has run. */
@@ -6020,7 +6189,7 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
 
-      // The field layer — half resolution by default, full for @fullres effects.
+      // The field layer — half resolution by default, full for #fullres effects.
       this.fieldFullW = width
       this.fieldFullH = height
       this.createFieldTargets()
@@ -6904,10 +7073,24 @@ export class Engine {
     this.camera.setVmdDriven(false)
   }
 
-  // Clock the camera VMD runs on: the first model with an active clip (playing or scrubbed),
-  // so a static stage in the scene never freezes the shot at frame 0. Falls back to the first
-  // model, then to 0 (empty scene).
-  private cameraClockTime(): number {
+  /**
+   * THE TRANSPORT'S CLOCK — where the scene is in its own playback.
+   *
+   * The first model with an active clip (playing or scrubbed), so a static stage
+   * never freezes it at frame 0. Falls back to the first model with a clip, then
+   * to 0 for an empty scene.
+   *
+   * NOT `sceneClock`, and the difference is the whole reason this has a name.
+   * `sceneClock` only ever accumulates delta — it is how long the engine has
+   * been running, it does not move when you scrub, and it does not stop when you
+   * pause. Anything that should line up with what the transport shows has to
+   * read THIS. An effect scheduled to frame 100 against sceneClock fires once,
+   * a hundred frames after the page loaded, and never again.
+   *
+   * Deterministic offline: the export loop advances model animation by an exact
+   * per-frame delta, so this reproduces frame for frame.
+   */
+  private transportTime(): number {
     let fallback: number | null = null
     for (const inst of this.modelInstances.values()) {
       // Stages are skipped outright. Scenery carries no motion, and it is added
@@ -10558,7 +10741,7 @@ export class Engine {
 
     // Drive the shot from the camera VMD (synced to the animated model's clock).
     if (this.camera.vmdDriven && this.cameraAnimation) {
-      const pose = this.cameraAnimation.sample(this.cameraClockTime())
+      const pose = this.cameraAnimation.sample(this.transportTime())
       if (pose) this.camera.setVmdPose(pose)
     }
 
@@ -10693,6 +10876,12 @@ export class Engine {
     // uniforms this frame.
     this.evaluateDissolveCycles()
     this.evaluateParamTracks()
+    // FIRST among the things that read an effect, because every one of them
+    // reads what this writes: the sim's clock, the particle uniform's weight,
+    // the light dispatch, the field draw. Evaluated here rather than by a
+    // caller so that playback, the export loop and a warm-up pass cannot
+    // disagree about when an effect is alive — none of them has to remember it.
+    this.evaluateEffectSchedules()
     this.stepSim(encoder, deltaTime)
     this.stepParticles(encoder, deltaTime)
     // Before the scene pass, which READS the slots this writes. Same buffer,
@@ -10754,7 +10943,7 @@ export class Engine {
     this.forEachInstance((inst) => this.renderModelTransparentPhase(pass, inst, camView))
     // Last in the pass: depth-tested against everything drawn above, so a
     // particle behind the character is simply hidden, and still inside the HDR
-    // target so an `@bloom` effect reaches the pyramid below.
+    // target so an `#bloom` effect reaches the pyramid below.
     this.renderParticles(pass, "camera")
     // Ribbons, in the same pass and after the particles: both are additive
     // light in HDR, and both reach the bloom pyramid because of it. This used

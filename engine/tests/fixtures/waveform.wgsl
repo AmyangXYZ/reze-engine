@@ -1,4 +1,4 @@
-// @layer additive — this effect is LIGHT, not matter. The layer ADDS to what
+#layer additive — this effect is LIGHT, not matter. The layer ADDS to what
 // the scene already drew, so a backdrop image, a flat colour, a skybox or
 // another effect behind it all stay visible and nothing here covers them.
 //

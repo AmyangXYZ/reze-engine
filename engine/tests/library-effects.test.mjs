@@ -30,9 +30,10 @@ import assert from "node:assert/strict"
 import { readFileSync, readdirSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { EFFECT_SCENE_API, buildFieldShader, parseEffectAnchors } from "../dist/shaders/passes/composite.js"
+import { EFFECT_SCENE_API, buildFieldShader } from "../dist/shaders/passes/composite.js"
+import { parseDirectives, stripDirectives } from "../dist/shaders/directives.js"
 import { buildLightEmitShader, hasLightEmit } from "../dist/shaders/lights.js"
-import { buildParticleComputeShader, buildParticleRenderShader, parseParticleCount } from "../dist/shaders/passes/particles.js"
+import { buildParticleComputeShader, buildParticleRenderShader } from "../dist/shaders/passes/particles.js"
 import { buildTrailShader } from "../dist/shaders/passes/trails.js"
 import { anchorAliasWgsl, buildAnchorTable } from "../dist/shaders/anchor-table.js"
 
@@ -66,7 +67,7 @@ const CAST = {
 
 /** Every module this effect's source is spliced into, as the engine would. */
 function modulesFor(wgsl) {
-  const anchors = parseEffectAnchors(wgsl, 8)
+  const anchors = parseDirectives(wgsl).directives.anchors.slice(0, 8)
   const alias = buildAnchorTable([anchors], 8).alias[0]
   const trailed = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
   const cast = { ...CAST, alias, trailCount: trailed.length }
@@ -87,7 +88,7 @@ function modulesFor(wgsl) {
     out.push(["field", buildFieldShader(effect)])
   }
   if (/\bfn\s+particleInit\s*\(/.test(wgsl)) {
-    const src = { wgsl, count: parseParticleCount(wgsl) || 64, blend: "alpha", bloom: false }
+    const src = { wgsl, count: parseDirectives(wgsl).directives.particles || 64, blend: "alpha", bloom: false }
     out.push(
       ["particle compute", buildParticleComputeShader(src, cast)],
       ["particle render", buildParticleRenderShader(src, cast)],
@@ -159,10 +160,14 @@ unpack4x8snorm unpack4x8unorm unpack4xI8 unpack4xU8 unpack2x16snorm unpack2x16un
 rgba8unorm rgba8snorm rgba8uint rgba8sint rgba16uint rgba16sint rgba16float r32uint r32sint r32float rg32uint
 rg32sint rg32float rgba32uint rgba32sint rgba32float bgra8unorm rg11b10ufloat`.split(/\s+/))
 
-/** Strip comments, attributes and member/swizzle accesses — everything that
- *  looks like an identifier without being a reference to one. */
+/** Strip directives, comments, attributes and member/swizzle accesses —
+ *  everything that looks like an identifier without being a reference to one.
+ *
+ *  Directives FIRST and by the engine's own function: `#grid 256` is a line of
+ *  configuration, not of shader code, and a scanner that took `grid` for an
+ *  identifier would report every declaring effect as using an undefined name. */
 function codeOnly(src) {
-  return src
+  return stripDirectives(src)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/\/\/[^\n]*/g, " ")
     .replace(/@\w+\s*\([^)]*\)/g, " ") // @builtin(position), @group(0)
@@ -235,12 +240,12 @@ for (const file of FIXTURES) {
   // The engine warns about this at install, where only someone with a browser
   // open sees it. A built-in shipping the dead directive is what taught authors
   // to write it, so the built-ins are held to it here too.
-  test(`${file}: declares @bloom only if something can bloom`, () => {
-    if (!/^\s*\/\/\s*@bloom\s*$/m.test(wgsl)) return
+  test(`${file}: declares #bloom only if something can bloom`, () => {
+    if (!/^\s*\/\/\s*#bloom\s*$/m.test(wgsl)) return
     const hdr = /\bfn\s+particleInit\s*\(/.test(wgsl) || /\bfn\s+trailWidth\s*\(/.test(wgsl)
     assert.ok(
       hdr,
-      `${file} declares // @bloom with neither particles nor ribbons. Field mounts composite after tone ` +
+      `${file} declares #bloom with neither particles nor ribbons. Field mounts composite after tone ` +
         `mapping, past the pyramid, so the directive does nothing and its glow is its own falloff.`,
     )
   })

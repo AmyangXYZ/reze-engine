@@ -1,5 +1,5 @@
-// @layer additive
-// @anchor センター trail
+#layer additive
+#anchor センター trail
 
 // Tunables — edit and ⌘⏎.
 const COLOR_L = vec3f(0.231, 0.510, 0.965);  // stage left — blue-500 #3b82f6
@@ -253,7 +253,7 @@ fn vivid(c: vec3f, k: f32) -> vec3f {
 //
 // The aim is the same lagged aim the shafts use — literally the same function,
 // so the light cannot drift away from the shaft supposed to be delivering it.
-// @lights 3
+#lights 3
 fn lightEmit(i: u32, time: f32) -> RzLight {
   var l: RzLight;
   // The SAME palette as the shafts, pushed. Haze reads pale because it is

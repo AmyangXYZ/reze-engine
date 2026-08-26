@@ -1,4 +1,4 @@
-// @particles 5000
+#particles 5000
 
 // Rain — the same rain, drawn as geometry.
 //

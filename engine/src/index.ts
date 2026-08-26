@@ -34,6 +34,10 @@ export { LYRIC_ATLAS_MAX_H, LYRIC_ATLAS_MAX_W, parseLRC, type LyricLine, type Ly
 // wants to draw a track, or scrub one, should read the same curve the engine
 // plays rather than reimplementing it a second time.
 export { sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
+// The strip an effect is scheduled by, and the pure evaluator behind it —
+// exported so a caller can draw a lane against the same numbers the engine
+// renders from, rather than a second copy of the ramp maths.
+export { effectState, type EffectWindow, type EffectState } from "./effect-schedule"
 export {
   compileGraph,
   validateGraph,
@@ -70,6 +74,17 @@ export { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 export { EYE_GRAPH } from "./graph/presets/eye"
 export { FACE_GRAPH } from "./graph/presets/face"
 export { UNLIT_GRAPH } from "./graph/presets/unlit"
+// What an effect declares, and the source with those lines blanked. Exported
+// because a host builds parameter controls from the declarations and needs the
+// same answer the engine got — two parsers is how they disagree.
+export {
+  parseDirectives,
+  stripDirectives,
+  DIRECTIVE_LINE,
+  DIRECTIVE_NOTE,
+  type EffectDirectives,
+  type EffectParamDecl,
+} from "./shaders/directives"
 export {
   Model,
   MATERIAL_MORPH_MULTIPLY,
