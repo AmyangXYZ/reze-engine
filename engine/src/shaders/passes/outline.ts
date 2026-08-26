@@ -17,9 +17,11 @@
 // a string baked at import cannot know what the device said.
 
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
+import { DISSOLVE_WGSL } from "../materials/common"
 
 export function outlineShaderWgsl(): string {
   return /* wgsl */ `
+${DISSOLVE_WGSL}
 struct CameraUniforms {
   view: mat4x4f,
   projection: mat4x4f,
@@ -29,12 +31,20 @@ struct CameraUniforms {
   viewportHeight: f32,
 };
 
+// The head of the material block, plus the one field at its tail. The middle is
+// skipped rather than named: this pass shades nothing, and every field it
+// declared would be a field that has to stay in step with the real struct for
+// no gain. The padding is explicit so the offsets are checkable by eye —
+// edgeColor at 0, edgeSize at 16, and dissolve last at 60.
 struct MaterialUniforms {
   edgeColor: vec4f,
   edgeSize: f32,
   _padding1: f32,
   _padding2: f32,
   _padding3: f32,
+  _skip0: vec4f,
+  _skip1: vec3f,
+  dissolve: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -46,6 +56,10 @@ struct MaterialUniforms {
 struct VertexOutput {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
+  /** BIND-POSE position, for the dissolve — the same value the colour pass and
+   *  the depth prepass measure against, so all three agree about which flakes
+   *  are gone. */
+  @location(1) restPos: vec3f,
 };
 
 @vertex fn vs(
@@ -95,6 +109,7 @@ struct VertexOutput {
   let offset = screenNormal * (material.edgeSize * 4.0 / viewport) * clipPos.w;
   output.position = vec4f(clipPos.xy + offset, clipPos.z, clipPos.w);
   output.uv = uv;
+  output.restPos = position;
   return output;
 }
 
@@ -109,6 +124,18 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
   // legs crossing lost their outline entirely. Modulating instead keeps a
   // proportional rim on sheer weave (never a solid black hull) and still
   // discards true cut-out margins like hair-card borders.
+  // THE HULL GOES WITH THE SURFACE IT TRACES.
+  //
+  // Without this the outline pass was the one pass that ignored the dissolve:
+  // the body discarded flake by flake and its hulls stayed, so a character who
+  // had gone left a solid silhouette in her own edge colour standing where she
+  // had been. Only models whose materials carry MMD's edge flag showed it,
+  // which is what made it look like some models "would not dissolve".
+  //
+  // The same test the colour pass and the depth prepass run, against the same
+  // bind-pose position — three passes, one rule, or they disagree about which
+  // pieces are still there.
+  if (material.dissolve < 0.9995 && rz_dissolve_threshold(input.restPos) > material.dissolve) { discard; }
   let texA = textureSample(diffuseTexture, edgeSampler, input.uv).a;
   if (texA < 0.05) {
     discard;

@@ -265,3 +265,41 @@ test("the world and the backdrop are separate seats", () => {
   assert.match(body, /u\[11\] = this\.backdropEquirectView \? 2 : showingWorld \? 3 : bg \? 1 : 0/)
   assert.match(body, /binding: 6, resource: this\.backdropEquirectView \?\? this\.worldEquirectView \?\? this\.fallbackEquirectView/)
 })
+
+test("every pass that draws the body honours the dissolve", () => {
+  // FOUR PASSES, ONE RULE. The colour pass shades her, the depth prepass claims
+  // depth for what it will shade, the shadow pass casts from her — and the
+  // outline pass traces her silhouette. Three of them tested and the fourth did
+  // not, so a character who had dissolved left her own hulls standing: a solid
+  // shape in her edge colour, where she had been.
+  //
+  // It looked like the model would not dissolve, and it only happened to models
+  // whose materials carry MMD's edge flag — which is what made it read as
+  // "some models are broken" rather than as one pass missing a line.
+  const passes = ["outline", "depth-prepass", "shadow"]
+  for (const name of passes) {
+    const src = readFileSync(new URL(`../src/shaders/passes/${name}.ts`, import.meta.url), "utf8")
+    assert.match(
+      src,
+      /material\.dissolve < 0\.9995 && rz_dissolve_threshold\(in(put)?\.restPos\) > material\.dissolve/,
+      `${name} must run the same dissolve test`,
+    )
+    // Against the same BIND-POSE position, or two passes disagree about which
+    // flakes are gone and the model writes depth where it no longer draws.
+    assert.match(src, /restPos/, `${name} must carry restPos`)
+  }
+  // And the colour pass, which reaches it through the graph prologue.
+  const slots = readFileSync(new URL("../src/graph/slots.ts", import.meta.url), "utf8")
+  assert.match(slots, /if \(rz_t > material\.dissolve\) \{ discard; \}/)
+})
+
+test("the outline's truncated material view puts dissolve on byte 60", () => {
+  // It declares the HEAD of the block plus the one field at the tail, so the
+  // offsets have to be counted by hand — and a field landing on the wrong byte
+  // reads a neighbour rather than failing, which is a hull that dissolves when
+  // some unrelated value happens to dip.
+  const src = readFileSync(new URL("../src/shaders/passes/outline.ts", import.meta.url), "utf8")
+  const struct = src.slice(src.indexOf("struct MaterialUniforms"), src.indexOf("@group(0) @binding(0)"))
+  // edgeColor 0..16, edgeSize + 3 pads 16..32, a vec4 32..48, a vec3 48..60.
+  assert.match(struct, /_skip0: vec4f,\s*_skip1: vec3f,\s*dissolve: f32,/)
+})
