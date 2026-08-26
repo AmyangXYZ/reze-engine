@@ -115,6 +115,37 @@ export class Camera {
   }
 
   /** Feed the next sampled MMD camera pose (engine calls this each frame while driving). */
+  /**
+   * The shot as MMD states one: a point, an orientation about it, how far back,
+   * and how wide. The five channels an MMD camera keyframe carries.
+   *
+   * ONE SHAPE FOR BOTH MODES, which is the point of it existing. A VMD-driven
+   * camera stores exactly this; an orbiting one holds alpha/beta/radius/target
+   * instead, which is the same statement with no roll. A caller that wants to
+   * know where the shot is should not have to ask which of the two is driving,
+   * and should certainly not have to take a view matrix apart to find out —
+   * both modes have the answer already, unfactored.
+   */
+  getPose(): CameraPose {
+    if (this.vmdDriven) {
+      return {
+        target: new Vec3(this._vmdTarget.x, this._vmdTarget.y, this._vmdTarget.z),
+        rotation: new Vec3(this._vmdRotation.x, this._vmdRotation.y, this._vmdRotation.z),
+        distance: this._vmdDistance,
+        fov: this.fov,
+      }
+    }
+    // Orbit. alpha and beta are the same yaw and pitch the VMD euler carries,
+    // in the same sense the shot is built from — see vmdEye. Distance is
+    // NEGATIVE to match: in a VMD the camera sits behind its target.
+    return {
+      target: new Vec3(this.target.x, this.target.y, this.target.z),
+      rotation: new Vec3(this.beta - Math.PI / 2, -this.alpha, 0),
+      distance: -this.radius,
+      fov: this.fov,
+    }
+  }
+
   setVmdPose(pose: CameraPose): void {
     this._vmdTarget.set(pose.target)
     this._vmdRotation.set(pose.rotation)

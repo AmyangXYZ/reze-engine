@@ -8,6 +8,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { buildMirrorCamera, reflectionAboutY } from "../dist/reflection.js"
 import { Mat4, Vec3 } from "../dist/math.js"
 
@@ -97,4 +98,25 @@ test("the reflection matrix is its own inverse and flips handedness", () => {
   // mirror out — this pins that the flip is real, not folklore.
   const det = r[0] * r[5] * r[10]
   assert.equal(det, -1)
+})
+
+test("the camera reports its pose the same way in both modes", () => {
+  // For a host writing the shot out to something else — an AE composition, a
+  // .vmd, a log. Both modes already hold the five channels MMD states a camera
+  // in; neither should make a caller take a view matrix apart to get them, and
+  // neither should make it ask which mode is driving first.
+  const src = readFileSync(new URL("../src/camera.ts", import.meta.url), "utf8")
+  const body = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "")
+  const fn = body.slice(body.indexOf("getPose(): CameraPose"), body.indexOf("setVmdPose"))
+  // VMD-driven: the stored pose, unfactored.
+  assert.match(fn, /if \(this\.vmdDriven\)/)
+  assert.match(fn, /distance: this\._vmdDistance/)
+  // Orbiting: the same five, with no roll. Distance NEGATIVE, because in a VMD
+  // the camera sits behind its target and a host reading one shape must not get
+  // two conventions.
+  assert.match(fn, /distance: -this\.radius/)
+  assert.match(fn, /rotation: new Vec3\(this\.beta - Math\.PI \/ 2, -this\.alpha, 0\)/)
+  // A COPY, not the live vectors — a caller sampling once a frame into an array
+  // would otherwise end up with one pose repeated however many times it read.
+  assert.match(fn, /target: new Vec3\(this\._vmdTarget\.x/)
 })

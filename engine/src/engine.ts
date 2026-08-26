@@ -10,7 +10,7 @@ import { MIDI_HEADER, MIDI_KEYS, MIDI_NOTES, MIDI_STRIDE } from "./shaders/midi-
 import { decodeTga } from "./tga-loader"
 import { VMDLoader, type CameraKeyframe } from "./vmd-loader"
 import { VMDWriter } from "./vmd-writer"
-import { CameraAnimation } from "./camera-animation"
+import { CameraAnimation, type CameraPose } from "./camera-animation"
 import { PmxLoader } from "./pmx-loader"
 import { RezePhysics } from "./physics"
 import type { WindOptions } from "./physics/world"
@@ -7170,6 +7170,17 @@ export class Engine {
   /** Vertical field of view in radians (default π/4). While a camera VMD
    *  drives the view it animates fov itself; the orbit value set here is
    *  restored when the VMD releases the camera. */
+  /**
+   * The shot as MMD states it — target, euler rotation, distance, fov.
+   *
+   * For a host writing the camera out to something else: an AE composition, a
+   * .vmd, a log. The same five channels whichever mode is driving, so the
+   * caller never asks and never decomposes a view matrix to find out.
+   */
+  getCameraPose(): CameraPose {
+    return this.camera.getPose()
+  }
+
   getCameraFov(): number {
     return this.camera.fov
   }
