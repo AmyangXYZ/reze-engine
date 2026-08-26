@@ -19,6 +19,15 @@
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
 import { DISSOLVE_WGSL } from "../materials/common"
 
+/**
+ * Where `dissolve` sits in the outline's own uniform, in bytes.
+ *
+ * Exported because the engine writes it and this file declares it, and the two
+ * agreeing is not something either can check alone. edgeColor takes 0..16 and
+ * edgeSize 16..20, so this is 20.
+ */
+export const RZ_OUTLINE_DISSOLVE_OFFSET = 20
+
 export function outlineShaderWgsl(): string {
   return /* wgsl */ `
 ${DISSOLVE_WGSL}
@@ -31,20 +40,21 @@ struct CameraUniforms {
   viewportHeight: f32,
 };
 
-// The head of the material block, plus the one field at its tail. The middle is
-// skipped rather than named: this pass shades nothing, and every field it
-// declared would be a field that has to stay in step with the real struct for
-// no gain. The padding is explicit so the offsets are checkable by eye —
-// edgeColor at 0, edgeSize at 16, and dissolve last at 60.
+// THE HULL'S OWN BLOCK, not the material's. 32 bytes of edge data, which is all
+// this pass shades with — and dissolve, which it has to obey.
+//
+// It reached for the material block's own layout first, declaring the skipped
+// middle to land dissolve on byte 60. That compiles and then fails validation
+// at draw time: the buffer actually bound here is 32 bytes, and a pipeline
+// asking for 64 is a pipeline nothing can satisfy. The lesson is the ordinary
+// one — the struct is a claim about the BUFFER, and the buffer is built
+// somewhere else.
 struct MaterialUniforms {
   edgeColor: vec4f,
   edgeSize: f32,
-  _padding1: f32,
+  dissolve: f32,
   _padding2: f32,
   _padding3: f32,
-  _skip0: vec4f,
-  _skip1: vec3f,
-  dissolve: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;

@@ -52,7 +52,7 @@ import {
   hasLightEmit,
 } from "./shaders/lights"
 import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
-import { outlineShaderWgsl } from "./shaders/passes/outline"
+import { outlineShaderWgsl, RZ_OUTLINE_DISSOLVE_OFFSET } from "./shaders/passes/outline"
 import { transparentDepthPrepassWgsl } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
 import { GIZMO_SHADER_WGSL } from "./shaders/passes/gizmo"
@@ -709,6 +709,13 @@ interface ModelInstance {
    *  writes ONE float into each of them and needs no other reason to hold a
    *  block: the whole 16-float copy exists only for materials that morph. */
   materialUniformBuffers: GPUBuffer[]
+  /** The outline hulls' own uniforms, for the materials that have them.
+   *
+   *  A SEPARATE LIST because they are a separate buffer: the hull pass binds 32
+   *  bytes of edge data, not the material block, so a dissolve written into the
+   *  material buffers never reached it and a dissolved character kept her
+   *  outline. Kept here so that write has somewhere to go. */
+  outlineUniformBuffers: GPUBuffer[]
   model: Model
   basePath: string
   assetReader: AssetReader
@@ -9229,6 +9236,7 @@ export class Engine {
       objectId: this.modelInstances.size + 1,
       dissolve: 1,
       materialUniformBuffers: [],
+      outlineUniformBuffers: [],
       cullModelIndex: 0,
       // Seeded false: the first skin-matrix upload decides it, and until then the
       // sphere path is the safe answer (it never culls something it should not).
@@ -9684,12 +9692,18 @@ export class Engine {
           mat.edgeColor[2],
           mat.edgeColor[3],
           mat.edgeSize,
-          0,
+          // How much of this material is still there — the hull has to go with
+          // the surface it traces. Its OWN copy at its own offset: this buffer
+          // is edge data, not the material block, and growing it to reach the
+          // block's layout would be 32 bytes of padding per outlined material
+          // to carry one float. See RZ_OUTLINE_DISSOLVE_OFFSET.
+          1,
           0,
           0,
         ])
         const outlineUniformBuffer = this.createUniformBuffer(`${prefix}outline: ${mat.name}`, materialUniformData)
         inst.gpuBuffers.push(outlineUniformBuffer)
+        inst.outlineUniformBuffers.push(outlineUniformBuffer)
         const outlineBindGroup = this.device.createBindGroup({
           label: `${prefix}outline: ${mat.name}`,
           layout: this.outlinePerMaterialBindGroupLayout,
@@ -11360,6 +11374,12 @@ export class Engine {
     const one = new Float32Array([v])
     for (const buffer of inst.materialUniformBuffers) {
       this.device.queue.writeBuffer(buffer, 60, one)
+    }
+    // And the hulls, which bind their own 32 bytes of edge data rather than the
+    // material block — so this is a different buffer at a different offset, and
+    // missing it left a dissolved character standing in her own outline.
+    for (const buffer of inst.outlineUniformBuffers) {
+      this.device.queue.writeBuffer(buffer, RZ_OUTLINE_DISSOLVE_OFFSET, one)
     }
     // The morph path rebuilds a material's block from its `base` copy and
     // uploads it whole, which would put the old value straight back. Patching

@@ -293,13 +293,42 @@ test("every pass that draws the body honours the dissolve", () => {
   assert.match(slots, /if \(rz_t > material\.dissolve\) \{ discard; \}/)
 })
 
-test("the outline's truncated material view puts dissolve on byte 60", () => {
-  // It declares the HEAD of the block plus the one field at the tail, so the
-  // offsets have to be counted by hand — and a field landing on the wrong byte
-  // reads a neighbour rather than failing, which is a hull that dissolves when
-  // some unrelated value happens to dip.
-  const src = readFileSync(new URL("../src/shaders/passes/outline.ts", import.meta.url), "utf8")
-  const struct = src.slice(src.indexOf("struct MaterialUniforms"), src.indexOf("@group(0) @binding(0)"))
-  // edgeColor 0..16, edgeSize + 3 pads 16..32, a vec4 32..48, a vec3 48..60.
-  assert.match(struct, /_skip0: vec4f,\s*_skip1: vec3f,\s*dissolve: f32,/)
+test("the outline's struct describes the buffer that is actually bound", () => {
+  // A STRUCT IS A CLAIM ABOUT A BUFFER, and the buffer is built somewhere else.
+  //
+  // This first reached for the material block's layout, declaring the skipped
+  // middle so dissolve landed on byte 60 — where setModelDissolve writes it for
+  // the colour pass. It compiled, and then failed validation at the first draw:
+  // the buffer bound here is 32 bytes of edge data, and a pipeline asking for 64
+  // is one nothing can satisfy.
+  //
+  // So the hull carries its own copy, and the two ends have to agree about
+  // where. The shader declares the offset and the engine writes it.
+  const shader = readFileSync(new URL("../src/shaders/passes/outline.ts", import.meta.url), "utf8")
+  const struct = shader.slice(shader.indexOf("struct MaterialUniforms"), shader.indexOf("@group(0) @binding(0)"))
+  // edgeColor 0..16, edgeSize 16..20, dissolve 20..24, two pads to 32.
+  assert.match(struct, /edgeColor: vec4f,\s*edgeSize: f32,\s*dissolve: f32,/)
+  assert.doesNotMatch(struct, /_skip/, "no reach into the material block's layout")
+  assert.match(shader, /export const RZ_OUTLINE_DISSOLVE_OFFSET = 20/)
+
+  const engine = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
+  // EIGHT FLOATS. Adding a ninth grows the buffer past what the bind group
+  // layout was built for, which is the same validation failure from the other
+  // direction.
+  const at = engine.indexOf("mat.edgeColor[0]")
+  const made = engine
+    .slice(engine.lastIndexOf("new Float32Array([", at), engine.indexOf("])", at))
+    // Comments first — they hold commas of their own, and counting those counts
+    // prose rather than floats.
+    .replace(/\/\/[^\n]*/g, "")
+    .replace("new Float32Array([", "")
+  assert.equal(
+    made.split(",").filter((l) => l.trim().length).length,
+    8,
+    "the outline uniform is eight floats",
+  )
+  // Written through the shared constant, never a literal — the two ends cannot
+  // drift if only one of them names the number.
+  assert.match(engine, /writeBuffer\(buffer, RZ_OUTLINE_DISSOLVE_OFFSET, one\)/)
+  assert.match(engine, /inst\.outlineUniformBuffers\.push\(outlineUniformBuffer\)/)
 })
