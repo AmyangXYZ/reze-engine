@@ -122,29 +122,64 @@ test("teleport (large jump) recovers without exploding", { skip: !hasAssets }, (
   assert.ok(maxSpeed(sim.store) < 50, `no runaway velocities: ${maxSpeed(sim.store).toFixed(2)}`)
 })
 
-test("the built-in floor keeps sunken cloth above y=0", { skip: !hasAssets }, () => {
-  const sim = makeSim()
-  for (let i = 0; i < 120; i++) sim.step()
-  // Sink the skeleton 6 units — a sitting-height pose: the skirt and hair
-  // would hang well below y=0 without the floor; the ground box catches them.
-  // (Sinking further drags KINEMATIC anchors under the floor and jointed
-  // cloth legitimately follows them — that's not a floor failure.)
+/** Sink the whole skeleton by `drop` units for 300 frames, the way a pose that
+ *  reaches the ground does, and report where the lowest dynamic body ended up
+ *  and how many contacts the floor collected. */
+function sinkAndMeasure(sim, drop) {
   for (let f = 0; f < 300; f++) {
     sim.model.update(DT)
     const mats = sim.model.getWorldMatrices()
-    for (const m of mats) m.values[13] -= 6
+    for (const m of mats) m.values[13] -= drop
     sim.physics.step(DT, mats, sim.model.getBoneInverseBindMatrices())
   }
-  assert.ok(allFinite(sim.store.positions), "positions finite")
+  const ground = sim.store.count - 1
+  let rows = 0
+  for (let i = 0; i < sim.physics.contacts.count; i++) {
+    if (sim.physics.contacts.get(i).bodyB === ground) rows++
+  }
   let minY = Infinity
   for (let i = 0; i < sim.store.count; i++) {
     if (sim.store.type[i] !== 1) continue
     const y = sim.store.positions[i * 3 + 1]
     if (y < minY) minY = y
   }
+  return { rows, minY }
+}
+
+// 20 UNITS, and the depth is the whole test. At 6 — a sitting-height pose, which
+// this used to use — nothing on this rig ever reaches y = 0: the lowest dynamic
+// body settles at 4.2 and the floor collects not one contact, so the assertion
+// below passed without the floor being involved in any way. At 20 it collects
+// some 700, which is what makes both of these tests mean something.
+const FLOOR_DROP = 20
+
+test("the built-in floor keeps sunken cloth above y=0", { skip: !hasAssets }, () => {
+  const sim = makeSim()
+  for (let i = 0; i < 120; i++) sim.step()
+  const { rows, minY } = sinkAndMeasure(sim, FLOOR_DROP)
+  assert.ok(allFinite(sim.store.positions), "positions finite")
+  assert.ok(rows > 0, "the floor is carrying cloth")
   // Sphere/capsule centers sit a radius above the face; small transient
   // penetration is fine — sinking metres below is not.
-  assert.ok(minY > -1.0, `dynamic bodies rest near the floor: minY=${minY.toFixed(2)}`)
+  assert.ok(minY > -1.5, `dynamic bodies rest near the floor: minY=${minY.toFixed(2)}`)
+})
+
+test("setFloor(false) lets the same cloth through", { skip: !hasAssets }, () => {
+  // The floor is model-space, so a figure lifted onto a stage or carried up by
+  // root motion takes it with her, and cloth that should hang past her feet
+  // piles on a surface nothing is standing on. Turning it off has to let go.
+  const sim = makeSim()
+  sim.physics.setFloor(false)
+  for (let i = 0; i < 120; i++) sim.step()
+  const { rows, minY } = sinkAndMeasure(sim, FLOOR_DROP)
+  assert.ok(allFinite(sim.store.positions), "positions finite")
+  assert.equal(rows, 0, "no floor contact once it is off")
+  assert.ok(minY < -5, `cloth follows the bones down: minY=${minY.toFixed(2)}`)
+
+  // And back, since the body was never removed from the store — only the index
+  // findContacts reads.
+  sim.physics.setFloor(true)
+  assert.ok(sinkAndMeasure(sim, FLOOR_DROP).rows > 0, "the floor comes back")
 })
 
 test("broadphase pairs match the brute-force filtered sweep", { skip: !hasAssets }, () => {

@@ -86,15 +86,24 @@ export class RezePhysics {
   // was detected and settled.
   teleportCount = 0
 
+  /** Where the floor body actually lives. `store.groundIndex` is the SWITCH —
+   *  see setFloor — and forgets it. */
+  private groundBody = -1
+
   constructor(rigidbodies: Rigidbody[], joints: Joint[] = []) {
     this.rigidbodies = rigidbodies
     this.joints = joints
-    // The floor is part of every world: a huge static box whose top face is
-    // model-space y = 0, so hair and hems rest on the ground instead of
-    // clipping through when a pose reaches it. Boneless (every bone-sync loop
-    // skips boneIndex < 0); collides with EVERY dynamic body regardless of
-    // group masks via findContacts' dedicated plane pass (spheres, capsules
-    // and boxes — box hems included).
+    // The floor: a huge static box whose top face is model-space y = 0, so hair
+    // and hems rest on the ground instead of clipping through when a pose
+    // reaches it. Boneless (every bone-sync loop skips boneIndex < 0); collides
+    // with EVERY dynamic body regardless of group masks via findContacts'
+    // dedicated plane pass (spheres, capsules and boxes — box hems included).
+    //
+    // It is MODEL SPACE, which is the whole reason setFloor exists: y = 0 is
+    // wherever this figure's own origin is, not where the scene's ground is. A
+    // character standing on a stage, hanging in the air, or carried up by root
+    // motion takes her floor with her, and hair that should fall past her feet
+    // piles on nothing instead.
     const ground: Rigidbody = {
       name: "__ground__",
       englishName: "__ground__",
@@ -119,6 +128,7 @@ export class RezePhysics {
     // dedicated plane pass against every dynamic body (all shapes, boxes too).
     this.store.collisionGroup[gi] = 0
     this.store.willCollideMask[gi] = 0
+    this.groundBody = gi
     this.store.groundIndex = gi
     this.world = new World(new Vec3(0, -98, 0))
     this.constraints = buildConstraints(rigidbodies, joints)
@@ -178,6 +188,19 @@ export class RezePhysics {
   private savePrevState(): void {
     this.prevPositions.set(this.store.positions)
     this.prevOrientations.set(this.store.orientations)
+  }
+
+  /**
+   * Whether the built-in floor collides at all.
+   *
+   * The body stays in the store either way: it is static, boneless and outside
+   * the pair list, so an idle one costs nothing, and keeping it means turning
+   * the floor back on cannot disturb any index the solver caches. What moves is
+   * `store.groundIndex`, which is what findContacts reads to decide whether to
+   * run the plane pass.
+   */
+  setFloor(on: boolean): void {
+    this.store.groundIndex = on ? this.groundBody : -1
   }
 
   setGravity(gravity: Vec3): void {

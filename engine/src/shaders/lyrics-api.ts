@@ -8,11 +8,12 @@
 // glyph atlases) into a fixed atlas the effect samples through rzLyricText.
 // The look — fill, outline, wipe, motion — is the effect author's, in WGSL.
 //
-// LAYOUT. A 4-float header (count, then padding that keeps the records
-// vec4-aligned), then LYRIC_LINES_MAX records of 8 floats:
+// LAYOUT. A 4-float header, then LYRIC_LINES_MAX records of 8 floats:
 //
-//   [0] start s   [1] end s   [2] character count   [3] reserved
-//   [4..7] atlas rect: u0, vTop, u1, vBottom
+//   header [0] line count   [1] the widest line's rect ratio   [2..3] padding,
+//     which keeps the records vec4-aligned
+//   record [0] start s   [1] end s   [2] character count   [3] reserved
+//          [4..7] atlas rect: u0, vTop, u1, vBottom
 //
 // FIXED SIZE, unlike the score: a song carries tens of lines, not thousands
 // of notes, so capping at 256 costs 8 KB and buys the property that setLyrics
@@ -98,6 +99,14 @@ export function packLyrics(lines: LyricLine[], rects?: LyricRect[]): Float32Arra
   const out = new Float32Array(new ArrayBuffer(LYRICS_FLOATS * 4))
   const n = Math.min(lines.length, LYRIC_LINES_MAX)
   out[0] = n
+  // THE WIDEST LINE IN THE TRACK, which is the one number an effect laying the
+  // words out cannot work out for itself: finding it means reading every rect,
+  // and a field shader would be doing that at every pixel of a 4K frame to
+  // answer something that changes only when the track does. Carried as the
+  // rect's own ratio rather than as an aspect, so it is a property of the pack
+  // and not of whatever the atlas happened to be sized at; rzLyricWidest turns
+  // it into the same number rzLyricAspect answers with.
+  let widest = 0
   for (let i = 0; i < n; i++) {
     const b = LYRIC_HEADER + i * LYRIC_STRIDE
     out[b] = lines[i].start
@@ -109,8 +118,11 @@ export function packLyrics(lines: LyricLine[], rects?: LyricRect[]): Float32Arra
       out[b + 5] = r[1]
       out[b + 6] = r[2]
       out[b + 7] = r[3]
+      const h = r[3] - r[1]
+      if (h > 0) widest = Math.max(widest, (r[2] - r[0]) / h)
     }
   }
+  out[1] = widest
   return out
 }
 
@@ -195,6 +207,23 @@ fn rzLyricAspect(i: i32) -> f32 {
   if (h <= 0.0) { return 1.0; }
   let dim = vec2f(textureDimensions(_rzLyricTex));
   return ((r.z - r.x) * dim.x) / (h * dim.y);
+}
+
+/**
+ * THE WIDEST LINE IN THE TRACK, on the same scale rzLyricAspect answers on.
+ *
+ * What it is for: setting the type so the longest line in the song fits the
+ * frame, once, for every line — which is the only way a column of lyrics can be
+ * bounded by the frame without lines changing size down the page. Sizing each
+ * line to its own width instead sets a verse smaller than the interjection above
+ * it, for a reason the reader cannot see.
+ *
+ * 0 before the lines are rasterised, and 0 with no track: there is no widest
+ * line yet, and a cap derived from it would be a cap on nothing. Guard it.
+ */
+fn rzLyricWidest() -> f32 {
+  let dim = vec2f(textureDimensions(_rzLyricTex));
+  return _rzLyrics[1] * dim.x / dim.y;
 }
 
 /**

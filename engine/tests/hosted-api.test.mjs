@@ -107,6 +107,7 @@ const EXCEPTIONS = {
   rzLyricText: "samples the lyric atlas, which only the field module binds",
   rzLyricAspect: "same",
   rzLyricPixels: "same",
+  rzLyricWidest: "same",
 }
 
 test("every author-facing name is in every module, or listed as an exception", () => {

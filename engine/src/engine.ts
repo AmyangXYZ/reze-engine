@@ -2080,6 +2080,7 @@ export class Engine {
   // scene, and a model loaded later must arrive into the same air as the rest.
   private gravity = new Vec3(0, -98, 0)
   private wind: WindOptions | null = null
+  private physicsFloor = true
   // GPU vertex-morph path. Set false BEFORE loadModel to fall back to the CPU path (A/B).
   private useGpuMorphs = true
 
@@ -8042,6 +8043,25 @@ export class Engine {
     this.forEachInstance((inst) => inst.physics?.setWind(this.wind))
   }
 
+  /**
+   * Whether cloth and hair land on a floor at each figure's own feet.
+   *
+   * ON is what a standing character wants: the floor is at her model-space
+   * y = 0, so a long skirt or hair reaching the ground rests on it instead of
+   * passing through. That same plane travels with her, which is what makes this
+   * a switch — lift her onto a stage, hang her in the air, carry her up with
+   * root motion, and everything that should now fall past her feet piles up on
+   * a surface nothing in the scene is standing on.
+   */
+  setPhysicsFloor(on: boolean): void {
+    this.physicsFloor = on
+    this.forEachInstance((inst) => inst.physics?.setFloor(on))
+  }
+
+  getPhysicsFloor(): boolean {
+    return this.physicsFloor
+  }
+
   getWind(): WindOptions | null {
     return this.wind ? { ...this.wind, direction: new Vec3(this.wind.direction.x, this.wind.direction.y, this.wind.direction.z) } : null
   }
@@ -9159,6 +9179,7 @@ export class Engine {
     if (physics) {
       physics.setGravity(this.gravity)
       if (this.wind) physics.setWind(this.wind)
+      physics.setFloor(this.physicsFloor)
     }
 
     // One per cascade: the shadow VERTEX shader reads a single matrix, and
