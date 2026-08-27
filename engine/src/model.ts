@@ -2407,10 +2407,15 @@ export class Model {
     // tight extension limit never reach the singular zone, which is why this
     // read as a model-specific bug rather than an engine one.
     //
-    // Links only, and only when a pose source is about to run: a blanket reset
-    // would wipe bones the host posed by hand through localRotations, and a
-    // suspended clip means the current pose IS the authority.
-    if (!this.clipApplySuspended) {
+    // Links only, and only when a SOLVE is about to consume the clean start:
+    // the reset exists to feed solveIKChains, and with IK off engine-wide the
+    // solve never runs — the wipe then only destroys rotations the host wrote
+    // by hand. MiKaPo poses legs through rotateBones with setIKEnabled(false),
+    // and this line erased them every frame on any model that still HAS its IK
+    // chains; the bundled demo model dodged it only because its IK bones are
+    // stripped, which is why uploads misbehaved while the demo looked fine.
+    // A suspended clip means the current pose IS the authority, same as before.
+    if (ikEnabled && !this.clipApplySuspended) {
       const solvers = this.runtimeSkeleton.ikSolvers
       if (solvers) {
         const rots = this.runtimeSkeleton.localRotations
