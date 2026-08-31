@@ -15,6 +15,12 @@ export const EYE_GRAPH: ShaderGraph = {
   tags: ["eye"],
   nodes: [
     { id: "tex", type: "texture" },
+    // Base colour: the texture times the PMX material's diffuse. MMD authors
+    // tint per MATERIAL rather than per texel — an eyebrow sharing the face
+    // atlas is painted once and coloured here — so the diffuse belongs in the
+    // base of every look.
+    { id: "mat_diffuse", type: "material_diffuse" },
+    { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     {
       id: "principled",
       type: "principled",
@@ -24,8 +30,10 @@ export const EYE_GRAPH: ShaderGraph = {
     { id: "add", type: "add_shader" },
   ],
   links: [
-    { from: { node: "tex", socket: "color" }, to: { node: "principled", socket: "base_color" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "emission", socket: "color" } },
+    { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
+    { from: { node: "mat_diffuse", socket: "color" }, to: { node: "tex_base", socket: "b" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "emission", socket: "color" } },
     { from: { node: "principled", socket: "color" }, to: { node: "add", socket: "a" } },
     { from: { node: "emission", socket: "color" }, to: { node: "add", socket: "b" } },
   ],

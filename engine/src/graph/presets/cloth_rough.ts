@@ -11,6 +11,12 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
   tags: ["cloth_rough"],
   nodes: [
     { id: "tex", type: "texture" },
+    // Base colour: the texture times the PMX material's diffuse. MMD authors
+    // tint per MATERIAL rather than per texel — an eyebrow sharing the face
+    // atlas is painted once and coloured here — so the diffuse belongs in the
+    // base of every look.
+    { id: "mat_diffuse", type: "material_diffuse" },
+    { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
     { id: "str", type: "shader_to_rgb_diffuse" },
     { id: "ramp_008", type: "ramp_constant_aa", inputs: { edge: 0.2966 } },
@@ -37,10 +43,12 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
   links: [
     { from: { node: "str", socket: "value" }, to: { node: "ramp_008", socket: "fac" } },
     { from: { node: "ramp_008", socket: "fac_out" }, to: { node: "mix04_fac", socket: "a" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "dark_tex", socket: "color" } },
+    { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
+    { from: { node: "mat_diffuse", socket: "color" }, to: { node: "tex_base", socket: "b" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "dark_tex", socket: "color" } },
     { from: { node: "mix04_fac", socket: "value" }, to: { node: "mix_004", socket: "fac" } },
     { from: { node: "dark_tex", socket: "color" }, to: { node: "mix_004", socket: "a" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "mix_004", socket: "b" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "mix_004", socket: "b" } },
     { from: { node: "geo", socket: "normal" }, to: { node: "sep_n", socket: "vector" } },
     { from: { node: "sep_n", socket: "y" }, to: { node: "bevel_clamp", socket: "a" } },
     { from: { node: "bevel_clamp", socket: "value" }, to: { node: "mix_003", socket: "fac" } },
@@ -54,7 +62,7 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
     { from: { node: "noise", socket: "value" }, to: { node: "noise_ramp", socket: "fac" } },
     { from: { node: "noise_ramp", socket: "fac_out" }, to: { node: "bump", socket: "height" } },
     { from: { node: "geo", socket: "normal" }, to: { node: "bump", socket: "normal" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "principled_base", socket: "color" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "principled_base", socket: "color" } },
     { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "bump", socket: "vector" }, to: { node: "principled", socket: "normal" } },
     { from: { node: "npr_emit", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },

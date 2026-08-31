@@ -14,6 +14,12 @@ export const STOCKINGS_GRAPH: ShaderGraph = {
   tags: ["stockings"],
   nodes: [
     { id: "tex", type: "texture" },
+    // Base colour: the texture times the PMX material's diffuse. MMD authors
+    // tint per MATERIAL rather than per texel — an eyebrow sharing the face
+    // atlas is painted once and coloured here — so the diffuse belongs in the
+    // base of every look.
+    { id: "mat_diffuse", type: "material_diffuse" },
+    { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
     { id: "map", type: "mapping", inputs: { loc: [1.0, 1.0, 1.0], rot: [0.0, 1.5708, 1.5708] } },
     { id: "grad", type: "tex_gradient" },
@@ -47,8 +53,10 @@ export const STOCKINGS_GRAPH: ShaderGraph = {
     { from: { node: "ramp_face", socket: "fac_out" }, to: { node: "mix_001", socket: "b" } },
     { from: { node: "mix_001", socket: "color" }, to: { node: "mask", socket: "a" } },
     { from: { node: "ramp_002", socket: "fac_out" }, to: { node: "mask", socket: "b" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "emission_hs", socket: "color" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "principled", socket: "base_color" } },
+    { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
+    { from: { node: "mat_diffuse", socket: "color" }, to: { node: "tex_base", socket: "b" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "emission_hs", socket: "color" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
     { from: { node: "emission_hs", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "mix_shader_001", socket: "b" } },
     { from: { node: "mask", socket: "color" }, to: { node: "mix_shader_001", socket: "fac" } },

@@ -14,6 +14,12 @@ export const FACE_GRAPH: ShaderGraph = {
   tags: ["face"],
   nodes: [
     { id: "tex", type: "texture" },
+    // Base colour: the texture times the PMX material's diffuse. MMD authors
+    // tint per MATERIAL rather than per texel — an eyebrow sharing the face
+    // atlas is painted once and coloured here — so the diffuse belongs in the
+    // base of every look.
+    { id: "mat_diffuse", type: "material_diffuse" },
+    { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
 
     // ── toon shading ──
@@ -82,8 +88,10 @@ export const FACE_GRAPH: ShaderGraph = {
   links: [
     // toon
     { from: { node: "str", socket: "value" }, to: { node: "toon", socket: "fac" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "shadow_tint", socket: "color" } },
-    { from: { node: "tex", socket: "color" }, to: { node: "lit_tint", socket: "color" } },
+    { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
+    { from: { node: "mat_diffuse", socket: "color" }, to: { node: "tex_base", socket: "b" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "shadow_tint", socket: "color" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "lit_tint", socket: "color" } },
     { from: { node: "toon", socket: "fac_out" }, to: { node: "toon_color", socket: "fac" } },
     { from: { node: "shadow_tint", socket: "color" }, to: { node: "toon_color", socket: "a" } },
     { from: { node: "lit_tint", socket: "color" }, to: { node: "toon_color", socket: "b" } },

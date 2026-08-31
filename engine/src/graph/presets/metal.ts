@@ -12,6 +12,12 @@ export const METAL_GRAPH: ShaderGraph = {
   tags: ["metal"],
   nodes: [
     { id: "tex", type: "texture" },
+    // Base colour: the texture times the PMX material's diffuse. MMD authors
+    // tint per MATERIAL rather than per texel — an eyebrow sharing the face
+    // atlas is painted once and coloured here — so the diffuse belongs in the
+    // base of every look.
+    { id: "mat_diffuse", type: "material_diffuse" },
+    { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
     { id: "tex_tint", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.800000011920929, fac: 1.0 } },
     { id: "str", type: "shader_to_rgb_diffuse" },
@@ -35,7 +41,9 @@ export const METAL_GRAPH: ShaderGraph = {
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.6967 } },
   ],
   links: [
-    { from: { node: "tex", socket: "color" }, to: { node: "tex_tint", socket: "color" } },
+    { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
+    { from: { node: "mat_diffuse", socket: "color" }, to: { node: "tex_base", socket: "b" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "tex_tint", socket: "color" } },
     { from: { node: "str", socket: "value" }, to: { node: "ramp_008", socket: "fac" } },
     { from: { node: "ramp_008", socket: "fac_out" }, to: { node: "mix04_fac", socket: "a" } },
     { from: { node: "tex_tint", socket: "color" }, to: { node: "dark_tex", socket: "color" } },
