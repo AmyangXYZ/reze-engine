@@ -149,6 +149,8 @@ export {
   OVERLAY_VERTEX_FLOATS,
   DEFAULT_BONE_PALETTE,
   DEFAULT_RIGIDBODY_PALETTE,
+  DEFAULT_JOINT_PALETTE,
+  DEFAULT_VERTEX_COLOR,
   type OverlayPrimitive,
   type OverlayShape,
   type OverlayGeometry,

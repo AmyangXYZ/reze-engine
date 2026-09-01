@@ -68,6 +68,7 @@ import {
   OVERLAY_VERTEX_FLOATS,
   OVERLAY_SHAPES,
   OVERLAY_SOLID_SHAPES,
+  DEFAULT_VERTEX_COLOR,
   type BoneOverlayOptions,
   type JointOverlayOptions,
   type OverlayGeometry,
@@ -1535,12 +1536,13 @@ export class Engine {
   private overlayBones: { modelName: string; options: BoneOverlayOptions } | null = null
   private overlayBodies: { modelName: string; options: RigidbodyOverlayOptions } | null = null
   private overlayJoints: { modelName: string; options: JointOverlayOptions } | null = null
-  private overlayVertices: { modelName: string; color: [number, number, number, number] } | null = null
+  private overlayVertices: { modelName: string; xray: boolean; thickness: number } | null = null
   private wireframePipeline!: GPURenderPipeline
+  private wireframeDepthPipeline!: GPURenderPipeline
   private wireframeUniformBuffer!: GPUBuffer
   private wireframeBindGroup!: GPUBindGroup
   private wireframeSkinLayout!: GPUBindGroupLayout
-  private wireframeColorData = new Float32Array(4)
+  private wireframeColorData = new Float32Array(8)
   /** Rebuilt every frame into these, grouped by shape so each shape is one draw. */
   private overlayByShape = new Map<OverlayShape, OverlayPrimitive[]>()
   private overlayScratch: OverlayPrimitive[] = []
@@ -7183,15 +7185,16 @@ export class Engine {
         ],
       },
       primitive: { topology: "triangle-list", cullMode: "none" },
-      // The overlay's OWN depth, not the scene's. The scene's is multisampled
-      // and discarded before the composite (see the depthRead note in render),
-      // and an editor wants the rig in front of the mesh regardless — what this
-      // buffer buys is that the rig sorts against ITSELF, so a body in front
-      // covers one behind and a skirt reads as a skirt.
+      // The rig ignores depth entirely. It shares this pass's buffer with the
+      // wireframe's mesh prepass, and that prepass exists to hide the far side
+      // of the BODY — not to hide the skeleton inside it. An editor wants the
+      // rig in front of the mesh, which is what "always" says. The cost is that
+      // the rig no longer sorts against itself; for line work a few pixels wide,
+      // draw order reads the same.
       depthStencil: {
         format: "depth24plus",
-        depthWriteEnabled: true,
-        depthCompare: this.depthAhead,
+        depthWriteEnabled: false,
+        depthCompare: "always",
       },
       multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
     } satisfies GPURenderPipelineDescriptor
@@ -7204,7 +7207,7 @@ export class Engine {
       ...overlayPipelineDescriptor,
       label: "overlay solid pipeline",
       primitive: { topology: "triangle-list", cullMode: "none" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: this.depthAhead },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "always" },
     })
 
     const compositeShader = this.device.createShaderModule({
@@ -7261,19 +7264,30 @@ export class Engine {
     // sits perfectly on a T-posed model and slides off every animated one.
     this.wireframeUniformBuffer = this.device.createBuffer({
       label: "wireframe color",
-      size: 16,
+      size: 32, // vec4 colour + vec2 viewport + thickness + pad
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     const wireBg0 = this.device.createBindGroupLayout({
-      label: "wireframe group 0 layout (camera + color)",
+      label: "wireframe group 0 layout (camera + wire)",
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // Both stages: the FS takes the colour, the VS takes the viewport and
+        // the stroke width it extrudes each edge quad to.
+        {
+          binding: 1,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
       ],
     })
+    const storageEntry = (binding: number) => ({
+      binding,
+      visibility: GPUShaderStage.VERTEX,
+      buffer: { type: "read-only-storage" as GPUBufferBindingType },
+    })
     this.wireframeSkinLayout = this.device.createBindGroupLayout({
-      label: "wireframe group 1 layout (skin matrices)",
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }],
+      label: "wireframe group 1 layout (mesh + skin)",
+      entries: [0, 1, 2, 3, 4].map(storageEntry),
     })
     const wireShader = this.device.createShaderModule({ label: "wireframe shader", code: WIREFRAME_SHADER_WGSL })
     this.wireframePipeline = this.device.createRenderPipeline({
@@ -7282,24 +7296,9 @@ export class Engine {
         label: "wireframe pipeline layout",
         bindGroupLayouts: [wireBg0, this.wireframeSkinLayout],
       }),
-      vertex: {
-        module: wireShader,
-        entryPoint: "vs",
-        buffers: [
-          {
-            arrayStride: 8 * 4,
-            attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat }],
-          },
-          {
-            arrayStride: 4 * 2,
-            attributes: [{ shaderLocation: 1, offset: 0, format: "uint16x4" as GPUVertexFormat }],
-          },
-          {
-            arrayStride: 4,
-            attributes: [{ shaderLocation: 2, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
-          },
-        ],
-      },
+      // No vertex stream: an edge quad's corners come from two different model
+      // vertices, so the mesh is read through storage instead.
+      vertex: { module: wireShader, entryPoint: "vs" },
       fragment: {
         module: wireShader,
         entryPoint: "fs",
@@ -7313,12 +7312,66 @@ export class Engine {
           },
         ],
       },
-      primitive: { topology: "line-list" },
+      primitive: { topology: "triangle-list", cullMode: "none" },
       // Depth-TESTED but not written: the mesh is a haze the rig reads against,
       // so a bone behind a triangle must not be punched out by it.
       depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: this.depthAhead },
       multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
     })
+    // The mesh's own depth, so the wireframe can be occluded by the body it
+    // belongs to. Occluded is the default everywhere — Blender's edit mode, Maya,
+    // three's and Babylon's wireframe materials all depth-test, and X-ray is a
+    // toggle beside them. Seeing both walls of a 30k-triangle body at once is
+    // moire, not information.
+    //
+    // It writes depth and nothing else — but it still DECLARES the colour
+    // target, at writeMask 0. A pipeline's attachment state has to match its
+    // pass's, and a pass with a colour attachment will not take a pipeline that
+    // has none. Same trick the scene's own depth prepass uses.
+    //
+    // Its own pass rather than the scene's, because the scene's depth is
+    // multisampled and discarded before the composite.
+    this.wireframeDepthPipeline = this.device.createRenderPipeline({
+      label: "wireframe depth prepass pipeline",
+      layout: this.device.createPipelineLayout({
+        label: "wireframe depth prepass layout",
+        bindGroupLayouts: [wireBg0, this.wireframeSkinLayout],
+      }),
+      vertex: {
+        module: wireShader,
+        entryPoint: "vsDepth",
+        buffers: [
+          { arrayStride: 8 * 4, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat }] },
+          { arrayStride: 4 * 2, attributes: [{ shaderLocation: 1, offset: 0, format: "uint16x4" as GPUVertexFormat }] },
+          { arrayStride: 4, attributes: [{ shaderLocation: 2, offset: 0, format: "unorm8x4" as GPUVertexFormat }] },
+        ],
+      },
+      fragment: {
+        module: wireShader,
+        entryPoint: "fs",
+        targets: [{ format: this.presentationFormat, writeMask: 0 }],
+      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: {
+        format: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: this.depthAhead,
+        // The wireframe lies exactly ON the surface this writes, so every edge
+        // ties with its own triangles and loses wherever rounding goes the wrong
+        // way — lines that break up and shift as the camera turns. Push the
+        // solid mesh back so the edges win their own ties. The slope term is
+        // what handles a surface seen at a grazing angle, where a pixel spans
+        // far more depth than a constant bias can cover.
+        //
+        // SIGNED BY CONVENTION, as the outline hulls are: bias adds to the depth
+        // VALUE, and reversed-Z inverts what a larger value means.
+        depthBias: this.reversedZ ? -64 : 64,
+        depthBiasSlopeScale: this.reversedZ ? -2 : 2,
+        depthBiasClamp: 0,
+      },
+      multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
+    })
+
     this.wireframeBindGroup = this.device.createBindGroup({
       label: "wireframe bind group",
       layout: wireBg0,
@@ -8555,8 +8608,10 @@ export class Engine {
    *
    * The edge list is deduplicated and built once, on the first frame this is on.
    */
-  setVertexOverlay(modelName: string | null, color: [number, number, number, number] = [1, 0.85, 0.2, 0.35]): void {
-    this.overlayVertices = modelName ? { modelName, color } : null
+  setVertexOverlay(modelName: string | null, options: { xray?: boolean; thickness?: number } = {}): void {
+    this.overlayVertices = modelName
+      ? { modelName, xray: options.xray ?? false, thickness: options.thickness ?? 2.5 }
+      : null
   }
 
   // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
@@ -9765,7 +9820,9 @@ export class Engine {
     const jointsBuffer = this.device.createBuffer({
       label: `${name}: joints buffer`,
       size: skinning.joints.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      // STORAGE so the wireframe overlay can skin from it: its quads read two
+      // different model vertices per corner, which no vertex stream can supply.
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
     })
     this.device.queue.writeBuffer(
       jointsBuffer,
@@ -9778,7 +9835,7 @@ export class Engine {
     const weightsBuffer = this.device.createBuffer({
       label: `${name}: weights buffer`,
       size: skinning.weights.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
     })
     this.device.queue.writeBuffer(
       weightsBuffer,
@@ -10928,13 +10985,19 @@ export class Engine {
     inst.wireEdgeBuffer = this.device.createBuffer({
       label: `wireframe edges ${inst.name}`,
       size: data.byteLength,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(inst.wireEdgeBuffer, 0, data)
     inst.wireBindGroup = this.device.createBindGroup({
-      label: `wireframe skin ${inst.name}`,
+      label: `wireframe mesh ${inst.name}`,
       layout: this.wireframeSkinLayout,
-      entries: [{ binding: 0, resource: { buffer: inst.skinMatrixBuffer } }],
+      entries: [
+        { binding: 0, resource: { buffer: inst.skinMatrixBuffer } },
+        { binding: 1, resource: { buffer: inst.vertexBuffer } },
+        { binding: 2, resource: { buffer: inst.jointsBuffer } },
+        { binding: 3, resource: { buffer: inst.weightsBuffer } },
+        { binding: 4, resource: { buffer: inst.wireEdgeBuffer } },
+      ],
     })
     return true
   }
@@ -10943,16 +11006,28 @@ export class Engine {
     if (!this.overlayVertices) return
     const inst = this.overlayModel(this.overlayVertices.modelName)
     if (!inst || !this.ensureEdgeBuffer(inst) || !inst.wireBindGroup || !inst.wireEdgeBuffer) return
-    this.wireframeColorData.set(this.overlayVertices.color)
+    this.wireframeColorData.set(DEFAULT_VERTEX_COLOR)
+    this.wireframeColorData[4] = this.canvas.width
+    this.wireframeColorData[5] = this.canvas.height
+    this.wireframeColorData[6] = this.overlayVertices.thickness
     this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, this.wireframeColorData)
-    pass.setPipeline(this.wireframePipeline)
     pass.setBindGroup(0, this.wireframeBindGroup)
     pass.setBindGroup(1, inst.wireBindGroup)
-    pass.setVertexBuffer(0, inst.vertexBuffer)
-    pass.setVertexBuffer(1, inst.jointsBuffer)
-    pass.setVertexBuffer(2, inst.weightsBuffer)
-    pass.setIndexBuffer(inst.wireEdgeBuffer, "uint32")
-    pass.drawIndexed(inst.wireEdgeCount)
+
+    // The solid mesh into depth only, so the far side of the body is hidden
+    // behind the near side. Skipped for x-ray, which is the whole toggle.
+    if (!this.overlayVertices.xray) {
+      pass.setPipeline(this.wireframeDepthPipeline)
+      pass.setVertexBuffer(0, inst.vertexBuffer)
+      pass.setVertexBuffer(1, inst.jointsBuffer)
+      pass.setVertexBuffer(2, inst.weightsBuffer)
+      pass.setIndexBuffer(inst.indexBuffer, "uint32")
+      pass.drawIndexed(inst.model.getIndices().length)
+    }
+
+    // Six vertices an edge, instanced.
+    pass.setPipeline(this.wireframePipeline)
+    pass.draw(6, inst.wireEdgeCount / 2)
   }
 
   private overlayActive(): boolean {

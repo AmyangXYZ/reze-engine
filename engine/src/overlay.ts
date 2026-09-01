@@ -405,22 +405,63 @@ function skeletonExtent(world: readonly Mat4[]): number {
 // ──────────────────────────────────────────────────────────────────
 // Bones
 
-export type BoneClass = "plain" | "ik" | "append" | "physics" | "twist" | "selected"
+/** What a bone is driven BY, which is what the colour says. Decided most
+ *  specific first: selected, ik, physics, plain.
+ *
+ *  Four, not the six this started with. Append and twist had classes of their
+ *  own and are plain now: a colour has to earn a category, and on a 147-bone
+ *  skeleton those two spent their distinction on bones nobody was hunting for.
+ *  Both are still on the Bone, for a panel to show where it matters. */
+export type BoneClass = "plain" | "ik" | "physics" | "selected"
 
+/**
+ * The overlay's colours, and the only place they live.
+ *
+ * NOT an option a host passes. An overlay means the same thing in every product
+ * that draws one — orange is a bone the solver drives, whichever app you are
+ * looking at — and a colour each app picks for itself is a colour that drifts.
+ * A host that wants its own look builds its own list through setOverlay.
+ *
+ * Every value is one step of the same ramp (Tailwind's 500), so the classes read
+ * as a set and hue is the only thing that separates them.
+ *
+ * Red and green are never used together — that pair is the confusion most colour
+ * blindness causes. Red is spent entirely on `selected`, the one distinction
+ * that must never be ambiguous; green is not used at all.
+ *
+ * A physics-driven bone and a dynamic body share orange on purpose. They are the
+ * same fact seen twice — the solver owns this — and colouring them apart would
+ * invent a difference that is not there.
+ *
+ * The CATEGORIES are MMD's, straight out of the PMX file — IK chains, 付与親,
+ * 軸制限, a body's physics mode. The colours are not: MMD has no canonical
+ * palette for them.
+ */
 export const DEFAULT_BONE_PALETTE: Record<BoneClass, RGBA> = {
-  plain: [0.62, 0.7, 0.82, 0.85],
-  ik: [1.0, 0.72, 0.24, 0.95],
-  append: [0.72, 0.55, 1.0, 0.9],
-  physics: [0.3, 0.86, 0.72, 0.9],
-  twist: [0.95, 0.45, 0.62, 0.9],
-  selected: [0.376, 0.647, 0.98, 1.0],
+  /** Nothing in particular drives it — most of the skeleton, so it is the colour
+   *  the whole overlay reads as. */
+  plain: [0.231, 0.51, 0.965, 1], // blue-500
+  /** Has an IK chain (ikLinks): the leg IK bones and friends. Grey because an IK
+   *  bone is a CONTROL rather than a deformer — nothing is skinned to it, and it
+   *  moves a chain instead of the mesh.
+   *
+   *  Dark grey, not light. Leg IK sits on the floor and reaches almost nothing,
+   *  so these are the smallest markers in the rig drawn against the ground — and
+   *  gray-400 there measured 1.02:1, which is not a dim marker but no marker. */
+  ik: [0.294, 0.333, 0.388, 1], // gray-600
+  /** A dynamic rigidbody moves it — hair, skirt, anything the solver owns. Blue,
+   *  the same as plain: which bones the solver owns is the rigidbody layer's
+   *  question, and it already answers it. Kept as a class so a panel can pick it
+   *  out, spending no colour on it here. */
+  physics: [0.231, 0.51, 0.965, 1], // blue-500
+  /** The one you picked. Red is spent entirely here and used nowhere else, so
+   *  nothing on screen can be mistaken for a selection. */
+  selected: [0.937, 0.267, 0.267, 1], // red-500
 }
 
 export interface BoneOverlayOptions {
   /** Name of the bone drawn in the `selected` colour. */
   selected?: string | null
-  /** Colour per class, over DEFAULT_BONE_PALETTE. */
-  palette?: Partial<Record<BoneClass, RGBA>>
   /** Marker radius for a bone that governs the whole model, world units. Every
    *  other bone shrinks by how much still hangs off it — see REACH in
    *  boneOverlay. Held between 0.55x and 1.0x. Defaults to 0.5% of the
@@ -428,8 +469,6 @@ export interface BoneOverlayOptions {
   markerSize?: number
   /** Stroke width of the links, device pixels. 0.5–24. Default 4. */
   thickness?: number
-  /** A leaf bone's length as a fraction of its parent's. 0–2. Default 0.5. */
-  tipRatio?: number
   /** Length for a leaf whose parent has no length either, world units. Default 0.25. */
   tipLength?: number
   /** Bone names to draw. Omit for all of them. */
@@ -448,8 +487,7 @@ export interface BoneOverlayOptions {
 export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): OverlayPrimitive[] {
   const bones = model.getSkeleton().bones
   const world = model.getWorldMatrices()
-  const palette = { ...DEFAULT_BONE_PALETTE, ...options.palette }
-  const tipRatio = options.tipRatio ?? 0.5
+  const palette = DEFAULT_BONE_PALETTE
   const tipLength = options.tipLength ?? 0.25
   const include = options.include ? new Set(options.include) : null
   const extent = skeletonExtent(world)
@@ -459,17 +497,6 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
   const physicsBones = new Set<number>()
   for (const rb of model.getRigidbodies()) {
     if (rb.type !== RigidbodyType.Static && rb.boneIndex >= 0) physicsBones.add(rb.boneIndex)
-  }
-
-  // Distance to the first child, in one pass, so a leaf can borrow its parent's.
-  // A bone array is not guaranteed parent-first, so this cannot ride the draw loop.
-  const spans = new Float32Array(bones.length)
-  for (let i = 0; i < bones.length && i < world.length; i++) {
-    const child = bones[i].children.length > 0 ? bones[i].children[0] : -1
-    if (child < 0 || child >= world.length) continue
-    const m = world[i].values
-    const cm = world[child].values
-    spans[i] = Math.hypot(cm[12] - m[12], cm[13] - m[13], cm[14] - m[14])
   }
 
   // Marker radius per bone, from its REACH: the longest chain still hanging off
@@ -541,26 +568,6 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
     const m = world[i].values
     head.setXYZ(m[12], m[13], m[14])
 
-    const child = bone.children.length > 0 ? bone.children[0] : -1
-    if (child >= 0 && child < world.length) {
-      const cm = world[child].values
-      tail.setXYZ(cm[12], cm[13], cm[14])
-    } else {
-      // A leaf carries on the way its parent came, at a fraction of its length —
-      // which is where a fingertip or a head bone reads as pointing, at a size
-      // that belongs to this model rather than to a constant.
-      const p = bone.parentIndex
-      if (p >= 0 && p < world.length) {
-        const pm = world[p].values
-        dir.setXYZ(head.x - pm[12], head.y - pm[13], head.z - pm[14])
-      } else {
-        dir.setXYZ(0, 1, 0)
-      }
-      normalizeInto(dir, 0, 1, 0)
-      const stub = p >= 0 && spans[p] > 1e-5 ? spans[p] * tipRatio : tipLength
-      tail.setXYZ(head.x + dir.x * stub, head.y + dir.y * stub, head.z + dir.z * stub)
-    }
-
     const selected = options.selected != null && bone.name === options.selected
     const cls: BoneClass = selected
       ? "selected"
@@ -568,32 +575,41 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
         ? "ik"
         : physicsBones.has(i)
           ? "physics"
-          : bone.appendParentIndex !== undefined && bone.appendParentIndex >= 0
-            ? "append"
-            : bone.fixedAxis
-              ? "twist"
-              : "plain"
+          : "plain"
     const color = palette[cls]
     const size = selected ? sizes[i] * 1.5 : sizes[i]
     const stroke = selected ? thickness * 1.6 : thickness
 
-    // The link first, so both markers draw over where it meets them.
-    const span = Math.hypot(tail.x - head.x, tail.y - head.y, tail.z - head.z)
-    if (child >= 0 && child < world.length && span > 1e-5) {
-      dir.setXYZ((tail.x - head.x) / span, (tail.y - head.y) / span, (tail.z - head.z) / span)
-      const rot = Quat.fromUnitVectors(UP, dir)
-      out.push(
-        applyRoot(root, {
-          shape: "link",
-          position: [head.x, head.y, head.z],
-          rotation: [rot.x, rot.y, rot.z, rot.w],
-          // Base half-width IS the marker's radius, so the two lines leave the
-          // ring at its edge; length runs to the child's marker.
-          scale: [size, span, size],
-          color,
-          thickness: stroke,
-        }),
-      )
+    // One link per bone, from its PARENT down to it — so every parent-child
+    // edge is drawn exactly once and branches all show.
+    //
+    // Not "from this bone to its first child", which is what this did and what
+    // made a thigh point at the wrong place: children are ordered by bone INDEX,
+    // not by anatomy, so 左足's children[0] is 左腿物理, a physics bone hanging
+    // off the thigh, and 左ひざ — the actual knee — came second. There is no
+    // ordering of children that is reliably the continuation. Drawing all of
+    // them removes the need to guess.
+    const parent = bone.parentIndex
+    if (parent >= 0 && parent < world.length) {
+      const pm = world[parent].values
+      tail.setXYZ(pm[12], pm[13], pm[14])
+      const span = Math.hypot(head.x - tail.x, head.y - tail.y, head.z - tail.z)
+      if (span > 1e-5) {
+        dir.setXYZ((head.x - tail.x) / span, (head.y - tail.y) / span, (head.z - tail.z) / span)
+        const rot = Quat.fromUnitVectors(UP, dir)
+        out.push(
+          applyRoot(root, {
+            shape: "link",
+            // The taper starts at the PARENT's marker and narrows onto this one,
+            // so its base half-width is the parent's radius.
+            position: [tail.x, tail.y, tail.z],
+            rotation: [rot.x, rot.y, rot.z, rot.w],
+            scale: [sizes[parent], span, sizes[parent]],
+            color,
+            thickness: stroke,
+          }),
+        )
+      }
     }
     // Only the bone that owns this position draws the marker.
     if (markerAt.get(key(m)) !== i) continue
@@ -624,19 +640,31 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
 
 export type RigidbodyClass = "static" | "dynamic" | "selected"
 
+/** Solid volumes, so alpha does the work a stroke used to: low enough to see the
+ *  body through them and the rig behind them. Cool follows its bone, warm is
+ *  driven by the solver. */
 export const DEFAULT_RIGIDBODY_PALETTE: Record<RigidbodyClass, RGBA> = {
-  static: [0.45, 0.8, 0.95, 0.8],
-  dynamic: [1.0, 0.55, 0.3, 0.9],
-  selected: [0.376, 0.647, 0.98, 1.0],
+  static: [0.055, 0.647, 0.914, 0.28], // sky-500
+  dynamic: [0.976, 0.451, 0.086, 0.38], // orange-500
+  selected: [0.937, 0.267, 0.267, 0.55], // red-500
 }
+
+/** The joint cross, the dashed lines to the bodies it holds, and its selection. */
+export const DEFAULT_JOINT_PALETTE = {
+  cross: [0.055, 0.647, 0.914, 1] as RGBA, // sky-500
+  link: [0.055, 0.647, 0.914, 0.5] as RGBA, // sky-500
+  selected: [0.937, 0.267, 0.267, 1] as RGBA, // red-500
+}
+
+/** The mesh wireframe. Yellow, because it has to carry over pale skin and dark
+ *  cloth alike and the rig owns the blues and greens. */
+export const DEFAULT_VERTEX_COLOR: RGBA = [0.918, 0.702, 0.031, 0.95] // yellow-500
 
 export interface RigidbodyOverlayOptions {
   /** Stroke width in device pixels. 0.5–24. Default 2.5. */
   thickness?: number
   /** Name of the body drawn in the `selected` colour. */
   selected?: string | null
-  /** Colour per class, over DEFAULT_RIGIDBODY_PALETTE. */
-  palette?: Partial<Record<RigidbodyClass, RGBA>>
   /** Body names to draw. Omit for all of them. */
   include?: readonly string[]
 }
@@ -654,7 +682,7 @@ export function rigidbodyOverlay(
   options: RigidbodyOverlayOptions = {},
 ): OverlayPrimitive[] {
   const bodies = model.getRigidbodies()
-  const palette = { ...DEFAULT_RIGIDBODY_PALETTE, ...options.palette }
+  const palette = DEFAULT_RIGIDBODY_PALETTE
   const extent = skeletonExtent(model.getWorldMatrices())
   const thickness = options.thickness ?? 2.5
   const include = options.include ? new Set(options.include) : null
@@ -726,12 +754,6 @@ export interface JointOverlayOptions {
   selected?: string | null
   /** Cross arm length, world units. Defaults to 0.6% of the skeleton's extent. */
   size?: number
-  /** Colour of the cross. Default a warm yellow. */
-  color?: RGBA
-  /** Colour of the dashed lines to the two bodies. Default a dim version of it. */
-  linkColor?: RGBA
-  /** Colour for the selected joint and its links. */
-  selectedColor?: RGBA
   /** Draw the dashed lines to the bodies a joint constrains. Default true. */
   links?: boolean
   /** Joint names to draw. Omit for all of them. */
@@ -756,9 +778,9 @@ export function jointOverlay(
   const extent = skeletonExtent(model.getWorldMatrices())
   const thickness = options.thickness ?? 2.5
   const size = options.size ?? extent * 0.006
-  const color = options.color ?? ([0.95, 0.86, 0.42, 0.95] as const)
-  const linkColor = options.linkColor ?? ([0.72, 0.66, 0.38, 0.55] as const)
-  const selectedColor = options.selectedColor ?? ([0.376, 0.647, 0.98, 1.0] as const)
+  const color = DEFAULT_JOINT_PALETTE.cross
+  const linkColor = DEFAULT_JOINT_PALETTE.link
+  const selectedColor = DEFAULT_JOINT_PALETTE.selected
   const links = options.links ?? true
   const include = options.include ? new Set(options.include) : null
   const root = rootTransform(model)
@@ -917,8 +939,3 @@ function applyRoot(root: RootTransform, p: OverlayPrimitive): OverlayPrimitive {
   return p
 }
 
-function normalizeInto(v: Vec3, fx: number, fy: number, fz: number): void {
-  const len = Math.hypot(v.x, v.y, v.z)
-  if (len < 1e-8) v.setXYZ(fx, fy, fz)
-  else v.setXYZ(v.x / len, v.y / len, v.z / len)
-}
