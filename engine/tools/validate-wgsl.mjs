@@ -48,6 +48,7 @@ const { buildTrailShader, trailEntryPoints } = await import(`${dist}/shaders/pas
 const { buildLightEmitShader, hasLightEmit, MAX_LIGHTS, parseLightCount } = await import(`${dist}/shaders/lights.js`)
 const { buildAnchorTable, anchorAliasWgsl } = await import(`${dist}/shaders/anchor-table.js`)
 const { REFLECTION_DEBUG_WGSL } = await import(`${dist}/reflection.js`)
+const { OVERLAY_SHADER_WGSL } = await import(`${dist}/shaders/passes/overlay.js`)
 
 /** name → wgsl. Everything here must compile clean on a real device. */
 const shaders = {}
@@ -66,6 +67,7 @@ setMrtIds(false)
 shaders["shadow depth"] = SHADOW_DEPTH_SHADER_WGSL
 shaders["reflection debug"] = REFLECTION_DEBUG_WGSL
 shaders["composite base"] = COMPOSITE_SHADER_WGSL
+shaders["editor overlay"] = OVERLAY_SHADER_WGSL
 
 // A dummy fragment over the shared prelude, CALLING sampleShadow and the lights
 // loop — so the prelude compiles as hand-written presets use it, not only as

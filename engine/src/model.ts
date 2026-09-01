@@ -607,6 +607,15 @@ export class Model {
     }
     this.deformOrder = order
 
+    // The loader leaves `children` empty and says the skeleton build fills it.
+    // Nothing did, so every bone read as a leaf — which is what a bone overlay
+    // asks first, and why one drew 147 disconnected stubs instead of a rig.
+    for (let i = 0; i < n; i++) bones[i].children.length = 0
+    for (let i = 0; i < n; i++) {
+      const p = bones[i].parentIndex
+      if (p >= 0 && p < n) bones[p].children.push(i)
+    }
+
     // Accumulate bind-pose world positions in the same parent-before-child order and
     // with the same add order as the old recursive computeBindPoseWorldPosition, so the
     // downstream arithmetic stays bit-identical.

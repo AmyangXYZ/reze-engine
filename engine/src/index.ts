@@ -133,3 +133,30 @@ export { PmxLoader } from "./pmx-loader"
 export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"
 export type { WindOptions } from "./physics/world"
+export { RigidbodyShape, RigidbodyType, type Rigidbody, type Joint } from "./physics/types"
+// Editor overlays. The three builders are pure and exported alongside the
+// engine methods that call them, so a host can produce the same list itself —
+// to show it as data, diff two poses, or hit-test it on the CPU.
+export {
+  boneOverlay,
+  rigidbodyOverlay,
+  jointOverlay,
+  buildOverlayShapes,
+  lineBetween,
+  writeOverlayInstance,
+  OVERLAY_SHAPES,
+  OVERLAY_INSTANCE_FLOATS,
+  OVERLAY_VERTEX_FLOATS,
+  DEFAULT_BONE_PALETTE,
+  DEFAULT_RIGIDBODY_PALETTE,
+  type OverlayPrimitive,
+  type OverlayShape,
+  type OverlayGeometry,
+  type BoneOverlayOptions,
+  type BoneClass,
+  type RigidbodyOverlayOptions,
+  type RigidbodyClass,
+  type JointOverlayOptions,
+  type RGBA,
+  type Vec3Tuple,
+} from "./overlay"

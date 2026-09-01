@@ -56,6 +56,25 @@ import { outlineShaderWgsl, RZ_OUTLINE_DISSOLVE_OFFSET } from "./shaders/passes/
 import { transparentDepthPrepassWgsl } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
 import { GIZMO_SHADER_WGSL } from "./shaders/passes/gizmo"
+import { OVERLAY_SHADER_WGSL, OVERLAY_COMPOSITE_SHADER_WGSL } from "./shaders/passes/overlay"
+import { WIREFRAME_SHADER_WGSL } from "./shaders/passes/wireframe"
+import {
+  boneOverlay,
+  buildOverlayShapes,
+  jointOverlay,
+  rigidbodyOverlay,
+  writeOverlayInstance,
+  OVERLAY_INSTANCE_FLOATS,
+  OVERLAY_VERTEX_FLOATS,
+  OVERLAY_SHAPES,
+  OVERLAY_SOLID_SHAPES,
+  type BoneOverlayOptions,
+  type JointOverlayOptions,
+  type OverlayGeometry,
+  type OverlayPrimitive,
+  type OverlayShape,
+  type RigidbodyOverlayOptions,
+} from "./overlay"
 import {
   BLOOM_BLIT_SHADER_WGSL,
   BLOOM_DOWNSAMPLE_SHADER_WGSL,
@@ -772,6 +791,12 @@ interface ModelInstance {
   materialMorphTargets: MaterialMorphTarget[] | null
   /** The same targets by PMX material index, so a named offset is one lookup. */
   materialMorphByIndex: Map<number, MaterialMorphTarget> | null
+  /** The mesh's unique edges as a line-list index buffer, built on first use.
+   *  Deduplicated: an interior edge belongs to two triangles, so drawing the
+   *  triangle list's edges directly would draw most of the mesh twice. */
+  wireEdgeBuffer: GPUBuffer | null
+  wireEdgeCount: number
+  wireBindGroup: GPUBindGroup | null
   physics: RezePhysics | null
   vertexBufferNeedsUpdate: boolean
   gpuMorph: GpuMorph | null
@@ -1477,6 +1502,50 @@ export class Engine {
   private selectionEdgePassDescriptor!: GPURenderPassDescriptor
   private selectionSampler!: GPUSampler
 
+  // ─── Editor overlays (bones, rigidbodies, joints) ──────────────────
+  // One instanced pass over unit wireframes. Static layers are whatever the
+  // host handed setOverlay; the three live ones are rebuilt from the model
+  // every frame, because a posed skeleton has moved by the next one.
+  private overlayVertexBuffer!: GPUBuffer
+  private overlayInstanceBuffer: GPUBuffer | null = null
+  private overlayInstanceCapacity = 0
+  private overlayPipeline!: GPURenderPipeline
+  private overlaySolidPipeline!: GPURenderPipeline
+  private overlayBindGroup!: GPUBindGroup
+  private overlayGeometry!: OverlayGeometry
+  private overlayPassDescriptor!: GPURenderPassDescriptor
+  private overlayDepthTexture: GPUTexture | null = null
+  private overlayMsaaTexture: GPUTexture | null = null
+  private overlayResolveTexture: GPUTexture | null = null
+  private overlayUniformBuffer!: GPUBuffer
+  private overlayUniformData = new Float32Array(4)
+  private overlayCompositePipeline!: GPURenderPipeline
+  private overlayCompositeLayout!: GPUBindGroupLayout
+  private overlayCompositeBindGroup: GPUBindGroup | null = null
+  private overlayCompositePassDescriptor!: GPURenderPassDescriptor
+  private overlayTargetSize: [number, number] = [0, 0]
+  /** The overlay renders multisampled into its own layer; the scene's own depth
+   *  is discarded before the composite (see the depthRead note in render), so it
+   *  could not have shared either that or the single-sample swapchain. */
+  private static readonly OVERLAY_SAMPLE_COUNT = 4
+  /** Dash period in device pixels — dashes are geometry, so this is only the
+   *  reference the dashedLine shape is cut against. */
+  private static readonly OVERLAY_DASH_PERIOD_PX = 8.0
+  private overlayLayers = new Map<string, OverlayPrimitive[]>()
+  private overlayBones: { modelName: string; options: BoneOverlayOptions } | null = null
+  private overlayBodies: { modelName: string; options: RigidbodyOverlayOptions } | null = null
+  private overlayJoints: { modelName: string; options: JointOverlayOptions } | null = null
+  private overlayVertices: { modelName: string; color: [number, number, number, number] } | null = null
+  private wireframePipeline!: GPURenderPipeline
+  private wireframeUniformBuffer!: GPUBuffer
+  private wireframeBindGroup!: GPUBindGroup
+  private wireframeSkinLayout!: GPUBindGroupLayout
+  private wireframeColorData = new Float32Array(4)
+  /** Rebuilt every frame into these, grouped by shape so each shape is one draw. */
+  private overlayByShape = new Map<OverlayShape, OverlayPrimitive[]>()
+  private overlayScratch: OverlayPrimitive[] = []
+  private overlayInstanceData = new Float32Array(0)
+
   // ─── Transform gizmo ───────────────────────────────────────────────
   private selectedBone: { modelName: string; boneName: string; boneIndex: number } | null = null
   private gizmoVertexBuffer!: GPUBuffer
@@ -1856,6 +1925,7 @@ export class Engine {
     "field",
     "bloom",
     "composite",
+    "overlay",
   ] as const
   private timestampQuerySet: GPUQuerySet | null = null
   private timestampResolve: GPUBuffer | null = null
@@ -6070,6 +6140,9 @@ export class Engine {
     // ─── Transform gizmo (3 axes + 3 rings) ─────────────────────────
     this.setupGizmo()
 
+    // ─── Editor overlays (instanced wireframe primitives) ────────────
+    this.setupOverlay()
+
     // ─── Bloom (EEVEE 3.6 pyramid): blit(Karis prefilter) → 13-tap downsamples → 9-tap tent upsamples ───
     // Mirrors source/blender/draw/engines/eevee/shaders/effect_bloom_frag.glsl.
     // Firefly suppression lives in the blit (Karis luminance-weighted 4-tap average). A single-pass
@@ -7036,6 +7109,249 @@ export class Engine {
     }
   }
 
+  // Builds the overlay pipeline and the one vertex buffer holding every unit
+  // wireframe. The instance buffer is grown on demand in renderOverlayPass — a
+  // scene with no overlays on never allocates one.
+  private setupOverlay() {
+    this.overlayGeometry = buildOverlayShapes()
+    const verts = this.overlayGeometry.vertices
+    this.overlayVertexBuffer = this.device.createBuffer({
+      label: "overlay vertex buffer",
+      size: verts.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(this.overlayVertexBuffer, 0, verts)
+
+    this.overlayUniformBuffer = this.device.createBuffer({
+      label: "overlay uniforms",
+      size: 16, // vec2 viewport + dash period + pad
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const bgLayout = this.device.createBindGroupLayout({
+      label: "overlay group 0 layout (camera + overlay)",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+      ],
+    })
+    const shader = this.device.createShaderModule({ label: "overlay shader", code: OVERLAY_SHADER_WGSL })
+    const overlayPipelineDescriptor = {
+      label: "overlay pipeline",
+      layout: this.device.createPipelineLayout({
+        label: "overlay pipeline layout",
+        bindGroupLayouts: [bgLayout],
+      }),
+      vertex: {
+        module: shader,
+        entryPoint: "vs",
+        buffers: [
+          {
+            arrayStride: OVERLAY_VERTEX_FLOATS * 4,
+            attributes: [
+              { shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat }, // pos
+              { shaderLocation: 1, offset: 3 * 4, format: "float32x3" as GPUVertexFormat }, // dir
+              { shaderLocation: 2, offset: 6 * 4, format: "float32x2" as GPUVertexFormat }, // caps
+              { shaderLocation: 3, offset: 8 * 4, format: "float32" as GPUVertexFormat }, // side
+              { shaderLocation: 4, offset: 9 * 4, format: "float32" as GPUVertexFormat }, // t
+              { shaderLocation: 5, offset: 10 * 4, format: "float32" as GPUVertexFormat }, // mode
+            ],
+          },
+          {
+            arrayStride: OVERLAY_INSTANCE_FLOATS * 4,
+            stepMode: "instance",
+            attributes: [
+              { shaderLocation: 6, offset: 0, format: "float32x4" as GPUVertexFormat }, // rotation
+              { shaderLocation: 7, offset: 4 * 4, format: "float32x4" as GPUVertexFormat }, // position + extent
+              { shaderLocation: 8, offset: 8 * 4, format: "float32x4" as GPUVertexFormat }, // scale + thickness
+              { shaderLocation: 9, offset: 12 * 4, format: "float32x4" as GPUVertexFormat }, // color
+            ],
+          },
+        ],
+      },
+      fragment: {
+        module: shader,
+        entryPoint: "fs",
+        targets: [
+          {
+            format: this.presentationFormat,
+            // Premultiplied: the FS already scaled rgb by alpha. See the shader.
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      // The overlay's OWN depth, not the scene's. The scene's is multisampled
+      // and discarded before the composite (see the depthRead note in render),
+      // and an editor wants the rig in front of the mesh regardless — what this
+      // buffer buys is that the rig sorts against ITSELF, so a body in front
+      // covers one behind and a skirt reads as a skirt.
+      depthStencil: {
+        format: "depth24plus",
+        depthWriteEnabled: true,
+        depthCompare: this.depthAhead,
+      },
+      multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
+    } satisfies GPURenderPipelineDescriptor
+    this.overlayPipeline = this.device.createRenderPipeline(overlayPipelineDescriptor)
+
+    // The solid volumes: the same shader and layout, with no depth write and no
+    // culling. A translucent body must not hide the rig behind it, and you have
+    // to see its far wall for it to read as a volume rather than a silhouette.
+    this.overlaySolidPipeline = this.device.createRenderPipeline({
+      ...overlayPipelineDescriptor,
+      label: "overlay solid pipeline",
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: this.depthAhead },
+    })
+
+    const compositeShader = this.device.createShaderModule({
+      label: "overlay composite shader",
+      code: OVERLAY_COMPOSITE_SHADER_WGSL,
+    })
+    this.overlayCompositeLayout = this.device.createBindGroupLayout({
+      label: "overlay composite layout",
+      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } }],
+    })
+    this.overlayCompositePipeline = this.device.createRenderPipeline({
+      label: "overlay composite pipeline",
+      layout: this.device.createPipelineLayout({
+        label: "overlay composite pipeline layout",
+        bindGroupLayouts: [this.overlayCompositeLayout],
+      }),
+      vertex: { module: compositeShader, entryPoint: "vs" },
+      fragment: {
+        module: compositeShader,
+        entryPoint: "fs",
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "triangle-list" },
+      multisample: { count: 1 },
+    })
+    this.overlayCompositePassDescriptor = {
+      label: "overlay composite pass",
+      colorAttachments: [
+        { view: undefined as unknown as GPUTextureView, loadOp: "load", storeOp: "store" },
+      ],
+    }
+
+    this.overlayBindGroup = this.device.createBindGroup({
+      label: "overlay bind group",
+      layout: bgLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.overlayUniformBuffer } },
+      ],
+    })
+
+    // The mesh wireframe: the same line-list target, its own pipeline, because it
+    // draws the model's OWN vertex buffer through the model's OWN skin matrices.
+    // That is the whole reason it exists rather than emitting lines from the
+    // loader's positions — those are bind pose, and a wireframe built from them
+    // sits perfectly on a T-posed model and slides off every animated one.
+    this.wireframeUniformBuffer = this.device.createBuffer({
+      label: "wireframe color",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const wireBg0 = this.device.createBindGroupLayout({
+      label: "wireframe group 0 layout (camera + color)",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      ],
+    })
+    this.wireframeSkinLayout = this.device.createBindGroupLayout({
+      label: "wireframe group 1 layout (skin matrices)",
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }],
+    })
+    const wireShader = this.device.createShaderModule({ label: "wireframe shader", code: WIREFRAME_SHADER_WGSL })
+    this.wireframePipeline = this.device.createRenderPipeline({
+      label: "wireframe pipeline",
+      layout: this.device.createPipelineLayout({
+        label: "wireframe pipeline layout",
+        bindGroupLayouts: [wireBg0, this.wireframeSkinLayout],
+      }),
+      vertex: {
+        module: wireShader,
+        entryPoint: "vs",
+        buffers: [
+          {
+            arrayStride: 8 * 4,
+            attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4 * 2,
+            attributes: [{ shaderLocation: 1, offset: 0, format: "uint16x4" as GPUVertexFormat }],
+          },
+          {
+            arrayStride: 4,
+            attributes: [{ shaderLocation: 2, offset: 0, format: "unorm8x4" as GPUVertexFormat }],
+          },
+        ],
+      },
+      fragment: {
+        module: wireShader,
+        entryPoint: "fs",
+        targets: [
+          {
+            format: this.presentationFormat,
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "line-list" },
+      // Depth-TESTED but not written: the mesh is a haze the rig reads against,
+      // so a bone behind a triangle must not be punched out by it.
+      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: this.depthAhead },
+      multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
+    })
+    this.wireframeBindGroup = this.device.createBindGroup({
+      label: "wireframe bind group",
+      layout: wireBg0,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.wireframeUniformBuffer } },
+      ],
+    })
+
+    this.overlayPassDescriptor = {
+      label: "overlay pass",
+      timestampWrites: this.stamps("overlay"),
+      colorAttachments: [
+        {
+          view: undefined as unknown as GPUTextureView,
+          resolveTarget: undefined,
+          // Transparent, because this layer is composited over the frame rather
+          // than drawn into it. storeOp discard keeps the 4 samples in tile
+          // memory on a TBDR part — only the resolve reaches RAM.
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "discard",
+        },
+      ],
+      depthStencilAttachment: {
+        view: undefined as unknown as GPUTextureView,
+        depthClearValue: this.depthClear,
+        depthLoadOp: "clear",
+        depthStoreOp: "discard",
+      },
+    }
+  }
+
   // Step 4: Create camera and uniform buffer
   private setupCamera() {
     this.cameraUniformBuffer = this.device.createBuffer({
@@ -7720,6 +8036,19 @@ export class Engine {
       this.canvas.removeEventListener("touchend", this.handleCanvasTouch)
     }
 
+    this.overlayDepthTexture?.destroy()
+    this.overlayDepthTexture = null
+    this.overlayMsaaTexture?.destroy()
+    this.overlayMsaaTexture = null
+    this.overlayResolveTexture?.destroy()
+    this.overlayResolveTexture = null
+    this.overlayInstanceBuffer?.destroy()
+    this.overlayInstanceBuffer = null
+    for (const inst of this.modelInstances.values()) {
+      inst.wireEdgeBuffer?.destroy()
+      inst.wireEdgeBuffer = null
+    }
+
     // Remove gizmo drag listeners
     this.canvas.removeEventListener("mousedown", this.handleGizmoMouseDown, { capture: true })
     window.removeEventListener("mousemove", this.handleGizmoMouseMove)
@@ -8174,6 +8503,60 @@ export class Engine {
     }
     const boneIndex = inst.model.getSkeleton().bones.findIndex((b) => b.name === boneName)
     this.selectedBone = boneIndex >= 0 ? { modelName, boneName, boneIndex } : null
+  }
+
+  // ─── Editor overlays ───────────────────────────────────────────────
+  //
+  // Two ways in. setOverlay takes a list and draws exactly that list, so a host
+  // can paste one in, hand one to a test, or print one back out. The three live
+  // layers name a model instead and are rebuilt from its pose every frame,
+  // which is the only way a skeleton overlay can be right on an animated model.
+
+  /**
+   * Replace one named layer of overlay primitives. World space, drawn as given
+   * until it is replaced. An empty list removes the layer.
+   */
+  setOverlay(layer: string, primitives: OverlayPrimitive[]): void {
+    if (primitives.length === 0) this.overlayLayers.delete(layer)
+    else this.overlayLayers.set(layer, primitives)
+  }
+
+  /** Drop one named layer, or every one. Live layers keep drawing. */
+  clearOverlay(layer?: string): void {
+    if (layer === undefined) this.overlayLayers.clear()
+    else this.overlayLayers.delete(layer)
+  }
+
+  /** Draw an octahedron per bone of `modelName`, rebuilt each frame. Null off. */
+  setBoneOverlay(modelName: string | null, options: BoneOverlayOptions = {}): void {
+    this.overlayBones = modelName ? { modelName, options } : null
+  }
+
+  /** Draw every rigidbody of `modelName` where the simulation has it, rebuilt
+   *  each frame. Null off. */
+  setRigidbodyOverlay(modelName: string | null, options: RigidbodyOverlayOptions = {}): void {
+    this.overlayBodies = modelName ? { modelName, options } : null
+  }
+
+  /** Draw a cross per joint of `modelName` plus dashed lines to the bodies it
+   *  holds together, rebuilt each frame. Null off. */
+  setJointOverlay(modelName: string | null, options: JointOverlayOptions = {}): void {
+    this.overlayJoints = modelName ? { modelName, options } : null
+  }
+
+  /**
+   * Draw `modelName`'s mesh as a wireframe — its vertices and its topology.
+   *
+   * Skinned on the GPU from the model's own vertex buffer and skin matrices, so
+   * it sits on the POSED mesh. The loader's CPU-side positions are bind pose: a
+   * wireframe built from those looks right on a T-posed model and slides off
+   * every animated one, which is exactly the state a user is in while looking at
+   * weights.
+   *
+   * The edge list is deduplicated and built once, on the first frame this is on.
+   */
+  setVertexOverlay(modelName: string | null, color: [number, number, number, number] = [1, 0.85, 0.2, 0.35]): void {
+    this.overlayVertices = modelName ? { modelName, color } : null
   }
 
   // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
@@ -9498,6 +9881,9 @@ export class Engine {
       jointsBuffer,
       weightsBuffer,
       skinMatrixBuffer,
+      wireEdgeBuffer: null,
+      wireEdgeCount: 0,
+      wireBindGroup: null,
       drawCalls: [],
       shadowDrawCalls: [],
       shadowBindGroups,
@@ -10514,6 +10900,251 @@ export class Engine {
     epass.end()
   }
 
+  // Unique edges of the mesh, as a line-list index buffer. Each interior edge is
+  // shared by two triangles, so deduplicating halves both the buffer and the
+  // draw. Built once per model, on the first frame its wireframe is asked for.
+  private ensureEdgeBuffer(inst: ModelInstance): boolean {
+    if (inst.wireEdgeBuffer) return inst.wireEdgeCount > 0
+    const indices = inst.model.getIndices()
+    const seen = new Set<number>()
+    const edges: number[] = []
+    const vertexCount = inst.model.getGeometry().positions.length / 3
+    const add = (a: number, b: number) => {
+      const lo = a < b ? a : b
+      const hi = a < b ? b : a
+      const key = lo * vertexCount + hi
+      if (seen.has(key)) return
+      seen.add(key)
+      edges.push(lo, hi)
+    }
+    for (let i = 0; i + 2 < indices.length; i += 3) {
+      add(indices[i], indices[i + 1])
+      add(indices[i + 1], indices[i + 2])
+      add(indices[i + 2], indices[i])
+    }
+    inst.wireEdgeCount = edges.length
+    if (edges.length === 0) return false
+    const data = new Uint32Array(edges)
+    inst.wireEdgeBuffer = this.device.createBuffer({
+      label: `wireframe edges ${inst.name}`,
+      size: data.byteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(inst.wireEdgeBuffer, 0, data)
+    inst.wireBindGroup = this.device.createBindGroup({
+      label: `wireframe skin ${inst.name}`,
+      layout: this.wireframeSkinLayout,
+      entries: [{ binding: 0, resource: { buffer: inst.skinMatrixBuffer } }],
+    })
+    return true
+  }
+
+  private renderWireframe(pass: GPURenderPassEncoder): void {
+    if (!this.overlayVertices) return
+    const inst = this.overlayModel(this.overlayVertices.modelName)
+    if (!inst || !this.ensureEdgeBuffer(inst) || !inst.wireBindGroup || !inst.wireEdgeBuffer) return
+    this.wireframeColorData.set(this.overlayVertices.color)
+    this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, this.wireframeColorData)
+    pass.setPipeline(this.wireframePipeline)
+    pass.setBindGroup(0, this.wireframeBindGroup)
+    pass.setBindGroup(1, inst.wireBindGroup)
+    pass.setVertexBuffer(0, inst.vertexBuffer)
+    pass.setVertexBuffer(1, inst.jointsBuffer)
+    pass.setVertexBuffer(2, inst.weightsBuffer)
+    pass.setIndexBuffer(inst.wireEdgeBuffer, "uint32")
+    pass.drawIndexed(inst.wireEdgeCount)
+  }
+
+  private overlayActive(): boolean {
+    return (
+      this.overlayLayers.size > 0 ||
+      this.overlayBones !== null ||
+      this.overlayBodies !== null ||
+      this.overlayJoints !== null ||
+      this.overlayVertices !== null
+    )
+  }
+
+  private overlayModel(name: string): ModelInstance | null {
+    return this.modelInstances.get(name) ?? null
+  }
+
+  /** The primitives a live layer would draw right now. Same list the pass uses,
+   *  so a host can show it as data, diff it, or hit-test it on the CPU. */
+  getOverlayPrimitives(layer: "bones" | "rigidbodies" | "joints"): OverlayPrimitive[] {
+    if (layer === "bones") {
+      const inst = this.overlayBones ? this.overlayModel(this.overlayBones.modelName) : null
+      return inst ? boneOverlay(inst.model, this.overlayBones!.options) : []
+    }
+    if (layer === "rigidbodies") {
+      const inst = this.overlayBodies ? this.overlayModel(this.overlayBodies.modelName) : null
+      return inst ? rigidbodyOverlay(inst.model, inst.physics, this.overlayBodies!.options) : []
+    }
+    const inst = this.overlayJoints ? this.overlayModel(this.overlayJoints.modelName) : null
+    return inst ? jointOverlay(inst.model, inst.physics, this.overlayJoints!.options) : []
+  }
+
+  // The overlay's own layer: a 4x multisampled colour target, its resolve, and a
+  // matching depth. All three are allocated the first frame an overlay is
+  // actually on, so a scene that never shows one never pays for any of it.
+  private ensureOverlayTargets(width: number, height: number): void {
+    if (this.overlayResolveTexture && this.overlayTargetSize[0] === width && this.overlayTargetSize[1] === height) {
+      return
+    }
+    const samples = Engine.OVERLAY_SAMPLE_COUNT
+    this.overlayDepthTexture?.destroy()
+    this.overlayMsaaTexture?.destroy()
+    this.overlayResolveTexture?.destroy()
+
+    this.overlayMsaaTexture = this.device.createTexture({
+      label: "overlay msaa",
+      size: [width, height],
+      sampleCount: samples,
+      format: this.presentationFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    this.overlayResolveTexture = this.device.createTexture({
+      label: "overlay resolve",
+      size: [width, height],
+      format: this.presentationFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.overlayDepthTexture = this.device.createTexture({
+      label: "overlay depth",
+      size: [width, height],
+      sampleCount: samples,
+      format: "depth24plus",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    this.overlayTargetSize = [width, height]
+
+    const colorAtt = (this.overlayPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
+    colorAtt.view = this.overlayMsaaTexture.createView()
+    colorAtt.resolveTarget = this.overlayResolveTexture.createView()
+    const depthAtt = this.overlayPassDescriptor.depthStencilAttachment as GPURenderPassDepthStencilAttachment
+    depthAtt.view = this.overlayDepthTexture.createView()
+
+    this.overlayCompositeBindGroup = this.device.createBindGroup({
+      label: "overlay composite bind group",
+      layout: this.overlayCompositeLayout,
+      entries: [{ binding: 0, resource: this.overlayResolveTexture.createView() }],
+    })
+  }
+
+  private ensureOverlayInstanceCapacity(count: number): void {
+    if (this.overlayInstanceBuffer && this.overlayInstanceCapacity >= count) return
+    // Grow in powers of two so a skirt gaining bodies one at a time does not
+    // reallocate once per body.
+    let capacity = Math.max(64, this.overlayInstanceCapacity || 64)
+    while (capacity < count) capacity *= 2
+    this.overlayInstanceBuffer?.destroy()
+    this.overlayInstanceBuffer = this.device.createBuffer({
+      label: "overlay instance buffer",
+      size: capacity * OVERLAY_INSTANCE_FLOATS * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    })
+    this.overlayInstanceCapacity = capacity
+    this.overlayInstanceData = new Float32Array(capacity * OVERLAY_INSTANCE_FLOATS)
+  }
+
+  // Collects every layer, groups it by shape so each shape is one instanced
+  // draw, and runs them into the swapchain over the finished frame.
+  private renderOverlayPass(encoder: GPUCommandEncoder, swapchainView: GPUTextureView): void {
+    if (!this.camera) return
+
+    const byShape = this.overlayByShape
+    for (const shape of OVERLAY_SHAPES) {
+      const list = byShape.get(shape)
+      if (list) list.length = 0
+    }
+    let total = 0
+    const collect = (primitives: readonly OverlayPrimitive[]) => {
+      for (const primitive of primitives) {
+        let list = byShape.get(primitive.shape)
+        if (!list) {
+          list = []
+          byShape.set(primitive.shape, list)
+        }
+        list.push(primitive)
+        total++
+      }
+    }
+
+    for (const layer of this.overlayLayers.values()) collect(layer)
+    if (this.overlayBones) {
+      const inst = this.overlayModel(this.overlayBones.modelName)
+      if (inst) collect(boneOverlay(inst.model, this.overlayBones.options))
+    }
+    if (this.overlayBodies) {
+      const inst = this.overlayModel(this.overlayBodies.modelName)
+      if (inst) collect(rigidbodyOverlay(inst.model, inst.physics, this.overlayBodies.options))
+    }
+    if (this.overlayJoints) {
+      const inst = this.overlayModel(this.overlayJoints.modelName)
+      if (inst) collect(jointOverlay(inst.model, inst.physics, this.overlayJoints.options))
+    }
+    if (total === 0 && !this.overlayVertices) return
+
+    this.ensureOverlayInstanceCapacity(total)
+    const data = this.overlayInstanceData
+    const draws: { shape: OverlayShape; first: number; count: number }[] = []
+    let written = 0
+    for (const shape of OVERLAY_SHAPES) {
+      const list = byShape.get(shape)
+      if (!list || list.length === 0) continue
+      draws.push({ shape, first: written, count: list.length })
+      for (const primitive of list) {
+        writeOverlayInstance(primitive, data, written * OVERLAY_INSTANCE_FLOATS)
+        written++
+      }
+    }
+    this.device.queue.writeBuffer(
+      this.overlayInstanceBuffer!,
+      0,
+      data.buffer,
+      data.byteOffset,
+      written * OVERLAY_INSTANCE_FLOATS * 4,
+    )
+
+    const width = this.canvas.width
+    const height = this.canvas.height
+    this.ensureOverlayTargets(width, height)
+    this.overlayUniformData[0] = width
+    this.overlayUniformData[1] = height
+    this.overlayUniformData[2] = Engine.OVERLAY_DASH_PERIOD_PX
+    this.device.queue.writeBuffer(this.overlayUniformBuffer, 0, this.overlayUniformData)
+
+    const pass = encoder.beginRenderPass(this.overlayPassDescriptor)
+    // Under everything: the mesh is the haze the rig is read against.
+    this.renderWireframe(pass)
+    pass.setBindGroup(0, this.overlayBindGroup)
+    pass.setVertexBuffer(0, this.overlayVertexBuffer)
+    pass.setVertexBuffer(1, this.overlayInstanceBuffer!)
+    // Volumes first and without depth writes, then the line work over them.
+    for (const solid of [true, false]) {
+      let bound = false
+      for (const draw of draws) {
+        if (OVERLAY_SOLID_SHAPES.has(draw.shape) !== solid) continue
+        if (!bound) {
+          pass.setPipeline(solid ? this.overlaySolidPipeline : this.overlayPipeline)
+          bound = true
+        }
+        const range = this.overlayGeometry.ranges[draw.shape]
+        pass.draw(range.count, draw.count, range.first, draw.first)
+      }
+    }
+    pass.end()
+
+    // The resolved layer over the finished frame, premultiplied.
+    const compositeAtt = (this.overlayCompositePassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
+    compositeAtt.view = swapchainView
+    const composite = encoder.beginRenderPass(this.overlayCompositePassDescriptor)
+    composite.setPipeline(this.overlayCompositePipeline)
+    composite.setBindGroup(0, this.overlayCompositeBindGroup!)
+    composite.draw(3)
+    composite.end()
+  }
+
   // Writes gizmo transform = T(bonePos) · R(boneWorldRot) · S(GIZMO_WORLD_SIZE),
   // then runs 6 triangle-list draws (3 axes + 3 rings). Local-axes mode: rotation
   // aligns rings with the bone's current world orientation, so clicking a ring
@@ -11373,6 +12004,9 @@ export class Engine {
     this.renderIdDebugPass(encoder, swapchainView)
 
     if (this.selectedMaterial && hasModels) this.renderSelectionPasses(encoder, swapchainView)
+    // Under the gizmo: the handles you drag stay on top of the rig you are
+    // reading them against.
+    if (this.overlayActive()) this.renderOverlayPass(encoder, swapchainView)
     if (this.selectedBone && hasModels) this.renderGizmoPass(encoder, swapchainView)
 
     const pick = this.pendingPick
