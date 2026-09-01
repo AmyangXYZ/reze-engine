@@ -34,8 +34,8 @@ const RISE = 2.6;         // metres a second, before size weighting
 const LEAN = vec3f(0.55, 0.0, 0.2);    // his MOVEMENT_DIRECTION, as a drift
 const WANDER = 0.9;       // how far the noise pushes them off that line
 const SWIRL = 0.14;       // how tightly the wander curls
-const SIZE_MIN = 0.055;
-const SIZE_MAX = 0.26;
+const SIZE_MIN = 0.026;
+const SIZE_MAX = 0.115;
 const TUMBLE = 1.5;       // how fast a flake turns over
 const SECTORS = 9.0;      // corners on a flake's outline
 // HOW DEEP THE NOTCHES GO, and it is the difference between ash and confetti.
@@ -55,9 +55,9 @@ const CORE_OUT = 0.50;
 // that runs white-hot to orange to dark red as it climbs is burning, and the
 // range itself is what reads as heat. Every other change here is smaller than
 // this one.
-const HOT = vec3f(1.00, 0.82, 0.42);   // just off the floor
-const FIRE = vec3f(1.00, 0.22, 0.03);  // most of the climb
-const BLOOD = vec3f(0.34, 0.01, 0.01); // going out under the ceiling
+const HOT = vec3f(1.00, 0.58, 0.18);   // just off the floor
+const FIRE = vec3f(0.96, 0.09, 0.02);  // most of the climb
+const BLOOD = vec3f(0.28, 0.004, 0.006); // going out under the ceiling
 const COOL_POW = 0.7;     // <1 holds the heat longer before it drops away
 const SPARK_GAIN = 4.2;   // HDR: white here is grey after AgX, so a spark needs headroom
 const BLOOM_GAIN = 1.1;
@@ -177,9 +177,12 @@ fn particleShade(p: Particle, uv: vec2f) -> vec4f {
 
   // How far up it has got, which is how much heat it has lost.
   let climb = pow(clamp(p.pos.y / TOP, 0.0, 1.0), COOL_POW);
-  let heat = select(mix(FIRE, BLOOD, clamp((climb - 0.3) / 0.7, 0.0, 1.0)),
-                    mix(HOT, FIRE, clamp(climb / 0.3, 0.0, 1.0)),
-                    climb < 0.3);
+  // The hot stage is SHORT — a flake is orange for the first sixth of its climb
+  // and red for the rest of it. Most of what is on screen at any moment should
+  // already be cooling, or the field reads as sparks rather than as ash.
+  let heat = select(mix(FIRE, BLOOD, clamp((climb - 0.16) / 0.84, 0.0, 1.0)),
+                    mix(HOT, FIRE, clamp(climb / 0.16, 0.0, 1.0)),
+                    climb < 0.16);
 
   // Cubed, so a handful are fierce and most are barely there — the distribution
   // a real fire has, and the reason bloom has anything to find.

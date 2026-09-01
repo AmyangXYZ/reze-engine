@@ -1,5 +1,5 @@
-#anchor 左手首
-#anchor 右手首
+#anchor 左手首 trail
+#anchor 右手首 trail
 #particles 3600
 #blend additive
 #bloom
@@ -64,9 +64,11 @@ const DEAD = vec3f(0.44, 0.04, 0.01); // and out
 const BLUE_END = 0.12;    // how much of a spark's life is still blue — keep it short
 const WHITE_END = 0.34;
 const GAIN = 4.6;          // HDR: white here is grey after AgX
-const LIGHT_COLOR = vec3f(1.0, 0.58, 0.18);
-const LIGHT_POWER = 1.4;
-const LIGHT_R = 3.4;
+const LIGHT_COLOR = vec3f(1.00, 0.62, 0.22);  // the shower's body, not its blue tip
+const LIGHT_I = 1.15;
+const LIGHT_R = 7.0;      // world units — an arm's length, not the room
+const LIGHT_REST = 0.4;   // what a still hand keeps
+const LIGHT_FULL = 9.0;   // hand speed at which the light is fully up
 
 /**
  * The temperature run: 0 the instant a spark is thrown, 1 as it goes out.
@@ -178,18 +180,48 @@ fn particleShade(p: Particle, uv: vec2f) -> vec4f {
  */
 fn lightEmit(i: u32, time: f32) -> RzLight {
   var l: RzLight;
+  // The shower's BODY, never the blue tip. A blue-white lamp on skin reads as
+  // moonlight, and the colour a viewer takes off the sparks is the orange they
+  // spend most of their life at.
   l.color = LIGHT_COLOR;
   l.intensity = 0.0;
   l.radius = 1.0;
   l.pos = vec3f(0.0, 0.0, 0.0);
-  // One lamp per wrist, in the order the anchors are declared at the top of this
-  // file — the light index IS the slot here, unlike the sparks, which pick a
-  // hand each.
+
+  // One lamp per wrist. Slot 0 is the left and 1 the right, the order the
+  // anchors are declared at the top — the light index IS the slot here, unlike
+  // the sparks, which pick a hand each.
+  //
+  // SUBJECT 0 only. A light is a declared cost, and covering four dancers would
+  // spend eight of the sixteen slots on one effect.
   let a = rzAnchor(0, i32(i));
   if (!a.valid) { return l; }
   l.pos = a.pos;
   l.radius = LIGHT_R;
-  // Steady, because the shower is. It only breathes enough to look alive.
-  l.intensity = LIGHT_POWER * (0.9 + 0.1 * sin(time * 11.0));
+
+  // HOW FAST SHE IS MOVING, AVERAGED OVER THE WHOLE RECORDED PATH.
+  //
+  // Not length(a.vel): that is one frame's velocity, and a pose track is sampled
+  // rather than smooth, so it jumps between frames. A light driven by it
+  // flickers on the model and no curve fixes that, because the input is the
+  // noise. Walking the path and dividing the distance covered by how long it
+  // took is an average over the trail's whole span, so the light can change only
+  // as fast as a hand can change its mind.
+  //
+  // Path LENGTH, not the distance between the ends — a circling hand returns to
+  // where it started and would otherwise read as standing still. Divine Ribbon
+  // arrived at the same thing for the same reason.
+  let n = rzTrailCount(0, i32(i));
+  var travelled = 0.0;
+  if (n >= 2) {
+    var prev = rzTrail(0, i32(i), 0).xyz;
+    for (var s = 1; s < n; s = s + 1) {
+      let cur = rzTrail(0, i32(i), s).xyz;
+      travelled = travelled + distance(prev, cur);
+      prev = cur;
+    }
+  }
+  let span = max(rzTrail(0, i32(i), max(n - 1, 0)).w, 1e-3);
+  l.intensity = LIGHT_I * mix(LIGHT_REST, 1.0, clamp((travelled / span) / LIGHT_FULL, 0.0, 1.0));
   return l;
 }
