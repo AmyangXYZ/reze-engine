@@ -1,4 +1,3 @@
-import { castDistanceStub } from "./cast-distance"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
@@ -154,7 +153,20 @@ fn rzGrid(uv: vec2f) -> vec4f { return rzGridPrev(uv); }
 ` +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
-    idApi(false, 0, 0) + castDistanceStub() +
+    idApi(false, 0, 0) +
+    // Inlined rather than imported from cast-distance, and NOT for tidiness.
+    //
+    // This module and composite.ts import each other — grid takes
+    // EFFECT_SCENE_API from it, composite takes gridReadApi from here — and that
+    // cycle has always been benign because both only touch the other inside
+    // functions. Adding an import here put a third module ahead of composite in
+    // grid's own evaluation order, which is enough to change where a bundler
+    // enters the cycle: Node's loader tolerated it and a browser one threw
+    // "Cannot access 'grid' before initialization" at load.
+    //
+    // One line of WGSL is not worth an import into a module that is already in a
+    // cycle. The other mounts import it normally — none of them is.
+    "fn rzCastDistance(uv: vec2f) -> f32 { return 1.0e30; }\n" +
     "\n// ── user effect (setEffect) ──\n" +
     wgsl +
     /* wgsl */ `
