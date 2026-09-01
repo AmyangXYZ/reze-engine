@@ -36,6 +36,8 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   // which is what makes a border look stuck on rather than attached.
   let inner = clamp(d + 0.5, 0.0, 1.0);
   // And the outer edge is a cut, not a glow: solid to the feather, then off.
-  let outer = smoothstep(WIDTH, WIDTH - FEATHER, d);
+  // 1 - smoothstep(lo, hi), never smoothstep(hi, lo): WGSL leaves it undefined
+  // when low >= high, and it is the kind of undefined that works locally.
+  let outer = 1.0 - smoothstep(WIDTH - FEATHER, WIDTH, d);
   return vec4f(COLOR, inner * outer * OPACITY);
 }

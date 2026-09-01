@@ -3516,6 +3516,19 @@ export class Engine {
     // the earlier one's buffers: the candidate is never installed, so no release
     // path ever sees them. Matters more with a list — one bad effect among
     // thirteen should cost nothing but itself.
+    // DECLARED BEFORE abandon, and that is load-bearing.
+    //
+    // abandon closes over all three. Declaring them after it meant that a
+    // failure in the FIRST stage — particles — called a function whose body
+    // touches `grid`, which was still in its temporal dead zone: the throw
+    // replaced the diagnostic with "Cannot access 'grid' before initialization"
+    // and the author never saw why their shader was rejected. Only the first
+    // stage could hit it, which is why it survived: a bad grid or a bad ribbon
+    // reported correctly.
+    let particles: EffectParticles | null = null
+    let grid: EffectGrid | null = null
+    let trails: EffectTrails | null = null
+
     const abandon = (diagnostics: string[]): EffectResult => {
       particles?.buffer.destroy()
       particles?.uniform.destroy()
@@ -3525,19 +3538,16 @@ export class Engine {
       trails?.uniform.destroy()
       return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration }
     }
-    let particles: EffectParticles | null = null
     if (wantsParticles) {
       const built = await this.buildParticles(wgsl, d, anchors, alias)
       if (!built.ok) return abandon(built.diagnostics)
       particles = built.state
     }
-    let grid: EffectGrid | null = null
     if (gridEntryPoint(wgsl)) {
       const built = await this.buildSim(wgsl, d, anchors, alias)
       if (!built.ok) return abandon(built.diagnostics)
       grid = built.state
     }
-    let trails: EffectTrails | null = null
     if (wantsTrails) {
       // Only anchors that asked for `trail` have a path to draw; a ribbon on a
       // bone recorded without one would read zeroes and paint a line to the origin.
