@@ -25,6 +25,7 @@
 // and the loop does not branch on it, so it is honest padding rather than a
 // switch with one case.
 
+import { castDistanceStub } from "./passes/cast-distance"
 import { audioApi } from "./audio-api"
 import { midiApi } from "./midi-api"
 import { lyricsApi } from "./lyrics-api"
@@ -160,7 +161,7 @@ ${viewportApi("viewU[6].w")}
 ${trailSlotsApi(cast.trailCount)}
 // The id accessors, stubbed: this module cannot read an attachment the
 // scene pass writes. See id-api.ts — the author's whole file compiles here.
-${idApi(false, 0, 0)}
+${idApi(false, 0, 0) + castDistanceStub()}
 ${wgsl}
 
 @compute @workgroup_size(64)

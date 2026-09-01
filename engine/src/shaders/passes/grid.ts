@@ -1,3 +1,4 @@
+import { castDistanceStub } from "./cast-distance"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
@@ -153,7 +154,7 @@ fn rzGrid(uv: vec2f) -> vec4f { return rzGridPrev(uv); }
 ` +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
-    idApi(false, 0, 0) +
+    idApi(false, 0, 0) + castDistanceStub() +
     "\n// ── user effect (setEffect) ──\n" +
     wgsl +
     /* wgsl */ `

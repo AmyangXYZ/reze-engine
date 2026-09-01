@@ -83,6 +83,16 @@ import {
   buildSimShader,
   gridEntryPoint,
 } from "./shaders/passes/grid"
+import {
+  buildCastResolveShader,
+  buildCastSeedShader,
+  buildCastStepShader,
+  castDistanceUsed,
+  CAST_COVERAGE_FORMAT,
+  CAST_DIST_FORMAT,
+  CAST_FIELD_DIV,
+  CAST_SEED_FORMAT,
+} from "./shaders/passes/cast-distance"
 import { buildTrailShader, trailEntryPoints, TRAIL_SUBDIVISIONS } from "./shaders/passes/trails"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
@@ -1337,6 +1347,9 @@ interface EffectInstance {
    *  change while an effect is installed, and the frame path should not be
    *  running regexes. */
   readsIds: boolean
+  /** Does this source read the distance-to-cast field? Parsed at install for the
+   *  same reason readsIds is, and it turns the whole flood on by itself. */
+  readsCastDistance: boolean
   /** Bones this source asked for, in ITS OWN declaration order. The scene table
    *  maps these onto shared addresses; this list is what it is rebuilt from. */
   anchors: { bone: string; trail: boolean }[]
@@ -1686,6 +1699,34 @@ export class Engine {
     string,
     { modelName: string; groupId: string; paramId: string; keys: ParamKey[]; last: ParamValue | null }
   >()
+  /**
+   * The distance-to-cast field: seeds ping-ponged by a jump flood, then resolved.
+   *
+   * All null until some installed effect names rzCastDistance. Nothing is
+   * allocated and no pass is encoded for a scene that never asks — the same
+   * bargain the grid and the id buffer strike.
+   */
+  private castSeedTextures: (GPUTexture | null)[] = [null, null]
+  private castSeedViews: (GPUTextureView | null)[] = [null, null]
+  private castCoverageTexture: GPUTexture | null = null
+  private castCoverageView: GPUTextureView | null = null
+  private castDistTexture: GPUTexture | null = null
+  private castDistView: GPUTextureView | null = null
+  /** 1x1 holding half-float 65504, bound whenever the pass is not running: an
+   *  effect keyed on distance then finds the cast unreachably far and draws
+   *  nothing, rather than the accessor being a name that does not exist. */
+  private castDistFallback: GPUTexture | null = null
+  private castDistFallbackView: GPUTextureView | null = null
+  private castSeedPipeline: GPURenderPipeline | null = null
+  private castStepPipeline: GPURenderPipeline | null = null
+  private castResolvePipeline: GPURenderPipeline | null = null
+  private castSeedBindGroup: GPUBindGroup | null = null
+  private castStepBindGroups: GPUBindGroup[] = []
+  private castResolveBindGroup: GPUBindGroup | null = null
+  private castStepStrideBuffers: GPUBuffer[] = []
+  /** Does anything installed actually read the field? Set from the effect list. */
+  private castDistanceWanted = false
+
   private fieldBgTextures: (GPUTexture | null)[] = [null, null]
   private fieldBgViews: (GPUTextureView | null)[] = [null, null]
   private fieldFgTextures: (GPUTexture | null)[] = [null, null]
@@ -2795,8 +2836,149 @@ export class Engine {
     return this.fieldPairUsed(layer) && view ? view : this.trailFallbackView
   }
 
+  /**
+   * The distance field's textures, and the bind groups that walk the flood.
+   *
+   * Rebuilt with the field targets, because it is sized off the same swap chain
+   * and a resize invalidates every view. Torn down entirely when nothing reads
+   * it: the memory is two coordinate targets and a distance one at half res,
+   * which is real, and a scene with no such effect should not hold it.
+   */
+  private createCastDistanceTargets(): void {
+    for (const t of this.castSeedTextures) t?.destroy()
+    this.castCoverageTexture?.destroy()
+    this.castDistTexture?.destroy()
+    for (const b of this.castStepStrideBuffers) b.destroy()
+    this.castSeedTextures = [null, null]
+    this.castSeedViews = [null, null]
+    this.castCoverageTexture = null
+    this.castCoverageView = null
+    this.castDistTexture = null
+    this.castDistView = null
+    this.castStepStrideBuffers = []
+    this.castStepBindGroups = []
+    this.castSeedBindGroup = null
+    this.castResolveBindGroup = null
+    if (!this.device || !this.castDistanceWanted || this.fieldFullW === 0) return
+    if (!this.castSeedPipeline || !this.castStepPipeline || !this.castResolvePipeline) return
+
+    const w = Math.max(1, Math.ceil(this.fieldFullW / CAST_FIELD_DIV))
+    const h = Math.max(1, Math.ceil(this.fieldFullH / CAST_FIELD_DIV))
+    for (let i = 0; i < 2; i++) {
+      this.castSeedTextures[i] = this.device.createTexture({
+        label: `cast distance seeds ${i}`,
+        size: [w, h],
+        format: CAST_SEED_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.castSeedViews[i] = this.castSeedTextures[i]!.createView()
+    }
+    this.castCoverageTexture = this.device.createTexture({
+      label: "cast coverage",
+      size: [w, h],
+      format: CAST_COVERAGE_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.castCoverageView = this.castCoverageTexture.createView()
+    this.castDistTexture = this.device.createTexture({
+      label: "cast distance",
+      size: [w, h],
+      format: CAST_DIST_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.castDistView = this.castDistTexture.createView()
+
+    // The flood starts at half the longest side and halves to one. That is what
+    // makes it exact everywhere rather than out to some radius: every seed gets
+    // the chance to reach every texel it is nearest to.
+    const strides: number[] = []
+    for (let k = 1 << Math.ceil(Math.log2(Math.max(w, h))); k >= 1; k >>= 1) strides.push(k)
+
+    this.castSeedBindGroup = this.device.createBindGroup({
+      label: "cast distance seed",
+      layout: this.castSeedPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.idView! },
+        { binding: 1, resource: { buffer: this.castBuffer } },
+      ],
+    })
+    strides.forEach((stride, i) => {
+      const buf = this.device!.createBuffer({
+        label: `cast distance stride ${stride}`,
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      this.device!.queue.writeBuffer(buf, 0, new Float32Array([stride, 0, 0, 0]))
+      this.castStepStrideBuffers.push(buf)
+      // Pass i reads the texture pass i-1 wrote. The seed lands in 0, so an even
+      // pass reads 0 and writes 1.
+      this.castStepBindGroups.push(
+        this.device!.createBindGroup({
+          label: `cast distance step ${stride}`,
+          layout: this.castStepPipeline!.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.castSeedViews[i % 2]! },
+            { binding: 1, resource: { buffer: buf } },
+          ],
+        }),
+      )
+    })
+    this.castResolveBindGroup = this.device.createBindGroup({
+      label: "cast distance resolve",
+      layout: this.castResolvePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.castSeedViews[strides.length % 2]! },
+        { binding: 1, resource: this.castCoverageView! },
+      ],
+    })
+  }
+
+  /**
+   * The flood, encoded once a frame before the field pass reads it.
+   *
+   * Seed, then one pass per halving of the stride, then resolve to a distance.
+   * Nothing here depends on how far any effect intends to look — that is the
+   * whole point of paying for it in passes rather than in per-pixel search.
+   */
+  private encodeCastDistance(encoder: GPUCommandEncoder): void {
+    if (!this.castDistanceWanted || !this.castSeedBindGroup || !this.castResolveBindGroup) return
+    const seed = encoder.beginRenderPass({
+      label: "cast distance (seed)",
+      colorAttachments: [
+        { view: this.castSeedViews[0]!, loadOp: "clear", clearValue: { r: -1, g: -1, b: 0, a: 0 }, storeOp: "store" },
+        { view: this.castCoverageView!, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" },
+      ],
+    })
+    seed.setPipeline(this.castSeedPipeline!)
+    seed.setBindGroup(0, this.castSeedBindGroup)
+    seed.draw(3)
+    seed.end()
+
+    this.castStepBindGroups.forEach((group, i) => {
+      const pass = encoder.beginRenderPass({
+        label: "cast distance (flood)",
+        colorAttachments: [{ view: this.castSeedViews[(i + 1) % 2]!, loadOp: "clear", clearValue: { r: -1, g: -1, b: 0, a: 0 }, storeOp: "store" }],
+      })
+      pass.setPipeline(this.castStepPipeline!)
+      pass.setBindGroup(0, group)
+      pass.draw(3)
+      pass.end()
+    })
+
+    const resolve = encoder.beginRenderPass({
+      label: "cast distance (resolve)",
+      colorAttachments: [{ view: this.castDistView!, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" }],
+    })
+    resolve.setPipeline(this.castResolvePipeline!)
+    resolve.setBindGroup(0, this.castResolveBindGroup)
+    resolve.draw(3)
+    resolve.end()
+  }
+
   private createFieldTargets(): void {
     if (!this.device || this.fieldFullW === 0) return
+    // Same swap chain, same invalidation.
+    this.createCastDistanceTargets()
     for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
       const scale = Engine.FIELD_SCALES[i]
       const w = Math.max(1, Math.ceil(this.fieldFullW / scale))
@@ -2857,6 +3039,7 @@ export class Engine {
           ...(this.idView ? [{ binding: 23, resource: this.idView }] : []),
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
+          { binding: 26, resource: this.castDistView ?? this.castDistFallbackView! },
         ],
       })
     // Per effect: the params buffer and the grid are both its own, so two
@@ -3422,6 +3605,7 @@ export class Engine {
         // so matching against it would report every effect as a reader and the
         // attachment would be stored exactly as often as before.
         readsIds: /\brz(?:ObjectAt|MaterialAt)\s*\(/.test(wgsl),
+        readsCastDistance: castDistanceUsed(wgsl),
         anchors,
         // The effect's own clock starts now. Per effect so that one installed
         // later still gets a frame where rzGridFrame() is 0 and can seed.
@@ -3571,6 +3755,17 @@ export class Engine {
     this.releaseTrails()
     this.releaseGrid()
     this.effects = instances
+    // Turn the distance field on or off with the list that asked for it. Only
+    // rebuilds when the answer CHANGES: the targets are half-res render
+    // attachments and reallocating them per install would churn them for every
+    // unrelated effect a scene adds.
+    const wantsCastDistance = instances.some((e) => e.readsCastDistance)
+    if (wantsCastDistance !== this.castDistanceWanted) {
+      this.castDistanceWanted = wantsCastDistance
+      this.createCastDistanceTargets()
+      // The field bind groups name the distance texture, and it has just been
+      // created or destroyed — they are rebuilt below with the new list anyway.
+    }
     // The new list's emitters need their slots before the next frame reads them.
     this.allocateLightSlots()
     // A rig the cap refused is worth saying out loud on the effect that asked
@@ -4207,6 +4402,10 @@ export class Engine {
     // two 16MB writes a frame to produce the transparent black the fallback
     // already is. Most scenes leave the full-res pair empty, since an effect only
     // lands there by declaring #fullres.
+    // The distance field, before anything reads it. Returns immediately when no
+    // installed effect names rzCastDistance, which is the common case.
+    this.encodeCastDistance(encoder)
+
     let stamped = false
     for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
       const bg = this.fieldBgViews[i]
@@ -5202,11 +5401,67 @@ export class Engine {
           : []),
         { binding: 17, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
         { binding: 18, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+        // Distance to the cast. Always in the layout — the accessor is always
+        // compiled, and a 1x1 stands in when the flood is not running, so an
+        // author never has to guard the name.
+        { binding: 26, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
       ],
     })
     this.fieldPipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [this.fieldBindGroupLayout],
     })
+
+    // ── The distance-to-cast field's three pipelines ──
+    //
+    // Built once, whether or not anything reads the field: they cost a shader
+    // module each and nothing per frame, and building them lazily would put a
+    // pipeline compile in the frame where an author first types the name.
+    {
+      const seedModule = this.device.createShaderModule({ label: "cast distance seed", code: buildCastSeedShader(Engine.MULTISAMPLE_COUNT) })
+      const stepModule = this.device.createShaderModule({ label: "cast distance step", code: buildCastStepShader() })
+      const resolveModule = this.device.createShaderModule({ label: "cast distance resolve", code: buildCastResolveShader() })
+      this.castSeedPipeline = this.device.createRenderPipeline({
+        label: "cast distance seed",
+        layout: "auto",
+        vertex: { module: seedModule, entryPoint: "vs" },
+        fragment: {
+          module: seedModule,
+          entryPoint: "fs",
+          targets: [{ format: CAST_SEED_FORMAT }, { format: CAST_COVERAGE_FORMAT }],
+        },
+        primitive: { topology: "triangle-list" },
+      })
+      this.castStepPipeline = this.device.createRenderPipeline({
+        label: "cast distance step",
+        layout: "auto",
+        vertex: { module: stepModule, entryPoint: "vs" },
+        fragment: { module: stepModule, entryPoint: "fs", targets: [{ format: CAST_SEED_FORMAT }] },
+        primitive: { topology: "triangle-list" },
+      })
+      this.castResolvePipeline = this.device.createRenderPipeline({
+        label: "cast distance resolve",
+        layout: "auto",
+        vertex: { module: resolveModule, entryPoint: "vs" },
+        fragment: { module: resolveModule, entryPoint: "fs", targets: [{ format: CAST_DIST_FORMAT }] },
+        primitive: { topology: "triangle-list" },
+      })
+      // 65504 is the largest half float. Bound wherever the field is not
+      // running, so rzCastDistance answers "unreachably far" and an effect keyed
+      // on it draws nothing at all.
+      this.castDistFallback = this.device.createTexture({
+        label: "cast distance fallback (1x1, far)",
+        size: [1, 1],
+        format: CAST_DIST_FORMAT,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      this.device.queue.writeTexture(
+        { texture: this.castDistFallback },
+        new Uint16Array([0x7bff]),
+        { bytesPerRow: 2 },
+        { width: 1, height: 1 },
+      )
+      this.castDistFallbackView = this.castDistFallback.createView()
+    }
 
     this.fallbackMaterialTexture = this.device.createTexture({
       label: "fallback material texture (1x1 white)",
@@ -10884,7 +11139,9 @@ export class Engine {
     // whose result no one is going to read.
     const idAtt = (this.renderPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[2]
     if (idAtt) {
-      const idsRead = this.idDebug || this.effects.some((e) => e.readsIds)
+      // The flood seeds from the id attachment, so an effect that reads only the
+      // DISTANCE still needs the ids kept — it just never names them itself.
+      const idsRead = this.idDebug || this.effects.some((e) => e.readsIds || e.readsCastDistance)
       idAtt.storeOp = idsRead ? "store" : "discard"
     }
 

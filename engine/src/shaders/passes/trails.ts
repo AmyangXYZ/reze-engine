@@ -1,3 +1,4 @@
+import { castDistanceStub } from "./cast-distance"
 import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
@@ -235,7 +236,7 @@ fn rzTurnRadius(a: vec3f, b: vec3f, c: vec3f) -> f32 {
     lyricsApi(0, 6) +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
-    idApi(false, 0, 0) +
+    idApi(false, 0, 0) + castDistanceStub() +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `
