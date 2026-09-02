@@ -1546,6 +1546,11 @@ export class Engine {
   private wireframeDepthPipeline!: GPURenderPipeline
   private wireframeUniformBuffer!: GPUBuffer
   private wireframeBindGroup!: GPUBindGroup
+  /** The seam pass draws in the same frame at a different stroke and alpha, and
+   *  every queue write lands before the command buffer runs — writing the one
+   *  buffer twice would give both draws the second value. */
+  private wireframeSeamUniformBuffer!: GPUBuffer
+  private wireframeSeamBindGroup!: GPUBindGroup
   private wireframeSkinLayout!: GPUBindGroupLayout
   private wireframeColorData = new Float32Array(8)
   /** Rebuilt every frame into these, grouped by shape so each shape is one draw. */
@@ -7269,6 +7274,11 @@ export class Engine {
       size: 32, // vec4 colour + vec2 viewport + thickness + pad
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    this.wireframeSeamUniformBuffer = this.device.createBuffer({
+      label: "wireframe color (material borders)",
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
     const wireBg0 = this.device.createBindGroupLayout({
       label: "wireframe group 0 layout (camera + wire)",
       entries: [
@@ -7384,6 +7394,14 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: { buffer: this.wireframeUniformBuffer } },
+      ],
+    })
+    this.wireframeSeamBindGroup = this.device.createBindGroup({
+      label: "wireframe bind group (material borders)",
+      layout: wireBg0,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.wireframeSeamUniformBuffer } },
       ],
     })
 
@@ -11067,28 +11085,69 @@ export class Engine {
     return null
   }
 
-  private ensureEdgeBuffer(inst: ModelInstance, material: string | null): boolean {
-    const key = material ?? ""
+  /** A cache key no material can collide with — a PMX name is never empty and
+   *  never contains a NUL. */
+  private static readonly SEAM_KEY = "\u0000seams"
+
+  /**
+   * @param material one material's own edges, or null for the whole mesh
+   * @param seams    every material's OUTLINE instead — the borders between them
+   */
+  private ensureEdgeBuffer(inst: ModelInstance, material: string | null, seams = false): boolean {
+    const key = material ?? (seams ? Engine.SEAM_KEY : "")
     if (inst.wireEdges.has(key)) return inst.wireEdges.get(key) !== null
-    const range = this.materialIndexRange(inst, material)
-    if (!range) return false
-    const [start, end] = range
     const indices = inst.model.getIndices()
-    const seen = new Set<number>()
-    const edges: number[] = []
     const vertexCount = inst.model.getGeometry().positions.length / 3
-    const add = (a: number, b: number) => {
-      const lo = a < b ? a : b
-      const hi = a < b ? b : a
-      const key = lo * vertexCount + hi
-      if (seen.has(key)) return
-      seen.add(key)
-      edges.push(lo, hi)
-    }
-    for (let i = start; i + 2 < end; i += 3) {
-      add(indices[i], indices[i + 1])
-      add(indices[i + 1], indices[i + 2])
-      add(indices[i + 2], indices[i])
+    const edges: number[] = []
+
+    if (seams && !material) {
+      // Inside one material's run an interior edge belongs to two triangles and
+      // a border edge to one, so counting uses within the run and keeping the
+      // singles gives exactly that material's outline.
+      //
+      // Per run, never over the whole mesh: an edge two materials share is
+      // interior to the model and a border to both, and only the per-run count
+      // can tell those two cases apart.
+      const used = new Map<number, number>()
+      const seen = new Set<number>()
+      let offset = 0
+      for (const m of inst.model.getMaterials()) {
+        const end = offset + m.vertexCount
+        used.clear()
+        const bump = (a: number, b: number) => {
+          const k = (a < b ? a : b) * vertexCount + (a < b ? b : a)
+          used.set(k, (used.get(k) ?? 0) + 1)
+        }
+        for (let i = offset; i + 2 < end; i += 3) {
+          bump(indices[i], indices[i + 1])
+          bump(indices[i + 1], indices[i + 2])
+          bump(indices[i + 2], indices[i])
+        }
+        for (const [k, count] of used) {
+          if (count !== 1 || seen.has(k)) continue
+          seen.add(k)
+          edges.push(Math.floor(k / vertexCount), k % vertexCount)
+        }
+        offset = end
+      }
+    } else {
+      const range = this.materialIndexRange(inst, material)
+      if (!range) return false
+      const [start, end] = range
+      const seen = new Set<number>()
+      const add = (a: number, b: number) => {
+        const lo = a < b ? a : b
+        const hi = a < b ? b : a
+        const k = lo * vertexCount + hi
+        if (seen.has(k)) return
+        seen.add(k)
+        edges.push(lo, hi)
+      }
+      for (let i = start; i + 2 < end; i += 3) {
+        add(indices[i], indices[i + 1])
+        add(indices[i + 1], indices[i + 2])
+        add(indices[i + 2], indices[i])
+      }
     }
     if (edges.length === 0) {
       inst.wireEdges.set(key, null)
@@ -11096,13 +11155,13 @@ export class Engine {
     }
     const data = new Uint32Array(edges)
     const buffer = this.device.createBuffer({
-      label: `wireframe edges ${inst.name}${material ? ` / ${material}` : ""}`,
+      label: `wireframe edges ${inst.name}${material ? ` / ${material}` : seams ? " / seams" : ""}`,
       size: data.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(buffer, 0, data)
     const bindGroup = this.device.createBindGroup({
-      label: `wireframe mesh ${inst.name}${material ? ` / ${material}` : ""}`,
+      label: `wireframe mesh ${inst.name}${material ? ` / ${material}` : seams ? " / seams" : ""}`,
       layout: this.wireframeSkinLayout,
       entries: [
         { binding: 0, resource: { buffer: inst.skinMatrixBuffer } },
@@ -11119,17 +11178,33 @@ export class Engine {
   private renderWireframe(pass: GPURenderPassEncoder): void {
     if (!this.overlayVertices) return
     const inst = this.overlayModel(this.overlayVertices.modelName)
-    const material = this.overlayVertices.material
+    const { material, xray } = this.overlayVertices
     if (!inst || !this.ensureEdgeBuffer(inst, material)) return
     const edges = inst.wireEdges.get(material ?? "")
     if (!edges) return
+
+    // The whole mesh gets its material BORDERS drawn over it — that is what
+    // makes the view read as every material at once rather than as one body of
+    // undifferentiated lines. A single material asked for by name is already
+    // one material, so it needs no borders to separate it from anything.
+    const seams =
+      material === null && this.ensureEdgeBuffer(inst, null, true)
+        ? (inst.wireEdges.get(Engine.SEAM_KEY) ?? null)
+        : null
+
     this.wireframeColorData.set(DEFAULT_VERTEX_COLOR)
     this.wireframeColorData[4] = this.canvas.width
     this.wireframeColorData[5] = this.canvas.height
     this.wireframeColorData[6] = OVERLAY_STYLE.meshStrokePx
+    // The triangulation steps back only when there is something drawn over it
+    // to step back FROM.
+    if (seams) this.wireframeColorData[3] = DEFAULT_VERTEX_COLOR[3] * OVERLAY_STYLE.meshAlpha
     this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, this.wireframeColorData)
-    pass.setBindGroup(0, this.wireframeBindGroup)
-    pass.setBindGroup(1, edges.bindGroup)
+    if (seams) {
+      this.wireframeColorData[3] = DEFAULT_VERTEX_COLOR[3]
+      this.wireframeColorData[6] = OVERLAY_STYLE.seamStrokePx
+      this.device.queue.writeBuffer(this.wireframeSeamUniformBuffer, 0, this.wireframeColorData)
+    }
 
     // What writes depth is what is allowed to hide the wireframe, and that
     // differs between the two views.
@@ -11145,7 +11220,9 @@ export class Engine {
     // back faces stay hidden and it reads as an object instead of a haze —
     // which is the difference between this and turning x-ray on.
     const range = material !== null ? this.materialIndexRange(inst, material) : null
-    if (!this.overlayVertices.xray) {
+    pass.setBindGroup(0, this.wireframeBindGroup)
+    pass.setBindGroup(1, edges.bindGroup)
+    if (!xray) {
       pass.setPipeline(this.wireframeDepthPipeline)
       pass.setVertexBuffer(0, inst.vertexBuffer)
       pass.setVertexBuffer(1, inst.jointsBuffer)
@@ -11158,6 +11235,12 @@ export class Engine {
     // Six vertices an edge, instanced.
     pass.setPipeline(this.wireframePipeline)
     pass.draw(6, edges.count / 2)
+
+    if (seams) {
+      pass.setBindGroup(0, this.wireframeSeamBindGroup)
+      pass.setBindGroup(1, seams.bindGroup)
+      pass.draw(6, seams.count / 2)
+    }
   }
 
   /** The bone overlay's options with `selected` filled in from setSelectedBone,

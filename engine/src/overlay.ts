@@ -499,6 +499,16 @@ export const OVERLAY_STYLE = {
   minReach: 0.25,
   /** Joint cross arm length, as a fraction of the skeleton's extent. */
   jointSize: 0.006,
+
+  /** Stroke for the material borders drawn over the mesh wireframe. */
+  seamStrokePx: 3,
+  /** How strongly the triangulation draws under those borders.
+   *
+   *  Both at full strength is one undifferentiated field of yellow — forty
+   *  thousand edges saying what the model is made of the way a page of hex says
+   *  what a file contains. The borders are the answer and the triangulation is
+   *  the ground it reads against, so the ground steps back. */
+  meshAlpha: 0.35,
 } as const
 
 export const DEFAULT_BONE_PALETTE: Record<BoneClass, RGBA> = {
