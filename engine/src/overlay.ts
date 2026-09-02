@@ -68,7 +68,7 @@ export interface OverlayPrimitive {
   /** Linear rgba, each 0–1. */
   color: RGBA
   /** Stroke width in device pixels. Ignored by the filled shapes (`circle`,
-   *  `dot`), whose weight is in their geometry. 0.5–24. Default 3. */
+   *  `dot`), whose weight is in their geometry. Defaults to OVERLAY_STYLE.strokePx. */
   thickness?: number
 }
 
@@ -372,7 +372,7 @@ export function writeOverlayInstance(p: OverlayPrimitive, out: Float32Array, off
   out[offset + 8] = s[0]
   out[offset + 9] = s[1]
   out[offset + 10] = s[2]
-  out[offset + 11] = p.thickness ?? 3
+  out[offset + 11] = p.thickness ?? OVERLAY_STYLE.strokePx
   out[offset + 12] = p.color[0]
   out[offset + 13] = p.color[1]
   out[offset + 14] = p.color[2]
@@ -381,6 +381,35 @@ export function writeOverlayInstance(p: OverlayPrimitive, out: Float32Array, off
 
 const IDENTITY_ROT: readonly [number, number, number, number] = [0, 0, 0, 1]
 const UNIT_SCALE: Vec3Tuple = [1, 1, 1]
+
+/**
+ * Every bone's marker position in world space, root transform included.
+ *
+ * THE SAME points boneOverlay puts markers at, which is the whole reason it is a
+ * function rather than a loop inside the picker: a hit test that recomputes
+ * where a marker "should" be is a hit test that drifts away from the one drawn.
+ */
+export function boneMarkerPositions(model: Model, out?: Float32Array): Float32Array {
+  const world = model.getWorldMatrices()
+  const dst = out && out.length >= world.length * 3 ? out : new Float32Array(world.length * 3)
+  const root = rootTransform(model)
+  const local = new Vec3(0, 0, 0)
+  for (let i = 0; i < world.length; i++) {
+    const m = world[i].values
+    if (root.identity) {
+      dst[i * 3] = m[12]
+      dst[i * 3 + 1] = m[13]
+      dst[i * 3 + 2] = m[14]
+      continue
+    }
+    local.setXYZ(m[12] * root.scale, m[13] * root.scale, m[14] * root.scale)
+    const r = Quat.rotateVec(root.rotation, local)
+    dst[i * 3] = r.x + root.position.x
+    dst[i * 3 + 1] = r.y + root.position.y
+    dst[i * 3 + 2] = r.z + root.position.z
+  }
+  return dst
+}
 
 /**
  * How big this model is, from its bone positions — the reference every default
@@ -425,9 +454,14 @@ export type BoneClass = "plain" | "ik" | "physics" | "selected"
  * Every value is one step of the same ramp (Tailwind's 500), so the classes read
  * as a set and hue is the only thing that separates them.
  *
- * Red and green are never used together — that pair is the confusion most colour
- * blindness causes. Red is spent entirely on `selected`, the one distinction
- * that must never be ambiguous; green is not used at all.
+ * The rig is one colour and selection is another, and that is the whole scheme.
+ * Every class that had a hue of its own lost it: on a 147-bone skeleton the
+ * distinctions were spent on bones nobody was hunting for, and the panel is
+ * where those belong. The classes remain so a panel can filter on them.
+ *
+ * Red is spent entirely on `selected`, the one distinction that must never be
+ * ambiguous, and green is not used at all — red-green being the confusion most
+ * colour blindness causes.
  *
  * A physics-driven bone and a dynamic body share orange on purpose. They are the
  * same fact seen twice — the solver owns this — and colouring them apart would
@@ -437,18 +471,47 @@ export type BoneClass = "plain" | "ik" | "physics" | "selected"
  * 軸制限, a body's physics mode. The colours are not: MMD has no canonical
  * palette for them.
  */
+/**
+ * Every number the overlay's LOOK depends on, in one place beside the colours,
+ * and for the same reason: an overlay should read the same in every product that
+ * draws one, so none of this is an option a host passes.
+ *
+ * A host that wants its own look builds its own list through setOverlay.
+ */
+export const OVERLAY_STYLE = {
+  /** Stroke width for the rig, in DEVICE pixels — half this on screen at 2x. */
+  strokePx: 2,
+  /** Stroke width for the mesh wireframe. Thinner: there are tens of thousands
+   *  of edges and they are a ground for the rig, not the subject. */
+  meshStrokePx: 2,
+  /** How much heavier the selected item draws, on both stroke and marker. */
+  selectedScale: 1.6,
+
+  /** Bone marker radius for a bone that governs the whole model, as a fraction
+   *  of the skeleton's extent — so one number suits any model scale. */
+  markerSize: 0.005,
+  /** The reach a full-size marker corresponds to, as a fraction of the extent. */
+  markerReference: 0.2,
+  /** Marker radius is held between these multiples of markerSize. */
+  markerMin: 0.55,
+  markerMax: 1.0,
+  /** Floor on a leaf's reach, world units, so a tip still has a marker. */
+  minReach: 0.25,
+  /** Joint cross arm length, as a fraction of the skeleton's extent. */
+  jointSize: 0.006,
+} as const
+
 export const DEFAULT_BONE_PALETTE: Record<BoneClass, RGBA> = {
   /** Nothing in particular drives it — most of the skeleton, so it is the colour
    *  the whole overlay reads as. */
   plain: [0.231, 0.51, 0.965, 1], // blue-500
-  /** Has an IK chain (ikLinks): the leg IK bones and friends. Grey because an IK
-   *  bone is a CONTROL rather than a deformer — nothing is skinned to it, and it
-   *  moves a chain instead of the mesh.
-   *
-   *  Dark grey, not light. Leg IK sits on the floor and reaches almost nothing,
-   *  so these are the smallest markers in the rig drawn against the ground — and
-   *  gray-400 there measured 1.02:1, which is not a dim marker but no marker. */
-  ik: [0.294, 0.333, 0.388, 1], // gray-600
+  /** Has an IK chain (ikLinks): the leg IK bones and friends. Blue, the same as
+   *  plain — a colour of its own bought nothing here. Leg IK sits on the floor
+   *  and reaches almost nothing, so these are the smallest markers in the rig
+   *  and mostly overlapped by the foot bones they share a place with; no hue
+   *  rescues that. If they need to stand out later it is their SIZE that has to
+   *  change, since a control bone's length means nothing to begin with. */
+  ik: [0.231, 0.51, 0.965, 1], // blue-500
   /** A dynamic rigidbody moves it — hair, skirt, anything the solver owns. Blue,
    *  the same as plain: which bones the solver owns is the rigidbody layer's
    *  question, and it already answers it. Kept as a class so a panel can pick it
@@ -462,15 +525,6 @@ export const DEFAULT_BONE_PALETTE: Record<BoneClass, RGBA> = {
 export interface BoneOverlayOptions {
   /** Name of the bone drawn in the `selected` colour. */
   selected?: string | null
-  /** Marker radius for a bone that governs the whole model, world units. Every
-   *  other bone shrinks by how much still hangs off it — see REACH in
-   *  boneOverlay. Held between 0.55x and 1.0x. Defaults to 0.5% of the
-   *  skeleton's extent, which suits any model scale. */
-  markerSize?: number
-  /** Stroke width of the links, device pixels. 0.5–24. Default 4. */
-  thickness?: number
-  /** Length for a leaf whose parent has no length either, world units. Default 0.25. */
-  tipLength?: number
   /** Bone names to draw. Omit for all of them. */
   include?: readonly string[]
 }
@@ -488,11 +542,9 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
   const bones = model.getSkeleton().bones
   const world = model.getWorldMatrices()
   const palette = DEFAULT_BONE_PALETTE
-  const tipLength = options.tipLength ?? 0.25
   const include = options.include ? new Set(options.include) : null
   const extent = skeletonExtent(world)
-  const markerSize = options.markerSize ?? extent * 0.005
-  const thickness = options.thickness ?? 4
+  const markerSize = extent * OVERLAY_STYLE.markerSize
 
   const physicsBones = new Set<number>()
   for (const rb of model.getRigidbodies()) {
@@ -535,10 +587,10 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
   // Square-rooted, so the spread stays legible: without it the root bone's reach
   // is the whole model and everything below it collapses into the floor.
   const sizes = new Float32Array(bones.length)
-  const referenceReach = Math.max(extent * 0.2, 1e-6)
+  const referenceReach = Math.max(extent * OVERLAY_STYLE.markerReference, 1e-6)
   for (let i = 0; i < bones.length; i++) {
-    const r = Math.sqrt(Math.max(reach[i], tipLength) / referenceReach)
-    sizes[i] = markerSize * Math.min(Math.max(r, 0.55), 1.0)
+    const r = Math.sqrt(Math.max(reach[i], OVERLAY_STYLE.minReach) / referenceReach)
+    sizes[i] = markerSize * Math.min(Math.max(r, OVERLAY_STYLE.markerMin), OVERLAY_STYLE.markerMax)
   }
 
   // MMD stacks control bones on one point — 全ての親, センター and グルーブ all sit
@@ -577,8 +629,8 @@ export function boneOverlay(model: Model, options: BoneOverlayOptions = {}): Ove
           ? "physics"
           : "plain"
     const color = palette[cls]
-    const size = selected ? sizes[i] * 1.5 : sizes[i]
-    const stroke = selected ? thickness * 1.6 : thickness
+    const size = selected ? sizes[i] * OVERLAY_STYLE.selectedScale : sizes[i]
+    const stroke = selected ? OVERLAY_STYLE.strokePx * OVERLAY_STYLE.selectedScale : OVERLAY_STYLE.strokePx
 
     // One link per bone, from its PARENT down to it — so every parent-child
     // edge is drawn exactly once and branches all show.
@@ -661,8 +713,6 @@ export const DEFAULT_JOINT_PALETTE = {
 export const DEFAULT_VERTEX_COLOR: RGBA = [0.918, 0.702, 0.031, 0.95] // yellow-500
 
 export interface RigidbodyOverlayOptions {
-  /** Stroke width in device pixels. 0.5–24. Default 2.5. */
-  thickness?: number
   /** Name of the body drawn in the `selected` colour. */
   selected?: string | null
   /** Body names to draw. Omit for all of them. */
@@ -683,8 +733,6 @@ export function rigidbodyOverlay(
 ): OverlayPrimitive[] {
   const bodies = model.getRigidbodies()
   const palette = DEFAULT_RIGIDBODY_PALETTE
-  const extent = skeletonExtent(model.getWorldMatrices())
-  const thickness = options.thickness ?? 2.5
   const include = options.include ? new Set(options.include) : null
   const root = rootTransform(model)
 
@@ -710,7 +758,6 @@ export function rigidbodyOverlay(
           rotation: [rot.x, rot.y, rot.z, rot.w],
           scale: [r, r, r],
           color,
-          thickness: selected ? thickness * 1.8 : thickness,
         }),
       )
     } else if (rb.shape === RigidbodyShape.Box) {
@@ -722,7 +769,6 @@ export function rigidbodyOverlay(
           // PMX box size is half-extents already.
           scale: [rb.size.x, rb.size.y, rb.size.z],
           color,
-          thickness: selected ? thickness * 1.8 : thickness,
         }),
       )
     } else {
@@ -736,7 +782,6 @@ export function rigidbodyOverlay(
           // PMX capsule size.y is the CYLINDER's length, caps not included.
           extent: rb.size.y * 0.5,
           color,
-          thickness: selected ? thickness * 1.8 : thickness,
         }),
       )
     }
@@ -748,12 +793,8 @@ export function rigidbodyOverlay(
 // Joints
 
 export interface JointOverlayOptions {
-  /** Stroke width in device pixels. 0.5–24. Default 2.5. */
-  thickness?: number
   /** Name of the joint drawn in the `selected` colour. */
   selected?: string | null
-  /** Cross arm length, world units. Defaults to 0.6% of the skeleton's extent. */
-  size?: number
   /** Draw the dashed lines to the bodies a joint constrains. Default true. */
   links?: boolean
   /** Joint names to draw. Omit for all of them. */
@@ -776,8 +817,7 @@ export function jointOverlay(
   const joints = model.getJoints()
   const bodies = model.getRigidbodies()
   const extent = skeletonExtent(model.getWorldMatrices())
-  const thickness = options.thickness ?? 2.5
-  const size = options.size ?? extent * 0.006
+  const size = extent * OVERLAY_STYLE.jointSize
   const color = DEFAULT_JOINT_PALETTE.cross
   const linkColor = DEFAULT_JOINT_PALETTE.link
   const selectedColor = DEFAULT_JOINT_PALETTE.selected
@@ -826,7 +866,7 @@ export function jointOverlay(
         rotation: [rot.x, rot.y, rot.z, rot.w],
         scale: [size, size, size],
         color: crossColor,
-        thickness: selected ? thickness * 1.8 : thickness,
+        thickness: selected ? OVERLAY_STYLE.strokePx * OVERLAY_STYLE.selectedScale : OVERLAY_STYLE.strokePx,
       }),
     )
 
@@ -841,7 +881,7 @@ export function jointOverlay(
         true,
       )
       if (line) {
-        line.thickness = thickness
+        line.thickness = OVERLAY_STYLE.strokePx
         out.push(applyRoot(root, line))
       }
     }

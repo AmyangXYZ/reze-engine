@@ -36,3 +36,7 @@ blender-*.tar.xz
 # Reference Blender projects — read to learn what to port, never redistributed.
 *.blend
 *.blend1
+
+# Test fixtures that are someone else's model. MMD models carry
+# redistribution terms; the round-trip test skips when this is absent.
+engine/tests/fixtures/*.pmx

@@ -60,6 +60,7 @@ import { OVERLAY_SHADER_WGSL, OVERLAY_COMPOSITE_SHADER_WGSL } from "./shaders/pa
 import { WIREFRAME_SHADER_WGSL } from "./shaders/passes/wireframe"
 import {
   boneOverlay,
+  boneMarkerPositions,
   buildOverlayShapes,
   jointOverlay,
   rigidbodyOverlay,
@@ -69,6 +70,7 @@ import {
   OVERLAY_SHAPES,
   OVERLAY_SOLID_SHAPES,
   DEFAULT_VERTEX_COLOR,
+  OVERLAY_STYLE,
   type BoneOverlayOptions,
   type JointOverlayOptions,
   type OverlayGeometry,
@@ -1536,7 +1538,7 @@ export class Engine {
   private overlayBones: { modelName: string; options: BoneOverlayOptions } | null = null
   private overlayBodies: { modelName: string; options: RigidbodyOverlayOptions } | null = null
   private overlayJoints: { modelName: string; options: JointOverlayOptions } | null = null
-  private overlayVertices: { modelName: string; xray: boolean; thickness: number } | null = null
+  private overlayVertices: { modelName: string; xray: boolean } | null = null
   private wireframePipeline!: GPURenderPipeline
   private wireframeDepthPipeline!: GPURenderPipeline
   private wireframeUniformBuffer!: GPUBuffer
@@ -1546,10 +1548,16 @@ export class Engine {
   /** Rebuilt every frame into these, grouped by shape so each shape is one draw. */
   private overlayByShape = new Map<OverlayShape, OverlayPrimitive[]>()
   private overlayScratch: OverlayPrimitive[] = []
+  private bonePickScratch: Float32Array = new Float32Array(0)
   private overlayInstanceData = new Float32Array(0)
 
   // ─── Transform gizmo ───────────────────────────────────────────────
   private selectedBone: { modelName: string; boneName: string; boneIndex: number } | null = null
+  /** The transform gizmo follows setSelectedBone, which is also what selects a
+   *  bone to INSPECT. A model editor selects bones constantly and poses them
+   *  rarely, so the two need separating: off leaves selection working and takes
+   *  the handles away. */
+  private gizmoEnabled = true
   private gizmoVertexBuffer!: GPUBuffer
   private gizmoTransformBuffer!: GPUBuffer
   private gizmoPipeline!: GPURenderPipeline
@@ -5099,15 +5107,6 @@ export class Engine {
     this.createPipelines()
     this.setupResize()
     Engine.instance = this
-    // One line, at init, naming the three answers that differ between two
-    // browsers on the same machine. Not a debug flag and not a readout — it is
-    // the identity of the renderer that was actually built, and on a device that
-    // cannot be attached to a debugger it is the only way to know which of the
-    // three paths is running. Every graphics application prints this.
-    const r = this.gpuReport()
-    console.info(
-      `[reze] hdr=${r.hdrFormat} depth=${r.depthFormat} reversedZ=${r.reversedZ} ids=${r.ids} msaa=${r.sampleCount}`,
-    )
   }
 
   // One-shot bake of EEVEE's combined BRDF LUT — DFG (bsdf_lut_frag.glsl) packed
@@ -7280,14 +7279,18 @@ export class Engine {
         },
       ],
     })
-    const storageEntry = (binding: number) => ({
-      binding,
-      visibility: GPUShaderStage.VERTEX,
-      buffer: { type: "read-only-storage" as GPUBufferBindingType },
-    })
+    // Spelled out rather than mapped over a range: tests/bindings.test.mjs reads
+    // these statically to check every bind group covers its layout, and a loop
+    // hides the bindings from it.
     this.wireframeSkinLayout = this.device.createBindGroupLayout({
       label: "wireframe group 1 layout (mesh + skin)",
-      entries: [0, 1, 2, 3, 4].map(storageEntry),
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      ],
     })
     const wireShader = this.device.createShaderModule({ label: "wireframe shader", code: WIREFRAME_SHADER_WGSL })
     this.wireframePipeline = this.device.createRenderPipeline({
@@ -8544,6 +8547,11 @@ export class Engine {
     this.selectedMaterial = modelName && materialName ? { modelName, materialName } : null
   }
 
+  /** Show the transform gizmo on the selected bone. On by default. */
+  setGizmoEnabled(on: boolean): void {
+    this.gizmoEnabled = on
+  }
+
   setSelectedBone(modelName: string | null, boneName: string | null): void {
     if (!modelName || !boneName) {
       this.selectedBone = null
@@ -8580,6 +8588,65 @@ export class Engine {
     else this.overlayLayers.delete(layer)
   }
 
+  /**
+   * The bone whose marker is nearest a point on the canvas, or null.
+   *
+   * On the CPU, and exact. A few hundred bones with known world positions is a
+   * loop, not a render pass — and having the answer synchronously is what makes
+   * cycling through overlapping bones possible at all. Only VERTICES justify GPU
+   * picking, at tens of thousands.
+   *
+   * `x`/`y` are CSS pixels relative to the canvas, which is what a MouseEvent
+   * gives once getBoundingClientRect is subtracted.
+   *
+   * It projects boneMarkerPositions, the same points the overlay draws markers
+   * at, so the hit box cannot drift away from the circle you are aiming at.
+   */
+  pickBone(
+    x: number,
+    y: number,
+    options: { radiusPx?: number; modelName?: string } = {},
+  ): { modelName: string; boneName: string; boneIndex: number } | null {
+    if (!this.camera) return null
+    const width = this.canvas.clientWidth
+    const height = this.canvas.clientHeight
+    if (width <= 0 || height <= 0) return null
+    const vp = this.camera.getProjectionMatrix().multiply(this.camera.getViewMatrix()).values
+
+    let best: { modelName: string; boneName: string; boneIndex: number } | null = null
+    let bestDist = options.radiusPx ?? 14
+    let bestDepth = Infinity
+
+    for (const inst of this.modelInstances.values()) {
+      if (options.modelName !== undefined && inst.name !== options.modelName) continue
+      if (inst.isStage || inst.isPlane) continue
+      const bones = inst.model.getSkeleton().bones
+      this.bonePickScratch = boneMarkerPositions(inst.model, this.bonePickScratch)
+      const pos = this.bonePickScratch
+      for (let i = 0; i < bones.length; i++) {
+        const px = pos[i * 3]
+        const py = pos[i * 3 + 1]
+        const pz = pos[i * 3 + 2]
+        const cw = vp[3] * px + vp[7] * py + vp[11] * pz + vp[15]
+        if (cw <= 1e-6) continue // behind the camera
+        const cx = vp[0] * px + vp[4] * py + vp[8] * pz + vp[12]
+        const cy = vp[1] * px + vp[5] * py + vp[9] * pz + vp[13]
+        const sx = ((cx / cw) * 0.5 + 0.5) * width
+        const sy = (1 - ((cy / cw) * 0.5 + 0.5)) * height
+        const d = Math.hypot(sx - x, sy - y)
+        if (d > bestDist) continue
+        // Within a couple of pixels the two are the same click, and MMD stacks
+        // control bones on one point — so the nearer bone takes it.
+        if (d < bestDist - 2 || cw < bestDepth) {
+          best = { modelName: inst.name, boneName: bones[i].name, boneIndex: i }
+          bestDist = d
+          bestDepth = cw
+        }
+      }
+    }
+    return best
+  }
+
   /** Draw an octahedron per bone of `modelName`, rebuilt each frame. Null off. */
   setBoneOverlay(modelName: string | null, options: BoneOverlayOptions = {}): void {
     this.overlayBones = modelName ? { modelName, options } : null
@@ -8608,10 +8675,8 @@ export class Engine {
    *
    * The edge list is deduplicated and built once, on the first frame this is on.
    */
-  setVertexOverlay(modelName: string | null, options: { xray?: boolean; thickness?: number } = {}): void {
-    this.overlayVertices = modelName
-      ? { modelName, xray: options.xray ?? false, thickness: options.thickness ?? 2.5 }
-      : null
+  setVertexOverlay(modelName: string | null, options: { xray?: boolean } = {}): void {
+    this.overlayVertices = modelName ? { modelName, xray: options.xray ?? false } : null
   }
 
   // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
@@ -8709,8 +8774,23 @@ export class Engine {
     return this.ikEnabled
   }
 
+  /**
+   * Run the solver, or stop it.
+   *
+   * Turning it OFF snaps every body back onto its bone. Merely halting the step
+   * leaves hair and skirts hanging wherever the simulation happened to be — a
+   * pose nothing in the document describes, which is the opposite of what "off"
+   * is asked for: you switch physics off to see what the RIG does, and a frozen
+   * mid-swing is still the solver's answer, just a stale one.
+   */
   setPhysicsEnabled(enabled: boolean): void {
+    if (this.physicsEnabled === enabled) return
     this.physicsEnabled = enabled
+    if (enabled) return
+    for (const inst of this.modelInstances.values()) {
+      if (!inst.physics) continue
+      inst.physics.reset(inst.model.getWorldMatrices())
+    }
   }
 
   getPhysicsEnabled(): boolean {
@@ -11009,7 +11089,7 @@ export class Engine {
     this.wireframeColorData.set(DEFAULT_VERTEX_COLOR)
     this.wireframeColorData[4] = this.canvas.width
     this.wireframeColorData[5] = this.canvas.height
-    this.wireframeColorData[6] = this.overlayVertices.thickness
+    this.wireframeColorData[6] = OVERLAY_STYLE.meshStrokePx
     this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, this.wireframeColorData)
     pass.setBindGroup(0, this.wireframeBindGroup)
     pass.setBindGroup(1, inst.wireBindGroup)
@@ -11030,6 +11110,19 @@ export class Engine {
     pass.draw(6, inst.wireEdgeCount / 2)
   }
 
+  /** The bone overlay's options with `selected` filled in from setSelectedBone,
+   *  so clicking a bone highlights it without the host mirroring the state. An
+   *  explicit `selected` in the options still wins. */
+  private boneOverlayOptions(modelName: string): BoneOverlayOptions {
+    const options = this.overlayBones?.options ?? {}
+    if (options.selected !== undefined) return options
+    const chosen = this.selectedBone?.modelName === modelName ? this.selectedBone.boneName : null
+    this.boneOptionsScratch.selected = chosen
+    this.boneOptionsScratch.include = options.include
+    return this.boneOptionsScratch
+  }
+  private boneOptionsScratch: BoneOverlayOptions = {}
+
   private overlayActive(): boolean {
     return (
       this.overlayLayers.size > 0 ||
@@ -11049,7 +11142,7 @@ export class Engine {
   getOverlayPrimitives(layer: "bones" | "rigidbodies" | "joints"): OverlayPrimitive[] {
     if (layer === "bones") {
       const inst = this.overlayBones ? this.overlayModel(this.overlayBones.modelName) : null
-      return inst ? boneOverlay(inst.model, this.overlayBones!.options) : []
+      return inst ? boneOverlay(inst.model, this.boneOverlayOptions(inst.name)) : []
     }
     if (layer === "rigidbodies") {
       const inst = this.overlayBodies ? this.overlayModel(this.overlayBodies.modelName) : null
@@ -11148,7 +11241,7 @@ export class Engine {
     for (const layer of this.overlayLayers.values()) collect(layer)
     if (this.overlayBones) {
       const inst = this.overlayModel(this.overlayBones.modelName)
-      if (inst) collect(boneOverlay(inst.model, this.overlayBones.options))
+      if (inst) collect(boneOverlay(inst.model, this.boneOverlayOptions(inst.name)))
     }
     if (this.overlayBodies) {
       const inst = this.overlayModel(this.overlayBodies.modelName)
@@ -11434,7 +11527,7 @@ export class Engine {
   }
 
   private handleGizmoMouseDown = (e: MouseEvent) => {
-    if (!this.selectedBone || !this.camera || !this.device || e.button !== 0) return
+    if (!this.gizmoEnabled || !this.selectedBone || !this.camera || !this.device || e.button !== 0) return
     const inst = this.modelInstances.get(this.selectedBone.modelName)
     if (!inst) return
     const worldMats = inst.model.getWorldMatrices()
@@ -12082,7 +12175,7 @@ export class Engine {
     // Under the gizmo: the handles you drag stay on top of the rig you are
     // reading them against.
     if (this.overlayActive()) this.renderOverlayPass(encoder, swapchainView)
-    if (this.selectedBone && hasModels) this.renderGizmoPass(encoder, swapchainView)
+    if (this.gizmoEnabled && this.selectedBone && hasModels) this.renderGizmoPass(encoder, swapchainView)
 
     const pick = this.pendingPick
     if (pick && hasModels) this.renderPickPass(encoder)

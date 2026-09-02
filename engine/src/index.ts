@@ -130,6 +130,25 @@ export {
 export { VMDLoader, DEFAULT_CAMERA_INTERPOLATION, type CameraKeyframe, type IkFrame } from "./vmd-loader"
 export { VMDWriter, type VmdTrackSelection } from "./vmd-writer"
 export { PmxLoader } from "./pmx-loader"
+// The PMX file as data, losslessly — separate from Model, which drops everything
+// it does not draw. An editor writes from this; a viewer never touches it.
+export {
+  readPmxDocument,
+  writePmxDocument,
+  type PmxDocument,
+  type PmxGlobals,
+  type PmxEncoding,
+  type PmxVertex,
+  type PmxWeightType,
+  type PmxMaterial,
+  type PmxBone,
+  type PmxIkLink,
+  type PmxMorph,
+  type PmxMorphOffset,
+  type PmxDisplayFrame,
+  type PmxRigidbody,
+  type PmxJoint,
+} from "./pmx-document"
 export { CameraAnimation, type CameraPose } from "./camera-animation"
 export { RezePhysics } from "./physics"
 export type { WindOptions } from "./physics/world"
@@ -139,6 +158,7 @@ export { RigidbodyShape, RigidbodyType, type Rigidbody, type Joint } from "./phy
 // to show it as data, diff two poses, or hit-test it on the CPU.
 export {
   boneOverlay,
+  boneMarkerPositions,
   rigidbodyOverlay,
   jointOverlay,
   buildOverlayShapes,
@@ -151,6 +171,7 @@ export {
   DEFAULT_RIGIDBODY_PALETTE,
   DEFAULT_JOINT_PALETTE,
   DEFAULT_VERTEX_COLOR,
+  OVERLAY_STYLE,
   type OverlayPrimitive,
   type OverlayShape,
   type OverlayGeometry,
