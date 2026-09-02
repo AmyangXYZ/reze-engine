@@ -710,7 +710,11 @@ export const DEFAULT_JOINT_PALETTE = {
 
 /** The mesh wireframe. Yellow, because it has to carry over pale skin and dark
  *  cloth alike and the rig owns the blues and greens. */
-export const DEFAULT_VERTEX_COLOR: RGBA = [0.918, 0.702, 0.031, 0.95] // yellow-500
+// yellow-400, opaque. yellow-500 measured correct on the canvas and still read
+// as gold: a 2px stroke through 4x MSAA is mostly partial-coverage pixels, so a
+// dense mesh of lines lands well under the flat swatch it is cut from. The step
+// up pays that back rather than the pipeline being wrong.
+export const DEFAULT_VERTEX_COLOR: RGBA = [0.98, 0.8, 0.082, 1]
 
 export interface RigidbodyOverlayOptions {
   /** Name of the body drawn in the `selected` colour. */

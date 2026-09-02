@@ -796,10 +796,13 @@ interface ModelInstance {
   materialMorphByIndex: Map<number, MaterialMorphTarget> | null
   /** The mesh's unique edges as a line-list index buffer, built on first use.
    *  Deduplicated: an interior edge belongs to two triangles, so drawing the
-   *  triangle list's edges directly would draw most of the mesh twice. */
-  wireEdgeBuffer: GPUBuffer | null
-  wireEdgeCount: number
-  wireBindGroup: GPUBindGroup | null
+   *  triangle list's edges directly would draw most of the mesh twice.
+   *
+   *  Keyed by the material the edges were cut from, "" for the whole mesh. A
+   *  material is a consecutive index run, so scoping is a slice of the same
+   *  build — and both stay cached, because narrowing to one material and
+   *  widening back out is the loop somebody auditing a model is in. */
+  wireEdges: Map<string, { buffer: GPUBuffer; count: number; bindGroup: GPUBindGroup } | null>
   physics: RezePhysics | null
   vertexBufferNeedsUpdate: boolean
   gpuMorph: GpuMorph | null
@@ -1538,7 +1541,7 @@ export class Engine {
   private overlayBones: { modelName: string; options: BoneOverlayOptions } | null = null
   private overlayBodies: { modelName: string; options: RigidbodyOverlayOptions } | null = null
   private overlayJoints: { modelName: string; options: JointOverlayOptions } | null = null
-  private overlayVertices: { modelName: string; xray: boolean } | null = null
+  private overlayVertices: { modelName: string; xray: boolean; material: string | null } | null = null
   private wireframePipeline!: GPURenderPipeline
   private wireframeDepthPipeline!: GPURenderPipeline
   private wireframeUniformBuffer!: GPUBuffer
@@ -8101,8 +8104,8 @@ export class Engine {
     this.overlayInstanceBuffer?.destroy()
     this.overlayInstanceBuffer = null
     for (const inst of this.modelInstances.values()) {
-      inst.wireEdgeBuffer?.destroy()
-      inst.wireEdgeBuffer = null
+      for (const edges of inst.wireEdges.values()) edges?.buffer.destroy()
+      inst.wireEdges.clear()
     }
 
     // Remove gizmo drag listeners
@@ -8674,9 +8677,20 @@ export class Engine {
    * weights.
    *
    * The edge list is deduplicated and built once, on the first frame this is on.
+   *
+   * `material` narrows the wireframe to one material's faces. The mesh still
+   * writes depth in full, so the material reads as part of the body rather than
+   * as a shell floating in front of it — which is the point of scoping it: you
+   * are asking where this material's faces ARE, and an answer that ignores the
+   * torso in front of them is not one.
    */
-  setVertexOverlay(modelName: string | null, options: { xray?: boolean } = {}): void {
-    this.overlayVertices = modelName ? { modelName, xray: options.xray ?? false } : null
+  setVertexOverlay(
+    modelName: string | null,
+    options: { xray?: boolean; material?: string | null } = {},
+  ): void {
+    this.overlayVertices = modelName
+      ? { modelName, xray: options.xray ?? false, material: options.material ?? null }
+      : null
   }
 
   // Build a material's bind group with binding(4) pointing at a given StyleUniforms buffer
@@ -10018,9 +10032,7 @@ export class Engine {
       jointsBuffer,
       weightsBuffer,
       skinMatrixBuffer,
-      wireEdgeBuffer: null,
-      wireEdgeCount: 0,
-      wireBindGroup: null,
+      wireEdges: new Map(),
       drawCalls: [],
       shadowDrawCalls: [],
       shadowBindGroups,
@@ -11040,8 +11052,27 @@ export class Engine {
   // Unique edges of the mesh, as a line-list index buffer. Each interior edge is
   // shared by two triangles, so deduplicating halves both the buffer and the
   // draw. Built once per model, on the first frame its wireframe is asked for.
-  private ensureEdgeBuffer(inst: ModelInstance): boolean {
-    if (inst.wireEdgeBuffer) return inst.wireEdgeCount > 0
+  /** The index run `material` owns, or the whole list when it is null. Materials
+   *  are consecutive runs in declaration order, so the offset is a prefix sum —
+   *  the same walk the draw list does. Returns null for a name the model does
+   *  not have, which is what a stale selection looks like after a reload. */
+  private materialIndexRange(inst: ModelInstance, material: string | null): [number, number] | null {
+    const indices = inst.model.getIndices()
+    if (!material) return [0, indices.length]
+    let offset = 0
+    for (const m of inst.model.getMaterials()) {
+      if (m.name === material) return [offset, offset + m.vertexCount]
+      offset += m.vertexCount
+    }
+    return null
+  }
+
+  private ensureEdgeBuffer(inst: ModelInstance, material: string | null): boolean {
+    const key = material ?? ""
+    if (inst.wireEdges.has(key)) return inst.wireEdges.get(key) !== null
+    const range = this.materialIndexRange(inst, material)
+    if (!range) return false
+    const [start, end] = range
     const indices = inst.model.getIndices()
     const seen = new Set<number>()
     const edges: number[] = []
@@ -11054,60 +11085,79 @@ export class Engine {
       seen.add(key)
       edges.push(lo, hi)
     }
-    for (let i = 0; i + 2 < indices.length; i += 3) {
+    for (let i = start; i + 2 < end; i += 3) {
       add(indices[i], indices[i + 1])
       add(indices[i + 1], indices[i + 2])
       add(indices[i + 2], indices[i])
     }
-    inst.wireEdgeCount = edges.length
-    if (edges.length === 0) return false
+    if (edges.length === 0) {
+      inst.wireEdges.set(key, null)
+      return false
+    }
     const data = new Uint32Array(edges)
-    inst.wireEdgeBuffer = this.device.createBuffer({
-      label: `wireframe edges ${inst.name}`,
+    const buffer = this.device.createBuffer({
+      label: `wireframe edges ${inst.name}${material ? ` / ${material}` : ""}`,
       size: data.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
-    this.device.queue.writeBuffer(inst.wireEdgeBuffer, 0, data)
-    inst.wireBindGroup = this.device.createBindGroup({
-      label: `wireframe mesh ${inst.name}`,
+    this.device.queue.writeBuffer(buffer, 0, data)
+    const bindGroup = this.device.createBindGroup({
+      label: `wireframe mesh ${inst.name}${material ? ` / ${material}` : ""}`,
       layout: this.wireframeSkinLayout,
       entries: [
         { binding: 0, resource: { buffer: inst.skinMatrixBuffer } },
         { binding: 1, resource: { buffer: inst.vertexBuffer } },
         { binding: 2, resource: { buffer: inst.jointsBuffer } },
         { binding: 3, resource: { buffer: inst.weightsBuffer } },
-        { binding: 4, resource: { buffer: inst.wireEdgeBuffer } },
+        { binding: 4, resource: { buffer } },
       ],
     })
+    inst.wireEdges.set(key, { buffer, count: edges.length, bindGroup })
     return true
   }
 
   private renderWireframe(pass: GPURenderPassEncoder): void {
     if (!this.overlayVertices) return
     const inst = this.overlayModel(this.overlayVertices.modelName)
-    if (!inst || !this.ensureEdgeBuffer(inst) || !inst.wireBindGroup || !inst.wireEdgeBuffer) return
+    const material = this.overlayVertices.material
+    if (!inst || !this.ensureEdgeBuffer(inst, material)) return
+    const edges = inst.wireEdges.get(material ?? "")
+    if (!edges) return
     this.wireframeColorData.set(DEFAULT_VERTEX_COLOR)
     this.wireframeColorData[4] = this.canvas.width
     this.wireframeColorData[5] = this.canvas.height
     this.wireframeColorData[6] = OVERLAY_STYLE.meshStrokePx
     this.device.queue.writeBuffer(this.wireframeUniformBuffer, 0, this.wireframeColorData)
     pass.setBindGroup(0, this.wireframeBindGroup)
-    pass.setBindGroup(1, inst.wireBindGroup)
+    pass.setBindGroup(1, edges.bindGroup)
 
-    // The solid mesh into depth only, so the far side of the body is hidden
-    // behind the near side. Skipped for x-ray, which is the whole toggle.
+    // What writes depth is what is allowed to hide the wireframe, and that
+    // differs between the two views.
+    //
+    // The whole mesh, so the far wall of a 30k-triangle body does not draw on
+    // top of the near one — occluded is the default everywhere, Blender's edit
+    // mode and Maya included, and seeing both walls at once is moire rather than
+    // information.
+    //
+    // A PICKED material writes only its OWN faces. The question a pick asks is
+    // where this material is, and half of it is usually under a coat; letting
+    // the coat hide it does not answer that. Its own depth still goes in, so its
+    // back faces stay hidden and it reads as an object instead of a haze —
+    // which is the difference between this and turning x-ray on.
+    const range = material !== null ? this.materialIndexRange(inst, material) : null
     if (!this.overlayVertices.xray) {
       pass.setPipeline(this.wireframeDepthPipeline)
       pass.setVertexBuffer(0, inst.vertexBuffer)
       pass.setVertexBuffer(1, inst.jointsBuffer)
       pass.setVertexBuffer(2, inst.weightsBuffer)
       pass.setIndexBuffer(inst.indexBuffer, "uint32")
-      pass.drawIndexed(inst.model.getIndices().length)
+      if (range) pass.drawIndexed(range[1] - range[0], 1, range[0])
+      else pass.drawIndexed(inst.model.getIndices().length)
     }
 
     // Six vertices an edge, instanced.
     pass.setPipeline(this.wireframePipeline)
-    pass.draw(6, inst.wireEdgeCount / 2)
+    pass.draw(6, edges.count / 2)
   }
 
   /** The bone overlay's options with `selected` filled in from setSelectedBone,
