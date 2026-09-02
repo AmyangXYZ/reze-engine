@@ -1302,7 +1302,23 @@ const FIELD_LAYER_BLEND: GPUBlendState = {
  */
 const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
   color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
-  alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+  // COVERAGE ACCUMULATES TOO, and dropping it was a real bug rather than a
+  // simplification. The canvas is premultiplied, which REQUIRES rgb <= alpha;
+  // an additive layer that contributed colour and no alpha handed the
+  // compositor an invalid pixel, and an invalid pixel loses its colour.
+  //
+  // Nothing showed it while the background was opaque, because the composite
+  // forces the canvas opaque there and never consults this at all. Put anything
+  // transparent behind it — a backdrop video, an alpha export — and every
+  // additive effect vanished, surviving only where the SCENE happened to supply
+  // the alpha its own pixels lacked. Which read as the effect being drawn on
+  // the ground grid and nowhere else.
+  //
+  // Additive, to match the colour beside it: light that arrives adds, and what
+  // arrives is what covers. srcRgb <= 1, so the colour's src-alpha * srcRgb is
+  // always <= this one's srcAlpha, and the premultiplied invariant holds by
+  // construction rather than by hoping an author stayed inside it.
+  alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
 }
 
 /**
