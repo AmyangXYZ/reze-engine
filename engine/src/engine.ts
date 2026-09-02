@@ -6498,7 +6498,35 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
 
+      // The id attachment. Multisampled like the rest of the pass, and with NO
+      // resolve texture beside it: resolving averages, and the average of two
+      // ids is a third id naming something that was never drawn. Consumers read
+      // sample 0 with textureLoad, the way linearDepth already does.
+      this.idTexture?.destroy()
+      this.idTexture = null
+      this.idView = null
+      // The debug bind group holds the OLD view. Dropped here so it is rebuilt
+      // against the new one — keeping it would sample a destroyed texture at
+      // the first resize with the debug view open.
+      this.idDebugBindGroup = null
+      if (mrtIdsEnabled()) {
+        this.idTexture = this.device.createTexture({
+          label: "object id",
+          size: [width, height],
+          sampleCount: Engine.MULTISAMPLE_COUNT,
+          format: SCENE_ID_FORMAT,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        })
+        this.idView = this.idTexture.createView()
+      }
+
       // The field layer — half resolution by default, full for #fullres effects.
+      // AFTER the id attachment above: createFieldTargets rebuilds the cast
+      // distance flood, whose seed pass binds idView. Built before it, the seed
+      // group names the id texture the lines above have just destroyed, and
+      // every frame that encodes the flood is rejected whole — a black canvas
+      // for the first resize after a silhouette effect is installed, which is
+      // what a video export always is.
       this.fieldFullW = width
       this.fieldFullH = height
       this.createFieldTargets()
@@ -6521,28 +6549,6 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
       this.maskResolveView = this.maskResolveTexture.createView()
-
-      // The id attachment. Multisampled like the rest of the pass, and with NO
-      // resolve texture beside it: resolving averages, and the average of two
-      // ids is a third id naming something that was never drawn. Consumers read
-      // sample 0 with textureLoad, the way linearDepth already does.
-      this.idTexture?.destroy()
-      this.idTexture = null
-      this.idView = null
-      // The debug bind group holds the OLD view. Dropped here so it is rebuilt
-      // against the new one — keeping it would sample a destroyed texture at
-      // the first resize with the debug view open.
-      this.idDebugBindGroup = null
-      if (mrtIdsEnabled()) {
-        this.idTexture = this.device.createTexture({
-          label: "object id",
-          size: [width, height],
-          sampleCount: Engine.MULTISAMPLE_COUNT,
-          format: SCENE_ID_FORMAT,
-          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        })
-        this.idView = this.idTexture.createView()
-      }
 
       // The floor mirror's targets — FULL resolution, the same attachment
       // contract and sample count as the scene pass, which is what lets the
