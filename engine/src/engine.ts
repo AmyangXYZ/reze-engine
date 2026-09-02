@@ -2065,6 +2065,9 @@ export class Engine {
   private groundVertexBuffer?: GPUBuffer
   private groundIndexBuffer?: GPUBuffer
   private hasGround = false
+  /** The user's own "no ground" switch — see setGroundVisible. Distinct from
+   *  hasGround, which records whether a ground was ever built. */
+  private groundHidden = false
   private shadowMapTextures: GPUTexture[] = []
   private shadowMapDepthViews: GPUTextureView[] = []
   private brdfLutTexture!: GPUTexture
@@ -8062,7 +8065,26 @@ export class Engine {
   /** True while a stage is in the scene, which is when the built-in ground plane
    *  must not draw. */
   groundIsSuppressed(): boolean {
-    return this.hasStage()
+    return this.hasStage() || this.groundHidden
+  }
+
+  /**
+   * Draw the built-in ground, or do not.
+   *
+   * Separate from opacity, which cannot express this: a ground at opacity 0
+   * still WRITES DEPTH and still catches shadow — that is what makes it a
+   * shadow catcher, and it is why an alpha export keeps its shadows. So a scene
+   * that wants no floor at all cannot ask for one by turning the opacity down;
+   * the plane is still there, still occluding, and anything reading scene depth
+   * still finds a square where the floor is. A water surface deciding what lies
+   * beneath it draws that square's edge across the pool.
+   *
+   * Suppression rather than a teardown, matching what a stage does to the same
+   * plane: the ground keeps its colour, its size and its grid, so switching it
+   * back restores the scene the user had rather than an engine default.
+   */
+  setGroundVisible(on: boolean): void {
+    this.groundHidden = !on
   }
 
   /** Per cascade: does its map currently hold nothing but the cleared far plane?
