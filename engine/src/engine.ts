@@ -12399,14 +12399,18 @@ export class Engine {
       u[40] = cameraPos.x
       u[41] = cameraPos.y
       u[42] = cameraPos.z
-      // Character positions (viewU[11..14]), count in viewU[10].w. Stages are
-      // excluded: an effect asking where the cast is means the characters, and a
-      // stage's origin is wherever its author put it, which is not a place
-      // anything is standing. Four is the cap because the uniform is small and a
-      // scene with five characters is not the case this serves.
+      // Character positions (viewU[11..14]), count in viewU[10].w. Neither a
+      // stage nor a plane is a performer: an effect asking where the cast is
+      // means the characters, a stage's origin is wherever its author put it,
+      // and a card is a picture with an id. Leaving a card in the list hands its
+      // object id to every consumer of the cast — the distance field then seeds
+      // the whole rectangle, so a silhouette effect drew a border around the
+      // video behind her and none at all around her. Four is the cap because the
+      // uniform is small and a scene with five characters is not the case this
+      // serves.
       let n = 0
       this.forEachInstance((inst) => {
-        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage) return
+        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane) return
         const m = inst.model
         // The model transform is only where the model was PLACED. A motion moves
         // the character by animating bones, so an effect anchored to the
