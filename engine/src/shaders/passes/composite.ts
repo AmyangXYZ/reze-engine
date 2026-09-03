@@ -1,4 +1,5 @@
 import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
+import { sceneTapApi } from "../scene-tap"
 import { anchorAliasWgsl } from "../anchor-table"
 import { CAST_API } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
@@ -674,6 +675,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     // texel is CAST_FIELD_DIV of them and the accessor scales on the way out.
     // An author writes the width they mean and never learns how it is built.
     castDistanceApi(0, 26, 18, CAST_FIELD_DIV) +
+    sceneTapApi(0, 27, 28) +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +

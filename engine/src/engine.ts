@@ -3035,9 +3035,10 @@ export class Engine {
    * change that only ever toggles between two known states.
    */
   private rebuildFieldBindGroup(): void {
-    if (!this.device || !this.depthReadView || this.fieldUniformBuffers.length === 0) return
-    // Captured, so the null guard above survives into the closure.
+    if (!this.device || !this.depthReadView || !this.compositeBloomView || this.fieldUniformBuffers.length === 0) return
+    // Captured, so the null guards above survive into the closure.
     const depth = this.depthReadView
+    const bloom = this.compositeBloomView
     const build = (owner: EffectInstance, grid: GPUTextureView) =>
       this.device.createBindGroup({
         label: "field layer bind group",
@@ -3059,6 +3060,13 @@ export class Engine {
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
           { binding: 26, resource: this.castDistView ?? this.castDistFallbackView! },
+          { binding: 27, resource: this.hdrResolveTexture.createView() },
+          { binding: 28, resource: this.simSampler },
+          { binding: 2, resource: this.bloomSampler },
+          { binding: 5, resource: this.filmicLutView },
+          { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
+          { binding: 1, resource: bloom },
+          { binding: 4, resource: this.maskResolveView },
         ],
       })
     // Per effect: the params buffer and the grid are both its own, so two
@@ -4886,6 +4894,14 @@ export class Engine {
     const proj = this.camera.getProjectionMatrix().values
     u[8] = proj[10]
     u[9] = proj[14]
+    // THE FAR PLANE ITSELF, written rather than left to be re-derived. An effect
+    // that resamples has to know whether the scene was drawn at a given pixel,
+    // and "nothing was drawn" reads back as exactly this distance. Recovering it
+    // from the pair above means inverting a cleared depth, which is a sign trap
+    // that differs by projection convention and fails silently — as an effect
+    // that draws nothing at all, or one that paints the sky. The camera knows
+    // the number; this hands it over.
+    u[10] = this.camera.far
     this.device.queue.writeBuffer(this.dofUniformBuffer, 0, u)
   }
 
@@ -5434,6 +5450,23 @@ export class Engine {
         // compiled, and a 1x1 stands in when the flood is not running, so an
         // author never has to guard the name.
         { binding: 26, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+        // The finished scene, and a sampler of its own — see scene-tap.ts for
+        // why it may not borrow the one at 18.
+        { binding: 27, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 28, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        // THE VIEW TRANSFORM'S OWN RESOURCES. viewTransform() lives in the
+        // header both this module and the composite share, but its lookups did
+        // not: an effect calling it compiled and then failed at pipeline
+        // creation with "binding doesn't exist", naming a binding no effect
+        // author ever wrote. Sharing the code meant sharing these.
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
+        // And the scene's COVERAGE and bloom, without which the tap cannot
+        // reconstruct a pixel: the HDR target is premultiplied, so colour alone
+        // reads a half-transparent ground as a dark opaque one.
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
     this.fieldPipelineLayout = this.device.createPipelineLayout({
@@ -7223,6 +7256,19 @@ export class Engine {
    * analysis would render silence into the exported video.
    */
   setAudioData(data: Float32Array | null, bandsPerFrame: number, secondsPerFrame: number): void {
+    // NOT YET, OR NEVER AGAIN. `device` is definite-assignment: it is undefined
+    // until init() resolves and after dispose(), and TypeScript cannot see
+    // either state. This setter is reached from an ASYNC callback — the audio
+    // analysis, the score fetch, the lyric rasteriser all land whenever they
+    // land — so on a hot reload the in-flight promise of the outgoing engine
+    // resolves against the incoming one, which is holding a ref but has not
+    // finished init. It threw "Cannot read properties of undefined (reading
+    // 'createBuffer')" from a line whose only crime was being fast.
+    //
+    // Dropped rather than queued: every caller here re-pushes on the effect
+    // that owns the asset, and that effect re-runs on the very reload that
+    // caused this.
+    if (!this.device) return
     if (this.audioBuffer !== this.audioFallbackBuffer) this.audioBuffer.destroy()
     if (!data || data.length === 0) {
       this.audioBuffer = this.audioFallbackBuffer
@@ -7271,6 +7317,19 @@ export class Engine {
     lines: LyricLine[] | null,
     atlas?: { source: GPUCopyExternalImageSource; width: number; height: number; rects: LyricRect[] },
   ): void {
+    // NOT YET, OR NEVER AGAIN. `device` is definite-assignment: it is undefined
+    // until init() resolves and after dispose(), and TypeScript cannot see
+    // either state. This setter is reached from an ASYNC callback — the audio
+    // analysis, the score fetch, the lyric rasteriser all land whenever they
+    // land — so on a hot reload the in-flight promise of the outgoing engine
+    // resolves against the incoming one, which is holding a ref but has not
+    // finished init. It threw "Cannot read properties of undefined (reading
+    // 'createBuffer')" from a line whose only crime was being fast.
+    //
+    // Dropped rather than queued: every caller here re-pushes on the effect
+    // that owns the asset, and that effect re-runs on the very reload that
+    // caused this.
+    if (!this.device) return
     this.device.queue.writeBuffer(this.lyricsBuffer, 0, packLyrics(lines ?? [], atlas?.rects))
     if (!atlas) return
     const w = Math.min(atlas.width, LYRIC_ATLAS_MAX_W)
@@ -7302,6 +7361,19 @@ export class Engine {
   }
 
   setMidiNotes(notes: MidiNote[] | null, release = 0.35): void {
+    // NOT YET, OR NEVER AGAIN. `device` is definite-assignment: it is undefined
+    // until init() resolves and after dispose(), and TypeScript cannot see
+    // either state. This setter is reached from an ASYNC callback — the audio
+    // analysis, the score fetch, the lyric rasteriser all land whenever they
+    // land — so on a hot reload the in-flight promise of the outgoing engine
+    // resolves against the incoming one, which is holding a ref but has not
+    // finished init. It threw "Cannot read properties of undefined (reading
+    // 'createBuffer')" from a line whose only crime was being fast.
+    //
+    // Dropped rather than queued: every caller here re-pushes on the effect
+    // that owns the asset, and that effect re-runs on the very reload that
+    // caused this.
+    if (!this.device) return
     if (this.midiBuffer !== this.midiFallbackBuffer) this.midiBuffer.destroy()
     this.midiRelease = Math.max(0, release)
     // Sorted by onset. Nothing in the accessors requires it, but a caller

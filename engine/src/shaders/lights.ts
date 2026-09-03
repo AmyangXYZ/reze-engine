@@ -1,3 +1,4 @@
+import { SCENE_TAP_STUB } from "./scene-tap"
 // Positional lights, as data — the sibling of the cast, audio and score
 // interfaces, and shaped like them: one shared buffer, read through accessors,
 // never touched directly.
@@ -140,6 +141,7 @@ export function buildLightEmitShader(
 @group(0) @binding(2) var<uniform> viewU: array<vec4<f32>, 15>;
 @group(0) @binding(3) var<storage, read> _rzCast: array<vec4f>;
 ${sceneApi}
+${SCENE_TAP_STUB}
 // Audio and score at 4 and 5, the same bindings the particle and trail modules
 // put them on. A lamp that pulses on the beat or lights on a note is the whole
 // point of a light an effect owns rather than one the document places, so this

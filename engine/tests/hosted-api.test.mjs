@@ -102,6 +102,17 @@ const EXCEPTIONS = {
   RZ_SLOTS: "how many ribbons THIS module draws; RZ_TRAIL_SLOTS is the author-facing count",
   // The lyric atlas texture is bound only where lines get DRAWN — the field
   // module. Timing (rzLyric*) is universal; the words are a field concern.
+  // The finished scene. The particle and trail modules render INSIDE the scene
+  // pass, so at the moment they run there is nothing resolved to sample.
+  rzScene: "samples the resolved scene; only the field pass runs after it exists",
+  bgScene: "alias of rzScene",
+  rzSceneDepth: "reads the scene depth buffer, bound to the field group only",
+  rzSceneFar: "derived from the depth uniform, bound to the field group only",
+  rzSceneHit: "same",
+  rzSceneDisplay: "runs the composite view transform; only the field pass has it",
+  rzSceneAlpha: "reads the scene mask, bound to the field group only",
+  rzSceneFrame: "same",
+  rzBackground: "reads the composite view uniform, bound to the field group only",
   rzLyricText: "samples the lyric atlas, which only the field module binds",
   rzLyricAspect: "same",
   rzLyricPixels: "same",
