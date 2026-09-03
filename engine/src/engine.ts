@@ -1567,6 +1567,10 @@ export class Engine {
    *  buffer twice would give both draws the second value. */
   private wireframeSeamUniformBuffer!: GPUBuffer
   private wireframeSeamBindGroup!: GPUBindGroup
+  /** Same reason: the hovered material draws its own stroke, self-occluding, in
+   *  the same frame as the base mesh and the seams. */
+  private wireframeHoverUniformBuffer!: GPUBuffer
+  private wireframeHoverBindGroup!: GPUBindGroup
   private wireframeSkinLayout!: GPUBindGroupLayout
   private wireframeColorData = new Float32Array(8)
   /** Rebuilt every frame into these, grouped by shape so each shape is one draw. */
@@ -1577,6 +1581,11 @@ export class Engine {
 
   // ─── Transform gizmo ───────────────────────────────────────────────
   private selectedBone: { modelName: string; boneName: string; boneIndex: number } | null = null
+  /** The material a pointer is currently over, or null. Cheap and separate from
+   *  setVertexOverlay on purpose — the same split setSelectedBone takes from
+   *  setBoneOverlay — because this is written every frame the pointer moves and
+   *  the overlay's own option object is not something to reconstruct that often. */
+  private hoverMaterial: { modelName: string; materialName: string } | null = null
   /** The transform gizmo follows setSelectedBone, which is also what selects a
    *  bone to INSPECT. A model editor selects bones constantly and poses them
    *  rarely, so the two need separating: off leaves selection working and takes
@@ -7337,6 +7346,11 @@ export class Engine {
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
+    this.wireframeHoverUniformBuffer = this.device.createBuffer({
+      label: "wireframe color (hovered material)",
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
     const wireBg0 = this.device.createBindGroupLayout({
       label: "wireframe group 0 layout (camera + wire)",
       entries: [
@@ -7460,6 +7474,14 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: { buffer: this.wireframeSeamUniformBuffer } },
+      ],
+    })
+    this.wireframeHoverBindGroup = this.device.createBindGroup({
+      label: "wireframe bind group (hovered material)",
+      layout: wireBg0,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.wireframeHoverUniformBuffer } },
       ],
     })
 
@@ -8060,6 +8082,13 @@ export class Engine {
      *  scaled by how far the reflected geometry sits behind the surface. */
     mirrorBlur?: number
   }): void {
+    // NOT YET, OR NEVER AGAIN — same race setAudioData documents. This call is
+    // deferred a frame by useSceneSync's own rAF batching, and a hot reload
+    // that swaps in a new (uninitialized) engine between the schedule and the
+    // callback lands this on a `device` that has not been assigned yet. The
+    // effect that scheduled it re-fires once the new engine is ready, so
+    // dropping this one loses nothing.
+    if (!this.device) return
     const opts = {
       width: 160,
       height: 160,
@@ -8160,7 +8189,14 @@ export class Engine {
     return this.lightHeader[0]
   }
 
+  /** Guarded, unlike most private writers here, because its callers are not:
+   *  setWorld/setSun are public and can be called before init() finishes
+   *  assigning `device` — a scene-settings effect firing on mount races the
+   *  engine's own async setup. The state write still lands immediately either
+   *  way; only the GPU upload defers, and setupLighting's own writeWorld/
+   *  writeSun calls during init pick up whatever was already set. */
   private updateLightBuffer() {
+    if (!this.device || !this.lightUniformBuffer) return
     this.device.queue.writeBuffer(this.lightUniformBuffer, 0, this.lightData)
   }
 
@@ -8689,6 +8725,13 @@ export class Engine {
     this.gizmoEnabled = on
   }
 
+  /** A pointer-driven preview of a pick, not a pick itself — see pickMaterial
+   *  for the click that actually selects one. Cheap: a field write, nothing
+   *  rebuilt, safe to call every frame the pointer is over the canvas. */
+  setHoveredMaterial(modelName: string | null, materialName: string | null): void {
+    this.hoverMaterial = modelName && materialName ? { modelName, materialName } : null
+  }
+
   setSelectedBone(modelName: string | null, boneName: string | null): void {
     if (!modelName || !boneName) {
       this.selectedBone = null
@@ -8779,6 +8822,122 @@ export class Engine {
           bestDist = d
           bestDepth = cw
         }
+      }
+    }
+    return best
+  }
+
+  /** Skinned positions for picking, grown on demand. One click's worth of work
+   *  reused across clicks — a model's vertex count does not change. */
+  private materialPickScratch: Float32Array | null = null
+
+  /**
+   * The material under a point on the canvas, or null for a miss.
+   *
+   * On the CPU, like pickBone, and for the same reason: a click (or a hover) is
+   * rare and an answer you have synchronously is worth more than one that
+   * arrives a frame later. Tens of thousands of triangles is a loop that costs
+   * a few milliseconds ONCE, against a GPU id pass that costs an attachment and
+   * a readback every frame whether anyone is pointing at the model or not.
+   *
+   * Skinned on the CPU with getSkinMatrices — the same matrices the vertex
+   * shader uses — so the pick lands on the POSED mesh. Bind-pose geometry would
+   * be right on a T-posed model and wrong on every animated one, which is
+   * exactly when someone is clicking around a costume.
+   *
+   * Morph offsets are NOT applied: they move a face, never move it into another
+   * material, and reading them back per click would cost more than the pick.
+   *
+   * `x`/`y` are CSS pixels relative to the canvas, as pickBone takes them.
+   */
+  pickMaterial(
+    x: number,
+    y: number,
+    options: { modelName?: string } = {},
+  ): { modelName: string; materialName: string; materialIndex: number } | null {
+    if (!this.camera) return null
+    const width = this.canvas.clientWidth
+    const height = this.canvas.clientHeight
+    if (width <= 0 || height <= 0) return null
+    const vp = this.camera.getProjectionMatrix().multiply(this.camera.getViewMatrix()).values
+
+    let best: { modelName: string; materialName: string; materialIndex: number } | null = null
+    let bestDepth = Infinity
+
+    for (const inst of this.modelInstances.values()) {
+      if (options.modelName !== undefined && inst.name !== options.modelName) continue
+      if (inst.isStage || inst.isPlane) continue
+      const model = inst.model
+      const { positions } = model.getGeometry()
+      const count = positions.length / 3
+      const { joints, weights } = model.getSkinning()
+      const skin = model.getSkinMatrices()
+
+      // Project every vertex ONCE into screen x, y and clip w. The triangle
+      // loop then reads three of these rather than re-skinning shared vertices
+      // — a closed mesh uses each vertex about six times.
+      if (!this.materialPickScratch || this.materialPickScratch.length !== count * 3) {
+        this.materialPickScratch = new Float32Array(count * 3)
+      }
+      const proj = this.materialPickScratch
+      for (let v = 0; v < count; v++) {
+        const bx = positions[v * 3]
+        const by = positions[v * 3 + 1]
+        const bz = positions[v * 3 + 2]
+        let px = 0
+        let py = 0
+        let pz = 0
+        for (let k = 0; k < 4; k++) {
+          const w = weights[v * 4 + k] / 255
+          if (w === 0) continue
+          const m = joints[v * 4 + k] * 16
+          px += w * (skin[m] * bx + skin[m + 4] * by + skin[m + 8] * bz + skin[m + 12])
+          py += w * (skin[m + 1] * bx + skin[m + 5] * by + skin[m + 9] * bz + skin[m + 13])
+          pz += w * (skin[m + 2] * bx + skin[m + 6] * by + skin[m + 10] * bz + skin[m + 14])
+        }
+        const cw = vp[3] * px + vp[7] * py + vp[11] * pz + vp[15]
+        proj[v * 3 + 2] = cw
+        if (cw <= 1e-6) continue
+        const cx = vp[0] * px + vp[4] * py + vp[8] * pz + vp[12]
+        const cy = vp[1] * px + vp[5] * py + vp[9] * pz + vp[13]
+        proj[v * 3] = ((cx / cw) * 0.5 + 0.5) * width
+        proj[v * 3 + 1] = (1 - ((cy / cw) * 0.5 + 0.5)) * height
+      }
+
+      // Point-in-triangle in SCREEN space, nearest w wins. The same projection
+      // pickBone uses, so the two agree about where things are, and it needs no
+      // inverse view-projection to build a ray from.
+      const indices = model.getIndices()
+      const materials = model.getMaterials()
+      let m = 0
+      let matEnd = materials.length > 0 ? materials[0].vertexCount : indices.length
+      for (let i = 0; i + 2 < indices.length; i += 3) {
+        while (i >= matEnd && m + 1 < materials.length) {
+          m++
+          matEnd += materials[m].vertexCount
+        }
+        const a = indices[i] * 3
+        const b = indices[i + 1] * 3
+        const c = indices[i + 2] * 3
+        if (proj[a + 2] <= 1e-6 || proj[b + 2] <= 1e-6 || proj[c + 2] <= 1e-6) continue
+        const ax = proj[a]
+        const ay = proj[a + 1]
+        const bx = proj[b]
+        const by = proj[b + 1]
+        const cx2 = proj[c]
+        const cy2 = proj[c + 1]
+        // Barycentric sign test, both windings: PMX faces are one winding but a
+        // double-sided material is legitimately seen from behind.
+        const d1 = (x - bx) * (ay - by) - (ax - bx) * (y - by)
+        const d2 = (x - cx2) * (by - cy2) - (bx - cx2) * (y - cy2)
+        const d3 = (x - ax) * (cy2 - ay) - (cx2 - ax) * (y - ay)
+        const neg = d1 < 0 || d2 < 0 || d3 < 0
+        const pos = d1 > 0 || d2 > 0 || d3 > 0
+        if (neg && pos) continue
+        const depth = (proj[a + 2] + proj[b + 2] + proj[c + 2]) / 3
+        if (depth >= bestDepth) continue
+        bestDepth = depth
+        best = { modelName: inst.name, materialName: materials[m].name, materialIndex: m }
       }
     }
     return best
@@ -11308,6 +11467,16 @@ export class Engine {
         ? (inst.wireEdges.get(Engine.SEAM_KEY) ?? null)
         : null
 
+    // A pointer over a material previews EXACTLY what clicking it would pick —
+    // the same self-occluding reveal, layered over the section-wide view rather
+    // than replacing it, so the rest of the mesh stays legible while one
+    // material calls attention to itself. Meaningless once something IS
+    // picked, since only the picked material draws at all then.
+    const hm = this.hoverMaterial
+    const hoverName = material === null && hm?.modelName === inst.name ? hm.materialName : null
+    const hoverRange = hoverName ? this.materialIndexRange(inst, hoverName) : null
+    const hover = hoverRange && this.ensureEdgeBuffer(inst, hoverName) ? inst.wireEdges.get(hoverName!) : null
+
     this.wireframeColorData.set(DEFAULT_VERTEX_COLOR)
     this.wireframeColorData[4] = this.canvas.width
     this.wireframeColorData[5] = this.canvas.height
@@ -11320,6 +11489,42 @@ export class Engine {
       this.wireframeColorData[3] = DEFAULT_VERTEX_COLOR[3]
       this.wireframeColorData[6] = OVERLAY_STYLE.seamStrokePx
       this.device.queue.writeBuffer(this.wireframeSeamUniformBuffer, 0, this.wireframeColorData)
+    }
+    if (hover) {
+      this.wireframeColorData[6] = OVERLAY_STYLE.hoverStrokePx
+      this.device.queue.writeBuffer(this.wireframeHoverUniformBuffer, 0, this.wireframeColorData)
+    }
+
+    // Both bind groups, before the FIRST draw call below, regardless of which
+    // branch runs first — the depth prepass reads the camera from group 0 and
+    // the skin matrices from group 1 same as the edge pass does, and every
+    // draw in this function needs both set to SOMETHING before it runs. Each
+    // block below is free to swap either one out for its own draws.
+    pass.setBindGroup(0, this.wireframeBindGroup)
+    pass.setBindGroup(1, edges.bindGroup)
+
+    const bindMesh = () => {
+      pass.setPipeline(this.wireframeDepthPipeline)
+      pass.setVertexBuffer(0, inst.vertexBuffer)
+      pass.setVertexBuffer(1, inst.jointsBuffer)
+      pass.setVertexBuffer(2, inst.weightsBuffer)
+      pass.setIndexBuffer(inst.indexBuffer, "uint32")
+    }
+
+    // The hover preview writes and draws against its OWN depth first, while the
+    // shared depth buffer is still empty — the same trick a pick uses, run
+    // before the base mesh below gets a chance to occlude it. The base mesh's
+    // depth write further down repeats the SAME geometry for these faces
+    // (identical z), so it neither disturbs this nor needs to skip them.
+    if (hover && hoverRange && !xray) {
+      bindMesh()
+      pass.drawIndexed(hoverRange[1] - hoverRange[0], 1, hoverRange[0])
+      pass.setBindGroup(0, this.wireframeHoverBindGroup)
+      pass.setBindGroup(1, hover.bindGroup)
+      pass.setPipeline(this.wireframePipeline)
+      pass.draw(6, hover.count / 2)
+      pass.setBindGroup(0, this.wireframeBindGroup)
+      pass.setBindGroup(1, edges.bindGroup)
     }
 
     // What writes depth is what is allowed to hide the wireframe, and that
@@ -11336,14 +11541,8 @@ export class Engine {
     // back faces stay hidden and it reads as an object instead of a haze —
     // which is the difference between this and turning x-ray on.
     const range = material !== null ? this.materialIndexRange(inst, material) : null
-    pass.setBindGroup(0, this.wireframeBindGroup)
-    pass.setBindGroup(1, edges.bindGroup)
     if (!xray) {
-      pass.setPipeline(this.wireframeDepthPipeline)
-      pass.setVertexBuffer(0, inst.vertexBuffer)
-      pass.setVertexBuffer(1, inst.jointsBuffer)
-      pass.setVertexBuffer(2, inst.weightsBuffer)
-      pass.setIndexBuffer(inst.indexBuffer, "uint32")
+      bindMesh()
       if (range) pass.drawIndexed(range[1] - range[0], 1, range[0])
       else pass.drawIndexed(inst.model.getIndices().length)
     }

@@ -502,13 +502,18 @@ export const OVERLAY_STYLE = {
 
   /** Stroke for the material borders drawn over the mesh wireframe. */
   seamStrokePx: 3,
+  /** Stroke for the material under the pointer — the same self-occluding reveal
+   *  a pick draws, layered over the section-wide view rather than replacing it,
+   *  and heavier than either a pick's own edges or a seam so it still pops out
+   *  of a view that already has two other things drawn in it. */
+  hoverStrokePx: 4,
   /** How strongly the triangulation draws under those borders.
    *
    *  Both at full strength is one undifferentiated field of yellow — forty
    *  thousand edges saying what the model is made of the way a page of hex says
    *  what a file contains. The borders are the answer and the triangulation is
    *  the ground it reads against, so the ground steps back. */
-  meshAlpha: 0.35,
+  meshAlpha: 0.55,
 } as const
 
 export const DEFAULT_BONE_PALETTE: Record<BoneClass, RGBA> = {
