@@ -1333,7 +1333,23 @@ const FIELD_LAYER_BLEND: GPUBlendState = {
  */
 const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
   color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
-  alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+  // COVERAGE ACCUMULATES TOO, and dropping it was a real bug rather than a
+  // simplification. The canvas is premultiplied, which REQUIRES rgb <= alpha;
+  // an additive layer that contributed colour and no alpha handed the
+  // compositor an invalid pixel, and an invalid pixel loses its colour.
+  //
+  // Nothing showed it while the background was opaque, because the composite
+  // forces the canvas opaque there and never consults this at all. Put anything
+  // transparent behind it — a backdrop video, an alpha export — and every
+  // additive effect vanished, surviving only where the SCENE happened to supply
+  // the alpha its own pixels lacked. Which read as the effect being drawn on
+  // the ground grid and nowhere else.
+  //
+  // Additive, to match the colour beside it: light that arrives adds, and what
+  // arrives is what covers. srcRgb <= 1, so the colour's src-alpha * srcRgb is
+  // always <= this one's srcAlpha, and the premultiplied invariant holds by
+  // construction rather than by hoping an author stayed inside it.
+  alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
 }
 
 /**
@@ -2153,6 +2169,9 @@ export class Engine {
   private groundVertexBuffer?: GPUBuffer
   private groundIndexBuffer?: GPUBuffer
   private hasGround = false
+  /** The user's own "no ground" switch — see setGroundVisible. Distinct from
+   *  hasGround, which records whether a ground was ever built. */
+  private groundHidden = false
   private shadowMapTextures: GPUTexture[] = []
   private shadowMapDepthViews: GPUTextureView[] = []
   private brdfLutTexture!: GPUTexture
@@ -3104,9 +3123,10 @@ export class Engine {
    * change that only ever toggles between two known states.
    */
   private rebuildFieldBindGroup(): void {
-    if (!this.device || !this.depthReadView || this.fieldUniformBuffers.length === 0) return
-    // Captured, so the null guard above survives into the closure.
+    if (!this.device || !this.depthReadView || !this.compositeBloomView || this.fieldUniformBuffers.length === 0) return
+    // Captured, so the null guards above survive into the closure.
     const depth = this.depthReadView
+    const bloom = this.compositeBloomView
     const build = (owner: EffectInstance, grid: GPUTextureView) =>
       this.device.createBindGroup({
         label: "field layer bind group",
@@ -3128,6 +3148,13 @@ export class Engine {
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
           { binding: 26, resource: this.castDistView ?? this.castDistFallbackView! },
+          { binding: 27, resource: this.hdrResolveTexture.createView() },
+          { binding: 28, resource: this.simSampler },
+          { binding: 2, resource: this.bloomSampler },
+          { binding: 5, resource: this.filmicLutView },
+          { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
+          { binding: 1, resource: bloom },
+          { binding: 4, resource: this.maskResolveView },
         ],
       })
     // Per effect: the params buffer and the grid are both its own, so two
@@ -4955,6 +4982,14 @@ export class Engine {
     const proj = this.camera.getProjectionMatrix().values
     u[8] = proj[10]
     u[9] = proj[14]
+    // THE FAR PLANE ITSELF, written rather than left to be re-derived. An effect
+    // that resamples has to know whether the scene was drawn at a given pixel,
+    // and "nothing was drawn" reads back as exactly this distance. Recovering it
+    // from the pair above means inverting a cleared depth, which is a sign trap
+    // that differs by projection convention and fails silently — as an effect
+    // that draws nothing at all, or one that paints the sky. The camera knows
+    // the number; this hands it over.
+    u[10] = this.camera.far
     this.device.queue.writeBuffer(this.dofUniformBuffer, 0, u)
   }
 
@@ -5494,6 +5529,23 @@ export class Engine {
         // compiled, and a 1x1 stands in when the flood is not running, so an
         // author never has to guard the name.
         { binding: 26, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+        // The finished scene, and a sampler of its own — see scene-tap.ts for
+        // why it may not borrow the one at 18.
+        { binding: 27, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 28, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        // THE VIEW TRANSFORM'S OWN RESOURCES. viewTransform() lives in the
+        // header both this module and the composite share, but its lookups did
+        // not: an effect calling it compiled and then failed at pipeline
+        // creation with "binding doesn't exist", naming a binding no effect
+        // author ever wrote. Sharing the code meant sharing these.
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
+        // And the scene's COVERAGE and bloom, without which the tap cannot
+        // reconstruct a pixel: the HDR target is premultiplied, so colour alone
+        // reads a half-transparent ground as a dark opaque one.
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
     this.fieldPipelineLayout = this.device.createPipelineLayout({
@@ -6580,7 +6632,35 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
 
+      // The id attachment. Multisampled like the rest of the pass, and with NO
+      // resolve texture beside it: resolving averages, and the average of two
+      // ids is a third id naming something that was never drawn. Consumers read
+      // sample 0 with textureLoad, the way linearDepth already does.
+      this.idTexture?.destroy()
+      this.idTexture = null
+      this.idView = null
+      // The debug bind group holds the OLD view. Dropped here so it is rebuilt
+      // against the new one — keeping it would sample a destroyed texture at
+      // the first resize with the debug view open.
+      this.idDebugBindGroup = null
+      if (mrtIdsEnabled()) {
+        this.idTexture = this.device.createTexture({
+          label: "object id",
+          size: [width, height],
+          sampleCount: Engine.MULTISAMPLE_COUNT,
+          format: SCENE_ID_FORMAT,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        })
+        this.idView = this.idTexture.createView()
+      }
+
       // The field layer — half resolution by default, full for #fullres effects.
+      // AFTER the id attachment above: createFieldTargets rebuilds the cast
+      // distance flood, whose seed pass binds idView. Built before it, the seed
+      // group names the id texture the lines above have just destroyed, and
+      // every frame that encodes the flood is rejected whole — a black canvas
+      // for the first resize after a silhouette effect is installed, which is
+      // what a video export always is.
       this.fieldFullW = width
       this.fieldFullH = height
       this.createFieldTargets()
@@ -6603,28 +6683,6 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
       this.maskResolveView = this.maskResolveTexture.createView()
-
-      // The id attachment. Multisampled like the rest of the pass, and with NO
-      // resolve texture beside it: resolving averages, and the average of two
-      // ids is a third id naming something that was never drawn. Consumers read
-      // sample 0 with textureLoad, the way linearDepth already does.
-      this.idTexture?.destroy()
-      this.idTexture = null
-      this.idView = null
-      // The debug bind group holds the OLD view. Dropped here so it is rebuilt
-      // against the new one — keeping it would sample a destroyed texture at
-      // the first resize with the debug view open.
-      this.idDebugBindGroup = null
-      if (mrtIdsEnabled()) {
-        this.idTexture = this.device.createTexture({
-          label: "object id",
-          size: [width, height],
-          sampleCount: Engine.MULTISAMPLE_COUNT,
-          format: SCENE_ID_FORMAT,
-          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        })
-        this.idView = this.idTexture.createView()
-      }
 
       // The floor mirror's targets — FULL resolution, the same attachment
       // contract and sample count as the scene pass, which is what lets the
@@ -7591,6 +7649,19 @@ export class Engine {
    * analysis would render silence into the exported video.
    */
   setAudioData(data: Float32Array | null, bandsPerFrame: number, secondsPerFrame: number): void {
+    // NOT YET, OR NEVER AGAIN. `device` is definite-assignment: it is undefined
+    // until init() resolves and after dispose(), and TypeScript cannot see
+    // either state. This setter is reached from an ASYNC callback — the audio
+    // analysis, the score fetch, the lyric rasteriser all land whenever they
+    // land — so on a hot reload the in-flight promise of the outgoing engine
+    // resolves against the incoming one, which is holding a ref but has not
+    // finished init. It threw "Cannot read properties of undefined (reading
+    // 'createBuffer')" from a line whose only crime was being fast.
+    //
+    // Dropped rather than queued: every caller here re-pushes on the effect
+    // that owns the asset, and that effect re-runs on the very reload that
+    // caused this.
+    if (!this.device) return
     if (this.audioBuffer !== this.audioFallbackBuffer) this.audioBuffer.destroy()
     if (!data || data.length === 0) {
       this.audioBuffer = this.audioFallbackBuffer
@@ -7639,6 +7710,19 @@ export class Engine {
     lines: LyricLine[] | null,
     atlas?: { source: GPUCopyExternalImageSource; width: number; height: number; rects: LyricRect[] },
   ): void {
+    // NOT YET, OR NEVER AGAIN. `device` is definite-assignment: it is undefined
+    // until init() resolves and after dispose(), and TypeScript cannot see
+    // either state. This setter is reached from an ASYNC callback — the audio
+    // analysis, the score fetch, the lyric rasteriser all land whenever they
+    // land — so on a hot reload the in-flight promise of the outgoing engine
+    // resolves against the incoming one, which is holding a ref but has not
+    // finished init. It threw "Cannot read properties of undefined (reading
+    // 'createBuffer')" from a line whose only crime was being fast.
+    //
+    // Dropped rather than queued: every caller here re-pushes on the effect
+    // that owns the asset, and that effect re-runs on the very reload that
+    // caused this.
+    if (!this.device) return
     this.device.queue.writeBuffer(this.lyricsBuffer, 0, packLyrics(lines ?? [], atlas?.rects))
     if (!atlas) return
     const w = Math.min(atlas.width, LYRIC_ATLAS_MAX_W)
@@ -7670,6 +7754,19 @@ export class Engine {
   }
 
   setMidiNotes(notes: MidiNote[] | null, release = 0.35): void {
+    // NOT YET, OR NEVER AGAIN. `device` is definite-assignment: it is undefined
+    // until init() resolves and after dispose(), and TypeScript cannot see
+    // either state. This setter is reached from an ASYNC callback — the audio
+    // analysis, the score fetch, the lyric rasteriser all land whenever they
+    // land — so on a hot reload the in-flight promise of the outgoing engine
+    // resolves against the incoming one, which is holding a ref but has not
+    // finished init. It threw "Cannot read properties of undefined (reading
+    // 'createBuffer')" from a line whose only crime was being fast.
+    //
+    // Dropped rather than queued: every caller here re-pushes on the effect
+    // that owns the asset, and that effect re-runs on the very reload that
+    // caused this.
+    if (!this.device) return
     if (this.midiBuffer !== this.midiFallbackBuffer) this.midiBuffer.destroy()
     this.midiRelease = Math.max(0, release)
     // Sorted by onset. Nothing in the accessors requires it, but a caller
@@ -8462,7 +8559,26 @@ export class Engine {
   /** True while a stage is in the scene, which is when the built-in ground plane
    *  must not draw. */
   groundIsSuppressed(): boolean {
-    return this.hasStage()
+    return this.hasStage() || this.groundHidden
+  }
+
+  /**
+   * Draw the built-in ground, or do not.
+   *
+   * Separate from opacity, which cannot express this: a ground at opacity 0
+   * still WRITES DEPTH and still catches shadow — that is what makes it a
+   * shadow catcher, and it is why an alpha export keeps its shadows. So a scene
+   * that wants no floor at all cannot ask for one by turning the opacity down;
+   * the plane is still there, still occluding, and anything reading scene depth
+   * still finds a square where the floor is. A water surface deciding what lies
+   * beneath it draws that square's edge across the pool.
+   *
+   * Suppression rather than a teardown, matching what a stage does to the same
+   * plane: the ground keeps its colour, its size and its grid, so switching it
+   * back restores the scene the user had rather than an engine default.
+   */
+  setGroundVisible(on: boolean): void {
+    this.groundHidden = !on
   }
 
   /** Per cascade: does its map currently hold nothing but the cleared far plane?
@@ -13328,14 +13444,18 @@ export class Engine {
       u[40] = cameraPos.x
       u[41] = cameraPos.y
       u[42] = cameraPos.z
-      // Character positions (viewU[11..14]), count in viewU[10].w. Stages are
-      // excluded: an effect asking where the cast is means the characters, and a
-      // stage's origin is wherever its author put it, which is not a place
-      // anything is standing. Four is the cap because the uniform is small and a
-      // scene with five characters is not the case this serves.
+      // Character positions (viewU[11..14]), count in viewU[10].w. Neither a
+      // stage nor a plane is a performer: an effect asking where the cast is
+      // means the characters, a stage's origin is wherever its author put it,
+      // and a card is a picture with an id. Leaving a card in the list hands its
+      // object id to every consumer of the cast — the distance field then seeds
+      // the whole rectangle, so a silhouette effect drew a border around the
+      // video behind her and none at all around her. Four is the cap because the
+      // uniform is small and a scene with five characters is not the case this
+      // serves.
       let n = 0
       this.forEachInstance((inst) => {
-        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage) return
+        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane) return
         const m = inst.model
         // The model transform is only where the model was PLACED. A motion moves
         // the character by animating bones, so an effect anchored to the

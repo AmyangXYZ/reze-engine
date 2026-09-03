@@ -35,20 +35,22 @@ const {
   parseEffectAnchors,
   EFFECT_SCENE_API,
 } = await import(`${dist}/shaders/passes/composite.js`)
-const { buildSimShader, parseGridSize, gridEntryPoint, GRID_MAX } = await import(`${dist}/shaders/passes/grid.js`)
+const { buildSimShader, gridEntryPoint, GRID_MAX } = await import(`${dist}/shaders/passes/grid.js`)
+const { parseDirectives, stripDirectives } = await import(`${dist}/shaders/directives.js`)
 const {
   buildParticleComputeShader,
   buildParticleRenderShader,
-  parseParticleCount,
-  parseParticleBlend,
-  parseParticleBloom,
   particleEntryPoints,
 } = await import(`${dist}/shaders/passes/particles.js`)
 const { buildTrailShader, trailEntryPoints } = await import(`${dist}/shaders/passes/trails.js`)
-const { buildLightEmitShader, hasLightEmit, MAX_LIGHTS, parseLightCount } = await import(`${dist}/shaders/lights.js`)
+const { buildLightEmitShader, hasLightEmit, MAX_LIGHTS } = await import(`${dist}/shaders/lights.js`)
 const { buildAnchorTable, anchorAliasWgsl } = await import(`${dist}/shaders/anchor-table.js`)
 const { REFLECTION_DEBUG_WGSL } = await import(`${dist}/reflection.js`)
 const { OVERLAY_SHADER_WGSL } = await import(`${dist}/shaders/passes/overlay.js`)
+
+/** What the effect declared, clamped to what the engine will build. Directives
+ *  are one parse now: the per-tag parsers this used to call are gone. */
+const declared = (wgsl) => parseDirectives(wgsl).directives
 
 /** name → wgsl. Everything here must compile clean on a real device. */
 const shaders = {}
@@ -86,9 +88,15 @@ shaders["material prelude + minimal fs"] =
 // ── Every fixture effect, through every module its mounts reach ──
 const fixtures = readdirSync(join(here, "..", "tests", "fixtures")).filter((f) => f.endsWith(".wgsl"))
 for (const file of fixtures) {
-  const wgsl = readFileSync(join(here, "..", "tests", "fixtures", file), "utf8")
+  const source = readFileSync(join(here, "..", "tests", "fixtures", file), "utf8")
+  // The directives come off before anything compiles: `#lights 3` is a line the
+  // engine reads and WGSL cannot, so a module built from the raw file fails at
+  // the first one with "invalid character found". Every builder below takes the
+  // stripped source and every parser takes the raw text, which is the split the
+  // engine itself makes.
+  const wgsl = stripDirectives(source)
   const name = file.replace(/\.wgsl$/, "")
-  const anchors = parseEffectAnchors(wgsl, 8)
+  const anchors = parseEffectAnchors(source, 8)
   const table = buildAnchorTable([anchors], 8)
   const alias = table.alias[0]
   const trailed = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
@@ -110,7 +118,7 @@ for (const file of fixtures) {
       paramsDecl: "",
       hasBackground,
       hasForeground,
-      gridSize: parseGridSize(wgsl, GRID_MAX),
+      gridSize: Math.min(declared(source).grid, GRID_MAX),
       alias,
       trailCount: trailed.length,
     })
@@ -124,15 +132,15 @@ for (const file of fixtures) {
     })
   }
   if (gridEntryPoint(wgsl)) {
-    shaders[`${name}: grid step`] = buildSimShader(wgsl, parseGridSize(wgsl, GRID_MAX) || 256, cast)
+    shaders[`${name}: grid step`] = buildSimShader(wgsl, Math.min(declared(source).grid, GRID_MAX) || 256, cast)
   }
   const pep = particleEntryPoints(wgsl)
   if (pep.init && pep.step && pep.shade) {
     const src = {
       wgsl,
-      count: parseParticleCount(wgsl, 4096) || 64,
-      blend: parseParticleBlend(wgsl),
-      bloom: parseParticleBloom(wgsl),
+      count: Math.min(declared(source).particles, 4096) || 64,
+      blend: declared(source).particleBlend,
+      bloom: declared(source).bloom,
     }
     shaders[`${name}: particle sim`] = buildParticleComputeShader(src, cast)
     shaders[`${name}: particle draw`] = buildParticleRenderShader(src, cast)
@@ -144,7 +152,7 @@ for (const file of fixtures) {
       cast,
     )
   }
-  if (hasLightEmit(wgsl) && parseLightCount(wgsl, MAX_LIGHTS) > 0) {
+  if (hasLightEmit(wgsl) && Math.min(declared(source).lights, MAX_LIGHTS) > 0) {
     shaders[`${name}: light emit`] = buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias), cast)
   }
 }

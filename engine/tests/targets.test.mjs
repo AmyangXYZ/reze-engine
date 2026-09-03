@@ -300,6 +300,22 @@ test("the debug bind group is dropped when the attachment is recreated", () => {
   assert.match(body, /this\.idDebugBindGroup = null/, "the stale bind group must be dropped alongside the texture")
 })
 
+test("the id attachment is rebuilt before the resize rebinds it", () => {
+  // createFieldTargets rebuilds the cast distance flood, and the flood's seed
+  // pass binds idView. Run before the id texture is replaced, the seed group
+  // names the destroyed one, the submit carrying the flood is rejected whole,
+  // and the frame is black — what a video export's resize did to every scene
+  // holding a silhouette effect.
+  const at = engine.indexOf("private handleResize()")
+  assert.ok(at > 0, "handleResize not found")
+  const body = engine.slice(at, engine.indexOf("\n  private ", at + 10))
+  const id = body.indexOf("this.idView = this.idTexture.createView()")
+  const field = body.indexOf("this.createFieldTargets()")
+  assert.ok(id > 0, "handleResize must recreate the id attachment")
+  assert.ok(field > 0, "handleResize must rebuild the field targets")
+  assert.ok(id < field, "the id view must exist before createFieldTargets binds it")
+})
+
 /** Fragment-output locations a shader writes, from its output struct. */
 function outputLocations(wgsl, structName) {
   const at = wgsl.indexOf(`struct ${structName}`)

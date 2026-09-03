@@ -3,6 +3,7 @@ import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
 import { EFFECT_SCENE_API } from "./composite"
+import { SCENE_TAP_STUB } from "../scene-tap"
 import { type CastLayout } from "./particles"
 import { clockApi, trailSlotsApi, viewportApi } from "./hosted-api"
 import { idApi } from "../id-api"
@@ -136,6 +137,7 @@ fn rzGridPrev(uv: vec2f) -> vec4f {
 }
 ` +
     EFFECT_SCENE_API +
+    SCENE_TAP_STUB +
     // The alias _rzSlot, which the scene API's accessors route through. Every
     // module embedding EFFECT_SCENE_API must splice this; the sim module was
     // the one that did not, and every gridStep effect failed to install with

@@ -41,7 +41,7 @@ const HALO = vec3f(0.54, 0.40, 0.10);  // soft amber, the outer light
 const LIGHT_COLOR = vec3f(1.00, 0.85, 0.45);
 const LIGHT_POWER = 1.5;   // how hard she is lit
 const LIGHT_R = 9.0;       // reach of each lamp, in world units
-const REACH = 110.0;     // how far the light carries, in screen pixels
+const REACH = 110.0;     // how far the light carries, in pixels of a 1440-line frame
 const RIM = 5.0;         // width of the bright band against her outline
 const RIM_GAIN = 0.9;
 const AURA = 0.7;        // the broad glow's strength
@@ -53,8 +53,15 @@ const BREATH = 0.14;     // a slow swell, 0 holds it still
 const OPACITY = 1.0;
 
 fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
+  // REACH AND RIM ARE FRACTIONS OF THE PICTURE, not counts of device pixels.
+  // rzCastDistance answers in screen pixels, so bare numbers draw a glow half as
+  // wide in a 4K export as in the preview it was tuned in. Measured against 1440
+  // lines — about what the editor's preview is — it is the same glow at every
+  // resolution.
+  let px = rzResolution().y / 1440.0;
+  let reach = REACH * px;
   let d = rzCastDistance(uv);
-  if (d >= REACH) { return vec4f(0.0); }
+  if (d >= reach) { return vec4f(0.0); }
 
   // OUTSIDE ONLY, faded across the one pixel her edge lives in. The field reads
   // 0 on her and runs to -0.5 at a half-covered pixel, so this is 0 everywhere
@@ -65,7 +72,7 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
 
   // The broad aura, falling to exactly zero at REACH. A glow that merely gets
   // small has to be cut somewhere, and the cut is an edge.
-  let t = clamp(d / REACH, 0.0, 1.0);
+  let t = clamp(d / reach, 0.0, 1.0);
   let aura = pow(1.0 - t, FADE) * AURA;
 
   // The bright band against her.
@@ -76,7 +83,7 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   // once with a cube that peaks and falls immediately, which is smoother and
   // measurably more like light — and it looked weaker and further from what this
   // effect is for. A hot edge is the whole read.
-  let rim = (1.0 - smoothstep(0.0, RIM, d)) * RIM_GAIN;
+  let rim = (1.0 - smoothstep(0.0, RIM * px, d)) * RIM_GAIN;
 
   // Shafts, radiating from her middle rather than the frame's. Projecting her hip
   // is what makes them hers: they swing with her instead of sitting on the screen

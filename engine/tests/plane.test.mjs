@@ -85,7 +85,11 @@ test("a plane skips everything a stage skips", () => {
   // own silent bug: a card solving IK, or claiming to be the subject an effect
   // follows.
   for (const [what, re] of [
-    ["the cast buffer", /inst\.isStage \|\| inst\.isPlane\) continue\n      const model = inst\.model/],
+    // The SUBJECT LIST, which is the one that was wrong: this used to be spelled
+    // as the pattern below it and matched the focus loop instead, so a card sat
+    // in the cast for as long as the test claimed it did not.
+    ["the cast buffer", /if \(n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane\) return/],
+    ["the focus target", /inst\.isStage \|\| inst\.isPlane\) continue\n      const model = inst\.model/],
     ["the camera clock", /if \(inst\.isStage \|\| inst\.isPlane\) continue\n      const p = inst\.model\.getAnimationProgress\(\)/],
     ["physics", /!isStage && !isPlane && rbs\.length > 0/],
     ["IK", /inst\.isStage \|\| inst\.isPlane \? false : this\.ikEnabled/],

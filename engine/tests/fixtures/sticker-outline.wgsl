@@ -20,13 +20,24 @@
 
 // Tunables — edit a value and hit Cmd-Enter to see it live.
 const COLOR = vec3f(1.0, 1.0, 1.0);
-const WIDTH = 12.0;       // border thickness, in screen pixels — any width costs the same
-const FEATHER = 1.4;      // softness at the outer edge, in pixels
+const WIDTH = 12.0;       // border thickness, in pixels of a 1440-line frame
+const FEATHER = 1.4;      // softness at the outer edge, in real pixels
 const OPACITY = 1.0;      // 0..1
 
 fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
+  // THE WIDTH IS A FRACTION OF THE PICTURE, not a count of device pixels.
+  //
+  // rzCastDistance answers in screen pixels, so a bare 12 is twelve pixels of
+  // whatever frame is being drawn — the border tuned in the preview comes out
+  // half as thick in a 4K export, which is the copy anyone keeps. Measured
+  // against 1440 lines — about what the editor's preview is — it is the same
+  // border at every resolution, and the export is the preview enlarged.
+  //
+  // FEATHER stays in real pixels: it is the anti-aliasing of the cut, and a cut
+  // wants the same pixel and a half however many the frame has.
+  let width = WIDTH * rzResolution().y / 1440.0;
   let d = rzCastDistance(uv);
-  if (d >= WIDTH) { return vec4f(0.0); }
+  if (d >= width) { return vec4f(0.0); }
   // WHERE IT MEETS HER, faded across the one pixel her edge actually lives in.
   //
   // The distance is signed and its zero crossing is sub-pixel — it comes from the
@@ -38,6 +49,6 @@ fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f {
   // And the outer edge is a cut, not a glow: solid to the feather, then off.
   // 1 - smoothstep(lo, hi), never smoothstep(hi, lo): WGSL leaves it undefined
   // when low >= high, and it is the kind of undefined that works locally.
-  let outer = 1.0 - smoothstep(WIDTH - FEATHER, WIDTH, d);
+  let outer = 1.0 - smoothstep(width - FEATHER, width, d);
   return vec4f(COLOR, inner * outer * OPACITY);
 }
