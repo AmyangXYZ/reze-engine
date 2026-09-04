@@ -10,6 +10,61 @@ import { WORLD_AMBIENT_WGSL } from "../lights"
 // the struct this returns depends on what the probe at init found, and a string
 // baked at import time cannot know that. Called once, when the module is built.
 
+// How far the softest setting spreads the taps, in units of the sharp kernel's
+// own step, and how many taps carry that spread. Sixteen is what keeps a wide
+// disk reading as a penumbra instead of sixteen shadows.
+const SOFT_TAPS = 16
+const SOFT_MAX_SPREAD = 14
+
+/**
+ * PCF taps for one cascade, emitted per shadow map.
+ *
+ * At softness 0 this is the 3x3 box the ground has always used — same offsets,
+ * same weights, same result to the bit. Above it the taps spread over a Vogel
+ * disk whose radius IS the penumbra: an overcast sky throws no edge, and a
+ * razor-edged shadow under one is the loudest thing wrong in a composite.
+ *
+ * The branch is on a uniform, so a scene at softness 0 genuinely takes the
+ * nine-tap side rather than masking the wide one — the same reasoning the
+ * shadowStrength branch above it already documents.
+ *
+ * A string rather than a WGSL function because a texture is the one handle type
+ * this shader has never passed as a parameter, and the file is already a
+ * template that interpolates its constants.
+ *
+ * `acc` must already be declared and zeroed; the caller reads it back
+ * normalised, so there is no `/ 9.0` left at the call site.
+ */
+function pcfWgsl(map: string, uv: string, texel: string, z: string, acc: string, pad: string): string {
+  const golden = 2.39996323
+  return [
+    `if (material.shadowSoftness <= 0.0) {`,
+    `  let st = ${texel} * 2.0;`,
+    `  for (var y = -1; y <= 1; y++) {`,
+    `    for (var x = -1; x <= 1; x++) {`,
+    // ...Level, not the implicit-derivative form: identical on a single-mip
+    // shadow map, and legal inside a branch.
+    `      ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(f32(x), f32(y)) * st, ${z});`,
+    `    }`,
+    `  }`,
+    `  ${acc} *= ${1 / 9};`,
+    `} else {`,
+    `  let radius = ${texel} * 2.0 * (1.0 + material.shadowSoftness * ${SOFT_MAX_SPREAD}.0);`,
+    `  for (var s = 0; s < ${SOFT_TAPS}; s++) {`,
+    `    let fs = f32(s);`,
+    // sqrt of the index spaces the ring radii evenly by AREA; the golden angle
+    // keeps successive taps from lining up into spokes.
+    `    let r = sqrt((fs + 0.5) * ${1 / SOFT_TAPS});`,
+    `    let a = fs * ${golden} + rot;`,
+    `    ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(cos(a), sin(a)) * (r * radius), ${z});`,
+    `  }`,
+    `  ${acc} *= ${1 / SOFT_TAPS};`,
+    `}`,
+  ]
+    .map((l) => pad + l)
+    .join("\n")
+}
+
 export function groundShaderWgsl(): string {
   return /* wgsl */ `
 struct CameraUniforms { view: mat4x4f, projection: mat4x4f, viewPos: vec3f, _p: f32, };
@@ -22,7 +77,7 @@ struct GroundShadowMat {
   gridLineColor: vec3f, mirror: f32,
   // farCascade: 1 while a stage is loaded, 0 otherwise. See the branch below —
   // with no stage the far map is never drawn into, so its taps are known.
-  mirrorBlur: f32, farCascade: f32, _mb1: f32, _mb2: f32,
+  mirrorBlur: f32, farCascade: f32, shadowSoftness: f32, _mb2: f32,
   // Every shadow caster in one sphere, refreshed per frame. w = radius; 0 means
   // nothing casts, negative means "do not use this" (a rigid caster has no
   // sphere, so a scene with a stage keeps the taps). See rzShadowPossible.
@@ -152,6 +207,11 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // The same reasoning the noise tint below already got, applied to the term
   // that costs a hundred times more.
   if (material.shadowStrength > 0.0 && shadowPossible) {
+  // Per-pixel rotation for the soft disk, so its rings break up into fine noise
+  // rather than banding. Interleaved gradient noise: a function of the pixel
+  // alone, so a still camera gives a still shadow — the sharp path ignores it.
+  let ign = fract(52.9829189 * fract(dot(i.position.xy, vec2f(0.06711056, 0.00583715))));
+  let rot = ign * 6.28318530718;
   // The far cascade's taps, skipped entirely when nothing ever drew into it.
   //
   // This branch is the expensive one on a wide floor: it runs wherever the NEAR
@@ -165,32 +225,20 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   if (material.farCascade > 0.0 && frustum < 1.0 && frustum1 > 0.0) {
     let suv1 = vec2f(ndc1.x * 0.5 + 0.5, 0.5 - ndc1.y * 0.5);
     let suv1_c = clamp(suv1, vec2f(0.02), vec2f(0.98));
-    let st1 = ${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize} * 2.0;
     let compareZ1 = ndc1.z - 0.0035;
     var acc1 = 0.0;
-    for (var y = -1; y <= 1; y++) {
-      for (var x = -1; x <= 1; x++) {
-        acc1 += textureSampleCompareLevel(shadowMapFar, shadowSampler, suv1_c + vec2f(f32(x), f32(y)) * st1, compareZ1);
-      }
-    }
-    vis = mix(1.0, acc1 * (1.0 / 9.0), frustum1);
+${pcfWgsl("shadowMapFar", "suv1_c", `${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize}`, "compareZ1", "acc1", "    ")}
+    vis = mix(1.0, acc1, frustum1);
   }
   if (frustum > 0.0) {
     let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     let suv_c = clamp(suv, vec2f(0.02), vec2f(0.98));
-    let st = material.pcfTexel * 2.0;
     let compareZ = ndc.z - 0.0035;
     var acc = 0.0;
-    for (var y = -1; y <= 1; y++) {
-      for (var x = -1; x <= 1; x++) {
-        // ...Level, not the implicit-derivative form: identical on a single-mip
-        // shadow map, and legal inside this branch.
-        acc += textureSampleCompareLevel(shadowMap, shadowSampler, suv_c + vec2f(f32(x), f32(y)) * st, compareZ);
-      }
-    }
+${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ")}
     // The base is whatever the far cascade decided, so the near border blends
     // cascade to cascade rather than snapping to lit mid-floor.
-    vis = mix(vis, acc * (1.0 / 9.0), frustum);
+    vis = mix(vis, acc, frustum);
   }
   }
 

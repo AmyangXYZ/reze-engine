@@ -63,6 +63,19 @@ export class Camera {
   maxZ: number = FAR_CAP
   lowerBetaLimit: number = 0.001
   upperBetaLimit: number = Math.PI - 0.001
+  /**
+   * Orbit roll, radians — the lean the orbit itself cannot state.
+   *
+   * alpha and beta are a yaw and a pitch about an upright axis, and lookAt is
+   * handed world up, so an orbiting shot is level by construction. This tips
+   * that up vector about the eye→target line, which leaves WHERE the camera is
+   * and WHAT it looks at exactly as they were.
+   *
+   * That is the whole reason it lives here rather than in a pose pushed from
+   * outside: a rolled shot still follows a bone, still orbits, still zooms. A
+   * pose replaces all of that with one frozen answer.
+   */
+  roll: number = 0
 
   // Reused each frame so getViewMatrix/getProjectionMatrix don't allocate a Mat4 per call.
   private _viewMat = new Mat4(new Float32Array(16))
@@ -140,7 +153,10 @@ export class Camera {
     // NEGATIVE to match: in a VMD the camera sits behind its target.
     return {
       target: new Vec3(this.target.x, this.target.y, this.target.z),
-      rotation: new Vec3(this.beta - Math.PI / 2, -this.alpha, 0),
+      // z carries the roll, so a rolled orbit exports and reads back as the
+      // same shot rather than a level one — the AE rig and the VMD writer both
+      // take this channel.
+      rotation: new Vec3(this.beta - Math.PI / 2, -this.alpha, this.roll),
       distance: -this.radius,
       fov: this.fov,
     }
@@ -208,7 +224,49 @@ export class Camera {
     }
     const eye = this.getPosition()
     const t = this.target
-    Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, t.x, t.y, t.z, 0, 1, 0)
+    if (this.roll === 0) {
+      Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, t.x, t.y, t.z, 0, 1, 0)
+      return this._viewMat
+    }
+    // Roll = the up vector, turned about the view axis. Build the shot's own
+    // basis first (forward, then right, then a true up), because world up is
+    // only the camera's up while the shot is level — which is the thing this is
+    // about to stop being.
+    let fx = t.x - eye.x
+    let fy = t.y - eye.y
+    let fz = t.z - eye.z
+    const fl = Math.hypot(fx, fy, fz) || 1
+    fx /= fl
+    fy /= fl
+    fz /= fl
+    // right = forward × worldUp, with worldUp = (0,1,0), which is (−fz, 0, fx).
+    //
+    // WRITTEN THE OTHER WAY ROUND ONCE, and it did not fail quietly: that is
+    // worldUp × forward, so `right` pointed left, `up` below came out as right ×
+    // forward = DOWN, and the camera turned upside down the moment roll left
+    // zero. Degenerate only when the shot looks straight up or down, where
+    // beta's own limits already keep it from arriving.
+    let rx = -fz
+    let ry = 0
+    let rz = fx
+    const rl = Math.hypot(rx, ry, rz) || 1
+    rx /= rl
+    ry /= rl
+    rz /= rl
+    // up = right × forward
+    const ux = ry * fz - rz * fy
+    const uy = rz * fx - rx * fz
+    const uz = rx * fy - ry * fx
+    const c = Math.cos(this.roll)
+    const sn = Math.sin(this.roll)
+    Mat4.lookAtInto(
+      this._viewMat.values,
+      eye.x, eye.y, eye.z,
+      t.x, t.y, t.z,
+      ux * c + rx * sn,
+      uy * c + ry * sn,
+      uz * c + rz * sn,
+    )
     return this._viewMat
   }
 

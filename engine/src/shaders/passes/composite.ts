@@ -138,7 +138,7 @@ override APPLY_GAMMA: bool = true;
 // monotone-cubic (Fritsch–Carlson) fit through the same 14 anchors — same values, C1
 // continuity kills the banding — sampled with hardware linear filtering.
 @group(0) @binding(5) var filmicLut: texture_2d<f32>;
-// viewU[0] = (exposure, invGamma, _, _);  viewU[1] = (tint.rgb, intensity)
+// viewU[0] = (exposure, invGamma, grain amount, grain seed);  viewU[1] = (tint.rgb, intensity)
 // viewU[2] = (background.rgb, mode) — display-space sRGB, composited UNDER the
 //            scene post-tonemap. BASE-layer mode: 0 transparent (DOM shows),
 //            1 solid color, 2 = 360 equirect skybox sampled by view ray. A user
@@ -525,6 +525,23 @@ const COMPOSITE_BODY = /* wgsl */ `
   }
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));
+  }
+  // ── Film grain, on the SCENE ONLY ─────────────────────────────────────────
+  //
+  // Applied here, before the background is composited under, so it rides on what
+  // the engine drew and nothing else. That placement is the whole point when the
+  // background is footage: the plate came off a real sensor and already carries
+  // its own grain, and a second helping over the top would grade the photograph
+  // rather than match it. A clean CG figure on a grainy plate is one of the
+  // loudest tells there is — the noise gives it away long before the geometry.
+  //
+  // Multiplicative and weighted toward the mid-tones, which is how film behaves:
+  // little grain in the blacks, and the highlights clip it off.
+  if (viewU[0].z > 0.0) {
+    let gp = fragCoord.xy + vec2f(viewU[0].w, viewU[0].w * 1.7);
+    let gn = fract(sin(dot(gp, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5;
+    let glum = dot(disp, vec3f(0.2126, 0.7152, 0.0722));
+    disp = max(disp * (1.0 + gn * viewU[0].z * 4.0 * glum * (1.0 - glum)), vec3f(0.0));
   }
   // Composite over the background in display space (premultiplied out). The
   // background is TWO layers: a base (transparent / solid color / 360 equirect)

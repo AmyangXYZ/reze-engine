@@ -2395,6 +2395,33 @@ export class Engine {
     }
   }
 
+  /** Sensor grain: how much, and whether it moves. */
+  private grain = { amount: 0, animated: true }
+
+  /**
+   * Film grain over the rendered scene, 0–1.
+   *
+   * A property of a SENSOR, so it belongs to the camera rather than to any one
+   * subject, and it lands on what the engine drew and on nothing else — never on
+   * a background image or a backdrop video, which arrived with grain of their
+   * own and would be graded rather than matched by a second helping.
+   *
+   * `animated` false freezes it. A still photograph's grain does not move, and
+   * noise crawling over a frozen picture makes the rendering look more alive
+   * than the thing it is standing in.
+   *
+   * Costs one hash per pixel in a pass that already runs, and nothing at all at
+   * zero — the branch is on a uniform.
+   */
+  setFilmGrain(amount: number, animated = true): void {
+    this.grain.amount = Math.min(Math.max(amount, 0), 1)
+    this.grain.animated = animated
+    if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+  getFilmGrain(): Readonly<{ amount: number; animated: boolean }> {
+    return this.grain
+  }
+
   setViewTransformOptions(patch: Partial<ViewTransformOptions>): void {
     const v = this.viewTransform
     if (patch.exposure !== undefined) v.exposure = patch.exposure
@@ -2436,8 +2463,11 @@ export class Engine {
     // compiler doesn't fold `pow(x, 1/g)` into identity when g=1, so also emit
     // a uniform branch that skips the pow entirely in the common case.
     u[1] = 1.0 / Math.max(v.gamma, 1e-4)
-    u[2] = 0.0
-    u[3] = 0.0
+    u[2] = this.grain.amount
+    // The seed. Zero means STILL: a plate that is one photograph has grain that
+    // does not move, and CG noise crawling over a frozen picture makes the CG
+    // look more alive than the footage — the opposite of the point.
+    u[3] = this.grain.animated ? Math.floor(this.sceneClock * 24) % 1024 : 0
     u[4] = b.color.x
     u[5] = b.color.y
     u[6] = b.color.z
@@ -7580,19 +7610,73 @@ export class Engine {
   // A dedicated camera VMD (target / rotation / distance / fov animated). Motion VMDs loaded
   // via model.loadVmd never touch the camera — the camera shot is opt-in through here.
 
+  /** Whether a loaded camera track is allowed to drive (setCameraVmdEnabled).
+   *  Held separately from `camera.vmdDriven` because that flag now answers to
+   *  two sources, and a track switched off must stay off when the other one
+   *  releases the camera. */
+  private cameraVmdEnabled = true
+  /** A pose pushed in from outside — see setCameraPose. Reapplied every frame,
+   *  so it outranks the orbit AND a loaded track for as long as it is set. */
+  private cameraPoseOverride: CameraPose | null = null
+
+  /** The one place that decides who is holding the camera. An external pose
+   *  wins; a track drives when it is loaded and enabled; otherwise orbit. */
+  private refreshCameraDrive(): void {
+    this.camera.setVmdDriven(
+      this.cameraPoseOverride !== null || (this.cameraVmdEnabled && this.cameraAnimation !== null),
+    )
+  }
+
+  /**
+   * Aim the camera from outside — a solved match-move, a saved shot, a rig
+   * driving the view from the host's own clock.
+   *
+   * The exact partner of `getCameraPose`, and the same five channels: the shot
+   * as MMD states it, roll included. Orbit cannot express roll, so this is the
+   * only way a tilted camera reaches the engine.
+   *
+   * Reapplied every frame while set, which makes it authoritative rather than
+   * advisory — nothing the transport or a loaded track does moves it. Pass null
+   * to release, and whatever was driving before takes the camera back.
+   */
+  setCameraPose(pose: CameraPose | null): void {
+    if (pose) {
+      // Copied, not held: a host reusing one object per frame is the normal
+      // shape of a track, and storing the reference would make the value we
+      // reapply depend on when the caller next touched theirs.
+      this.cameraPoseOverride = {
+        target: new Vec3(pose.target.x, pose.target.y, pose.target.z),
+        rotation: new Vec3(pose.rotation.x, pose.rotation.y, pose.rotation.z),
+        distance: pose.distance,
+        fov: pose.fov,
+      }
+    } else {
+      this.cameraPoseOverride = null
+    }
+    this.refreshCameraDrive()
+    if (this.cameraPoseOverride) this.camera.setVmdPose(this.cameraPoseOverride)
+  }
+
+  /** The pose currently forced from outside, or null when nothing is. */
+  getCameraPoseOverride(): CameraPose | null {
+    return this.cameraPoseOverride
+  }
+
   /** Load a camera VMD (dedicated camera file, or any VMD's camera block) and drive the shot
    *  from it. Default-on once a non-empty track loads; toggle with setCameraVmdEnabled. */
   async loadCameraVmd(url: string): Promise<void> {
     const frames = await VMDLoader.loadCamera(url)
     this.cameraAnimation = frames.length ? new CameraAnimation(frames) : null
-    this.camera.setVmdDriven(this.cameraAnimation !== null)
+    this.cameraVmdEnabled = true
+    this.refreshCameraDrive()
   }
 
   /** Load a camera VMD from an already-fetched buffer (e.g. a File the user dropped). */
   loadCameraVmdFromBuffer(buffer: ArrayBuffer): void {
     const frames = VMDLoader.loadCameraFromBuffer(buffer)
     this.cameraAnimation = frames.length ? new CameraAnimation(frames) : null
-    this.camera.setVmdDriven(this.cameraAnimation !== null)
+    this.cameraVmdEnabled = true
+    this.refreshCameraDrive()
   }
 
   /**
@@ -7610,7 +7694,8 @@ export class Engine {
    */
   loadCameraClip(frames: CameraKeyframe[]): void {
     this.cameraAnimation = frames.length ? new CameraAnimation([...frames]) : null
-    this.camera.setVmdDriven(this.cameraAnimation !== null)
+    this.cameraVmdEnabled = true
+    this.refreshCameraDrive()
   }
 
   /** The loaded camera track as editable keyframes, or [] with none loaded.
@@ -7630,7 +7715,8 @@ export class Engine {
 
   /** Turn the loaded camera VMD on/off (falls back to orbit when off). No-op if none loaded. */
   setCameraVmdEnabled(enabled: boolean): void {
-    this.camera.setVmdDriven(enabled && this.cameraAnimation !== null)
+    this.cameraVmdEnabled = enabled
+    this.refreshCameraDrive()
     if (!enabled && this.cameraTargetModel) {
       // Follow resumes with a clean snap to bone + configured offset — one
       // predictable cut to the scene's framing, no easing from the shot.
@@ -7891,7 +7977,7 @@ export class Engine {
   /** Drop the loaded camera VMD and return to orbit control. */
   clearCameraVmd(): void {
     this.cameraAnimation = null
-    this.camera.setVmdDriven(false)
+    this.refreshCameraDrive()
   }
 
   /**
@@ -7934,6 +8020,29 @@ export class Engine {
     return this.camera.getPosition()
   }
 
+  /**
+   * The live orbit, read in ONE call.
+   *
+   * A host that stores the shot has to be able to ask where the camera actually
+   * IS, because a drag on the canvas moves this and nothing else — and a
+   * document that never asks will happily write back the angle it last set,
+   * discarding whatever the person just did with the mouse. Reading the four
+   * separately invites a torn set across a frame boundary; this cannot tear.
+   *
+   * `target` is the orbit's own centre. While the engine is following a bone
+   * that point rides the bone, so a caller storing a FOLLOW offset must keep its
+   * own and take only the angles from here.
+   */
+  getCameraOrbit(): { alpha: number; beta: number; distance: number; target: Vec3 } {
+    const c = this.camera
+    return {
+      alpha: c.alpha,
+      beta: c.beta,
+      distance: c.radius,
+      target: new Vec3(c.target.x, c.target.y, c.target.z),
+    }
+  }
+
   getCameraDistance(): number {
     return this.camera.radius
   }
@@ -7951,6 +8060,21 @@ export class Engine {
   }
   setCameraBeta(b: number): void {
     this.camera.beta = b
+  }
+  /**
+   * Roll the orbiting shot, radians — the lean alpha and beta cannot state.
+   *
+   * Tips the up vector about the eye→target line, so the camera stays exactly
+   * where it was and keeps looking at exactly what it looked at. Everything the
+   * orbit does still works underneath it: following a bone, dragging, zooming.
+   *
+   * A camera VMD carries its own roll and ignores this while it drives.
+   */
+  setCameraRoll(r: number): void {
+    this.camera.roll = r
+  }
+  getCameraRoll(): number {
+    return this.camera.roll
   }
   /** Vertical field of view in radians (default π/4). While a camera VMD
    *  drives the view it animates fov itself; the orbit value set here is
@@ -8081,6 +8205,16 @@ export class Engine {
     /** Mirror softness, 0–1: 0 a polished mirror, 1 the softest blur level,
      *  scaled by how far the reflected geometry sits behind the surface. */
     mirrorBlur?: number
+    /** How soft the received shadow's edge is, 0–1. 0 (default) is the sharp
+     *  kernel this has always used, to the bit; 1 spreads the taps fourteen
+     *  times as wide, which is the edge an overcast sky throws.
+     *
+     *  A property of the LIGHT, applied where the light is received: the sun
+     *  in a scene is either a point source with a hard edge or a sky with
+     *  none, and a floor that always answers "hard" can only match one of
+     *  them. Above 0 the taps go from nine to sixteen, so leave it at 0 for
+     *  scenes that want the sharp edge and pay nothing. */
+    shadowSoftness?: number
   }): void {
     // NOT YET, OR NEVER AGAIN — same race setAudioData documents. This call is
     // deferred a frame by useSceneSync's own rAF batching, and a hot reload
@@ -8104,6 +8238,7 @@ export class Engine {
       opacity: 1.0,
       mirror: false,
       mirrorBlur: 0,
+      shadowSoftness: 0,
       ...options,
     }
     this.createGroundGeometry(opts.width, opts.height)
@@ -10520,6 +10655,7 @@ export class Engine {
     opacity: number
     mirror: boolean
     mirrorBlur: number
+    shadowSoftness: number
   }) {
     const {
       diffuseColor,
@@ -10534,6 +10670,7 @@ export class Engine {
       opacity,
       mirror,
       mirrorBlur,
+      shadowSoftness,
     } = opts
     // Shadow map is already created in setupPipelines()
     // 20 floats: 16 for the original block, then (mirrorBlur, pad, pad, pad)
@@ -10559,6 +10696,9 @@ export class Engine {
     this.groundMirror = gb[15]
     gb[16] = Math.min(Math.max(mirrorBlur, 0), 1)
     this.groundMirrorBlur = gb[16]
+    // gb[18] — shadow edge softness. Was padding; the shader reads it as the
+    // Vogel disk's radius, and 0 takes the sharp nine-tap path unchanged.
+    gb[18] = Math.min(Math.max(shadowSoftness, 0), 1)
     // gb[17] — does the FAR cascade hold anything?
     //
     // It holds something only when a stage is loaded; that is what it exists for
@@ -11850,13 +11990,62 @@ export class Engine {
   }
 
   // World-space ray from camera through a canvas pixel. Uses WebGPU's NDC z ∈ [0,1].
+  /**
+   * Where a point on the canvas lands on a horizontal plane.
+   *
+   * `px,py` are canvas-relative pixels, top-left origin — what a pointer event
+   * gives you after subtracting the element's rect. Returns null when the ray
+   * cannot reach the plane: parallel to it, or pointing the other way, which is
+   * what a click on the sky above the horizon is.
+   *
+   * The one primitive a placement UI needs. Dragging a thing across the floor is
+   * otherwise three sliders in world units, which asks someone to guess numbers
+   * that have no visible relation to the picture they are looking at — and it
+   * throws away the property that makes pointing work at all: under perspective,
+   * moving something further away makes it smaller by exactly the right amount,
+   * so position and size stop being two controls to tune against each other.
+   */
+  groundPointAt(px: number, py: number, planeY = 0): Vec3 | null {
+    const ray = this.buildMouseRay(px, py)
+    if (!ray) return null
+    // Parallel to the plane: no intersection, and a huge one is not an answer.
+    if (Math.abs(ray.dir.y) < 1e-6) return null
+    const t = (planeY - ray.origin.y) / ray.dir.y
+    // Behind the camera — the plane is there, but not in this shot.
+    if (!(t > 0) || !isFinite(t)) return null
+    return new Vec3(ray.origin.x + ray.dir.x * t, planeY, ray.origin.z + ray.dir.z * t)
+  }
+
+  /** Hand the pointer to something else — a placement drag, a gizmo, a host's own
+   *  overlay — so the orbit does not also act on it. */
+  setCameraInputLocked(locked: boolean): void {
+    this.camera?.setInputLocked(locked)
+  }
+
   private buildMouseRay(px: number, py: number): { origin: Vec3; dir: Vec3 } | null {
     if (!this.camera) return null
     const width = this.canvas.clientWidth
     const height = this.canvas.clientHeight
-    if (width <= 0 || height <= 0) return null
-    const ndcX = (px / width) * 2 - 1
-    const ndcY = -((py / height) * 2 - 1)
+    if (width <= 0 || height <= 0 || this.canvas.width <= 0 || this.canvas.height <= 0) return null
+    // THE PICTURE, NOT THE ELEMENT.
+    //
+    // The projection's aspect comes from the DRAWING BUFFER, while a pointer
+    // arrives in the CSS box — and the two do not have to agree. The canvas is
+    // laid out `object-contain`, so whenever they differ the rendered image sits
+    // letterboxed inside the element with bars either side of it, and dividing
+    // by the element's own size lands the ray somewhere the picture is not.
+    // They disagree on every resize until the observer catches up, and
+    // permanently wherever a host frames the canvas to a shape of its own.
+    //
+    // So: work out where the image actually sits, and take the ray from that.
+    const bufAspect = this.canvas.width / this.canvas.height
+    const boxAspect = width / height
+    const imgW = bufAspect > boxAspect ? width : height * bufAspect
+    const imgH = bufAspect > boxAspect ? width / bufAspect : height
+    const ox = (width - imgW) / 2
+    const oy = (height - imgH) / 2
+    const ndcX = ((px - ox) / imgW) * 2 - 1
+    const ndcY = -(((py - oy) / imgH) * 2 - 1)
     const view = this.camera.getViewMatrix()
     const proj = this.camera.getProjectionMatrix()
     const invVP = proj.multiply(view).inverse()
@@ -12333,8 +12522,13 @@ export class Engine {
       }
     }
 
-    // Drive the shot from the camera VMD (synced to the animated model's clock).
-    if (this.camera.vmdDriven && this.cameraAnimation) {
+    // Who holds the shot this frame. An external pose is a statement about
+    // where the camera IS, so it is reapplied rather than sampled — and it
+    // outranks a loaded track, which is scene data.
+    if (this.cameraPoseOverride) {
+      this.camera.setVmdPose(this.cameraPoseOverride)
+    } else if (this.camera.vmdDriven && this.cameraAnimation) {
+      // Drive the shot from the camera VMD (synced to the animated model's clock).
       const pose = this.cameraAnimation.sample(this.transportTime())
       if (pose) this.camera.setVmdPose(pose)
     }
@@ -13635,6 +13829,12 @@ export class Engine {
       // clock is already per effect, which is the one that actually breaks
       // things (rzGridFrame()==0 is a grid's only chance to seed).
       u[24] = this.sceneClock - (this.effects[0]?.epochScene ?? 0)
+      // The grain's seed rides the same per-frame refresh, because it is the
+      // only thing that makes it move — a seed written once by its setter is a
+      // still pattern welded to the picture. On the SCENE clock like everything
+      // else here, so an export reproduces the editor exactly rather than
+      // scattering differently at whatever rate the encoder ran.
+      u[3] = this.grain.animated ? Math.floor((this.sceneClock * 24) % 1024) : 0
       u[26] = this.canvas.width
       u[27] = this.canvas.height
       // Camera world position (viewU[10]) — the other half of bgWorldPos. It

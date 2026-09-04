@@ -111,11 +111,14 @@ test("the camera reports its pose the same way in both modes", () => {
   // VMD-driven: the stored pose, unfactored.
   assert.match(fn, /if \(this\.vmdDriven\)/)
   assert.match(fn, /distance: this\._vmdDistance/)
-  // Orbiting: the same five, with no roll. Distance NEGATIVE, because in a VMD
-  // the camera sits behind its target and a host reading one shape must not get
-  // two conventions.
+  // Orbiting: the same five. Distance NEGATIVE, because in a VMD the camera sits
+  // behind its target and a host reading one shape must not get two conventions.
   assert.match(fn, /distance: -this\.radius/)
-  assert.match(fn, /rotation: new Vec3\(this\.beta - Math\.PI \/ 2, -this\.alpha, 0\)/)
+  // z is the ROLL, not a hard zero. It was zero for as long as an orbit could
+  // not lean; now that it can, a hard zero here would report a rolled shot as a
+  // level one — and this is the channel the AE rig and the VMD writer read, so
+  // the lean would survive on screen and vanish from every export of it.
+  assert.match(fn, /rotation: new Vec3\(this\.beta - Math\.PI \/ 2, -this\.alpha, this\.roll\)/)
   // A COPY, not the live vectors — a caller sampling once a frame into an array
   // would otherwise end up with one pose repeated however many times it read.
   assert.match(fn, /target: new Vec3\(this\._vmdTarget\.x/)
