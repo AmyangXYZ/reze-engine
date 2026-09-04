@@ -1510,6 +1510,13 @@ export class Engine {
   // tone (bottom). Stand-in for MMD's toon01–10.bmp, which we can't ship.
   private defaultToonRampTexture!: GPUTexture
   private groundShadowPipeline!: GPURenderPipeline
+  /** The soft-edge variant, built the first time a scene asks for one. Null while
+   *  no scene has, which is most of them — a pipeline nobody draws with is still
+   *  a shader compile at load. */
+  private groundShadowSoftPipeline: GPURenderPipeline | null = null
+  /** How the ground's own pipeline is chosen, kept beside the uniform that sets
+   *  it so the draw does not have to read the buffer back. */
+  private groundSoft = false
   private groundShadowBindGroupLayout!: GPUBindGroupLayout
   private outlinePipeline!: GPURenderPipeline
   private selectedMaterial: { modelName: string; materialName: string } | null = null
@@ -6068,14 +6075,9 @@ export class Engine {
         { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
-    const groundShadowShader = this.device.createShaderModule({
-      label: "ground shadow",
-      code: groundShaderWgsl(),
-    })
-    this.groundShadowPipeline = this.createRenderPipeline({
+    this.groundShadowPipelineDesc = {
       label: "ground shadow pipeline",
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.groundShadowBindGroupLayout] }),
-      shaderModule: groundShadowShader,
       // Slot 0 only — the ground has no skinning, and declaring the full
       // 3-slot layout while renderGround binds one buffer is a WebGPU
       // validation error that invalidates the whole command buffer.
@@ -6083,7 +6085,8 @@ export class Engine {
       fragmentTargets: sceneTargetsFor("ground", this.sceneFormats),
       cullMode: "back",
       depthStencil: { format: this.depthFormat, depthWriteEnabled: true, depthCompare: this.depthAhead },
-    })
+    }
+    this.groundShadowPipeline = this.buildGroundPipeline(false)
 
     // Outline: group 0 = per-frame (camera), group 1 = per-instance (skinMats), group 2 = per-material (edge uniforms)
     this.outlinePerFrameBindGroupLayout = this.device.createBindGroupLayout({
@@ -10642,6 +10645,28 @@ export class Engine {
     this.device.queue.writeBuffer(this.groundIndexBuffer, 0, indices)
   }
 
+  /** Everything about the ground's pipeline except which shadow variant it
+   *  compiles, so the two are built from one description and cannot drift. */
+  private groundShadowPipelineDesc!: Omit<Parameters<Engine["createRenderPipeline"]>[0], "shaderModule">
+
+  private buildGroundPipeline(soft: boolean): GPURenderPipeline {
+    return this.createRenderPipeline({
+      ...this.groundShadowPipelineDesc,
+      label: soft ? "ground shadow pipeline (soft)" : "ground shadow pipeline",
+      shaderModule: this.device.createShaderModule({
+        label: soft ? "ground shadow (soft)" : "ground shadow",
+        code: groundShaderWgsl(soft),
+      }),
+    })
+  }
+
+  /** Built on the first frame that actually needs it. A shader compile costs
+   *  load time, and the overwhelming majority of scenes never soften a shadow. */
+  private ensureGroundSoftPipeline(): GPURenderPipeline {
+    if (!this.groundShadowSoftPipeline) this.groundShadowSoftPipeline = this.buildGroundPipeline(true)
+    return this.groundShadowSoftPipeline
+  }
+
   private createShadowGroundResources(opts: {
     diffuseColor: Vec3
     fadeStart: number
@@ -10699,6 +10724,9 @@ export class Engine {
     // gb[18] — shadow edge softness. Was padding; the shader reads it as the
     // Vogel disk's radius, and 0 takes the sharp nine-tap path unchanged.
     gb[18] = Math.min(Math.max(shadowSoftness, 0), 1)
+    // Which variant the draw picks. Zero is the sharp shader, which is the one
+    // that existed before softness did.
+    this.groundSoft = gb[18] > 0
     // gb[17] — does the FAR cascade hold anything?
     //
     // It holds something only when a stage is loaded; that is what it exists for
@@ -11398,7 +11426,7 @@ export class Engine {
     // hasGround is left alone: remove the stage and the ground comes back.
     if (this.groundIsSuppressed()) return
     if (!this.hasGround || !this.groundVertexBuffer || !this.groundIndexBuffer || !this.groundDrawCall) return
-    pass.setPipeline(this.groundShadowPipeline)
+    pass.setPipeline(this.groundSoft ? this.ensureGroundSoftPipeline() : this.groundShadowPipeline)
     pass.setVertexBuffer(0, this.groundVertexBuffer)
     pass.setIndexBuffer(this.groundIndexBuffer, "uint16")
     pass.setBindGroup(0, this.groundDrawCall.bindGroup)

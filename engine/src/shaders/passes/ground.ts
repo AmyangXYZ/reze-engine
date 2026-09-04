@@ -35,37 +35,54 @@ const SOFT_MAX_SPREAD = 14
  * `acc` must already be declared and zeroed; the caller reads it back
  * normalised, so there is no `/ 9.0` left at the call site.
  */
-function pcfWgsl(map: string, uv: string, texel: string, z: string, acc: string, pad: string): string {
+function pcfWgsl(map: string, uv: string, texel: string, z: string, acc: string, pad: string, soft: boolean): string {
   const golden = 2.39996323
-  return [
-    `if (material.shadowSoftness <= 0.0) {`,
-    `  let st = ${texel} * 2.0;`,
-    `  for (var y = -1; y <= 1; y++) {`,
-    `    for (var x = -1; x <= 1; x++) {`,
+  // ONE BRANCH IS COMPILED, NOT BOTH.
+  //
+  // A runtime `if` on the softness uniform was the first cut, and it costs a
+  // scene that never softens a shadow. Both bodies land in the module, the wide
+  // one needs more live registers than the narrow one, and occupancy on this
+  // draw is set by the worst of them — so the frame gets slower whether or not
+  // the branch is ever taken. That is expensive HERE in particular: this file
+  // already records that the ground is a full-coverage draw costing tens of
+  // millions of shadow fetches, and that bisection on a slow device pinned the
+  // whole cost to it.
+  //
+  // So the flag is the COMPILED VARIANT, which is the idiom the composite pass
+  // already uses for its effects. A scene at softness 0 gets byte-for-byte the
+  // shader it had before any of this existed, and cannot pay for a feature it
+  // is not using.
+  const sharp = [
+    `let st = ${texel} * 2.0;`,
+    `for (var y = -1; y <= 1; y++) {`,
+    `  for (var x = -1; x <= 1; x++) {`,
     // ...Level, not the implicit-derivative form: identical on a single-mip
     // shadow map, and legal inside a branch.
-    `      ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(f32(x), f32(y)) * st, ${z});`,
-    `    }`,
+    `    ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(f32(x), f32(y)) * st, ${z});`,
     `  }`,
-    `  ${acc} *= ${1 / 9};`,
-    `} else {`,
-    `  let radius = ${texel} * 2.0 * (1.0 + material.shadowSoftness * ${SOFT_MAX_SPREAD}.0);`,
-    `  for (var s = 0; s < ${SOFT_TAPS}; s++) {`,
-    `    let fs = f32(s);`,
+    `}`,
+    `${acc} *= ${1 / 9};`,
+  ]
+  const wide = [
+    `let radius = ${texel} * 2.0 * (1.0 + material.shadowSoftness * ${SOFT_MAX_SPREAD}.0);`,
+    `for (var s = 0; s < ${SOFT_TAPS}; s++) {`,
+    `  let fs = f32(s);`,
     // sqrt of the index spaces the ring radii evenly by AREA; the golden angle
     // keeps successive taps from lining up into spokes.
-    `    let r = sqrt((fs + 0.5) * ${1 / SOFT_TAPS});`,
-    `    let a = fs * ${golden} + rot;`,
-    `    ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(cos(a), sin(a)) * (r * radius), ${z});`,
-    `  }`,
-    `  ${acc} *= ${1 / SOFT_TAPS};`,
+    `  let r = sqrt((fs + 0.5) * ${1 / SOFT_TAPS});`,
+    `  let a = fs * ${golden} + rot;`,
+    `  ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(cos(a), sin(a)) * (r * radius), ${z});`,
     `}`,
+    `${acc} *= ${1 / SOFT_TAPS};`,
   ]
-    .map((l) => pad + l)
-    .join("\n")
+  return (soft ? wide : sharp).map((l) => pad + l).join("\n")
 }
 
-export function groundShaderWgsl(): string {
+/**
+ * The ground's shader. `soft` selects the shadow-edge variant — see pcfWgsl for
+ * why this is a compiled flag and not a uniform the shader branches on.
+ */
+export function groundShaderWgsl(soft = false): string {
   return /* wgsl */ `
 struct CameraUniforms { view: mat4x4f, projection: mat4x4f, viewPos: vec3f, _p: f32, };
 struct Light { direction: vec4f, color: vec4f, };
@@ -207,11 +224,15 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // The same reasoning the noise tint below already got, applied to the term
   // that costs a hundred times more.
   if (material.shadowStrength > 0.0 && shadowPossible) {
-  // Per-pixel rotation for the soft disk, so its rings break up into fine noise
-  // rather than banding. Interleaved gradient noise: a function of the pixel
-  // alone, so a still camera gives a still shadow — the sharp path ignores it.
+${
+    soft
+      ? `  // Per-pixel rotation for the soft disk, so its rings break up into fine
+  // noise rather than banding. Interleaved gradient noise: a function of the
+  // pixel alone, so a still camera gives a still shadow.
   let ign = fract(52.9829189 * fract(dot(i.position.xy, vec2f(0.06711056, 0.00583715))));
-  let rot = ign * 6.28318530718;
+  let rot = ign * 6.28318530718;`
+      : ""
+  }
   // The far cascade's taps, skipped entirely when nothing ever drew into it.
   //
   // This branch is the expensive one on a wide floor: it runs wherever the NEAR
@@ -227,7 +248,7 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     let suv1_c = clamp(suv1, vec2f(0.02), vec2f(0.98));
     let compareZ1 = ndc1.z - 0.0035;
     var acc1 = 0.0;
-${pcfWgsl("shadowMapFar", "suv1_c", `${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize}`, "compareZ1", "acc1", "    ")}
+${pcfWgsl("shadowMapFar", "suv1_c", `${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize}`, "compareZ1", "acc1", "    ", soft)}
     vis = mix(1.0, acc1, frustum1);
   }
   if (frustum > 0.0) {
@@ -235,7 +256,7 @@ ${pcfWgsl("shadowMapFar", "suv1_c", `${1 / SHADOW_CASCADES[SHADOW_CASCADES.lengt
     let suv_c = clamp(suv, vec2f(0.02), vec2f(0.98));
     let compareZ = ndc.z - 0.0035;
     var acc = 0.0;
-${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ")}
+${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ", soft)}
     // The base is whatever the far cascade decided, so the near border blends
     // cascade to cascade rather than snapping to lit mid-floor.
     vis = mix(vis, acc, frustum);
