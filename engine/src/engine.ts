@@ -380,6 +380,24 @@ export type ModelTransform = {
   visible: boolean
 }
 
+/** How a model rides another — MMD's 外部親 (outside parent). See setModelParent. */
+export type ModelAttachment = {
+  /** Model key of the parent. */
+  model: string
+  /** Bone on the parent. A name the parent's rig lacks rides the parent's root. */
+  bone: string
+}
+
+/** The attachment as the engine keeps it: the record plus the two matrices the
+ *  per-frame placement needs, allocated once per attach rather than per frame. */
+type Attachment = ModelAttachment & {
+  /** Where the child's origin sits in the bone's space (position · rotation). */
+  offsetMatrix: Float32Array
+  /** The root the child is posed under this frame. Handed to Model.setRootParent
+   *  BY REFERENCE and refilled every frame; see placeAttached. */
+  rootMatrix: Float32Array
+}
+
 type SunOptions = {
   /** Linear color of the sun lamp (Blender: Light > Color). */
   color?: Vec3
@@ -778,6 +796,18 @@ interface ModelInstance {
    * plane into isStage would have made adding a title graphic delete the ground.
    */
   isPlane: boolean
+  /**
+   * A PROP: a PMX object a character holds or wears — a microphone, a fan, a
+   * sword. The third answer beside stage and plane. It keeps what a cast member
+   * has that scenery does not (physics, outlines, its own clip) and drops what
+   * makes one a performer: no effect subject id, no seeding of the scene clock,
+   * no bone picking. Like a card it leaves the floor alone. See addProp.
+   */
+  isProp: boolean
+  /** Who this model hangs from, or null. Any model can: a prop by design, a
+   *  card for a sign in her hand, a second character for a mascot on her
+   *  shoulder. See setModelParent. */
+  parent: Attachment | null
   /** This card's texture is rewritten every frame, so it is allocated with no
    *  mip chain — rebuilding one per frame is a pass per level per card, and is
    *  what a moving card was mostly costing. See setPlaneFrame. */
@@ -4970,7 +5000,7 @@ export class Engine {
     for (const inst of this.modelInstances.values()) {
       // Neither a stage nor a plane is a performer, so neither is a subject an
       // effect can follow.
-      if (!inst.model.visible || inst.isStage || inst.isPlane) continue
+      if (!inst.model.visible || inst.isStage || inst.isPlane || inst.isProp) continue
       const model = inst.model
       const matrices = model.getWorldMatrices()
       if (matrices.length === 0) continue
@@ -8008,7 +8038,7 @@ export class Engine {
       // is first in insertion order and was seeding this clock with its own
       // permanent zero. In a scene with a stage, a camera VMD therefore sampled
       // frame 0 forever and the shot never moved.
-      if (inst.isStage || inst.isPlane) continue
+      if (inst.isStage || inst.isPlane || inst.isProp) continue
       const p = inst.model.getAnimationProgress()
       if (p.playing || p.paused) return p.current
       // Otherwise the first cast member that actually HAS a clip: one still at
@@ -8460,6 +8490,16 @@ export class Engine {
     return model
   }
 
+  /** loadModel's folder/zip path for a prop. See addProp. */
+  async loadProp(
+    name: string,
+    options: LoadModelFromFilesOptions & { transform?: Partial<ModelTransform> },
+  ): Promise<Model> {
+    const { model, pmxKey, reader } = await this.openPmxFromFiles(name, options)
+    await this.addProp(model, pmxKey, { name, transform: options.transform, assetReader: reader })
+    return model
+  }
+
   /** Read a PMX out of a picked folder / expanded zip. Shared by loadModel and
    *  loadStage so the file-map and path handling exist in exactly one place. */
   private async openPmxFromFiles(
@@ -8485,7 +8525,7 @@ export class Engine {
     pmxPath: string,
     name?: string,
     assetReader?: AssetReader,
-    options?: { stage?: boolean; plane?: boolean; dynamic?: boolean },
+    options?: { stage?: boolean; plane?: boolean; dynamic?: boolean; prop?: boolean },
   ): Promise<string> {
     const requested = name ?? model.name
     let key = requested
@@ -8504,6 +8544,7 @@ export class Engine {
       options?.stage ?? false,
       options?.plane ?? false,
       options?.dynamic ?? false,
+      options?.prop ?? false,
     )
     return key
   }
@@ -8533,6 +8574,28 @@ export class Engine {
     options?: { name?: string; transform?: Partial<ModelTransform>; assetReader?: AssetReader },
   ): Promise<string> {
     const key = await this.addModel(model, pmxPath, options?.name, options?.assetReader, { stage: true })
+    if (options?.transform) this.setModelTransform(key, options.transform)
+    return key
+  }
+
+  /**
+   * Add a PMX as a PROP: an object a character holds or wears rather than a
+   * performer or the environment. A microphone, a fan, a sword, an umbrella.
+   *
+   * It keeps what makes a held thing look right — physics (the charm on a phone
+   * strap swings), toon outlines, its own clip if it has one — and drops what
+   * makes a model a cast member: no effect subject id, so a silhouette effect
+   * still outlines HER and not the mic; no seeding of the scene clock; no bone
+   * picking in the pose editor. Like a card it leaves the built-in ground
+   * alone, which is the one thing a stage does that a prop must not. Usually
+   * hung from a bone with setModelParent, though it can stand on its own.
+   */
+  async addProp(
+    model: Model,
+    pmxPath: string,
+    options?: { name?: string; transform?: Partial<ModelTransform>; assetReader?: AssetReader },
+  ): Promise<string> {
+    const key = await this.addModel(model, pmxPath, options?.name, options?.assetReader, { prop: true })
     if (options?.transform) this.setModelTransform(key, options.transform)
     return key
   }
@@ -8792,8 +8855,14 @@ export class Engine {
     // Per-group StyleUniforms buffers aren't in gpuBuffers (allocated post-load).
     for (const install of inst.styleGroups.values()) this.destroyInstall(install)
     this.modelInstances.delete(name)
+    // Whatever hung from it stands on its own now, at identity — the same
+    // place a detach leaves a model.
+    for (const other of this.modelInstances.values()) {
+      if (other.parent?.model === name) this.setModelParent(other.name, null)
+    }
     this.cullListDirty = true
     this.bundlesDirty = true
+    this.updateOrderDirty = true
   }
 
   getModelNames(): string[] {
@@ -8802,6 +8871,136 @@ export class Engine {
 
   getModel(name: string): Model | null {
     return this.modelInstances.get(name)?.model ?? null
+  }
+
+  /**
+   * Hang a model from a bone of another — MMD's 外部親 (outside parent).
+   *
+   * Every frame, after the parent has been posed and simulated, the child's
+   * root bones are placed at that bone with `offset` composed on top, and only
+   * then is the child posed itself. The placement enters through the child's
+   * BONES rather than its model transform (Model.setRootParent): physics runs
+   * in model space, so a root moved by the transform would have a charm on a
+   * phone strap feel gravity swing with the hand, while a root moved by the
+   * skeleton keeps down down. It also puts the child's own clip on top of the
+   * ride, as MMD does — an umbrella that spins keeps spinning in the hand.
+   *
+   * While attached the child's position and rotation are held at identity and
+   * setModelTransform ignores them; scale still applies, and is folded into
+   * the placement so the offset stays in the parent's units. Detaching leaves
+   * the model at identity until the host places it again.
+   *
+   * A bone the parent lacks rides the parent's root, which is what camera
+   * follow does with an unknown name. Returns false for an unknown model, a
+   * missing parent, or a model asked to ride itself.
+   */
+  setModelParent(
+    name: string,
+    parent: string | null,
+    bone = "全ての親",
+    offset?: { position?: Vec3; rotation?: Quat },
+  ): boolean {
+    const inst = this.modelInstances.get(name)
+    if (!inst) return false
+    if (parent === null) {
+      if (inst.parent) {
+        inst.parent = null
+        inst.model.setRootParent(null)
+        inst.skinMatricesDirty = true
+        this.updateOrderDirty = true
+      }
+      return true
+    }
+    if (parent === name || !this.modelInstances.has(parent)) return false
+    const p = offset?.position ?? new Vec3(0, 0, 0)
+    const r = offset?.rotation ?? Quat.identity()
+    const offsetMatrix = inst.parent?.offsetMatrix ?? new Float32Array(16)
+    Mat4.fromPositionRotationScaleInto(p.x, p.y, p.z, r.x, r.y, r.z, r.w, 1, offsetMatrix)
+    // Identity until the first frame fills it: a physics reset between now and
+    // then re-poses the model, and a zero matrix would fold it to a point.
+    const rootMatrix = inst.parent?.rootMatrix ?? new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
+    inst.parent = { model: parent, bone, offsetMatrix, rootMatrix }
+    inst.model.setPosition(new Vec3(0, 0, 0))
+    inst.model.setRotation(Quat.identity())
+    inst.model.setRootParent(rootMatrix)
+    inst.skinMatricesDirty = true
+    this.updateOrderDirty = true
+    return true
+  }
+
+  /** What a model hangs from, or null. */
+  getModelParent(name: string): ModelAttachment | null {
+    const att = this.modelInstances.get(name)?.parent
+    return att ? { model: att.model, bone: att.bone } : null
+  }
+
+  /**
+   * The root an attached model is posed under this frame: the parent's
+   * placement, its bone as posed and simulated, then the offset.
+   *
+   * The translation is divided by the child's own scale. The skin bake
+   * multiplies the child's scale back on outside the skeleton, and a uniform
+   * scale commutes with the rotation, so this is exactly what lands the child
+   * at the bone in world units while its mesh still comes out scaled.
+   */
+  private placeAttached(inst: ModelInstance): void {
+    const att = inst.parent!
+    const parent = this.modelInstances.get(att.model)
+    if (!parent) {
+      this.setModelParent(inst.name, null)
+      return
+    }
+    const out = att.rootMatrix
+    const tmp = this.attachScratch
+    const root = parent.model.getRootMatrix()
+    const bone = parent.model.getBoneWorldMatrix(att.bone)
+    if (bone) {
+      Mat4.multiplyArrays(root, 0, bone, 0, tmp, 0)
+      Mat4.multiplyArrays(tmp, 0, att.offsetMatrix, 0, out, 0)
+    } else {
+      Mat4.multiplyArrays(root, 0, att.offsetMatrix, 0, out, 0)
+    }
+    const s = inst.model.scale
+    if (s > 0 && s !== 1) {
+      const k = 1 / s
+      out[12] *= k
+      out[13] *= k
+      out[14] *= k
+    }
+  }
+  private readonly attachScratch = new Float32Array(16)
+
+  /** Instances in pose order: a parent before every model hanging from it, so
+   *  a child reads the bone as posed and simulated THIS frame. Insertion order
+   *  otherwise. Rebuilt when a model is added, removed or re-parented. */
+  private updateOrder: ModelInstance[] = []
+  private updateOrderDirty = true
+  private instancesInUpdateOrder(): ModelInstance[] {
+    if (!this.updateOrderDirty) return this.updateOrder
+    const placed = new Set<string>()
+    const order: ModelInstance[] = []
+    let pending = Array.from(this.modelInstances.values())
+    while (pending.length > 0) {
+      const rest: ModelInstance[] = []
+      for (const inst of pending) {
+        const p = inst.parent?.model
+        if (p === undefined || placed.has(p) || !this.modelInstances.has(p)) {
+          order.push(inst)
+          placed.add(inst.name)
+        } else rest.push(inst)
+      }
+      if (rest.length === pending.length) {
+        // A cycle: nothing left can go first. They pose in insertion order and
+        // each reads the other's previous frame, which is the best a cycle gets.
+        console.warn(`[reze] attachment cycle: ${rest.map((r) => r.name).join(" → ")}`)
+        order.push(...rest)
+        break
+      }
+      pending = rest
+    }
+    this.updateOrder = order
+    this.updateOrderDirty = false
+    return order
   }
 
   /**
@@ -8815,8 +9014,11 @@ export class Engine {
     const inst = this.modelInstances.get(name)
     const model = inst?.model
     if (!inst || !model) return
-    if (transform.position) model.setPosition(transform.position)
-    if (transform.rotation) model.setRotation(transform.rotation)
+    // An attached model is placed by its parent's bone; its own position and
+    // rotation are held at identity so the ride is the whole placement (see
+    // setModelParent). Scale and visibility are still its own.
+    if (transform.position && !inst.parent) model.setPosition(transform.position)
+    if (transform.rotation && !inst.parent) model.setRotation(transform.rotation)
     if (transform.scale !== undefined) model.setScale(transform.scale)
     if (transform.visible !== undefined) model.setVisible(transform.visible)
     // The root transform is baked into the skin matrices, so moving a model is a
@@ -8937,7 +9139,7 @@ export class Engine {
 
     for (const inst of this.modelInstances.values()) {
       if (options.modelName !== undefined && inst.name !== options.modelName) continue
-      if (inst.isStage || inst.isPlane) continue
+      if (inst.isStage || inst.isPlane || inst.isProp) continue
       const bones = inst.model.getSkeleton().bones
       this.bonePickScratch = boneMarkerPositions(inst.model, this.bonePickScratch)
       const pos = this.bonePickScratch
@@ -9004,7 +9206,7 @@ export class Engine {
 
     for (const inst of this.modelInstances.values()) {
       if (options.modelName !== undefined && inst.name !== options.modelName) continue
-      if (inst.isStage || inst.isPlane) continue
+      if (inst.isStage || inst.isPlane || inst.isProp) continue
       const model = inst.model
       const { positions } = model.getGeometry()
       const count = positions.length / 3
@@ -9321,12 +9523,18 @@ export class Engine {
   private updateInstances(deltaTime: number): void {
     let animMs = 0
     let physicsMs = 0
-    this.forEachInstance((inst) => {
+    for (const inst of this.instancesInUpdateOrder()) {
       const tAnim = performance.now()
+      // An attached model is placed from its parent's bone as posed and
+      // simulated THIS frame — the order guarantees the parent came first —
+      // and only then posed itself, so its clip and physics ride the placement.
+      const attached = inst.parent !== null
+      if (attached) this.placeAttached(inst)
       // A stage never solves IK — nothing drives its chains — and skips the pose
       // pass entirely while it is idle. Morph changes still come through, since
-      // that is the one thing a stage's controls do move.
-      const stageIdle = (inst.isStage || inst.isPlane) && inst.model.isIdle()
+      // that is the one thing a stage's controls do move. A prop idles the same
+      // way while it stands on its own; hung from a hand it moves every frame.
+      const stageIdle = (inst.isStage || inst.isPlane || inst.isProp) && !attached && inst.model.isIdle()
       let verticesChanged = false
       if (!stageIdle) {
         verticesChanged = inst.model.update(deltaTime, inst.isStage || inst.isPlane ? false : this.ikEnabled)
@@ -9370,7 +9578,7 @@ export class Engine {
         physicsMs += performance.now() - tPhys
       }
       if (inst.vertexBufferNeedsUpdate) this.updateVertexBuffer(inst)
-    })
+    }
     this.frameAnimMsRaw = animMs
     this.framePhysicsMsRaw = physicsMs
     const EMA = 0.1
@@ -10327,6 +10535,7 @@ export class Engine {
     isStage = false,
     isPlane = false,
     dynamicTexture = false,
+    isProp = false,
   ): Promise<void> {
     const vertices = model.getVertices()
     const skinning = model.getSkinning()
@@ -10472,6 +10681,8 @@ export class Engine {
       pickDrawCalls: [],
       isStage,
       isPlane,
+      isProp,
+      parent: null,
       dynamicTexture,
       // Seeded true: the bind pose has to reach the GPU once before any frame.
       skinMatricesDirty: true,
@@ -10500,6 +10711,7 @@ export class Engine {
     this.modelInstances.set(name, inst)
     this.cullListDirty = true
     this.bundlesDirty = true
+    this.updateOrderDirty = true
   }
 
   // Build the per-model GPU vertex-morph state. Returns null (and leaves the model on the
@@ -13882,7 +14094,7 @@ export class Engine {
       // serves.
       let n = 0
       this.forEachInstance((inst) => {
-        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane) return
+        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp) return
         const m = inst.model
         // The model transform is only where the model was PLACED. A motion moves
         // the character by animating bones, so an effect anchored to the

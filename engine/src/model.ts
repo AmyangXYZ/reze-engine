@@ -315,6 +315,38 @@ export class Model {
     this._visible = visible
   }
 
+  /** Hang the rig's root bones from `matrix` (model space, column-major 16
+   *  floats), or from nothing. The engine drives this every frame for an
+   *  attached model; the matrix is read at the next world pass, not copied. */
+  setRootParent(matrix: Float32Array | null): void {
+    this.rootParent = matrix
+    if (matrix) {
+      const root = this.skeleton.bones.find((b) => b.parentIndex < 0)
+      this.primaryRootBind = root ? [root.bindTranslation[0], root.bindTranslation[1], root.bindTranslation[2]] : [0, 0, 0]
+    }
+  }
+
+  getRootParent(): Float32Array | null {
+    return this.rootParent
+  }
+
+  /** The placement matrix (position · rotation · scale) the skin bake composes
+   *  onto every bone. Rebuilt lazily, the way getSkinMatrices does it. */
+  getRootMatrix(): Float32Array {
+    this.refreshRootMatrix()
+    return this.rootMatrixValues
+  }
+
+  private refreshRootMatrix(): void {
+    if (!this.rootMatrixDirty) return
+    const p = this._position, r = this._rotation, s = this._scale
+    Mat4.fromPositionRotationScaleInto(p.x, p.y, p.z, r.x, r.y, r.z, r.w, s, this.rootMatrixValues)
+    this.rootIsIdentity =
+      p.x === 0 && p.y === 0 && p.z === 0 &&
+      r.x === 0 && r.y === 0 && r.z === 0 && r.w === 1 && s === 1
+    this.rootMatrixDirty = false
+  }
+
   private vertexData: Float32Array<ArrayBuffer>
   private baseVertexData: Float32Array<ArrayBuffer> // Original vertex data before morphing
   private vertexCount: number
@@ -383,6 +415,21 @@ export class Model {
   private rootMatrixValues: Float32Array = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
   private rootMatrixDirty: boolean = false
   private rootIsIdentity: boolean = true
+  /** What every parentless bone hangs from — MMD's 外部親 (outside parent).
+   *  Model space, so the pose pipeline, IK and physics all see it: a prop bound
+   *  to a hand is moved by its BONES, and gravity keeps pointing down while the
+   *  hand tilts. Null is the ordinary rig, rooted at the model's own origin.
+   *  Written per frame by the engine from the parent's posed bone; see
+   *  Engine.setModelParent. */
+  private rootParent: Float32Array | null = null
+  /** The bind position of the PRIMARY root — the first parentless bone, 全ての親
+   *  by convention. Under a root parent that bone sits exactly ON the parent
+   *  bone, as MMD's 外部親 does, so its bind position is taken off every root's
+   *  local matrix: the primary lands at the parent, the other roots keep their
+   *  layout relative to it. Without this the MODEL ORIGIN went to the parent
+   *  bone, and a prop rigged with its one bone at the mesh's centre hung that
+   *  far away from the hand. */
+  private primaryRootBind: [number, number, number] = [0, 0, 0]
 
   // Cached skin matrices array to avoid allocations in getSkinMatrices
   private skinMatricesArray?: Float32Array
@@ -984,6 +1031,14 @@ export class Model {
     return this.clipApplySuspended
   }
 
+  /** A bone's posed matrix — model space, column-major, the live array rather
+   *  than a copy. Null for a name this rig does not have. */
+  getBoneWorldMatrix(boneName: string): Float32Array | null {
+    const idx = this.runtimeSkeleton.nameIndex[boneName]
+    if (idx === undefined || idx < 0) return null
+    return this.runtimeSkeleton.worldMatrices[idx].values
+  }
+
   // World bone origin (world matrix col3); unknown name → null
   getBoneWorldPosition(boneName: string): Vec3 | null {
     const idx = this.runtimeSkeleton.nameIndex[boneName]
@@ -1238,14 +1293,7 @@ export class Model {
     const skinMatrices = this.skinMatricesArray
 
     // Rebuild root matrix + cache identity-shortcut flag only when pos/rot changed.
-    if (this.rootMatrixDirty) {
-      const p = this._position, r = this._rotation, s = this._scale
-      Mat4.fromPositionRotationScaleInto(p.x, p.y, p.z, r.x, r.y, r.z, r.w, s, this.rootMatrixValues)
-      this.rootIsIdentity =
-        p.x === 0 && p.y === 0 && p.z === 0 &&
-        r.x === 0 && r.y === 0 && r.z === 0 && r.w === 1 && s === 1
-      this.rootMatrixDirty = false
-    }
+    this.refreshRootMatrix()
 
     if (this.rootIsIdentity) {
       // skinMatrix = worldMatrix × inverseBindMatrix
@@ -2644,6 +2692,12 @@ export class Model {
     if (b.parentIndex >= 0) {
       const parentMat = worldMats[b.parentIndex]
       Mat4.multiplyArrays(parentMat.values, 0, localMVals, 0, worldMat.values, 0)
+    } else if (this.rootParent) {
+      const pr = this.primaryRootBind
+      localMVals[12] -= pr[0]
+      localMVals[13] -= pr[1]
+      localMVals[14] -= pr[2]
+      Mat4.multiplyArrays(this.rootParent, 0, localMVals, 0, worldMat.values, 0)
     } else {
       worldMat.values.set(localMVals)
     }
@@ -2801,6 +2855,8 @@ export class Model {
     // leaving every other bone — the simulated ones above all — untouched.
     const order = subset ?? this.deformOrder
     const count = subset ? subset.length : boneCount
+    const rootParent = this.rootParent
+    const primaryRootBind = this.primaryRootBind
     const override = this.appendRotOverride
     const overrideSet = this.appendRotOverrideSet
     for (let k = 0; k < count; k++) {
@@ -2875,6 +2931,13 @@ export class Model {
       if (b.parentIndex >= 0) {
         const parentMat = worldMats[b.parentIndex]
         Mat4.multiplyArrays(parentMat.values, 0, localMVals, 0, worldMat.values, 0)
+      } else if (rootParent) {
+        // The primary root's bind position comes off every root, so the primary
+        // sits ON the parent bone. See primaryRootBind.
+        localMVals[12] -= primaryRootBind[0]
+        localMVals[13] -= primaryRootBind[1]
+        localMVals[14] -= primaryRootBind[2]
+        Mat4.multiplyArrays(rootParent, 0, localMVals, 0, worldMat.values, 0)
       } else {
         worldMat.values.set(localMVals)
       }
