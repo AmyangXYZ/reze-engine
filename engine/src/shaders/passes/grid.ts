@@ -107,9 +107,12 @@ struct SimU {
  * from", and that place is almost never a texel centre. Point-sampling it is
  * what turns smoke into a staircase.
  */
-export function buildSimShader(wgsl: string, size: number, cast: CastLayout): string {
+export function buildSimShader(wgsl: string, size: number, cast: CastLayout, paramsDecl = ""): string {
   return (
     SIM_UNIFORMS +
+    // The effect's declared dials, ahead of everything that reads them. Empty
+    // when it declared none.
+    paramsDecl +
     /* wgsl */ `
 @group(0) @binding(0) var<uniform> su: SimU;
 @group(0) @binding(1) var _rzGridPrevTex: texture_2d<f32>;

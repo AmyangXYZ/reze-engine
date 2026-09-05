@@ -184,3 +184,17 @@ export {
   type RGBA,
   type Vec3Tuple,
 } from "./overlay"
+
+/**
+ * The WGSL an effect's own source is compiled against — the hashes, the noise,
+ * the falloff, and the Particle struct the particle trio is written in terms of.
+ *
+ * Exported because reze-design renders LIBRARY PREVIEWS by hosting an effect's
+ * source itself, and a preview that reimplements this drifts from the renderer
+ * it is previewing. `rzHash13` meaning one thing on a card and another in the
+ * scene is worse than no card at all — and a preview missing them entirely just
+ * fails to compile, which is a blank card with nothing said anywhere.
+ *
+ * Pure strings, no GPU: importing them costs a host nothing.
+ */
+export { EFFECT_MATH_API, PARTICLE_STRUCT_WGSL } from "./shaders/passes/hosted-api"

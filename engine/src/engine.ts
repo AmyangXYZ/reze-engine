@@ -1271,6 +1271,26 @@ function vertexMorphReach(model: Model): number {
 const TEXTURE_EXTENSION_GUESSES = [".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".spa", ".sph"]
 
 /** One effect's GPU particle pool. Per effect: each declares its own count. */
+/**
+ * The binding number an effect's params take in each pass.
+ *
+ * 7 in the composite, the particle stages and the ribbon pass, which all stop
+ * below it. The GRID reaches 8 on its own, so it takes the next one up rather
+ * than everything else moving to accommodate one mount.
+ */
+const EFFECT_PARAMS_BINDING = 7
+const EFFECT_PARAMS_BINDING_GRID = 9
+
+/** How a mount receives the effect's declared dials: a generator for the struct
+ *  at the binding that mount has free, and the buffer behind it. Null buffer
+ *  means the effect declared none, and then neither the decl nor the binding is
+ *  emitted — WGSL has no empty struct, and a bound buffer nothing reads is a
+ *  layout mismatch. */
+type EffectParamsBinding = {
+  wgsl: (binding: number) => string
+  buffer: GPUBuffer | null
+}
+
 interface EffectParticles {
   count: number
   buffer: GPUBuffer
@@ -1313,6 +1333,9 @@ interface EffectGrid {
   data: Float32Array
   parity: number
   frame: number
+  /** The effect's declared dials, or null. Held HERE as well as on the instance
+   *  because the rebind path rebuilds this bind group from the grid alone. */
+  params: GPUBuffer | null
 }
 
 /**
@@ -3253,7 +3276,13 @@ export class Engine {
    * fail where it was written, it fails at the next submit.
    */
   private gridBindGroup(
-    g: { layout: GPUBindGroupLayout; uniform: GPUBuffer; read: [GPUTextureView, GPUTextureView]; textures: [GPUTexture, GPUTexture] },
+    g: {
+      layout: GPUBindGroupLayout
+      uniform: GPUBuffer
+      read: [GPUTextureView, GPUTextureView]
+      textures: [GPUTexture, GPUTexture]
+      params: GPUBuffer | null
+    },
     i: number,
   ): GPUBindGroup {
     return this.device.createBindGroup({
@@ -3268,6 +3297,9 @@ export class Engine {
         { binding: 6, resource: { buffer: this.compositeUniformBuffer } },
         { binding: 7, resource: { buffer: this.midiBuffer } },
         { binding: 8, resource: { buffer: this.lyricsBuffer } },
+        // The grid is the one pass whose own bindings reach 8, so its params sit
+        // above them rather than everything else shifting for one mount.
+        ...(g.params ? [{ binding: EFFECT_PARAMS_BINDING_GRID, resource: { buffer: g.params } }] : []),
       ],
     })
   }
@@ -3610,9 +3642,19 @@ export class Engine {
         paramsData[slot.offset + 2] = value.z
       }
     }
-    const paramsDecl = entries.length
-      ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(7) var<uniform> params: EffectParams;\n`
-      : ""
+    /**
+     * The params block, at whatever binding the pass asking has free.
+     *
+     * A single hardcoded slot cannot serve every mount — the grid's layout
+     * already reaches binding 8 — so the struct is generated per pass and each
+     * one states the number it can spare. Empty when nothing is declared: WGSL
+     * has no empty struct, and a binding nothing reads is a layout mismatch.
+     */
+    const paramsWgsl = (binding: number) =>
+      entries.length
+        ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(${binding}) var<uniform> params: EffectParams;\n`
+        : ""
+    const paramsDecl = paramsWgsl(EFFECT_PARAMS_BINDING)
 
     // ── Compile with validation captured, not thrown at the console. Line
     // numbers in diagnostics are rebased to the USER's source.
@@ -3720,7 +3762,32 @@ export class Engine {
     let grid: EffectGrid | null = null
     let trails: EffectTrails | null = null
 
+    // PARAMS ARE NOT A FIELD-MOUNT FEATURE, and used to be one by accident.
+    //
+    // `paramsDecl` was spliced into the composite alone, so `#param` worked for
+    // background/foreground and produced "unresolved value 'params'" for every
+    // particle, grid and ribbon effect — which is most of the ones anyone wants
+    // a dial on. Rain's fall speed is the whole example.
+    //
+    // The buffer is created HERE rather than beside the instance it ends up on,
+    // because the mount builders below need to bind it and they run first. That
+    // makes `abandon` its owner: a mount that fails to compile must not leak it.
+    let paramsBuffer: GPUBuffer | null = null
+    if (entries.length) {
+      paramsBuffer = this.device.createBuffer({
+        label: "effect params",
+        size: paramsData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      this.device.queue.writeBuffer(paramsBuffer, 0, paramsData)
+    }
+    /** What every mount splices and binds: a generator for the struct decl at
+     *  the binding that mount has free, and the buffer behind it. The buffer is
+     *  null when nothing is declared, and then no binding is added at all. */
+    const paramsFor: EffectParamsBinding = { wgsl: paramsWgsl, buffer: paramsBuffer }
+
     const abandon = (diagnostics: string[]): EffectResult => {
+      paramsBuffer?.destroy()
       particles?.buffer.destroy()
       particles?.uniform.destroy()
       grid?.textures[0].destroy()
@@ -3730,12 +3797,12 @@ export class Engine {
       return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration }
     }
     if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, d, anchors, alias)
+      const built = await this.buildParticles(wgsl, d, anchors, alias, paramsFor)
       if (!built.ok) return abandon(built.diagnostics)
       particles = built.state
     }
     if (gridEntryPoint(wgsl)) {
-      const built = await this.buildSim(wgsl, d, anchors, alias)
+      const built = await this.buildSim(wgsl, d, anchors, alias, paramsFor)
       if (!built.ok) return abandon(built.diagnostics)
       grid = built.state
     }
@@ -3744,9 +3811,9 @@ export class Engine {
       // bone recorded without one would read zeroes and paint a line to the origin.
       const trailSlots = anchors.filter((a) => a.trail).length
       if (trailSlots === 0) {
-        return { ok: false, diagnostics: ["a ribbon effect needs at least one #anchor <bone> trail"], mounts, params: d.params, duration: d.duration }
+        return abandon(["a ribbon effect needs at least one #anchor <bone> trail"])
       }
-      const built = await this.buildTrails(wgsl, d, anchors, alias)
+      const built = await this.buildTrails(wgsl, d, anchors, alias, paramsFor)
       if (!built.ok) return abandon(built.diagnostics)
       trails = built.state
     }
@@ -3783,15 +3850,6 @@ export class Engine {
         })
       : null
 
-    let paramsBuffer: GPUBuffer | null = null
-    if (entries.length) {
-      paramsBuffer = this.device.createBuffer({
-        label: "effect params",
-        size: paramsData.byteLength,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      })
-      this.device.queue.writeBuffer(paramsBuffer, 0, paramsData)
-    }
     const instance: EffectInstance = {
         wgsl,
         paramDecls: d.params,
@@ -4041,11 +4099,14 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
+    /** The effect's declared dials. Spliced into both stages and bound at 7,
+     *  the same binding the composite gives them. */
+    params: EffectParamsBinding,
   ): Promise<{ ok: true; state: EffectParticles } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
     const count = Math.min(d.particles || 1024, Engine.MAX_PARTICLES)
-    const src = { wgsl, count, blend: d.particleBlend, bloom: d.bloom }
+    const src = { wgsl, count, blend: d.particleBlend, bloom: d.bloom, paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING) }
     // Sparks want to spawn where a trail is, so the particle stages see the same
     // cast buffer the trail draw reads.
     const cast = {
@@ -4110,6 +4171,9 @@ export class Engine {
           // rule and a background read the same instant.
           { binding: 5, visibility, buffer: { type: "read-only-storage" } },
           { binding: 6, visibility, buffer: { type: "read-only-storage" } },
+          // Only when the effect declared any: WGSL has no empty struct, so a
+          // param-less effect must not carry the decl OR the binding.
+          ...(params.buffer ? [{ binding: 7, visibility, buffer: { type: "uniform" as const } }] : []),
         ],
       })
     const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer) =>
@@ -4123,6 +4187,7 @@ export class Engine {
           { binding: 4, resource: { buffer: this.audioBuffer } },
           { binding: 5, resource: { buffer: this.midiBuffer } },
           { binding: 6, resource: { buffer: this.lyricsBuffer } },
+          ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
         ],
       })
 
@@ -4380,6 +4445,8 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
+    /** The effect's declared dials, spliced and bound at 7 as everywhere else. */
+    params: EffectParamsBinding,
   ): Promise<{ ok: true; state: EffectTrails } | { ok: false; diagnostics: string[] }> {
     // `slots` here is how many RIBBONS to draw — one per trailed anchor — which
     // is a different number from the anchor ADDRESS SPACE the accessors index
@@ -4390,7 +4457,7 @@ export class Engine {
     // nothing before: ribbon i was read as anchor slot i.
     const ribbonSlots = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
     const slots = ribbonSlots.length
-    const src = { wgsl, slots, ribbonSlots, blend: d.particleBlend, bloom: d.bloom }
+    const src = { wgsl, slots, ribbonSlots, blend: d.particleBlend, bloom: d.bloom, paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING) }
     const code = buildTrailShader(src, {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
@@ -4434,6 +4501,9 @@ export class Engine {
         { binding: 5, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         // The lyrics, for rzLyric*.
         { binding: 6, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+        ...(params.buffer
+          ? [{ binding: 7, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" as const } }]
+          : []),
       ],
     })
     // TWO targets, the scene pass's own: HDR colour and the aux (bloom mask,
@@ -4486,6 +4556,7 @@ export class Engine {
               { binding: 4, resource: { buffer: this.audioBuffer } },
               { binding: 5, resource: { buffer: this.midiBuffer } },
               { binding: 6, resource: { buffer: this.lyricsBuffer } },
+              ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
             ],
           }),
           mirrorBind: this.device.createBindGroup({
@@ -4497,6 +4568,7 @@ export class Engine {
               { binding: 4, resource: { buffer: this.audioBuffer } },
               { binding: 5, resource: { buffer: this.midiBuffer } },
               { binding: 6, resource: { buffer: this.lyricsBuffer } },
+              ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
             ],
           }),
         },
@@ -4694,6 +4766,8 @@ export class Engine {
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
     alias: number[],
+    /** The effect's declared dials, spliced and bound above the grid's own. */
+    params: EffectParamsBinding,
   ): Promise<{ ok: true; state: EffectGrid } | { ok: false; diagnostics: string[] }> {
     const size = Math.min(d.grid || 256, GRID_MAX)
     const cast = {
@@ -4705,7 +4779,7 @@ export class Engine {
       trailCount: anchors.filter((x) => x.trail).length,
       alias,
     }
-    const code = buildSimShader(wgsl, size, cast)
+    const code = buildSimShader(wgsl, size, cast, params.wgsl(EFFECT_PARAMS_BINDING_GRID))
     const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "grid step", code })
@@ -4733,6 +4807,9 @@ export class Engine {
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        ...(params.buffer
+          ? [{ binding: EFFECT_PARAMS_BINDING_GRID, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" as const } }]
+          : []),
       ],
     })
 
@@ -4766,7 +4843,7 @@ export class Engine {
         return { ok: false, diagnostics: [scoped.message] }
       }
       // One per parity: binds[i] READS textures[i] and WRITES the other.
-      const bindFor = (i: number) => this.gridBindGroup({ layout, uniform, read, textures }, i)
+      const bindFor = (i: number) => this.gridBindGroup({ layout, uniform, read, textures, params: params.buffer }, i)
       return {
         ok: true,
         state: {
@@ -4780,6 +4857,7 @@ export class Engine {
           data: new Float32Array(4),
           parity: 0,
           frame: 0,
+          params: params.buffer,
         },
       }
     } catch (e) {
@@ -9395,6 +9473,59 @@ export class Engine {
     if (!inst) return
     if (inst.hiddenMaterials.has(materialName)) inst.hiddenMaterials.delete(materialName)
     else inst.hiddenMaterials.add(materialName)
+  }
+
+  /**
+   * Push a colour/shading edit straight into a material's own uniform buffer —
+   * the same block createMaterialUniformBuffer wrote at load, offset for
+   * offset. A single write per call, on the fields that actually moved, so
+   * dragging one slider does not touch the other eleven.
+   *
+   * UNGROUPED materials only. A grouped material renders through its style
+   * group's own compiled graph (setupPipelines' neutral/DEFAULT_GRAPH path is
+   * what reads this buffer, and a grouped material never runs it) — the call
+   * still writes the bytes, they are simply never sampled, which would look
+   * like the edit silently failing. Callers check groupsByModel first and this
+   * quietly no-ops rather than assume that check was made, since a document
+   * edit landing to the WRONG channel (the group's own colour input) would be
+   * a worse failure than one that does nothing.
+   *
+   * Structural fields — anything that changes which draw bucket a material is
+   * in, or which texture it binds — are NOT here: alpha crossing the 1.0
+   * opaque/transparent line, edge on/off, a texture swap, all need the draw
+   * list or the bind group rebuilt, not a uniform write. Those get their own
+   * call when something needs them.
+   */
+  setMaterialUniforms(
+    modelName: string,
+    materialName: string,
+    patch: {
+      diffuse?: readonly [number, number, number, number]
+      specular?: readonly [number, number, number]
+      specularPower?: number
+      ambient?: readonly [number, number, number]
+    },
+  ): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    const materials = inst.model.getMaterials()
+    const index = materials.findIndex((m) => m.name === materialName)
+    if (index < 0) return false
+    const buffer = inst.materialUniformBuffers[index]
+    if (!buffer) return false
+    if (patch.diffuse) {
+      this.device.queue.writeBuffer(buffer, 0, new Float32Array(patch.diffuse))
+    }
+    if (patch.ambient) {
+      this.device.queue.writeBuffer(buffer, 16, new Float32Array(patch.ambient))
+    }
+    if (patch.specularPower !== undefined) {
+      this.device.queue.writeBuffer(buffer, 28, new Float32Array([patch.specularPower]))
+    }
+    if (patch.specular) {
+      this.device.queue.writeBuffer(buffer, 32, new Float32Array(patch.specular))
+    }
+    return true
   }
 
   isMaterialVisible(modelName: string, materialName: string): boolean {

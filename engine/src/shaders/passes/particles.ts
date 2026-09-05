@@ -83,6 +83,10 @@ type ParticleSource = {
   blend: ParticleBlend
   /** Feed the bloom pyramid. Off by default — rain should not glow. */
   bloom: boolean
+  /** The effect's `#param` block, or empty. Spliced into BOTH stages: a spawn
+   *  rule reads the same dial the shading does, and rain's fall speed is used
+   *  in the compute half. */
+  paramsDecl: string
 }
 
 /** Bytes per particle. Explicitly padded — see the struct below. */
@@ -165,6 +169,7 @@ export function buildParticleComputeShader(src: ParticleSource, cast: CastLayout
     CAMERA_STRUCT +
     PARTICLE_UNIFORMS +
     `
+${src.paramsDecl}
 @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> pu: ParticleU;
 @group(0) @binding(2) var<uniform> cam: CameraU;
@@ -227,6 +232,7 @@ override ADDITIVE: bool = ${src.blend === "additive" ? "true" : "false"};\n` +
     CAMERA_STRUCT +
     PARTICLE_UNIFORMS +
     `
+${src.paramsDecl}
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<uniform> pu: ParticleU;
 @group(0) @binding(2) var<uniform> cam: CameraU;

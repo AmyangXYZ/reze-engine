@@ -33,6 +33,8 @@ type TrailSource = {
   /** For each ribbon, the LOCAL anchor slot it belongs to. Identity when every
    *  anchor is trailed; otherwise it skips the untrailed ones. */
   ribbonSlots: number[]
+  /** The effect's `#param` block, or empty. */
+  paramsDecl: string
   /** Additive, like most glowing ribbons, or straight alpha. */
   blend: "alpha" | "additive"
   bloom: boolean
@@ -138,6 +140,7 @@ struct TrailU {
   weight: f32,
   _pad2: f32,
 }
+${src.paramsDecl}
 @group(0) @binding(0) var<storage, read> _rzCast: array<vec4f>;
 @group(0) @binding(1) var<uniform> tu: TrailU;
 @group(0) @binding(2) var<uniform> cam: CameraU;
