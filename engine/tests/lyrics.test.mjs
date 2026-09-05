@@ -46,6 +46,19 @@ test("an empty-text stamp closes its predecessor without becoming a line", () =>
   assert.equal(lines[1].start, 30)
 })
 
+test("lines sharing a stamp keep file order and share the window", () => {
+  const lines = parseLRC("[00:14.42]まるで\n[00:14.42]仿佛\n[00:25.25]なんて\n[00:25.25]只是")
+  assert.deepEqual(
+    lines.map((l) => [l.start, l.end, l.text]),
+    [
+      [14.42, 25.25, "まるで"],
+      [14.42, 25.25, "仿佛"],
+      [25.25, 35.25, "なんて"],
+      [25.25, 35.25, "只是"],
+    ],
+  )
+})
+
 test("fractional stamps scale by their digit count", () => {
   assert.equal(parseLRC("[00:01.5]a")[0].start, 1.5)
   assert.equal(parseLRC("[00:01.50]a")[0].start, 1.5)

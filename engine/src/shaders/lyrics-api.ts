@@ -56,10 +56,13 @@ export type LyricRect = [number, number, number, number]
 /**
  * Parse an .lrc file: `[mm:ss.xx]` tags (several per line share the text),
  * an optional `[offset:±ms]` tag, blank-text tags kept as instrumental gaps'
- * end markers. Lines come out sorted; each line's end is the next line's
- * start, and the last line gets a ten-second hold. The offset follows the
- * LRC convention: positive shows lines EARLIER — the knob to turn when the
- * words feel late against this particular rip.
+ * end markers. Lines come out sorted; each line's end is the next LATER
+ * stamp's start, and the last line gets a ten-second hold. Several lines on
+ * one stamp — an original and its translation, the bilingual .lrc idiom —
+ * stay in file order and share the one window, so an effect finds a
+ * translation as the consecutive lines whose start equals the live line's.
+ * The offset follows the LRC convention: positive shows lines EARLIER — the
+ * knob to turn when the words feel late against this particular rip.
  */
 export function parseLRC(source: string): LyricLine[] {
   let offset = 0
@@ -84,7 +87,13 @@ export function parseLRC(source: string): LyricLine[] {
     // An empty-text stamp is an .lrc idiom for "the previous line ends here";
     // it closes its predecessor and is not a line of its own.
     if (stamped[i].text === "") continue
-    const next = stamped[i + 1]
+    // The window closes at the next stamp that is actually LATER. A stamp
+    // shared by an original and its translation is one moment; closing the
+    // first line at the second's start gave it a zero-length window no clock
+    // ever fell inside, and only the translation was ever drawn.
+    let j = i + 1
+    while (j < stamped.length && stamped[j].start <= stamped[i].start) j++
+    const next = stamped[j]
     lines.push({
       start: stamped[i].start,
       end: next ? next.start : stamped[i].start + 10,
