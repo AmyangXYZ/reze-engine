@@ -1493,6 +1493,9 @@ interface EffectInstance {
     /** How many slots it asked for. Its base is assigned by the engine and can
      *  move, which is why it travels in the uniform rather than the shader. */
     count: number
+    /** The effect's declared parameters, or null when it declares none. Kept
+     *  for the same reason `layout` is: `bind` is rebuilt on a buffer swap. */
+    params: GPUBuffer | null
   } | null
   /** The field mount's pipeline and its two parity bind groups, or null when the
    *  effect declares neither background nor foreground. */
@@ -3336,7 +3339,7 @@ export class Engine {
         e.particles.mirrorRenderBind = b.mirrorRenderBind
       }
       if (e.grid) e.grid.binds = [this.gridBindGroup(e.grid, 0), this.gridBindGroup(e.grid, 1)]
-      if (e.lights) e.lights.bind = this.lightEmitBindGroup(e.lights.layout, e.lights.uniform)
+      if (e.lights) e.lights.bind = this.lightEmitBindGroup(e.lights.layout, e.lights.uniform, e.lights.params)
     }
   }
 
@@ -3836,7 +3839,7 @@ export class Engine {
       ])
     }
     if (declaredLights > 0) {
-      const built = await this.buildLightEmit(wgsl, declaredLights, alias, anchors)
+      const built = await this.buildLightEmit(wgsl, declaredLights, alias, anchors, paramsFor)
       if (!built.ok) return abandon(built.diagnostics)
       lights = built.state
     }
@@ -4277,6 +4280,7 @@ export class Engine {
     count: number,
     alias: number[],
     anchors: { bone: string; trail: boolean }[],
+    params: EffectParamsBinding,
   ): Promise<{ ok: true; state: NonNullable<EffectInstance["lights"]> } | { ok: false; diagnostics: string[] }> {
     const layout = this.device.createBindGroupLayout({
       label: "light emit layout",
@@ -4288,13 +4292,21 @@ export class Engine {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        ...(params.buffer
+          ? [{ binding: EFFECT_PARAMS_BINDING, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" as const } }]
+          : []),
       ],
     })
     const module = this.device.createShaderModule({
       label: "light emit",
       // The same scene API and the same per-effect anchor alias its drawing
       // half gets, so a lamp reads the cast exactly as the beam that paints it.
-      code: buildLightEmitShader(wgsl, EFFECT_SCENE_API + anchorAliasWgsl(alias), { trailCount: anchors.filter((a) => a.trail).length }),
+      code: buildLightEmitShader(
+        wgsl,
+        EFFECT_SCENE_API + anchorAliasWgsl(alias),
+        { trailCount: anchors.filter((a) => a.trail).length },
+        params.wgsl(EFFECT_PARAMS_BINDING),
+      ),
     })
     const info = await module.getCompilationInfo()
     const diagnostics = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`)
@@ -4316,15 +4328,15 @@ export class Engine {
       uniform.destroy()
       return { ok: false, diagnostics: [scoped.message] }
     }
-    const bind = this.lightEmitBindGroup(layout, uniform)
+    const bind = this.lightEmitBindGroup(layout, uniform, params.buffer)
     // The layout travels with the state so the emitter can be rebound when a
     // shared buffer under it is replaced — see rebindSharedBuffers.
-    return { ok: true, state: { pipeline, bind, layout, uniform, data, count } }
+    return { ok: true, state: { pipeline, bind, layout, uniform, data, count, params: params.buffer } }
   }
 
   /** The light emitter's bind group. One author, for the reason gridBindGroup
    *  gives: it is built once and rebuilt on every shared-buffer swap. */
-  private lightEmitBindGroup(layout: GPUBindGroupLayout, uniform: GPUBuffer): GPUBindGroup {
+  private lightEmitBindGroup(layout: GPUBindGroupLayout, uniform: GPUBuffer, params: GPUBuffer | null): GPUBindGroup {
     return this.device.createBindGroup({
       label: "light emit bind",
       layout,
@@ -4336,6 +4348,7 @@ export class Engine {
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.midiBuffer } },
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
+        ...(params ? [{ binding: EFFECT_PARAMS_BINDING, resource: { buffer: params } }] : []),
       ],
     })
   }

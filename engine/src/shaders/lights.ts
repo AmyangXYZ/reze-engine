@@ -127,6 +127,7 @@ export function buildLightEmitShader(
   wgsl: string,
   sceneApi: string,
   cast: { trailCount: number },
+  paramsDecl = "",
 ): string {
   return /* wgsl */ `
 // read_write HERE and read-only in the material shaders. Different passes, so
@@ -164,6 +165,10 @@ ${trailSlotsApi(cast.trailCount)}
 // The id accessors, stubbed: this module cannot read an attachment the
 // scene pass writes. See id-api.ts — the author's whole file compiles here.
 ${idApi(false, 0, 0) + castDistanceStub()}
+// The dials the author declared, if any. A lamp is exactly the thing someone
+// retunes — its colour and its reach — so an emitter reads params like every
+// other mount rather than being the one place a #param resolves to nothing.
+${paramsDecl}
 ${wgsl}
 
 @compute @workgroup_size(64)
