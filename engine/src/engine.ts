@@ -7695,17 +7695,23 @@ export class Engine {
   /** Bind camera orbit center to a model's bone (Souls-style follow cam). Pass null to unbind. */
   setCameraTarget(model: Model | null, boneName: string, offset?: Vec3): void
   setCameraTarget(modelOrVec: Model | Vec3 | null, boneName?: string, offset?: Vec3): void {
+    // panLocked tracks the BINDING, on every path that changes it — a target
+    // set to a fixed point is pannable again, and forgetting it here is how the
+    // pan stays dead after the follow was turned off. See Camera.panLocked.
     if (modelOrVec === null) {
+      this.camera.panLocked = false
       this.cameraTargetModel = null
       return
     }
     if ("x" in modelOrVec && "y" in modelOrVec && "z" in modelOrVec) {
+      this.camera.panLocked = false
       this.cameraTargetModel = null
       this.camera.target.x = modelOrVec.x
       this.camera.target.y = modelOrVec.y
       this.camera.target.z = modelOrVec.z
       return
     }
+    this.camera.panLocked = true
     this.cameraTargetModel = modelOrVec
     this.cameraTargetBoneName = boneName ?? ""
     this.cameraTargetOffset.x = offset?.x ?? 0
@@ -7715,6 +7721,9 @@ export class Engine {
 
   /** Souls-style follow cam: orbit center tracks a model bone each frame. Shorthand for setCameraTarget(model, boneName, offset). */
   setCameraFollow(model: Model | null, boneName?: string, offset?: Vec3, smoothing?: number): void {
+    // Panning sets the very thing the follow overwrites each frame, so it is
+    // refused for as long as the shot is riding a bone. See Camera.panLocked.
+    this.camera.panLocked = model !== null
     if (model === null) {
       this.cameraTargetModel = null
       return

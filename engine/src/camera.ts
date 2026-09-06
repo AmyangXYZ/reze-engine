@@ -44,6 +44,16 @@ export class Camera {
   // Input state
   private canvas: HTMLCanvasElement | null = null
   private inputLocked: boolean = false
+  /**
+   * Panning is refused while the orbit rides a bone (Engine.setCameraFollow).
+   *
+   * A pan moves `target`, and the follow rewrites `target` from the bone every
+   * frame — so the drag was already going nowhere, it just spent a frame
+   * fighting for it and read as the camera stuttering under the pointer.
+   * Refusing it says the same thing the follow already means: while the shot is
+   * on somebody, where it points is theirs to decide.
+   */
+  panLocked: boolean = false
   private isDragging: boolean = false
   private mouseButton: number | null = null // Track which mouse button is pressed (0 = left, 2 = right)
   private lastMousePos = { x: 0, y: 0 }
@@ -430,7 +440,7 @@ export class Camera {
 
     if (this.mouseButton === 2) {
       // Right-click: pan the camera target
-      this.panCamera(deltaX, deltaY)
+      if (!this.panLocked) this.panCamera(deltaX, deltaY)
     } else {
       // Left-click (or default): rotate the camera
       this.alpha += deltaX * this.angularSensitivity
@@ -549,7 +559,7 @@ export class Camera {
       if (isPanGesture) {
         // Primary gesture is pan (two-finger drag)
         // Use panning similar to right-click pan
-        this.panCamera(midpointDeltaX, midpointDeltaY)
+        if (!this.panLocked) this.panCamera(midpointDeltaX, midpointDeltaY)
       }
 
       // Update tracking values
