@@ -1356,6 +1356,13 @@ interface EffectTrails {
   bind: GPUBindGroup
   /** The mirrored camera's view of the same ribbons — the floor mirror's. */
   mirrorBind: GPUBindGroup
+  /** The effect's declared parameters, or null when it declares none.
+   *
+   *  Kept for the same reason `layout` is: both bind groups are REBUILT on every
+   *  resize (rebindTrails), and a rebuild that cannot name this buffer produces
+   *  a group with one entry fewer than the layout it is validated against. The
+   *  lights mount had the identical hole; see setCameraFollow's note. */
+  params: GPUBuffer | null
 }
 
 /**
@@ -4556,6 +4563,8 @@ export class Engine {
           // baked here — it follows the live subject count and is computed per
           // draw (see drawTrails).
           slots,
+          // Travels with the state so rebindTrails can name it again on a resize.
+          params: params.buffer,
           uniform,
           data: new Float32Array(4),
           pipeline,
@@ -4728,6 +4737,11 @@ export class Engine {
     for (const e of this.effects) {
     const t = e.trails
     if (!t) continue
+    // The params binding is part of the LAYOUT whenever the effect declared
+    // one, so it has to be part of every group built against that layout —
+    // including this one. Omitting it here is not a missing uniform, it is a
+    // group WebGPU refuses outright, which takes the whole frame down.
+    const paramsEntry = t.params ? [{ binding: EFFECT_PARAMS_BINDING, resource: { buffer: t.params } }] : []
     t.bind = this.device.createBindGroup({
       layout: t.layout,
       entries: [
@@ -4737,6 +4751,7 @@ export class Engine {
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.midiBuffer } },
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
+        ...paramsEntry,
       ],
     })
     t.mirrorBind = this.device.createBindGroup({
@@ -4748,6 +4763,7 @@ export class Engine {
         { binding: 4, resource: { buffer: this.audioBuffer } },
         { binding: 5, resource: { buffer: this.midiBuffer } },
         { binding: 6, resource: { buffer: this.lyricsBuffer } },
+        ...paramsEntry,
       ],
     })
     }
