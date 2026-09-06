@@ -1278,6 +1278,25 @@ const TEXTURE_EXTENSION_GUESSES = [".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dd
  * below it. The GRID reaches 8 on its own, so it takes the next one up rather
  * than everything else moving to accommodate one mount.
  */
+/**
+ * One parameter's value for the uniform: what the caller passed, or what the
+ * source declared.
+ *
+ * A colour is written `#rrggbb` in the directive and reaches the GPU as three
+ * floats. Plain byte scaling, NOT an sRGB decode — the shader multiplies these
+ * against a texture that is itself sampled as sRGB, so decoding here would
+ * darken every authored colour by the transfer curve twice.
+ */
+function paramValue(p: EffectParamDecl, given: EffectParamValue | undefined): EffectParamValue {
+  if (given !== undefined) return given
+  if (p.kind === "color" && typeof p.value === "string") {
+    const n = parseInt(p.value.slice(1), 16)
+    return { x: ((n >> 16) & 255) / 255, y: ((n >> 8) & 255) / 255, z: (n & 255) / 255 }
+  }
+  if (Array.isArray(p.value)) return { x: p.value[0], y: p.value[1], z: p.value[2] }
+  return typeof p.value === "number" ? p.value : 0
+}
+
 const EFFECT_PARAMS_BINDING = 7
 const EFFECT_PARAMS_BINDING_GRID = 9
 
@@ -3627,19 +3646,35 @@ export class Engine {
     // Fields are emitted in declaration order; offsets follow WGSL's natural
     // uniform rules (f32 align 4, vec3f align 16 size 12), computed identically
     // on both sides so no reordering is needed.
-    const entries = Object.entries(params ?? {})
+    //
+    // THE SOURCE DECIDES THE STRUCT, and the caller only supplies values.
+    //
+    // This used to read `Object.entries(params ?? {})`, which made the struct a
+    // property of the CALL rather than of the shader: install the same source
+    // without a params object and every `params.X` in it became an unresolved
+    // identifier. Two callers installing one effect two ways is how an effect
+    // compiled in the scene and failed in the editor that was editing it.
+    //
+    // The directives are already parsed — `d.params` is returned in the result —
+    // so they are what the struct is built from. A value the caller passes wins
+    // over the declared default; a name it passes that the source never declared
+    // is ignored, because a field nothing reads is a binding nothing reads.
+    const entries: [string, EffectParamValue][] = d.params.map((p) => [p.name, paramValue(p, params?.[p.name])])
     const layout = new Map<string, { offset: number; comps: 1 | 3 }>()
     const fields: string[] = []
     let cursor = 0
-    for (const [name, value] of entries) {
-      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
-        return { ok: false, diagnostics: [`invalid param name "${name}" (must be a WGSL identifier)`], mounts, params: d.params, duration: d.duration }
+    for (const p of d.params) {
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(p.name)) {
+        return { ok: false, diagnostics: [`invalid param name "${p.name}" (must be a WGSL identifier)`], mounts, params: d.params, duration: d.duration }
       }
-      const isVec = typeof value !== "number"
+      // KIND comes from the declaration, never from the runtime type of the
+      // value: a caller handing a number to a colour must not silently turn a
+      // vec3f field into an f32 and shift every field after it.
+      const isVec = p.kind !== "float"
       const align = isVec ? 16 : 4
       const offset = Math.ceil(cursor / align) * align
-      layout.set(name, { offset: offset / 4, comps: isVec ? 3 : 1 })
-      fields.push(`  ${name}: ${isVec ? "vec3f" : "f32"},`)
+      layout.set(p.name, { offset: offset / 4, comps: isVec ? 3 : 1 })
+      fields.push(`  ${p.name}: ${isVec ? "vec3f" : "f32"},`)
       cursor = offset + (isVec ? 12 : 4)
     }
     const paramsData = new Float32Array(Math.max(4, Math.ceil(cursor / 16) * 4))
