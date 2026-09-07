@@ -96,6 +96,11 @@ type CompositeEffectSource = {
   hasBackground: boolean
   /** Defines `fn foreground(...)` — mount over the finished frame. */
   hasForeground: boolean
+  /** Calls rzSceneFrame — a FILTER, which carries the layers it read forward
+   *  (buildFieldShader) and so draws with blending off. */
+  filter?: boolean
+  /** `#layer additive`: how a filter's own output joins the layers it carries. */
+  additiveLayer?: boolean
   /** Grid resolution when the effect declared `#grid`, else 0. */
   gridSize: number
   /** Whether the scene pass carries the id attachment, so the field module can
@@ -146,7 +151,8 @@ override APPLY_GAMMA: bool = true;
 //            and no on/off uniform either: the pipeline is REBUILT per effect, so
 //            the compiled variant IS the flag.
 // viewU[3] = (camera right, tanHalfFov·aspect); viewU[4] = (camera up, tanHalfFov);
-// viewU[5] = (camera forward, _) — refreshed per frame while skybox/effect active.
+// viewU[5] = (camera forward, half pair consumed by a filter this frame) — refreshed
+//            per frame while skybox/effect active.
 // viewU[6] = (time seconds, view transform id, canvas width, canvas height).
 // viewU[7] = (grade offset.rgb, contrast);  viewU[8] = (grade power.rgb, saturation);
 // viewU[9] = (grade slope.rgb, grade on/off) — see grade() below.
@@ -605,7 +611,8 @@ const BACKGROUND_CALL = /* wgsl */ `
     // straight form it replaced.
     let bgFx = rzFieldMerge(
       clamp(textureSampleLevel(fieldBgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)),
-      clamp(textureSampleLevel(fieldBgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)));
+      // The half pair, unless a filter consumed it this frame (viewU[5].w).
+      clamp(textureSampleLevel(fieldBgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)) * (1.0 - viewU[5].w));
     bgPm = bgFx.rgb + bgPm * (1.0 - bgFx.a);
     bgA = bgFx.a + bgA * (1.0 - bgFx.a);
 `
@@ -617,7 +624,7 @@ const FOREGROUND_CALL = /* wgsl */ `
   // Premultiplied, as the background layer above — same reason.
   let fgFx = rzFieldMerge(
     clamp(textureSampleLevel(fieldFgTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)),
-    clamp(textureSampleLevel(fieldFgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)));
+    clamp(textureSampleLevel(fieldFgHalfTex, bloomSamp, fragCoord.xy / fullSz, 0.0), vec4f(0.0), vec4f(1.0)) * (1.0 - viewU[5].w));
   outRgb = fgFx.rgb + outRgb * (1.0 - fgFx.a);
   outA = fgFx.a + outA * (1.0 - fgFx.a);
 `
@@ -670,6 +677,16 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
   const fgLine = effect.hasForeground
     ? "out.fg = clamp(foreground(dir, uv, _rzFieldClock.x, linearDepth(vec2<i32>(min(fx, fullSz - 1.0)))), vec4f(0.0), vec4f(1.0));"
     : ""
+  // A FILTER read the other effects' layers through rzSceneFrame and now
+  // carries them: its own output goes over (or adds to) what they drew, and
+  // the pipeline writes the result with blending off. Weight has already
+  // scaled its alpha, so a filter faded to nothing passes the layers through
+  // untouched.
+  const carry = effect.filter
+    ? effect.additiveLayer
+      ? "out.bg = _rzCarryAdd(out.bg, _rzLayerBg(uv));\n  out.fg = _rzCarryAdd(out.fg, _rzLayerFg(uv));"
+      : "out.bg = _rzCarryOver(out.bg, _rzLayerBg(uv));\n  out.fg = _rzCarryOver(out.fg, _rzLayerFg(uv));"
+    : ""
   return (
     COMPOSITE_HEAD +
     EFFECT_SCENE_API +
@@ -692,7 +709,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     // texel is CAST_FIELD_DIV of them and the accessor scales on the way out.
     // An author writes the width they mean and never learns how it is built.
     castDistanceApi(0, 26, 18, CAST_FIELD_DIV) +
-    sceneTapApi(0, 27, 28) +
+    sceneTapApi(0, 27, 28, [29, 30, 31, 32]) +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
     "\n" +
@@ -710,6 +727,15 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
  * about what time it was. One buffer per effect, one answer.
  */
 @group(0) @binding(22) var<uniform> _rzFieldClock: vec4f;   // (time, weight, _, _)
+
+/** A filter's own straight-alpha output over the premultiplied layers it read
+ *  (the layer blend state, restated) and the additive form of the same. */
+fn _rzCarryOver(own: vec4f, under: vec4f) -> vec4f {
+  return vec4f(own.rgb * own.a + under.rgb * (1.0 - own.a), own.a + under.a * (1.0 - own.a));
+}
+fn _rzCarryAdd(own: vec4f, under: vec4f) -> vec4f {
+  return vec4f(own.rgb * own.a + under.rgb, own.a + under.a);
+}
 
 @vertex fn fieldVs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let x = f32((vi & 1u) << 2u) - 1.0;
@@ -740,6 +766,7 @@ struct FieldOut {
   // Scaling colour as well would fade as the square.
   out.bg.a *= _rzFieldClock.y;
   out.fg.a *= _rzFieldClock.y;
+  ${carry}
   return out;
 }
 `

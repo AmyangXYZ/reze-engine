@@ -44,10 +44,41 @@
  * Clamp-to-edge is what stops a warped offset wrapping the far side of the
  * screen into the picture.
  */
-export function sceneTapApi(group: number, tex: number, samp: number): string {
+export function sceneTapApi(
+  group: number,
+  tex: number,
+  samp: number,
+  layers: readonly [number, number, number, number],
+): string {
   return /* wgsl */ `
 @group(${group}) @binding(${tex}) var _rzSceneTex: texture_2d<f32>;
 @group(${group}) @binding(${samp}) var _rzSceneSamp: sampler;
+// The field layers as the other effects left them — see rzSceneFrame. Bound to
+// the pair the others drew into for a filter, and to a 1x1 transparent for
+// everything else: an effect cannot sample the pair it is drawing into.
+@group(${group}) @binding(${layers[0]}) var _rzLayerBgFull: texture_2d<f32>;
+@group(${group}) @binding(${layers[1]}) var _rzLayerFgFull: texture_2d<f32>;
+@group(${group}) @binding(${layers[2]}) var _rzLayerBgHalf: texture_2d<f32>;
+@group(${group}) @binding(${layers[3]}) var _rzLayerFgHalf: texture_2d<f32>;
+
+/** Premultiplied OVER, top in front — the composite's rzFieldMerge, restated so
+ *  this file keeps importing nothing. A resolution boundary is a layer
+ *  boundary: full res over half, exactly as the composite reads them. */
+fn _rzLayerOver(top: vec4f, bot: vec4f) -> vec4f {
+  return vec4f(top.rgb + bot.rgb * (1.0 - top.a), top.a + bot.a * (1.0 - top.a));
+}
+fn _rzLayerBg(uv: vec2f) -> vec4f {
+  let p = _rzTapUv(uv);
+  return _rzLayerOver(
+    clamp(textureSampleLevel(_rzLayerBgFull, _rzSceneSamp, p, 0.0), vec4f(0.0), vec4f(1.0)),
+    clamp(textureSampleLevel(_rzLayerBgHalf, _rzSceneSamp, p, 0.0), vec4f(0.0), vec4f(1.0)));
+}
+fn _rzLayerFg(uv: vec2f) -> vec4f {
+  let p = _rzTapUv(uv);
+  return _rzLayerOver(
+    clamp(textureSampleLevel(_rzLayerFgFull, _rzSceneSamp, p, 0.0), vec4f(0.0), vec4f(1.0)),
+    clamp(textureSampleLevel(_rzLayerFgHalf, _rzSceneSamp, p, 0.0), vec4f(0.0), vec4f(1.0)));
+}
 
 /** uv as the mount gives it (y=0 at the BOTTOM, the shadertoy convention the
  *  composite documents) turned into a texture coordinate (y=0 at the top).
@@ -176,25 +207,40 @@ fn rzSceneDisplay(uv: vec2f) -> vec3f {
 }
 
 /**
- * The finished pixel: the scene over its background, exactly as the composite
- * would lay it down. One call, and the answer already carries the ground's
- * fade, its opacity, and the background showing through both.
+ * The frame as it stands: the scene over its background, and both layers of
+ * every other field effect, laid down in the order the composite would lay
+ * them. One call, and the answer already carries the ground's fade, its
+ * opacity, the background showing through both, and whatever the other
+ * effects drew — a waveform, a caption, a glow.
  *
- * This is what a FILTER wants — anything re-rendering the whole frame on a tube
- * or a low-resolution screen. Reaching for rzSceneDisplay and a depth test
- * instead rebuilds this by hand and gets it wrong in one specific way every
- * time: coverage is not a yes or no, and treating it as one turns every soft
- * edge in the scene into a hard one.
+ * CALLING THIS MAKES THE EFFECT A FILTER. A filter runs after every other
+ * field effect, at full resolution, and what it returns replaces the layers it
+ * read: its own output is composed over them in its pass (buildFieldShader),
+ * so nothing drawn before it is lost and nothing is drawn twice. Two filters
+ * run in document order, each reading the one before. The layers are a
+ * pass-order fact — a filter reads the pair the others drew into while it
+ * draws into a page of its own (renderFieldPass).
  *
- * NOT INCLUDED: depth of field, background effects, and an equirect background
- * (a 360 dome reads as its average rather than its texture). Foregrounds compose
- * after this in any case.
+ * This is what a FILTER wants — anything re-rendering the whole frame on a
+ * tube, a low-resolution screen, or a card. Reaching for rzSceneDisplay and a
+ * depth test instead rebuilds this by hand and gets it wrong in one specific
+ * way every time: coverage is not a yes or no, and treating it as one turns
+ * every soft edge in the scene into a hard one.
+ *
+ * NOT INCLUDED: depth of field, and an equirect background (a 360 dome reads
+ * as its average rather than its texture).
  */
 fn rzSceneFrame(uv: vec2f) -> vec3f {
   let a = clamp(rzSceneAlpha(uv), 0.0, 1.0);
   let bg = viewU[2];
-  let bgRgb = bg.rgb * select(0.0, 1.0, bg.w > 0.5);
-  return rzSceneDisplay(uv) * a + bgRgb * (1.0 - a);
+  let bgA = select(0.0, 1.0, bg.w > 0.5);
+  // The background layer over the base, the scene over both, the foreground
+  // layer over the frame — the composite's own order.
+  let lb = _rzLayerBg(uv);
+  let under = lb.rgb + bg.rgb * bgA * (1.0 - lb.a);
+  let frame = rzSceneDisplay(uv) * a + under * (1.0 - a);
+  let lf = _rzLayerFg(uv);
+  return lf.rgb + frame * (1.0 - lf.a);
 }
 
 /**

@@ -1523,10 +1523,16 @@ interface EffectInstance {
      *  for the same reason `layout` is: `bind` is rebuilt on a buffer swap. */
     params: GPUBuffer | null
   } | null
-  /** The field mount's pipeline and its two parity bind groups, or null when the
-   *  effect declares neither background nor foreground. */
+  /** The field mount's pipeline and its bind groups, or null when the effect
+   *  declares neither background nor foreground. */
   fieldPipeline: GPURenderPipeline | null
-  fieldBindGroups: [GPUBindGroup, GPUBindGroup] | null
+  /** Two for a plain effect, one per grid parity. Eight for a filter — which
+   *  page it reads, whether it absorbs the half pair, grid parity — in
+   *  Engine.filterBindIndex order. */
+  fieldBindGroups: GPUBindGroup[] | null
+  /** Calls rzSceneFrame: runs after every other field effect, at full
+   *  resolution, reading their layers and carrying them forward. */
+  filter: boolean
   /** Which resolution pair this effect draws into: 0 full, 1 half. Its own
    *  declaration, not the scene's — see Engine.FIELD_SCALES. */
   fieldLayer: number
@@ -1932,6 +1938,13 @@ export class Engine {
   private fieldBgViews: (GPUTextureView | null)[] = [null, null]
   private fieldFgTextures: (GPUTexture | null)[] = [null, null]
   private fieldFgViews: (GPUTextureView | null)[] = [null, null]
+  /** The filter's page: a second full-res pair, so a filter can read the pair
+   *  the other effects drew into while it draws. Held only while a filter is
+   *  installed — see ensureFilterPage. */
+  private fieldPageBgTexture: GPUTexture | null = null
+  private fieldPageFgTexture: GPUTexture | null = null
+  private fieldPageBgView: GPUTextureView | null = null
+  private fieldPageFgView: GPUTextureView | null = null
   /** One per scale: the field shader reconstructs the full-res pixel it stands
    *  in for, so each pass needs its own (w, h, fullW, fullH). */
   private fieldUniformBuffers: GPUBuffer[] = []
@@ -3240,6 +3253,55 @@ export class Engine {
         new Float32Array([w, h, this.fieldFullW, this.fieldFullH]),
       )
     }
+    this.ensureFilterPage()
+  }
+
+  /**
+   * The filter's page, held only while a filter is installed.
+   *
+   * A full-res rgba16f pair is real memory — two 16MB targets at 1080p, four
+   * times that at 4K — and most scenes never install a filter. Created here
+   * and on resize, released the moment the last filter goes. Sized off the
+   * full pair, which is what a filter reads and what the composite reads back.
+   */
+  private ensureFilterPage(): void {
+    const wanted = !!this.device && this.fieldFullW > 0 && this.effects.some((e) => e.filter)
+    const w = Math.max(1, this.fieldFullW)
+    const h = Math.max(1, this.fieldFullH)
+    if (wanted && this.fieldPageBgTexture?.width === w && this.fieldPageBgTexture.height === h) return
+    this.fieldPageBgTexture?.destroy()
+    this.fieldPageFgTexture?.destroy()
+    this.fieldPageBgTexture = null
+    this.fieldPageFgTexture = null
+    this.fieldPageBgView = null
+    this.fieldPageFgView = null
+    if (!wanted) return
+    const make = (label: string) =>
+      this.device.createTexture({
+        label,
+        size: [w, h],
+        format: "rgba16float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+    this.fieldPageBgTexture = make("field layer page (background)")
+    this.fieldPageFgTexture = make("field layer page (foreground)")
+    this.fieldPageBgView = this.fieldPageBgTexture.createView()
+    this.fieldPageFgView = this.fieldPageFgTexture.createView()
+  }
+
+  /** Filters drawn this frame — the predicate renderFieldPass runs them by,
+   *  shared with the composite uniform that says the half pair was consumed. */
+  private filtersDrawn(): number {
+    if (!this.fieldPageBgView || !this.fieldPageFgView) return 0
+    let n = 0
+    for (const e of this.effects) if (e.filter && e.fieldPipeline && e.fieldBindGroups && e.weight > 0) n++
+    return n
+  }
+
+  /** Which of a filter's eight bind groups: the page it reads (0 the plain
+   *  pair, 1 the filter page), whether it absorbs the half pair, grid parity. */
+  private static filterBindIndex(readPage: 0 | 1, absorbHalf: boolean, gridParity: number): number {
+    return (readPage * 2 + (absorbHalf ? 1 : 0)) * 2 + gridParity
   }
 
   /**
@@ -3255,7 +3317,11 @@ export class Engine {
     // Captured, so the null guards above survive into the closure.
     const depth = this.depthReadView
     const bloom = this.compositeBloomView
-    const build = (owner: EffectInstance, grid: GPUTextureView) =>
+    const build = (
+      owner: EffectInstance,
+      grid: GPUTextureView,
+      layers: readonly [GPUTextureView, GPUTextureView, GPUTextureView, GPUTextureView],
+    ) =>
       this.device.createBindGroup({
         label: "field layer bind group",
         layout: this.fieldBindGroupLayout,
@@ -3278,6 +3344,11 @@ export class Engine {
           { binding: 26, resource: this.castDistView ?? this.castDistFallbackView! },
           { binding: 27, resource: this.hdrResolveTexture.createView() },
           { binding: 28, resource: this.simSampler },
+          // The other effects' layers, for rzSceneFrame — see the loop below.
+          { binding: 29, resource: layers[0] },
+          { binding: 30, resource: layers[1] },
+          { binding: 31, resource: layers[2] },
+          { binding: 32, resource: layers[3] },
           { binding: 2, resource: this.bloomSampler },
           { binding: 5, resource: this.filmicLutView },
           { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
@@ -3287,10 +3358,27 @@ export class Engine {
       })
     // Per effect: the params buffer and the grid are both its own, so two
     // effects cannot share a bind group even when everything else matches.
+    // What a filter reads, by variant. A plain effect draws into the pair it
+    // would otherwise read, so it gets the transparent 1x1 at every layer slot
+    // and rzSceneFrame answers the scene alone.
+    const none = this.trailFallbackView
+    const pairA: [GPUTextureView, GPUTextureView] = [this.fieldBgViews[0] ?? none, this.fieldFgViews[0] ?? none]
+    const page: [GPUTextureView, GPUTextureView] = [this.fieldPageBgView ?? none, this.fieldPageFgView ?? none]
+    const half: [GPUTextureView, GPUTextureView] = [this.fieldBgViews[1] ?? none, this.fieldFgViews[1] ?? none]
     for (const e of this.effects) {
-      e.fieldBindGroups = e.grid
-        ? [build(e, e.grid.read[0]), build(e, e.grid.read[1])]
-        : [build(e, this.simFallbackView), build(e, this.simFallbackView)]
+      const grids = e.grid ? [e.grid.read[0], e.grid.read[1]] : [this.simFallbackView, this.simFallbackView]
+      if (!e.filter) {
+        e.fieldBindGroups = grids.map((g) => build(e, g, [none, none, none, none]))
+        continue
+      }
+      // Eight, in filterBindIndex order: read page × absorbs half × grid parity.
+      const groups: GPUBindGroup[] = []
+      for (const read of [pairA, page]) {
+        for (const h of [[none, none], half] as [GPUTextureView, GPUTextureView][]) {
+          for (const g of grids) groups.push(build(e, g, [read[0], read[1], h[0], h[1]]))
+        }
+      }
+      e.fieldBindGroups = groups
     }
   }
 
@@ -3710,8 +3798,14 @@ export class Engine {
     const gridSize = gridEntryPoint(wgsl) ? Math.min(d.grid || 256, GRID_MAX) : 0
     // `alias` goes in: a field effect reads bones through _rzSlot exactly as a
     // particle one does, and it was the only module never handed the mapping.
+    // A FILTER by what it calls, like every other mount property. rzSceneFrame
+    // answers the frame with the other effects' layers in it, which is only
+    // possible from a pass that runs after theirs — see renderFieldPass.
+    const filter = (hasBackground || hasForeground) && /\brzSceneFrame\s*\(/.test(wgsl)
     const fieldEffect =
-      hasBackground || hasForeground ? { wgsl, paramsDecl, hasBackground, hasForeground, gridSize, alias, trailCount: anchors.filter((a) => a.trail).length } : null
+      hasBackground || hasForeground
+        ? { wgsl, paramsDecl, hasBackground, hasForeground, gridSize, alias, trailCount: anchors.filter((a) => a.trail).length, filter, additiveLayer: d.additiveLayer }
+        : null
     const source = buildCompositeShader(fieldEffect)
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
@@ -3752,10 +3846,15 @@ export class Engine {
             // the premultiplication happens here, and the composite reads it
             // back knowing that. With one effect over a cleared target the
             // result is identical to the replace it used to do.
-            targets: [
-              { format: "rgba16float", blend: layerBlend },
-              { format: "rgba16float", blend: layerBlend },
-            ],
+            // A filter composes over the layers in its own shader and writes
+            // the result outright: blending would layer it onto a page that
+            // holds nothing.
+            targets: filter
+              ? [{ format: "rgba16float" }, { format: "rgba16float" }]
+              : [
+                  { format: "rgba16float", blend: layerBlend },
+                  { format: "rgba16float", blend: layerBlend },
+                ],
           },
           primitive: { topology: "triangle-list" },
           multisample: { count: 1 },
@@ -3937,7 +4036,10 @@ export class Engine {
         // against 4.5ms). It is the right call for a soft additive glow, which
         // upsamples invisibly — and it is now a claim an author makes about
         // their own effect rather than a fate that befalls one.
-        fieldLayer: d.fieldLayer,
+        // A filter holds every other effect's pixels, so it holds them at full
+        // resolution whatever it declared for itself.
+        fieldLayer: filter ? 0 : d.fieldLayer,
+        filter,
         fieldPipeline,
         fieldClock,
         // Filled by rebuildFieldBindGroup below, which needs the instance to
@@ -4113,6 +4215,7 @@ export class Engine {
     // fieldLayer when the instance is built, and both target pairs exist for
     // the life of the surface. What used to be a scene-wide decision made here
     // is now each effect's own.
+    this.ensureFilterPage()
     this.rebuildFieldBindGroup()
     this.rebuildCompositeBindGroup()
     this.writeCompositeViewUniforms()
@@ -4736,17 +4839,31 @@ export class Engine {
     // installed effect names rzCastDistance, which is the common case.
     this.encodeCastDistance(encoder)
 
+    // FILTERS RUN LAST, each in a pass of its own, because each reads the pair
+    // the others drew into — a texture no pass may sample while drawing into
+    // it. So the full-res pair is two, the plain pair A and the filter's page,
+    // and the passes alternate between them. The composite reads A and is not
+    // rebuilt per frame, so the chain is arranged to END on A: with an odd
+    // number of filters the plain effects draw into the page instead, and the
+    // last filter lands where the composite looks. The half pair is read by
+    // the first filter and consumed — viewU[5].w tells the composite so.
+    const filters = drawn.filter((e) => e.filter)
+    const pageA: [GPUTextureView | null, GPUTextureView | null] = [this.fieldBgViews[0], this.fieldFgViews[0]]
+    const pageB: [GPUTextureView | null, GPUTextureView | null] = [this.fieldPageBgView, this.fieldPageFgView]
+    const canFilter = filters.length > 0 && !!pageB[0] && !!pageB[1]
+    const plainFull = canFilter && filters.length % 2 === 1 ? pageB : pageA
+    const attach = (views: [GPUTextureView | null, GPUTextureView | null]): GPURenderPassColorAttachment[] => [
+      { view: views[0]!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+      { view: views[1]!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+    ]
     let stamped = false
     for (let i = 0; i < Engine.FIELD_SCALES.length; i++) {
-      const bg = this.fieldBgViews[i]
-      const fg = this.fieldFgViews[i]
-      if (!bg || !fg || !this.fieldPairUsed(i)) continue
+      const target: [GPUTextureView | null, GPUTextureView | null] =
+        i === 0 ? plainFull : [this.fieldBgViews[i], this.fieldFgViews[i]]
+      if (!target[0] || !target[1] || !this.fieldPairUsed(i)) continue
       const pass = encoder.beginRenderPass({
         label: `field layer (${Engine.FIELD_SCALES[i] === 1 ? "full" : "half"})`,
-        colorAttachments: [
-          { view: bg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
-          { view: fg, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
-        ],
+        colorAttachments: attach(target),
         // One query pair is reserved for "field", and it goes to the first pair
         // that actually runs — full res when something declared #fullres, half
         // otherwise. Pinning it to i === 0 would have measured a pass that, now
@@ -4755,7 +4872,7 @@ export class Engine {
       })
       stamped = true
       for (const e of drawn) {
-        if (e.fieldLayer !== i) continue
+        if (e.fieldLayer !== i || e.filter) continue
         pass.setPipeline(e.fieldPipeline!)
         // The grid this effect just wrote — after its parity flip, the one at
         // `parity`. Per effect, so two grids never read each other's frame.
@@ -4764,6 +4881,23 @@ export class Engine {
       }
       pass.end()
     }
+    if (!canFilter) return
+    // Each filter reads what the previous pass left and writes the other page.
+    // The half pair goes to the first one, and only when something drew into
+    // it this frame — an unused pair is never cleared and holds stale pixels.
+    let read = plainFull
+    filters.forEach((e, k) => {
+      const write = read === pageA ? pageB : pageA
+      const pass = encoder.beginRenderPass({ label: "field layer (filter)", colorAttachments: attach(write) })
+      pass.setPipeline(e.fieldPipeline!)
+      pass.setBindGroup(
+        0,
+        e.fieldBindGroups![Engine.filterBindIndex(read === pageA ? 0 : 1, k === 0 && this.fieldPairUsed(1), e.grid?.parity ?? 0)],
+      )
+      pass.draw(3)
+      pass.end()
+      read = write
+    })
   }
 
   /** The trail bind group holds the depth view, which a resize recreates. */
@@ -5751,6 +5885,11 @@ export class Engine {
         // why it may not borrow the one at 18.
         { binding: 27, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 28, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        // The other effects' layers, for a filter's rzSceneFrame (scene-tap.ts).
+        { binding: 29, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 30, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 31, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 32, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         // THE VIEW TRANSFORM'S OWN RESOURCES. viewTransform() lives in the
         // header both this module and the composite share, but its lookups did
         // not: an effect calling it compiled and then failed at pipeline
@@ -14251,7 +14390,9 @@ export class Engine {
       u[20] = v[2]
       u[21] = v[6]
       u[22] = v[10]
-      u[23] = 0
+      // A drawn filter consumed the half pair (renderFieldPass); the composite
+      // skips it rather than laying it down a second time.
+      u[23] = this.filtersDrawn() > 0 ? 1 : 0
       // Effect clock + canvas size (viewU[6]) — written on the same refresh.
       // The effect clock, on the SCENE's time rather than the wall's.
       //
