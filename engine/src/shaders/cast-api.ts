@@ -27,7 +27,7 @@
 // They agree in value. Unifying them would be a behaviour change to every
 // shipped effect for no gain, so the seam stays and is named here instead.
 
-import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "./cast-layout"
+import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES, EFFECT_SUBJECT_VEC4S } from "./cast-layout"
 
 export const CAST_API = /* wgsl */ `
 const RZ_SUBJECTS: i32 = ${EFFECT_SUBJECTS};
@@ -55,6 +55,16 @@ struct RzSubject {
    * agree. 1 on a scene that never dissolves anybody.
    */
   dissolve: f32,
+  /**
+   * Where she is LOOKING, when her eyes are on something (Engine.setEyeTracking):
+   * a unit direction from between the eyes toward it, in world space. The eyes
+   * themselves turn only part of the way there by design, so an effect that
+   * should go where the gaze goes — a beam, a light — takes this rather than
+   * an eye bone's axis. Zero, with `looking` false, while the eyes are the
+   * motion's own.
+   */
+  gaze: vec3f,
+  looking: bool,
   /** False past the end of the cast, and every field is then zero. */
   valid: bool,
 }
@@ -81,11 +91,13 @@ fn rzSubject(i: i32) -> RzSubject {
   var s: RzSubject;
   s.valid = i >= 0 && i < rzSubjectCount();
   if (!s.valid) { return s; }
-  let b = i * 3;
+  let b = i * ${EFFECT_SUBJECT_VEC4S};
   s.root = _rzCast[b].xyz;
   s.dissolve = _rzCast[b].w;
   s.center = _rzCast[b + 1].xyz;
   s.bounds = _rzCast[b + 2];
+  s.gaze = _rzCast[b + 3].xyz;
+  s.looking = _rzCast[b + 3].w > 0.5;
   return s;
 }
 
@@ -101,7 +113,7 @@ fn rzAnchor(subject: i32, slot: i32) -> RzAnchor {
   a.valid = false;
   let g = _rzSlot(slot);
   if (subject < 0 || subject >= rzSubjectCount() || g < 0 || g >= RZ_MAX_ANCHORS) { return a; }
-  let b = ${EFFECT_SUBJECTS * 3} + (g * ${EFFECT_SUBJECTS} + subject) * 3;
+  let b = ${EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S} + (g * ${EFFECT_SUBJECTS} + subject) * 3;
   a.valid = _rzCast[b].w > 0.5;
   a.pos = _rzCast[b].xyz;
   a.vel = _rzCast[b + 1].xyz;
@@ -121,7 +133,7 @@ fn rzAnchor(subject: i32, slot: i32) -> RzAnchor {
 fn rzTrailCount(subject: i32, slot: i32) -> i32 {
   let g = _rzSlot(slot);
   if (subject < 0 || subject >= rzSubjectCount() || g < 0 || g >= RZ_MAX_ANCHORS) { return 0; }
-  return i32(_rzCast[${EFFECT_SUBJECTS * 3} + (g * ${EFFECT_SUBJECTS} + subject) * 3 + 2].w);
+  return i32(_rzCast[${EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S} + (g * ${EFFECT_SUBJECTS} + subject) * 3 + 2].w);
 }
 
 /** Sample i of a path: xyz where it was, w how many seconds ago. i = 0 is now. */

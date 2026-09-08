@@ -14,6 +14,8 @@
  * the whole engine failing to start on an import order nobody chose.
  */
 export const EFFECT_SUBJECTS = 4
+/** vec4 slots per subject: root+dissolve, hip+objectId, bounds, gaze+looking. */
+export const EFFECT_SUBJECT_VEC4S = 4
 /**
  * Bone anchors, for the WHOLE SCENE rather than per effect — this is an address
  * space that every installed effect draws slots from, and an effect asking for
@@ -60,4 +62,4 @@ export const EFFECT_ANCHORS = 16
  */
 export const EFFECT_TRAIL_SAMPLES = 128
 /** vec4 slot where the trails begin — after the subjects and the anchors. */
-export const EFFECT_TRAIL_BASE = EFFECT_SUBJECTS * 3 + EFFECT_ANCHORS * EFFECT_SUBJECTS * 3
+export const EFFECT_TRAIL_BASE = EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S + EFFECT_ANCHORS * EFFECT_SUBJECTS * 3
