@@ -30,6 +30,34 @@ const _animSlerp = new Quat(0, 0, 0, 1)
 const _animInterpT = new Vec3(0, 0, 0)
 const _convOut = new Vec3(0, 0, 0)
 const _convMat = new Float32Array(16)
+// Scratch for the eye solve — see solveEyes.
+const _eyeHx = new Vec3(0, 0, 0)
+const _eyeHy = new Vec3(0, 0, 0)
+const _eyeHz = new Vec3(0, 0, 0)
+const _eyeDir = new Vec3(0, 0, 0)
+const _eyeGaze = new Vec3(0, 0, 0)
+/** Rest forward of an eye — MMD models face -Z. */
+const _eyeFwd = new Vec3(0, 0, -1)
+const _eyeQuat = Quat.identity()
+const _eyeOwn = Quat.identity()
+const smooth01 = (a: number, b: number, x: number): number => {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)))
+  return t * t * (3 - 2 * t)
+}
+/** VRM's range map: `inMax` degrees of target offset onto `out` degrees of eye,
+ *  linearly — a look-at that never saturates. */
+const rangeMap = (v: number, inMax: number, out: number): number =>
+  (Math.min(Math.abs(v), inMax) / inMax) * out * Math.sign(v)
+
+/** What setEyeTracking asks for. */
+export interface EyeTrackingOptions {
+  /** 0..1 — how much of the solved gaze replaces the motion's own. Default 1. */
+  strength?: number
+  /** Degrees of yaw the eye reaches with the camera 75° to the side. The
+   *  vertical reaches a fraction of it. Default 20. */
+  range?: number
+}
+
 // Scratch for the post-physics append recovery — see applyPhysicsAppend.
 const _appendBasisX = new Vec3(0, 0, 0)
 const _appendBasisY = new Vec3(0, 0, 0)
@@ -1081,6 +1109,150 @@ export class Model {
 
   /** Post-pose local rotation offsets by bone index (see setBoneRotationOffset). */
   private readonly boneRotationOffsets = new Map<number, Quat>()
+
+  // ─── Eyes on a target ────────────────────────────────────────────────
+  /** What setEyeTracking asked for, or null while the eyes are the motion's. */
+  private eyeTracking: { strength: number; range: number } | null = null
+  /** Where the eyes are asked to look, MODEL space — set by the host each
+   *  frame before update(); the camera, as the host uses it. */
+  private readonly gazeTarget = new Vec3(0, 0, 0)
+  private gazeTargetSet = false
+  /** The gaze as it stands, per eye (左, 右), in degrees — kept so the eyes can
+   *  HOLD when the camera goes behind her. */
+  private readonly eyeYaw = [0, 0]
+  private readonly eyePitch = [0, 0]
+  private eyeSubset: Int32Array | null = null
+
+  /**
+   * Eyes on a target — the camera, as the host uses it.
+   *
+   * BONES, NOT MORPHS. MMD gaze is the 両目 → 左目/右目 chain, 両目 driving
+   * both through 付与; morphs shape the lids and never steer the iris. The
+   * solve writes 左目 and 右目 and holds 両目 at identity so its append cannot
+   * stack on top.
+   *
+   * LIVE, EVERY FRAME — after the motion, IK and 付与 have had their say and
+   * before the world pass the skin reads. So it holds under an orbit camera
+   * the same as under a camera motion, and an export sees what the editor did.
+   *
+   * `strength` is how much of the solved gaze replaces the motion's own;
+   * `range` the yaw the eye reaches with the camera at 90°, in degrees — the
+   * vertical reaches a fraction of it. Null gives the eyes back.
+   */
+  setEyeTracking(options: EyeTrackingOptions | null): void {
+    if (!options) {
+      this.eyeTracking = null
+      return
+    }
+    const first = this.eyeTracking === null
+    this.eyeTracking = {
+      strength: Math.min(1, Math.max(0, options.strength ?? 1)),
+      range: Math.min(30, Math.max(2, options.range ?? 20)),
+    }
+    if (first) {
+      this.eyeYaw[0] = this.eyeYaw[1] = 0
+      this.eyePitch[0] = this.eyePitch[1] = 0
+    }
+  }
+
+  hasEyeTracking(): boolean {
+    return this.eyeTracking !== null
+  }
+
+  /** Where the eyes look, in MODEL space. Set each frame before update();
+   *  null leaves them to the motion until a target is set again. */
+  setGazeTarget(target: Vec3 | null): void {
+    if (!target) {
+      this.gazeTargetSet = false
+      return
+    }
+    this.gazeTarget.set(target)
+    this.gazeTargetSet = true
+  }
+
+  /**
+   * The eye solve. Reads the head as IK left it, writes 左目/右目 and holds 両目.
+   * Angles are taken in the head's frame with forward = -Z, the way the model
+   * rests, and the rotation is the arc from that rest forward.
+   *
+   * What makes it read as alive rather than possessed, in order:
+   *  - BEHIND HER, THE EYES HOLD. Past 90° off her facing there is no target
+   *    to chase and nothing to return to: they keep where they were. Handing
+   *    them back to the motion read as a reset, and crossing straight behind
+   *    would flip the held side; a hold does neither, and they pick up again
+   *    as the camera comes round.
+   *  - VRM'S RANGE MAP, not an aim. The target's whole 90° of offset maps
+   *    linearly onto the eye's few degrees (VRMC_vrm lookAt.rangeMap), so a
+   *    camera 20° above her draws a fraction of a degree of look-up rather
+   *    than the most she has. Aiming the eye and clamping saturated almost at
+   *    once, and an MMD iris is most of the eyeball — a few degrees of pitch
+   *    carries it under the lid — so the vertical scales are a fraction of the
+   *    horizontal one.
+   *  - IMMEDIATE, as VRM applies it. Any smoothing or dead band read as the
+   *    eyes lagging the camera.
+   *  - VERGENCE. Each eye takes its own direction, so a close camera
+   *    converges them a little.
+   *  - NO ROLL. The rotation is the shortest arc from the rest forward.
+   */
+  private solveEyes(): void {
+    const t = this.eyeTracking
+    if (!t) return
+    const ni = this.runtimeSkeleton.nameIndex
+    const head = ni["頭"]
+    const left = ni["左目"]
+    const right = ni["右目"]
+    if (head === undefined || left === undefined || right === undefined) return
+    const both = ni["両目"]
+    const rots = this.runtimeSkeleton.localRotations
+    const worldMats = this.runtimeSkeleton.worldMatrices
+    const hm = worldMats[head].values
+    // The head's axes in model space: its columns. The head LOOKS along its
+    // local -Z — MMD models rest facing -Z — so forward is the third column
+    // negated.
+    const hx = _eyeHx.setXYZ(hm[0], hm[1], hm[2]).normalizeInPlace()
+    const hy = _eyeHy.setXYZ(hm[4], hm[5], hm[6]).normalizeInPlace()
+    const hz = _eyeHz.setXYZ(hm[8], hm[9], hm[10]).normalizeInPlace()
+    const g = this.gazeTarget
+    const toHead = _eyeDir.setXYZ(g.x - hm[12], g.y - hm[13], g.z - hm[14]).normalizeInPlace()
+    const behind = -(toHead.x * hz.x + toHead.y * hz.y + toHead.z * hz.z) < 0
+    const w = t.strength
+    const bothRot = both !== undefined ? rots[both] : null
+    // Both map a shorter input range than VRM's 90°: the eye reaches its full
+    // yaw with the camera at 75°, and the vertical — a camera is rarely far
+    // above or below her — its little at 45°.
+    const yawOut = t.range
+    const upOut = t.range * 0.22
+    const downOut = t.range * 0.3
+    const deg = 180 / Math.PI
+    for (let e = 0; e < 2; e++) {
+      const idx = e === 0 ? left : right
+      const em = worldMats[idx].values
+      // From this eye to the target, in the head's frame.
+      const d = _eyeDir.setXYZ(g.x - em[12], g.y - em[13], g.z - em[14]).normalizeInPlace()
+      const lx = d.x * hx.x + d.y * hx.y + d.z * hx.z
+      const ly = d.x * hy.x + d.y * hy.y + d.z * hy.z
+      const lz = -(d.x * hz.x + d.y * hz.y + d.z * hz.z)
+      const yaw = Math.atan2(lx, lz) * deg
+      const pitch = Math.asin(Math.max(-1, Math.min(1, ly))) * deg
+      if (!behind) {
+        this.eyeYaw[e] = rangeMap(yaw, 75, yawOut)
+        this.eyePitch[e] = rangeMap(pitch, 45, pitch > 0 ? upOut : downOut)
+      }
+      const ry = this.eyeYaw[e] / deg
+      const rp = this.eyePitch[e] / deg
+      const gaze = _eyeGaze.setXYZ(Math.sin(ry) * Math.cos(rp), Math.sin(rp), -Math.cos(ry) * Math.cos(rp))
+      Quat.fromUnitVectorsInto(_eyeFwd, gaze, _eyeQuat)
+      // Over the motion's own gaze — what 両目 and this eye together had.
+      const own = rots[idx]
+      if (bothRot) Quat.multiplyInto(bothRot, own, _eyeOwn)
+      else _eyeOwn.set(own)
+      Quat.slerpInto(_eyeOwn, _eyeQuat, w, own)
+    }
+    if (bothRot) bothRot.setIdentity()
+    // Only these need their world matrices again; nothing hangs off an eye.
+    this.eyeSubset ??= new Int32Array(both !== undefined ? [both, left, right] : [left, right])
+    this.computeWorldMatrices(this.eyeSubset)
+  }
 
   /** Compose a constant local rotation onto a bone AFTER every pose source (clip,
    *  blend, tween) each frame — the classic MMD "heel correction": pitch the 足首
@@ -2530,6 +2702,9 @@ export class Model {
       // Recompute world matrices with final IK rotations applied to localRotations
       this.computeWorldMatrices()
     }
+
+    // The eyes, last of all: they read the head as IK left it.
+    if (this.eyeTracking !== null && this.gazeTargetSet) this.solveEyes()
 
     return verticesChanged
   }

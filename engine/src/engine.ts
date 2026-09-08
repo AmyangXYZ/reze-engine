@@ -2,7 +2,7 @@ import { Camera } from "./camera"
 import { decodeDds, isDds } from "./dds-loader"
 import { Mat4, Quat, Vec3 } from "./math"
 import { decodePsd, isPsd } from "./psd-loader"
-import { Model, MATERIAL_MORPH_MULTIPLY, type Material, type Skeleton } from "./model"
+import { Model, MATERIAL_MORPH_MULTIPLY, type EyeTrackingOptions, type Material, type Skeleton } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
@@ -351,6 +351,8 @@ const MAX_EFFECT_ANCHORS = EFFECT_ANCHORS
 
 /** Only for the bounding sphere's height. */
 const HEAD_BONE = "頭"
+/** Scratch for the per-frame camera-to-model-space hand-off to the eyes. */
+const _gazeScratch = new Vec3(0, 0, 0)
 
 /** Path samples kept per trailed anchor. ~2.1s at the sampling rate below, which
  *  is a long ribbon — a dancer's arm draws most of a circle in that time.
@@ -9890,6 +9892,17 @@ export class Engine {
       const stageIdle = (inst.isStage || inst.isPlane || inst.isProp) && !attached && inst.model.isIdle()
       let verticesChanged = false
       if (!stageIdle) {
+        // The camera in the model's own space, for the eyes — the placement
+        // undone, since bones live in model space.
+        if (inst.model.hasEyeTracking()) {
+          const eye = this.camera.getEyePosition()
+          const m = inst.model
+          _gazeScratch.setXYZ(eye.x - m.position.x, eye.y - m.position.y, eye.z - m.position.z)
+          Quat.rotateVecInvInto(m.rotation, _gazeScratch, _gazeScratch)
+          const inv = 1 / Math.max(m.scale, 1e-6)
+          _gazeScratch.setXYZ(_gazeScratch.x * inv, _gazeScratch.y * inv, _gazeScratch.z * inv)
+          inst.model.setGazeTarget(_gazeScratch)
+        }
         verticesChanged = inst.model.update(deltaTime, inst.isStage || inst.isPlane ? false : this.ikEnabled)
         inst.skinMatricesDirty = true
       }
@@ -13743,6 +13756,18 @@ export class Engine {
    * gaps between them are the timing, and the hold between the middle two is how
    * long she is away.
    */
+  /**
+   * Eyes on the camera, per model — see Model.setEyeTracking. Live: solved
+   * every frame against wherever the camera is, orbit or motion alike. Null
+   * gives the eyes back to the motion.
+   */
+  setEyeTracking(modelName: string, options: EyeTrackingOptions | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    inst.model.setEyeTracking(options)
+    return true
+  }
+
   setModelDissolveCycle(modelName: string, cycle: DissolveCycle | null): boolean {
     if (!this.modelInstances.has(modelName)) return false
     if (!cycle) {

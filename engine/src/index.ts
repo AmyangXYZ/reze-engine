@@ -198,3 +198,4 @@ export {
  * Pure strings, no GPU: importing them costs a host nothing.
  */
 export { EFFECT_MATH_API, PARTICLE_STRUCT_WGSL } from "./shaders/passes/hosted-api"
+export type { EyeTrackingOptions } from "./model"
