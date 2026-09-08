@@ -4081,7 +4081,12 @@ export class Engine {
     list: { wgsl: string; params?: Record<string, EffectParamValue> }[] | null,
   ): Promise<EffectResult[]> {
     const noMounts = { background: false, foreground: false }
-    if (!this.device) return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts, params: [], duration: 0 }]
+    // Clearing an engine that has nothing yet is already done; only an install
+    // needs the device.
+    if (!this.device) {
+      if (!list || list.length === 0) return []
+      return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts, params: [], duration: 0 }]
+    }
 
     const requested = list ?? []
     if (requested.length === 0) {
@@ -4216,8 +4221,13 @@ export class Engine {
     // the life of the surface. What used to be a scene-wide decision made here
     // is now each effect's own.
     this.ensureFilterPage()
-    this.rebuildFieldBindGroup()
-    this.rebuildCompositeBindGroup()
+    // EVERY shared buffer, not only the field and composite groups. The mounts
+    // above were built across awaits, and audio, a score or lyrics landing in
+    // one of those gaps replaced its buffer and destroyed the old one — which
+    // the new particle, light, trail and grid groups had been built against,
+    // so the next submit named a destroyed buffer. Rebinding at install closes
+    // the gap from whichever side the asset arrived.
+    this.rebindSharedBuffers()
     this.writeCompositeViewUniforms()
     return results
   }
@@ -12036,10 +12046,12 @@ export class Engine {
     const inst = this.modelInstances.get(this.selectedMaterial.modelName)
     if (!inst) return
     const target = this.selectedMaterial.materialName
-    const draw = inst.drawCalls.find(
-      (d) => (d.type === "opaque" || d.type === "transparent") && d.materialName === target,
+    // Every draw under the name — see materialIndexRanges for why there can be
+    // more than one.
+    const draws = inst.drawCalls.filter(
+      (d) => (d.type === "opaque" || d.type === "transparent") && d.materialName === target && this.shouldRenderDrawCall(inst, d),
     )
-    if (!draw || !this.shouldRenderDrawCall(inst, draw)) return
+    if (draws.length === 0) return
 
     // Mask pass: fill the selected material's projected footprint with 1.0. Depth-always
     // (no depth attachment) so the outline traces complete boundaries even when the
@@ -12052,7 +12064,7 @@ export class Engine {
     mpass.setVertexBuffer(1, inst.jointsBuffer)
     mpass.setVertexBuffer(2, inst.weightsBuffer)
     mpass.setIndexBuffer(inst.indexBuffer, "uint32")
-    mpass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
+    for (const draw of draws) mpass.drawIndexed(draw.count, 1, draw.firstIndex, 0, 0)
     mpass.end()
 
     // Edge pass: screen-space edge detect on the mask, alpha-blended over swapchain.
@@ -12068,19 +12080,23 @@ export class Engine {
   // Unique edges of the mesh, as a line-list index buffer. Each interior edge is
   // shared by two triangles, so deduplicating halves both the buffer and the
   // draw. Built once per model, on the first frame its wireframe is asked for.
-  /** The index run `material` owns, or the whole list when it is null. Materials
-   *  are consecutive runs in declaration order, so the offset is a prefix sum —
-   *  the same walk the draw list does. Returns null for a name the model does
-   *  not have, which is what a stale selection looks like after a reload. */
-  private materialIndexRange(inst: ModelInstance, material: string | null): [number, number] | null {
+  /** The index runs `material` owns — EVERY run, because a PMX may carry
+   *  several materials under one name and a name is how the host asks; taking
+   *  the first left the rest of a hair or a coat out of its own wireframe —
+   *  or the whole list when it is null. Materials are consecutive runs in
+   *  declaration order, so each offset is a prefix sum, the same walk the draw
+   *  list does. Empty for a name the model does not have, which is what a
+   *  stale selection looks like after a reload. */
+  private materialIndexRanges(inst: ModelInstance, material: string | null): [number, number][] {
     const indices = inst.model.getIndices()
-    if (!material) return [0, indices.length]
+    if (!material) return [[0, indices.length]]
+    const runs: [number, number][] = []
     let offset = 0
     for (const m of inst.model.getMaterials()) {
-      if (m.name === material) return [offset, offset + m.vertexCount]
+      if (m.name === material) runs.push([offset, offset + m.vertexCount])
       offset += m.vertexCount
     }
-    return null
+    return runs
   }
 
   /** A cache key no material can collide with — a PMX name is never empty and
@@ -12129,9 +12145,8 @@ export class Engine {
         offset = end
       }
     } else {
-      const range = this.materialIndexRange(inst, material)
-      if (!range) return false
-      const [start, end] = range
+      const runs = this.materialIndexRanges(inst, material)
+      if (runs.length === 0) return false
       const seen = new Set<number>()
       const add = (a: number, b: number) => {
         const lo = a < b ? a : b
@@ -12141,10 +12156,12 @@ export class Engine {
         seen.add(k)
         edges.push(lo, hi)
       }
-      for (let i = start; i + 2 < end; i += 3) {
-        add(indices[i], indices[i + 1])
-        add(indices[i + 1], indices[i + 2])
-        add(indices[i + 2], indices[i])
+      for (const [start, end] of runs) {
+        for (let i = start; i + 2 < end; i += 3) {
+          add(indices[i], indices[i + 1])
+          add(indices[i + 1], indices[i + 2])
+          add(indices[i + 2], indices[i])
+        }
       }
     }
     if (edges.length === 0) {
@@ -12197,8 +12214,8 @@ export class Engine {
     // picked, since only the picked material draws at all then.
     const hm = this.hoverMaterial
     const hoverName = material === null && hm?.modelName === inst.name ? hm.materialName : null
-    const hoverRange = hoverName ? this.materialIndexRange(inst, hoverName) : null
-    const hover = hoverRange && this.ensureEdgeBuffer(inst, hoverName) ? inst.wireEdges.get(hoverName!) : null
+    const hoverRuns = hoverName ? this.materialIndexRanges(inst, hoverName) : []
+    const hover = hoverRuns.length > 0 && this.ensureEdgeBuffer(inst, hoverName) ? inst.wireEdges.get(hoverName!) : null
 
     this.wireframeColorData.set(DEFAULT_VERTEX_COLOR)
     this.wireframeColorData[4] = this.canvas.width
@@ -12239,9 +12256,9 @@ export class Engine {
     // before the base mesh below gets a chance to occlude it. The base mesh's
     // depth write further down repeats the SAME geometry for these faces
     // (identical z), so it neither disturbs this nor needs to skip them.
-    if (hover && hoverRange && !xray) {
+    if (hover && !xray) {
       bindMesh()
-      pass.drawIndexed(hoverRange[1] - hoverRange[0], 1, hoverRange[0])
+      for (const [start, end] of hoverRuns) pass.drawIndexed(end - start, 1, start)
       pass.setBindGroup(0, this.wireframeHoverBindGroup)
       pass.setBindGroup(1, hover.bindGroup)
       pass.setPipeline(this.wireframePipeline)
@@ -12263,10 +12280,10 @@ export class Engine {
     // the coat hide it does not answer that. Its own depth still goes in, so its
     // back faces stay hidden and it reads as an object instead of a haze —
     // which is the difference between this and turning x-ray on.
-    const range = material !== null ? this.materialIndexRange(inst, material) : null
+    const runs = material !== null ? this.materialIndexRanges(inst, material) : null
     if (!xray) {
       bindMesh()
-      if (range) pass.drawIndexed(range[1] - range[0], 1, range[0])
+      if (runs) for (const [start, end] of runs) pass.drawIndexed(end - start, 1, start)
       else pass.drawIndexed(inst.model.getIndices().length)
     }
 
