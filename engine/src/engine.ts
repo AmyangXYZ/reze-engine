@@ -7897,23 +7897,23 @@ export class Engine {
   /** Bind camera orbit center to a model's bone (Souls-style follow cam). Pass null to unbind. */
   setCameraTarget(model: Model | null, boneName: string, offset?: Vec3): void
   setCameraTarget(modelOrVec: Model | Vec3 | null, boneName?: string, offset?: Vec3): void {
-    // panLocked tracks the BINDING, on every path that changes it — a target
-    // set to a fixed point is pannable again, and forgetting it here is how the
-    // pan stays dead after the follow was turned off. See Camera.panLocked.
+    // panSink tracks the BINDING, on every path that changes it — a target set
+    // after a follow would otherwise still send pans into an offset nothing
+    // reads any more. See Camera.panSink.
     if (modelOrVec === null) {
-      this.camera.panLocked = false
+      this.camera.panSink = null
       this.cameraTargetModel = null
       return
     }
     if ("x" in modelOrVec && "y" in modelOrVec && "z" in modelOrVec) {
-      this.camera.panLocked = false
+      this.camera.panSink = null
       this.cameraTargetModel = null
       this.camera.target.x = modelOrVec.x
       this.camera.target.y = modelOrVec.y
       this.camera.target.z = modelOrVec.z
       return
     }
-    this.camera.panLocked = true
+    this.camera.panSink = this.cameraTargetOffset
     this.cameraTargetModel = modelOrVec
     this.cameraTargetBoneName = boneName ?? ""
     this.cameraTargetOffset.x = offset?.x ?? 0
@@ -7924,8 +7924,8 @@ export class Engine {
   /** Souls-style follow cam: orbit center tracks a model bone each frame. Shorthand for setCameraTarget(model, boneName, offset). */
   setCameraFollow(model: Model | null, boneName?: string, offset?: Vec3, smoothing?: number): void {
     // Panning sets the very thing the follow overwrites each frame, so it is
-    // refused for as long as the shot is riding a bone. See Camera.panLocked.
-    this.camera.panLocked = model !== null
+    // goes to the offset for as long as the shot is riding a bone. See Camera.panSink.
+    this.camera.panSink = model !== null ? this.cameraTargetOffset : null
     if (model === null) {
       this.cameraTargetModel = null
       return

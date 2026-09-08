@@ -45,15 +45,16 @@ export class Camera {
   private canvas: HTMLCanvasElement | null = null
   private inputLocked: boolean = false
   /**
-   * Panning is refused while the orbit rides a bone (Engine.setCameraFollow).
+   * Where a pan goes while the orbit rides a bone (Engine.setCameraFollow).
    *
    * A pan moves `target`, and the follow rewrites `target` from the bone every
-   * frame — so the drag was already going nowhere, it just spent a frame
-   * fighting for it and read as the camera stuttering under the pointer.
-   * Refusing it says the same thing the follow already means: while the shot is
-   * on somebody, where it points is theirs to decide.
+   * frame — so a pan into the target went nowhere, and read as the camera
+   * stuttering under the pointer. While following, the engine points this at
+   * the follow's OFFSET from the bone, and a pan moves that instead: the shot
+   * stays on her, and the drag decides where beside her it sits. Null while
+   * the target is free.
    */
-  panLocked: boolean = false
+  panSink: Vec3 | null = null
   private isDragging: boolean = false
   private mouseButton: number | null = null // Track which mouse button is pressed (0 = left, 2 = right)
   private lastMousePos = { x: 0, y: 0 }
@@ -337,7 +338,14 @@ export class Camera {
     const panRight = right.scale(-deltaX * panDistance)
     const panUp = up.scale(deltaY * panDistance)
 
-    // Update target position smoothly
+    // Into the follow's offset while the shot rides a bone — see panSink.
+    const sink = this.panSink
+    if (sink) {
+      sink.x += panRight.x + panUp.x
+      sink.y += panRight.y + panUp.y
+      sink.z += panRight.z + panUp.z
+      return
+    }
     this.target = this.target.add(panRight).add(panUp)
   }
 
@@ -440,7 +448,7 @@ export class Camera {
 
     if (this.mouseButton === 2) {
       // Right-click: pan the camera target
-      if (!this.panLocked) this.panCamera(deltaX, deltaY)
+      this.panCamera(deltaX, deltaY)
     } else {
       // Left-click (or default): rotate the camera
       this.alpha += deltaX * this.angularSensitivity
@@ -559,7 +567,7 @@ export class Camera {
       if (isPanGesture) {
         // Primary gesture is pan (two-finger drag)
         // Use panning similar to right-click pan
-        if (!this.panLocked) this.panCamera(midpointDeltaX, midpointDeltaY)
+        this.panCamera(midpointDeltaX, midpointDeltaY)
       }
 
       // Update tracking values
