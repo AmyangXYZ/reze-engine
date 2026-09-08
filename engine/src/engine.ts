@@ -1,4 +1,5 @@
 import { Camera } from "./camera"
+import { EFFECT_SUBJECT_VEC4S } from "./shaders/cast-layout"
 import { decodeDds, isDds } from "./dds-loader"
 import { Mat4, Quat, Vec3 } from "./math"
 import { decodePsd, isPsd } from "./psd-loader"
@@ -369,7 +370,7 @@ const TRAIL_DT = 1 / TRAIL_HZ
 
 /** vec4 slots: four subjects × 3, then anchors × four subjects × 3, then the
  *  trails — slot-major, four subjects each, TRAIL_SAMPLES apiece. */
-const CAST_SUBJECT_VEC4S = MAX_EFFECT_SUBJECTS * 3
+const CAST_SUBJECT_VEC4S = MAX_EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S
 const CAST_ANCHOR_VEC4S = MAX_EFFECT_ANCHORS * MAX_EFFECT_SUBJECTS * 3
 const CAST_TRAIL_BASE = EFFECT_TRAIL_BASE
 const CAST_VEC4S = CAST_TRAIL_BASE + MAX_EFFECT_ANCHORS * MAX_EFFECT_SUBJECTS * TRAIL_SAMPLES
@@ -4272,7 +4273,7 @@ export class Engine {
     const cast = {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
-      base: MAX_EFFECT_SUBJECTS * 3,
+      base: MAX_EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S,
       trailBase: CAST_TRAIL_BASE,
       slots: MAX_EFFECT_ANCHORS,
       trailCount: anchors.filter((x) => x.trail).length,
@@ -4631,7 +4632,7 @@ export class Engine {
     const code = buildTrailShader(src, {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
-      base: MAX_EFFECT_SUBJECTS * 3,
+      base: MAX_EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S,
       trailBase: CAST_TRAIL_BASE,
       slots: MAX_EFFECT_ANCHORS,
       alias,
@@ -4983,7 +4984,7 @@ export class Engine {
     const cast = {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
-      base: MAX_EFFECT_SUBJECTS * 3,
+      base: MAX_EFFECT_SUBJECTS * EFFECT_SUBJECT_VEC4S,
       trailBase: CAST_TRAIL_BASE,
       slots: MAX_EFFECT_ANCHORS,
       trailCount: anchors.filter((x) => x.trail).length,
@@ -14574,7 +14575,7 @@ export class Engine {
     // rest is margin for a motion that reaches.
     const head = m.getBoneWorldPosition(HEAD_BONE)
     const height = head ? Math.max(0.01, toWorld(head).y - floorY) : Math.max(0.01, (py - floorY) * 2)
-    const b = n * 12
+    const b = n * EFFECT_SUBJECT_VEC4S * 4
     cd[b] = px
     cd[b + 1] = floorY
     cd[b + 2] = pz
@@ -14596,6 +14597,21 @@ export class Engine {
     cd[b + 9] = floorY + height * 0.5
     cd[b + 10] = pz
     cd[b + 11] = height * 0.75
+    // Where she is looking — see RzSubject.gaze. Model space from the solve,
+    // turned by the placement like every other direction in here.
+    const gaze = m.getGaze()
+    if (gaze) {
+      Quat.rotateVecInto(m.rotation, gaze, gaze)
+      cd[b + 12] = gaze.x
+      cd[b + 13] = gaze.y
+      cd[b + 14] = gaze.z
+      cd[b + 15] = 1
+    } else {
+      cd[b + 12] = 0
+      cd[b + 13] = 0
+      cd[b + 14] = 0
+      cd[b + 15] = 0
+    }
 
     // Declared bones. Velocity is per model AND per slot, so two characters
     // wearing the same effect never inherit each other's motion.

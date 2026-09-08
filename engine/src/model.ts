@@ -1122,6 +1122,10 @@ export class Model {
   private readonly eyeYaw = [0, 0]
   private readonly eyePitch = [0, 0]
   private eyeSubset: Int32Array | null = null
+  /** From between the eyes toward the target, model space — what the eyes
+   *  are on, as opposed to the fraction of the way they turn. */
+  private readonly gazeDir = new Vec3(0, 0, 0)
+  private gazeDirSet = false
 
   /**
    * Eyes on a target — the camera, as the host uses it.
@@ -1142,6 +1146,7 @@ export class Model {
   setEyeTracking(options: EyeTrackingOptions | null): void {
     if (!options) {
       this.eyeTracking = null
+      this.gazeDirSet = false
       return
     }
     const first = this.eyeTracking === null
@@ -1159,11 +1164,19 @@ export class Model {
     return this.eyeTracking !== null
   }
 
+  /** Where the eyes are on, as a unit direction from between them in model
+   *  space — or null while they are the motion's own. See RzSubject.gaze. */
+  getGaze(): Vec3 | null {
+    if (this.eyeTracking === null || !this.gazeDirSet) return null
+    return new Vec3(this.gazeDir.x, this.gazeDir.y, this.gazeDir.z)
+  }
+
   /** Where the eyes look, in MODEL space. Set each frame before update();
    *  null leaves them to the motion until a target is set again. */
   setGazeTarget(target: Vec3 | null): void {
     if (!target) {
       this.gazeTargetSet = false
+      this.gazeDirSet = false
       return
     }
     this.gazeTarget.set(target)
@@ -1217,6 +1230,16 @@ export class Model {
     const behind = -(toHead.x * hz.x + toHead.y * hz.y + toHead.z * hz.z) < 0
     const w = t.strength
     const bothRot = both !== undefined ? rots[both] : null
+    // The gaze itself, for the cast: from between the eyes to the target.
+    {
+      const lm = worldMats[left].values
+      const rm = worldMats[right].values
+      const mx = (lm[12] + rm[12]) * 0.5
+      const my = (lm[13] + rm[13]) * 0.5
+      const mz = (lm[14] + rm[14]) * 0.5
+      this.gazeDir.setXYZ(g.x - mx, g.y - my, g.z - mz).normalizeInPlace()
+      this.gazeDirSet = true
+    }
     // Both map a shorter input range than VRM's 90°: the eye reaches its full
     // yaw with the camera at 75°, and the vertical — a camera is rarely far
     // above or below her — its little at 45°.

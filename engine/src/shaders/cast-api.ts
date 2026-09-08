@@ -60,7 +60,7 @@ struct RzSubject {
    * a unit direction from between the eyes toward it, in world space. The eyes
    * themselves turn only part of the way there by design, so an effect that
    * should go where the gaze goes — a beam, a light — takes this rather than
-   * an eye bone's axis. Zero, with `looking` false, while the eyes are the
+   * an eye bone's axis. Zero, with looking false, while the eyes are the
    * motion's own.
    */
   gaze: vec3f,
