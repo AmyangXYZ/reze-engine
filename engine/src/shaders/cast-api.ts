@@ -56,12 +56,13 @@ struct RzSubject {
    */
   dissolve: f32,
   /**
-   * Where she is LOOKING, when her eyes are on something (Engine.setEyeTracking):
-   * a unit direction from between the eyes toward it, in world space. The eyes
-   * themselves turn only part of the way there by design, so an effect that
-   * should go where the gaze goes — a beam, a light — takes this rather than
-   * an eye bone's axis. Zero, with looking false, while the eyes are the
-   * motion's own.
+   * Where she LOOKS: a unit direction from between the eyes, in world space.
+   * Exact while her eyes are on something (Engine.setEyeTracking); otherwise
+   * the motion's own eye turn undone through the range map — an eye bone
+   * turns a fraction of the way toward what it looks at, and this gives back
+   * the whole of it. An effect that should go where the look goes — a beam,
+   * a light — takes this rather than an eye bone's axis, and it holds in
+   * either mode. Zero, with looking false, only for a model without eyes.
    */
   gaze: vec3f,
   looking: bool,

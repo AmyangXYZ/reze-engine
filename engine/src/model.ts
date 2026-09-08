@@ -1164,11 +1164,53 @@ export class Model {
     return this.eyeTracking !== null
   }
 
-  /** Where the eyes are on, as a unit direction from between them in model
-   *  space — or null while they are the motion's own. See RzSubject.gaze. */
+  /**
+   * Where she looks: a unit direction in model space, or null for a model
+   * without eye bones. See RzSubject.gaze.
+   *
+   * Exact while the eyes are on something (setEyeTracking). Otherwise the
+   * motion's own eye turn UNDONE THROUGH THE RANGE MAP: an eye bone turns a
+   * fraction of the way toward what it looks at — on an anime face a few
+   * degrees of bone read as a long look, which is why the map exists — and
+   * this gives back the whole of it, so a beam or a light can go where the
+   * eye visibly looks rather than down the bone's axis. The inverse of the
+   * map the eyes would be under, both eyes averaged.
+   */
   getGaze(): Vec3 | null {
-    if (this.eyeTracking === null || !this.gazeDirSet) return null
-    return new Vec3(this.gazeDir.x, this.gazeDir.y, this.gazeDir.z)
+    if (this.eyeTracking !== null && this.gazeDirSet) return new Vec3(this.gazeDir.x, this.gazeDir.y, this.gazeDir.z)
+    const ni = this.runtimeSkeleton.nameIndex
+    const head = ni["頭"]
+    const left = ni["左目"]
+    const right = ni["右目"]
+    if (head === undefined || left === undefined || right === undefined) return null
+    const worldMats = this.runtimeSkeleton.worldMatrices
+    const hm = worldMats[head].values
+    const hx = _eyeHx.setXYZ(hm[0], hm[1], hm[2]).normalizeInPlace()
+    const hy = _eyeHy.setXYZ(hm[4], hm[5], hm[6]).normalizeInPlace()
+    const hz = _eyeHz.setXYZ(hm[8], hm[9], hm[10]).normalizeInPlace()
+    const range = this.eyeTracking?.range ?? 20
+    const deg = 180 / Math.PI
+    let yaw = 0
+    let pitch = 0
+    for (let e = 0; e < 2; e++) {
+      const em = worldMats[e === 0 ? left : right].values
+      // The eye looks down its local -Z: the third column, negated.
+      const ax = _eyeDir.setXYZ(-em[8], -em[9], -em[10]).normalizeInPlace()
+      const lx = ax.x * hx.x + ax.y * hx.y + ax.z * hx.z
+      const ly = ax.x * hy.x + ax.y * hy.y + ax.z * hy.z
+      const lz = -(ax.x * hz.x + ax.y * hz.y + ax.z * hz.z)
+      const y = Math.atan2(lx, lz) * deg
+      const p = Math.asin(Math.max(-1, Math.min(1, ly))) * deg
+      // rangeMap ran 75° onto `range` and 45° onto its fractions; this runs back.
+      yaw += Math.max(-75, Math.min(75, (y * 75) / range)) * 0.5
+      pitch += (p > 0 ? Math.min(45, (p * 45) / (0.22 * range)) : Math.max(-45, (p * 45) / (0.3 * range))) * 0.5
+    }
+    const ry = yaw / deg
+    const rp = pitch / deg
+    const x = Math.sin(ry) * Math.cos(rp)
+    const y = Math.sin(rp)
+    const z = -Math.cos(ry) * Math.cos(rp)
+    return new Vec3(hx.x * x + hy.x * y + hz.x * z, hx.y * x + hy.y * y + hz.y * z, hx.z * x + hy.z * y + hz.z * z).normalizeInPlace()
   }
 
   /** Where the eyes look, in MODEL space. Set each frame before update();
