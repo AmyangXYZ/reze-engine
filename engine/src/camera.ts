@@ -434,9 +434,29 @@ export class Camera {
 
   private onMouseDown(e: MouseEvent) {
     if (this.inputLocked) return
+    // Middle-click's own default is the browser's autoscroll cursor — since
+    // the middle button is orbit here (Blender's own binding), that default
+    // has to lose before a drag ever starts, not be cleaned up after.
+    if (e.button === 1) e.preventDefault()
     this.isDragging = true
     this.mouseButton = e.button
     this.lastMousePos = { x: e.clientX, y: e.clientY }
+  }
+
+  /**
+   * Which button drags orbit the view. "left" is every consumer's original
+   * binding — anything that is not the pan button (right) rotates, which in
+   * practice means left, since a middle-drag was never a deliberate gesture
+   * this ever built for. "middle" is Blender's own binding, matching a
+   * dedicated orbit button against a dedicated pan button — opt-in only,
+   * via setOrbitButton, so a host that wants its own left button free for
+   * something else (a box-select, say) can ask for it without changing the
+   * default for every OTHER consumer of this engine.
+   */
+  private orbitButton: "left" | "middle" = "left"
+
+  setOrbitButton(button: "left" | "middle"): void {
+    this.orbitButton = button
   }
 
   private onMouseMove(e: MouseEvent) {
@@ -447,13 +467,10 @@ export class Camera {
     const deltaY = e.clientY - this.lastMousePos.y
 
     if (this.mouseButton === 2) {
-      // Right-click: pan the camera target
       this.panCamera(deltaX, deltaY)
-    } else {
-      // Left-click (or default): rotate the camera
+    } else if (this.orbitButton === "middle" ? this.mouseButton === 1 : this.mouseButton !== 2) {
       this.alpha += deltaX * this.angularSensitivity
       this.beta -= deltaY * this.angularSensitivity
-
       // Clamp beta to prevent flipping
       this.beta = Math.max(this.lowerBetaLimit, Math.min(this.upperBetaLimit, this.beta))
     }

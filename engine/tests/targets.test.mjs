@@ -31,6 +31,7 @@ import { dirname, join } from "node:path"
 import { sceneTargets, sceneColorFormats, mrtIdsEnabled, setMrtIds, SCENE_ID_FORMAT } from "../dist/shaders/passes/scene-contract.js"
 import * as materials from "../dist/shaders/materials/common.js"
 import * as ground from "../dist/shaders/passes/ground.js"
+import * as mirror from "../dist/shaders/passes/mirror.js"
 import * as outline from "../dist/shaders/passes/outline.js"
 import * as particles from "../dist/shaders/passes/particles.js"
 import * as trails from "../dist/shaders/passes/trails.js"
@@ -46,7 +47,7 @@ const groundSrc = read("../src/shaders/passes/ground.ts")
  *  here is about count, order and blend rather than which float it is. */
 const FORMATS = { hdr: "rgba16float", aux: "rg8unorm" }
 
-const CLASSES = ["material", "ground", "outline", "particle", "particle-additive", "trail", "depth-prepass"]
+const CLASSES = ["material", "ground", "mirror", "outline", "particle", "particle-additive", "trail", "depth-prepass"]
 
 /** Classes whose shaders write an id, and so declare a third fragment output. */
 const WRITES_ID = ["material", "ground"]
@@ -180,6 +181,12 @@ test("nothing names the aux format except the attachment and the contract", () =
     /private static readonly BLOOM_MASK_FORMAT/, // the declaration
     /return \{ hdr: this\.hdrFormat, aux: Engine\.BLOOM_MASK_FORMAT \}/, // the one feed into the contract
     /format: Engine\.BLOOM_MASK_FORMAT,\n\s*usage:/, // creating the attachment itself
+    // The coverage pyramid: ONE target, rendered into the aux texture the way
+    // the bloom pyramid renders into the HDR one. A single-target list is not a
+    // scene-pass attachment list and cannot drift from one — the scene pass has
+    // never had fewer than two. Deliberately spelled as the whole one-element
+    // array so a two-target list still trips.
+    /targets: \[\{ format: Engine\.BLOOM_MASK_FORMAT \}\]/,
   ]
   // Each line judged at ITS OWN offset. Looking the line up with indexOf finds
   // the first copy of its text, and `format: Engine.BLOOM_MASK_FORMAT,` appears
@@ -332,6 +339,10 @@ const CAST = { subjects: 4, samples: 128, base: 12, trailBase: 108, slots: 8, re
 const SHADERS = [
   ["materials (shared prelude)", () => materials.commonFsOutWgsl(), "FSOut", "material"],
   ["ground", () => ground.groundShaderWgsl(), "FSOut", "ground"],
+  // The mirror surface writes no id — a reflection is a picture of the cast,
+  // not the cast — so it is the class most likely to be left declaring two
+  // outputs against three targets. That is the whole shape of the Safari bug.
+  ["mirror surface", () => mirror.mirrorShaderWgsl(), "FSOut", "mirror"],
   ["outline", () => outline.outlineShaderWgsl(), "FSOut", "outline"],
   // The prepass writes no colour at all and takes every target at writeMask 0.
   // It is in this list precisely BECAUSE of that: it is the shader with the most

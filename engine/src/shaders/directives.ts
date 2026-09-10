@@ -56,6 +56,21 @@ export type EffectDirectives = {
   /** This effect takes the cast apart — the host reads the timing. */
   dissolve: boolean
   /**
+   * This effect IS a mirror: a plane in the scene showing a true reflection of
+   * it, folded and re-rendered by the engine.
+   *
+   * A mount with no shader, and the second of them — `#lights` was the first.
+   * The reasoning is identical: a planar reflection re-renders every model from
+   * a folded camera, which is a PASS, and no mount is a pass. So the effect
+   * declares the mirror and the engine reflects, exactly as a lighting rig
+   * declares lamps and the engine shades.
+   *
+   * The plane comes from the effect's own `#param` dials, by name — see the
+   * engine's MIRROR_DIALS. That is what makes it an effect rather than a switch:
+   * it publishes, forks, schedules and fades like every other one.
+   */
+  mirror: boolean
+  /**
    * How long ONE firing of this effect lasts, in seconds. 0 = undeclared.
    *
    * An effect is one of two things, and only its author knows which. A HIT has
@@ -84,6 +99,7 @@ const SPEC = {
   grid: 1,
   bloom: 0,
   dissolve: 0,
+  mirror: 0,
   duration: 1,
 } as const
 
@@ -139,6 +155,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     grid: 0,
     bloom: false,
     dissolve: false,
+    mirror: false,
     duration: 0,
   }
   const errors: string[] = []
@@ -234,6 +251,9 @@ export function parseDirectives(wgsl: string): DirectiveResult {
         return
       case "dissolve":
         d.dissolve = true
+        return
+      case "mirror":
+        d.mirror = true
         return
       case "duration": {
         // SECONDS, like every other time a directive states (see #dissolve).

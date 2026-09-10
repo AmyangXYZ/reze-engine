@@ -54,17 +54,34 @@ test("the ground pipeline writes depth", () => {
   )
 })
 
-test("the ground shader never discards", () => {
+test("the ground discards for the mirror clip and for nothing else", () => {
   // The radial fade returns early on a fully faded pixel, which is a shading
-  // shortcut and NOT a discard — the fragment still writes depth. A discard
-  // here would be the same bug as depthWriteEnabled: false, arrived at from the
-  // other side, and it would be invisible in the pipeline descriptor above.
-  assert.doesNotMatch(
-    shader,
-    /\bdiscard\b/,
+  // shortcut and NOT a discard — the fragment still writes depth. An
+  // unconditional discard here would be the same bug as depthWriteEnabled:
+  // false, arrived at from the other side, and it would be invisible in the
+  // pipeline descriptor above: a discarded fragment writes no depth, which
+  // punches holes in the floor for everything that reads depth to find it.
+  //
+  // THE ONE EXCEPTION is the mirror pass, and it is an exception because the
+  // requirement is inverted there. A mirror shows nothing behind itself, and
+  // the floor is the geometry most often behind one — stand a pane up and half
+  // the floor is behind it, lay it facing up and all of it is. Writing depth
+  // without colour would not do: the ground draws after the models in that
+  // pass, so a floor the mirror cannot see would still occlude the particles
+  // and ribbons that come after it.
+  //
+  // So: exactly one discard, and it must be under the clip. The camera's own
+  // bind group carries a block with `on` = 0, which is what keeps the real
+  // floor whole.
+  const discards = [...shader.matchAll(/\bdiscard\b/g)]
+  assert.equal(
+    discards.length,
+    1,
     "a discarded fragment writes no depth, which would punch holes in the floor for everything that " +
-      "reads depth to find it",
+      "reads depth to find it — the mirror clip is the only draw allowed to do it",
   )
+  const before = shader.slice(Math.max(0, discards[0].index - 240), discards[0].index)
+  assert.match(before, /clip\.on\b/, "the discard must be guarded by the mirror clip, not reached in the camera pass")
 })
 
 test("nothing skips the ground draw on opacity", () => {

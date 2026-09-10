@@ -84,6 +84,12 @@ type SceneRenderClass =
   | "ground"
   /** Backface-expanded hulls. Also a material blend — it is geometry. */
   | "outline"
+  /** A mirror surface: opaque geometry carrying a projective sample of the
+   *  reflection target. Blends like a material because it IS one, and is out of
+   *  WRITES_ID because what it shows is a picture of the cast rather than the
+   *  cast — a reflection that claimed her object id would seed the distance
+   *  field twice and put every silhouette effect's border around the glass. */
+  | "mirror"
   /** Particles and ribbons in their default, non-additive mode. */
   | "particle"
   /** Particles declaring `#blend additive` — LIGHT rather than matter, so
@@ -158,12 +164,20 @@ const ADD_PREMULTIPLIED: GPUBlendState = {
  * consequence. Outline hulls, particles and ribbons are OUT: they are not
  * things you would ever address by id, and a hull would overwrite the id of the
  * body it traces.
+ *
+ * So is the mirror — see the class's own note.
  */
 const WRITES_ID = new Set<SceneRenderClass>(["material", "ground"])
 
 /** The blends each class writes its two attachments with. */
 const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState, GPUBlendState]> = {
   material: [ALPHA_OVER, ALPHA_OVER],
+  // PREMULTIPLIED, like the ground and for the same reason: what a mirror
+  // writes is a sample of the HDR target, and that target already holds colour
+  // premultiplied by its own alpha. Handed to the src-alpha blend it would be
+  // weighted a second time, and a reflection at coverage 0.5 would arrive at a
+  // quarter strength.
+  mirror: [PREMULTIPLIED_OVER, ALPHA_OVER],
   // PREMULTIPLIED colour, alone among the classes — see the blend's own note.
   // The aux is ordinary alpha-over: the ground writes its mask unweighted, like
   // everything else, and coverage is what the blend applies.

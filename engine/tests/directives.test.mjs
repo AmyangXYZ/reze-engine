@@ -101,6 +101,7 @@ test("every directive the engine knows round-trips", () => {
       "#grid 256",
       "#bloom",
       "#dissolve",
+      "#mirror",
       "#anchor 頭",
       "#anchor 左手首 trail",
     ].join("\n"),
@@ -113,10 +114,17 @@ test("every directive the engine knows round-trips", () => {
   assert.equal(d.grid, 256)
   assert.equal(d.bloom, true)
   assert.equal(d.dissolve, true)
+  assert.equal(d.mirror, true)
   assert.deepEqual(d.anchors, [
     { bone: "頭", trail: false },
     { bone: "左手首", trail: true },
   ])
+})
+
+test("saying nothing is not a mirror", () => {
+  // The flag directives all default false, and this is the one whose default
+  // costs a whole extra render of the scene if it ever slipped to true.
+  assert.equal(ok("#particles 10").mirror, false)
 })
 
 test("every directive the shipped effects use is one the parser knows", () => {

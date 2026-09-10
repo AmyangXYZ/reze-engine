@@ -123,6 +123,26 @@ struct MirrorVP { viewProj: mat4x4f, params: vec4f, };
 // The frost noise, PRE-BAKED — see GROUND_NOISE_BAKE_WGSL below. Sampled with
 // the repeat sampler already at binding 10.
 @group(0) @binding(12) var noiseTex: texture_2d<f32>;
+// The mirror pass's resolved aux. .g is accumulated alpha — the reflection's
+// coverage. It lives here rather than in the colour target's own alpha because
+// the HDR format is rg11b10ufloat wherever the device allows it, and that
+// format has no alpha channel at all.
+@group(0) @binding(13) var mirrorMask: texture_2d<f32>;
+// THE MIRROR'S OWN PLANE, and whether this draw is the one inside the mirror
+// pass. A mirror shows nothing behind itself, and the floor is the geometry
+// most often behind one: stand a pane up and half the floor is behind it, lay
+// it facing UP and the whole floor is. Without this the reflection carries a
+// grid that the mirror cannot see.
+//
+// A uniform rather than a branch on some global, because the two ground bind
+// groups already differ — the camera's binds a block set to 0 and the
+// mirror's binds the live plane. No per-pass write, and nothing to get wrong
+// about which pass is running.
+// The flag is named on, not active: WGSL RESERVES active, and a reserved
+// word in a struct field fails the whole module — taking the ground
+// pipeline, and every style group and effect compiled after it, with it.
+struct MirrorClip { plane: vec4f, on: f32, _p0: f32, _p1: f32, _p2: f32, };
+@group(0) @binding(14) var<uniform> clip: MirrorClip;
 ${WORLD_AMBIENT_WGSL}
 ${lightsApi(0, 6)}
 
@@ -136,6 +156,14 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // flow and everything below branches on world position.
   let gp = i.worldPos.xz / material.gridSpacing;
   let gridDeriv = fwidth(gp);
+
+  // The clip, straight after the derivatives and before anything else branches.
+  // EPSILON rather than zero: a pane lying flat on the floor is coplanar with
+  // it, and a floor reflecting itself at zero distance is z-fighting, not a
+  // reflection.
+  if (clip.on > 0.5 && dot(clip.plane.xyz, i.worldPos) + clip.plane.w < 0.01) {
+    discard;
+  }
 
   var out: FSOut;
   let n = normalize(i.normal);
@@ -315,6 +343,11 @@ ${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ", 
   // independence the grid won earlier. The branch is on a uniform, so the
   // whole cost vanishes for the scenes that leave it off.
   var reflShadowed = vec3f(0.0);
+  // How much of this texel the reflection pass actually covered. The target
+  // clears TRANSPARENT, so this is 1 where something reflected and 0 over the
+  // empty sky — which is what stops a floor mirror from painting the backdrop
+  // onto itself and wiping out the ground's own colour.
+  var reflA = 0.0;
   if (material.mirror > 0.0) {
     let mc = mirrorVP.viewProj * vec4f(i.worldPos, 1.0);
     let mndc = mc.xyz / max(mc.w, 1e-6);
@@ -349,10 +382,11 @@ ${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ", 
       let BLUR_SPAN = 14.0;
       lod = material.mirrorBlur * 5.0 * clamp(height / BLUR_SPAN, 0.0, 1.0);
     }
-    let refl = textureSampleLevel(mirrorTex, linearSampler, muv, lod).rgb;
+    let refl = textureSampleLevel(mirrorTex, linearSampler, muv, lod);
     // Still under the received shadow: a polished floor in shade shows a dim
     // reflection, and a mirror that ignored the shadow would glow in it.
-    reflShadowed = refl * (1.0 - dark * 0.65);
+    reflShadowed = refl.rgb * (1.0 - dark * 0.65);
+    reflA = textureSampleLevel(mirrorMask, linearSampler, muv, 0.0).g;
   }
   // THREE LAYERS, composited premultiplied, bottom to top: the shadow the
   // catcher receives, the ground surface, and the grid.
@@ -364,15 +398,17 @@ ${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ", 
   // alpha, and the grid is simply on or off.
   let surfA = edgeFade * material.opacity;
   let gridA = gridLine * material.gridLineOpacity * edgeFade;
-  // The mirror is opaque across the ground's extent when on — it always shows
-  // SOMETHING, because the backdrop rides in the reflection target itself.
-  let mirrA = material.mirror * edgeFade;
+  // The mirror covers only what it actually REFLECTS. The backdrop no longer
+  // rides in the reflection target — it clears transparent — so the floor keeps
+  // its own colour everywhere the cast is not standing, which is the difference
+  // between an MMD stage floor and a mirror of the sky.
+  let mirrA = material.mirror * edgeFade * reflA;
   // As opacity drops the received shadow becomes a translucent dark layer
   // (Blender's Shadow Catcher), so models still feel grounded on a photo or a
   // 360 backdrop. Colourless by construction: it darkens by covering. The
   // MIRROR subsumes it: the reflection already carries the received shadow,
   // and a catcher stacked on top would darken the same shadow twice.
-  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity) * (1.0 - material.mirror);
+  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity) * (1.0 - mirrA);
 
   // FOUR LAYERS, premultiplied, bottom to top: reflection, received shadow,
   // ground surface, grid. Each with its own coverage, none scaling another —
