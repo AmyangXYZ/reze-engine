@@ -906,6 +906,12 @@ interface GpuMorph {
   weightsData: Float32Array // staging copy uploaded when weights change
   workgroups: number
   dispatchNeeded: boolean
+  /** The compute pass's OWN base positions — what it recomputes FROM on its
+   *  next dispatch, regardless of what a direct vertex-buffer write just put
+   *  there. A permanent geometry edit under a morph-capable model (a bone
+   *  scale's own vertex half) has to land here too, or the very next morph
+   *  weight change quietly reverts it. */
+  baseBuf: GPUBuffer
 }
 
 // ── Sheer-material detection ──────────────────────────────────────────────────
@@ -10217,6 +10223,76 @@ export class Engine {
     return best
   }
 
+  /** Scratch for the small per-vertex writeBuffer calls setVertexPositions
+   *  and setBoneBindPositions make — one float32x3, reused so a live drag
+   *  calling either hundreds of times a frame does not also allocate hundreds
+   *  of throwaway arrays. */
+  private vec3Scratch = new Float32Array(3)
+
+  /**
+   * Overwrites BASE (pre-morph) vertex positions — a PERMANENT geometry edit
+   * (a bone scale's own vertex half, say), not a transient morph: nothing
+   * here is undone by a weight going back to 0.
+   *
+   * Three places have to agree, or the very next frame — or the next morph
+   * weight change — quietly reverts this: the model's own CPU copy
+   * (Model.setVertexPositions), the live render buffer, and, for a model
+   * whose morphs run on the GPU, the compute pass's OWN base-positions
+   * buffer, which it recomputes from on its next dispatch regardless of
+   * whatever a direct vertex-buffer write just put there.
+   */
+  setVertexPositions(
+    modelName: string,
+    updates: readonly { index: number; position: readonly [number, number, number] }[],
+  ): void {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst || updates.length === 0) return
+    inst.model.setVertexPositions(updates)
+    const scratch = this.vec3Scratch
+    for (const { index, position } of updates) {
+      scratch[0] = position[0]
+      scratch[1] = position[1]
+      scratch[2] = position[2]
+      this.device.queue.writeBuffer(inst.vertexBuffer, index * 32, scratch)
+      if (inst.gpuMorph) this.device.queue.writeBuffer(inst.gpuMorph.baseBuf, index * 12, scratch)
+    }
+  }
+
+  /**
+   * Moves bones to new WORLD bind (rest) positions — a permanent rig edit
+   * (a bone scale's own bone half), never a pose. Patches bindTranslation
+   * (relative to the bone's CURRENT parent world position, read fresh off
+   * its own inverseBindMatrix — pass parents before children in one call if
+   * a bone's OWN local offset needs to stay exactly consistent, though nothing
+   * downstream of this actually reads bindTranslation live: skinning, the
+   * bone overlay and picking all read inverseBindMatrices directly, which
+   * this always writes correctly regardless of order) and the cached
+   * inverse-bind matrix directly, so every one of those picks the new
+   * position up on the very next frame with nothing else to recompute.
+   */
+  setBoneBindPositions(
+    modelName: string,
+    updates: readonly { index: number; position: readonly [number, number, number] }[],
+  ): void {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst || updates.length === 0) return
+    const skeleton = inst.model.getSkeleton()
+    const invBind = skeleton.inverseBindMatrices
+    for (const { index, position } of updates) {
+      const bone = skeleton.bones[index]
+      if (!bone) continue
+      const parent = bone.parentIndex >= 0 ? bone.parentIndex : -1
+      const parentPos: [number, number, number] =
+        parent >= 0
+          ? [-invBind[parent * 16 + 12], -invBind[parent * 16 + 13], -invBind[parent * 16 + 14]]
+          : [0, 0, 0]
+      bone.bindTranslation = [position[0] - parentPos[0], position[1] - parentPos[1], position[2] - parentPos[2]]
+      invBind[index * 16 + 12] = -position[0]
+      invBind[index * 16 + 13] = -position[1]
+      invBind[index * 16 + 14] = -position[2]
+    }
+  }
+
   /** Scratch for selectMaterialFaces — same shape as materialPickScratch,
    *  its own buffer since a drag can end while a click is still in flight
    *  from a different frame's hover. */
@@ -11993,6 +12069,7 @@ export class Engine {
       weightsData: new Float32Array(data.morphCount),
       workgroups: Math.ceil(data.vertexCount / 64),
       dispatchNeeded: false, // vertex buffer already holds base; dispatch on first weight change
+      baseBuf,
     }
   }
 

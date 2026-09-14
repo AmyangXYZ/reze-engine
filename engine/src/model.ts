@@ -1024,6 +1024,22 @@ export class Model {
     return this.skeleton
   }
 
+  /**
+   * Overwrites BASE (pre-morph) positions in place — a permanent geometry
+   * edit (a bone scale's own vertex half), not a transient morph. Only the
+   * CPU copy: the caller (Engine.setVertexPositions) owns pushing the same
+   * change to whichever GPU buffer(s) actually feed the render this frame.
+   */
+  setVertexPositions(updates: readonly { index: number; position: readonly [number, number, number] }[]): void {
+    for (const { index, position } of updates) {
+      if (index < 0 || index >= this.vertexCount) continue
+      const vi = index * VERTEX_STRIDE
+      this.baseVertexData[vi] = position[0]
+      this.baseVertexData[vi + 1] = position[1]
+      this.baseVertexData[vi + 2] = position[2]
+    }
+  }
+
   // Direct bone local-transform accessors (used by interactive gizmo drag).
   // Readers return the live runtime state — callers that want a snapshot for
   // later comparison should `.clone()` the returned Quat / copy the Vec3.
