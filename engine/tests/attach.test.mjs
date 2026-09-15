@@ -181,7 +181,7 @@ test("a keyed model picks its hold on this frame's clock, before it is placed", 
   const place = loop.indexOf("this.placeAttached(inst)")
   assert.ok(keyed > 0 && keyed < place, "the hold is chosen BEFORE the placement reads it")
   const apply = engine.slice(engine.indexOf("  private applyParentKeys("), engine.indexOf("  private placeAttached("))
-  assert.match(apply, /parentKeyIndex\(track\.keys, this\.transportTime\(\)\)/, "the transport clock, which the camera VMD and effect windows read")
+  assert.match(apply, /parentKeySpan\(track\.keys, this\.transportTime\(\)\)/, "the transport clock, which the camera VMD and effect windows read")
   const order = engine.slice(engine.indexOf("  private instancesInUpdateOrder("), engine.indexOf("  setModelTransform(name: string"))
   assert.match(order, /!i\.isStage && !i\.isPlane && !i\.isProp && !i\.parentKeys/, "a keyed model waits for the unkeyed cast, whose clips are that clock")
   assert.match(order, /for \(const k of inst\.parentKeys\.keys\) if \(k\.parent !== null\) names\.add\(k\.parent\)/, "and for every parent its keys name")

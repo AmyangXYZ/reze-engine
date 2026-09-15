@@ -3,10 +3,11 @@
  *
  * A throw is three holds on one object: in her right hand, in the air, in his
  * left hand. Each is a KEY: from its time until the next key's, the model rides
- * that bone with that offset, or stands on its own at that placement. A parent
- * is a choice with no in-between, so keys do not interpolate; what moves the
- * object smoothly across a switch is its own clip, and the offsets a host
- * writes from the pose at the moment of each switch.
+ * that bone with that offset, or stands on its own at that placement. A key
+ * switches at its time, or, marked `tween`, is arrived at gradually: across the
+ * time since the previous key the model stands free at the blend of the two
+ * placements. That is how a flight is a run of free keys and a catch lands in a
+ * moving hand.
  *
  * SECONDS on the transport clock, like effect windows, so a 60Hz preview and a
  * 30 or 60fps export switch on the same frame.
@@ -28,6 +29,9 @@ export type ModelParentKey = {
   /** With a parent, the offset in the bone's space. Without one, where the model stands. */
   position?: Vec3
   rotation?: Quat
+  /** Arrive at this key gradually, from the previous key's placement, rather
+   *  than switching at its time. */
+  tween?: boolean
 }
 
 /** How far past the clock a key may sit and still be reached. The transport
@@ -44,4 +48,22 @@ export function parentKeyIndex(keys: readonly { time: number }[], time: number):
   let i = 0
   while (i + 1 < keys.length && keys[i + 1].time <= time + PARENT_KEY_TOLERANCE) i++
   return i
+}
+
+/**
+ * The key in force at `time`, and how far the placement has travelled toward
+ * the next key: 0 unless that key tweens, else the fraction of the way from
+ * this key's time to its.
+ */
+export function parentKeySpan(
+  keys: readonly { time: number; tween?: boolean }[],
+  time: number,
+): { index: number; toward: number } {
+  const index = parentKeyIndex(keys, time)
+  const next = keys[index + 1]
+  if (index < 0 || !next?.tween) return { index, toward: 0 }
+  const start = keys[index].time
+  const span = next.time - start
+  if (span <= 0 || time <= start) return { index, toward: 0 }
+  return { index, toward: Math.min(1, (time - start) / span) }
 }

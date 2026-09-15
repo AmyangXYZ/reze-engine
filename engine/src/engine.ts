@@ -31,7 +31,7 @@ import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import { effectState, type EffectWindow } from "./effect-schedule"
-import { parentKeyIndex, type ModelParentKey } from "./parent-keys"
+import { parentKeySpan, type ModelParentKey } from "./parent-keys"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import { MIRROR_MASK_DOWNSAMPLE_WGSL, MIRROR_MAT_BYTES, mirrorShaderWgsl, mirrorShadowWgsl } from "./shaders/passes/mirror"
@@ -411,11 +411,12 @@ type Attachment = ModelAttachment & {
 }
 
 /** A parent key as the engine keeps it: its own copy, defaults filled in. */
-type HeldParentKey = { time: number; parent: string | null; bone: string; position: Vec3; rotation: Quat }
+type HeldParentKey = { time: number; parent: string | null; bone: string; position: Vec3; rotation: Quat; tween: boolean }
 
-/** A model's parent keys, sorted by time, and the one last applied, so a frame
- *  that stays inside one hold does no work. See setModelParentKeys. */
-type ParentTrack = { keys: HeldParentKey[]; applied: number }
+/** A model's parent keys, sorted by time, the one last applied — so a frame
+ *  that stays inside one hold does no work — and the bind position of the
+ *  model's first root, the seat a ride puts on the bone. See setModelParentKeys. */
+type ParentTrack = { keys: HeldParentKey[]; applied: number; seat: [number, number, number] }
 
 type SunOptions = {
   /** Linear color of the sun lamp (Blender: Light > Color). */
@@ -9896,9 +9897,10 @@ export class Engine {
    * transport seconds, the clock the camera VMD and effect windows read, so
    * playback, a scrub and an offline export all switch on the same frame.
    *
-   * A switch is instant. What carries an object smoothly from one hold to the
-   * next is its own clip, plus offsets the host writes from the pose at the
-   * moment of each switch.
+   * A key switches at its time. A key marked `tween` is arrived at instead:
+   * from the previous key's time to its own the model stands free at the blend
+   * of the two placements, each read live — so a run of free keys is a flight,
+   * and a tween into a key on a hand lands in that hand wherever it has moved.
    *
    * While keys are set they own the model's parent, position and rotation;
    * setModelTransform still sets scale and visibility. A key naming a model that
@@ -9918,9 +9920,12 @@ export class Engine {
         bone: k.bone ?? "全ての親",
         position: k.position ? new Vec3(k.position.x, k.position.y, k.position.z) : new Vec3(0, 0, 0),
         rotation: k.rotation ? k.rotation.clone() : Quat.identity(),
+        tween: k.tween === true,
       }))
       .sort((a, b) => a.time - b.time)
-    inst.parentKeys = held.length > 0 ? { keys: held, applied: -1 } : null
+    const root = inst.model.getSkeleton().bones.find((b) => b.parentIndex < 0)
+    const seat: [number, number, number] = root ? [root.bindTranslation[0], root.bindTranslation[1], root.bindTranslation[2]] : [0, 0, 0]
+    inst.parentKeys = held.length > 0 ? { keys: held, applied: -1, seat } : null
     return true
   }
 
@@ -9934,6 +9939,7 @@ export class Engine {
       bone: k.bone,
       position: new Vec3(k.position.x, k.position.y, k.position.z),
       rotation: k.rotation.clone(),
+      tween: k.tween,
     }))
   }
 
@@ -9946,8 +9952,13 @@ export class Engine {
    */
   private applyParentKeys(inst: ModelInstance): void {
     const track = inst.parentKeys!
-    const i = parentKeyIndex(track.keys, this.transportTime())
+    const { index: i, toward } = parentKeySpan(track.keys, this.transportTime())
     const k = track.keys[i]
+    if (toward > 0 && this.placeBetweenKeys(inst, track, k, track.keys[i + 1], toward)) {
+      // The hold after the tween applies afresh once the clock reaches it.
+      track.applied = -1
+      return
+    }
     const parent = k.parent !== null && k.parent !== inst.name && this.modelInstances.has(k.parent) ? k.parent : null
     if (i === track.applied && (inst.parent?.model ?? null) === parent) return
     track.applied = i
@@ -9961,6 +9972,79 @@ export class Engine {
     inst.model.setRotation(standing ? k.rotation.clone() : Quat.identity())
     inst.skinMatricesDirty = true
   }
+
+  /**
+   * Stand a keyed model free, `toward` of the way from one key's placement to
+   * the next's. Both are read live, so an end on a hand follows the hand as it
+   * moves. False when either end names a model that is not loaded.
+   */
+  private placeBetweenKeys(
+    inst: ModelInstance,
+    track: ParentTrack,
+    from: HeldParentKey,
+    to: HeldParentKey,
+    toward: number,
+  ): boolean {
+    if (!this.keyPlacementInto(inst, track, from, this.tweenFrom)) return false
+    if (!this.keyPlacementInto(inst, track, to, this.tweenTo)) return false
+    if (inst.parent) this.setModelParent(inst.name, null)
+    const p = this.tweenFrom.position
+    const q = this.tweenTo.position
+    this.tweenPosition.setXYZ(p.x + (q.x - p.x) * toward, p.y + (q.y - p.y) * toward, p.z + (q.z - p.z) * toward)
+    Quat.slerpInto(this.tweenFrom.rotation, this.tweenTo.rotation, toward, this.tweenRotation)
+    inst.model.setPosition(this.tweenPosition)
+    inst.model.setRotation(this.tweenRotation)
+    inst.skinMatricesDirty = true
+    return true
+  }
+
+  /**
+   * Where a key puts a model, as the free placement that looks the same: its
+   * own position and rotation when it stands alone, or — riding a bone — the
+   * bone as posed now times the offset, with the seat taken off along it (the
+   * root rule in setModelParent).
+   */
+  private keyPlacementInto(
+    inst: ModelInstance,
+    track: ParentTrack,
+    key: HeldParentKey,
+    out: { position: Vec3; rotation: Quat },
+  ): boolean {
+    if (key.parent === null) {
+      out.position.set(key.position)
+      out.rotation.set(key.rotation)
+      return true
+    }
+    const parent = key.parent !== inst.name ? this.modelInstances.get(key.parent) : undefined
+    if (!parent) return false
+    const frame = this.tweenMatrix
+    const bone = parent.model.getBoneWorldMatrix(key.bone)
+    if (bone) Mat4.multiplyArrays(parent.model.getRootMatrix(), 0, bone, 0, frame, 0)
+    else frame.set(parent.model.getRootMatrix())
+    const o = key.position
+    const r = key.rotation
+    Mat4.fromPositionRotationScaleInto(o.x, o.y, o.z, r.x, r.y, r.z, r.w, 1, this.tweenOffset)
+    const m = this.tweenScratch
+    Mat4.multiplyArrays(frame, 0, this.tweenOffset, 0, m, 0)
+    const s = inst.model.scale
+    const x = -s * track.seat[0]
+    const y = -s * track.seat[1]
+    const z = -s * track.seat[2]
+    out.position.setXYZ(
+      m[0] * x + m[4] * y + m[8] * z + m[12],
+      m[1] * x + m[5] * y + m[9] * z + m[13],
+      m[2] * x + m[6] * y + m[10] * z + m[14],
+    )
+    Mat4.toQuatFromArrayInto(m, 0, out.rotation)
+    return true
+  }
+  private readonly tweenFrom = { position: new Vec3(0, 0, 0), rotation: Quat.identity() }
+  private readonly tweenTo = { position: new Vec3(0, 0, 0), rotation: Quat.identity() }
+  private readonly tweenPosition = new Vec3(0, 0, 0)
+  private readonly tweenRotation = Quat.identity()
+  private readonly tweenMatrix = new Float32Array(16)
+  private readonly tweenOffset = new Float32Array(16)
+  private readonly tweenScratch = new Float32Array(16)
 
   /**
    * The root an attached model is posed under this frame: the parent's

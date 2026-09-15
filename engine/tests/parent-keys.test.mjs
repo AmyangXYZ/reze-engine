@@ -6,7 +6,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { parentKeyIndex } from "../dist/parent-keys.js"
+import { parentKeyIndex, parentKeySpan } from "../dist/parent-keys.js"
 
 const keys = [{ time: 0 }, { time: 4 }, { time: 5 }]
 
@@ -31,4 +31,13 @@ test("a clock summed from frame deltas reaches a key on its frame, and not a fra
     assert.equal(parentKeyIndex(keys, t), 1, `${fps}fps: frame ${4 * fps} is the switch`)
     assert.equal(parentKeyIndex(keys, 4 - 1 / fps), 0, `${fps}fps: the frame before is still the old hold`)
   }
+})
+
+test("a tweened key is arrived at across the time since the previous key", () => {
+  const tweened = [{ time: 0 }, { time: 2, tween: true }, { time: 4 }]
+  assert.deepEqual(parentKeySpan(tweened, 0), { index: 0, toward: 0 }, "at the previous key nothing has moved")
+  assert.deepEqual(parentKeySpan(tweened, 1), { index: 0, toward: 0.5 })
+  assert.deepEqual(parentKeySpan(tweened, 2), { index: 1, toward: 0 }, "at its own time the tweened key is in force")
+  assert.deepEqual(parentKeySpan(tweened, 3), { index: 1, toward: 0 }, "a key that does not tween switches")
+  assert.deepEqual(parentKeySpan([], 1), { index: -1, toward: 0 })
 })
