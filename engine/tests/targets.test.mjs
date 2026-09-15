@@ -28,6 +28,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
+import { EFFECT_SUBJECT_VEC4S } from "../dist/shaders/cast-layout.js"
 import { sceneTargets, sceneColorFormats, mrtIdsEnabled, setMrtIds, SCENE_ID_FORMAT } from "../dist/shaders/passes/scene-contract.js"
 import * as materials from "../dist/shaders/materials/common.js"
 import * as ground from "../dist/shaders/passes/ground.js"
@@ -460,7 +461,7 @@ test("the subject id and the pick id are the same number", () => {
   // same field off the instance. Two derivations of one id are two that drift,
   // and then a mask selects a different model than a click does.
   assert.match(engine, /cd\[b \+ 7\] = inst\.objectId/, "the cast must carry the object id")
-  assert.match(fieldWith(true), /return u32\(_rzCast\[i \* 3 \+ 1\]\.w\)/, "rzSubjectId must read that same slot")
+  assert.match(fieldWith(true), new RegExp(`return u32\\(_rzCast\\[i \\* ${EFFECT_SUBJECT_VEC4S} \\+ 1\\]\\.w\\)`), "rzSubjectId must read that same slot")
 })
 
 test("only the ground blends premultiplied, and only because it premultiplies", () => {

@@ -5,6 +5,7 @@ import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
 import { CAST_API } from "../cast-api"
+import { EFFECT_SUBJECT_VEC4S } from "../cast-layout"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 import { idApi } from "../id-api"
@@ -165,7 +166,7 @@ fn rzCamPos() -> vec3f { return cam.camPos; }
 fn rzSubjectCount() -> i32 {
   var n = 0;
   for (var i = 0; i < RZ_SUBJECTS; i++) {
-    if (_rzCast[i * 3 + 2].w > 0.0) { n = i + 1; }
+    if (_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 2].w > 0.0) { n = i + 1; }
   }
   return n;
 }

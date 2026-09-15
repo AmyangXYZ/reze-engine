@@ -180,8 +180,9 @@ override APPLY_GAMMA: bool = true;
 // STABLE and never will be, because it depends on what each effect declared.
 // Reading it directly is the one thing that would freeze it forever.
 //
-// vec4 slots: [0 .. 11] four subjects, three each (root+valid, hip, bounds);
-// then MAX_ANCHORS × four subjects, three each (pos+valid, vel, fwd).
+// vec4 slots: [0 .. 15] four subjects, EFFECT_SUBJECT_VEC4S each (root+dissolve,
+// hip+objectId, bounds, gaze+looking); then MAX_ANCHORS × four subjects, three
+// each (pos+valid, vel, fwd).
 @group(0) @binding(11) var<storage, read> _rzCast: array<vec4f>;
 // The FIELD LAYER: the user's background/foreground mounts, rendered at half
 // resolution in their own pass (see buildFieldShader) and sampled here. Field

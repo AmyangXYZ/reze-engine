@@ -85,7 +85,7 @@ struct RzAnchor {
 /** Which model this is, stable across a scene — for per-subject variation. */
 fn rzSubjectId(i: i32) -> u32 {
   if (i < 0 || i >= rzSubjectCount()) { return 0u; }
-  return u32(_rzCast[i * 3 + 1].w);
+  return u32(_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 1].w);
 }
 
 fn rzSubject(i: i32) -> RzSubject {

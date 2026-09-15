@@ -1,4 +1,4 @@
-import { EFFECT_SUBJECTS } from "../cast-layout"
+import { EFFECT_SUBJECT_VEC4S, EFFECT_SUBJECTS } from "../cast-layout"
 
 // How far is this pixel from the cast? — the primitive behind every silhouette
 // look, computed once and read by anyone.
@@ -99,13 +99,13 @@ const RZ_ID_SAMPLES: i32 = ${samples};
 fn rzSubjectCount() -> i32 {
   var n = 0;
   for (var i = 0; i < RZ_SUBJECTS; i++) {
-    if (_rzCast[i * 3 + 2].w > 0.0) { n = i + 1; }
+    if (_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 2].w > 0.0) { n = i + 1; }
   }
   return n;
 }
 fn rzSubjectId(i: i32) -> u32 {
   if (i < 0 || i >= rzSubjectCount()) { return 0u; }
-  return u32(_rzCast[i * 3 + 1].w);
+  return u32(_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 1].w);
 }
 
 ${FULLSCREEN_VS}
