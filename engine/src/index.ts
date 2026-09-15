@@ -39,7 +39,15 @@ export { sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 // The strip an effect is scheduled by, and the pure evaluator behind it —
 // exported so a caller can draw a lane against the same numbers the engine
 // renders from, rather than a second copy of the ramp maths.
-export { effectState, type EffectWindow, type EffectState } from "./effect-schedule"
+export {
+  activeWindow,
+  advanceSim,
+  effectState,
+  SIM_MAX_STEP,
+  type EffectWindow,
+  type EffectState,
+  type SimClock,
+} from "./effect-schedule"
 // Who a model hangs from over time, and the lookup behind it — exported so a
 // timeline draws its holds from the same rule the engine switches by.
 export { parentKeyIndex, type ModelParentKey } from "./parent-keys"

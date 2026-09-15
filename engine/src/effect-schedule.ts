@@ -88,12 +88,7 @@ export function effectState(
   // it keeps "which strip am I in" a question with one answer — but a document
   // can be hand-edited, and "the one most recently entered" is the reading that
   // matches what you would see if they were laid down in order.
-  let window: EffectWindow | null = null
-  for (const w of windows) {
-    if (sceneTime < w.start) continue
-    if (w.end !== undefined && (w.end <= w.start || sceneTime > w.end)) continue
-    if (!window || w.start > window.start) window = w
-  }
+  const window = activeWindow(windows, sceneTime)
   if (!window) return SILENT
 
   const { start, end } = window
@@ -117,4 +112,57 @@ export function effectState(
   // than asked for, still smooth, never out of range. Multiplying them would
   // dip toward zero in the middle of a short strip, which is not a fade.
   return { weight: level * clamp01(ramp), time }
+}
+
+/**
+ * The window that holds `sceneTime`: the latest start that contains it, edges
+ * inclusive, an end at or before its start holding nothing. Null outside every
+ * window and for a missing lane. effectState plays this window.
+ */
+export function activeWindow(windows: readonly EffectWindow[] | null, sceneTime: number): EffectWindow | null {
+  if (!windows) return null
+  let window: EffectWindow | null = null
+  for (const w of windows) {
+    if (sceneTime < w.start) continue
+    if (w.end !== undefined && (w.end <= w.start || sceneTime > w.end)) continue
+    if (!window || w.start > window.start) window = w
+  }
+  return window
+}
+
+/** The largest single step a scheduled simulation takes, in seconds. A hitch or
+ *  a scrub forward advances it this far and no further, and restarts nothing. */
+export const SIM_MAX_STEP = 0.1
+
+/** Where a scheduled effect's simulation stood last frame: the start of the
+ *  window it was in, and its own time there. Both null outside every window. */
+export type SimClock = { start: number | null; time: number | null }
+
+/**
+ * One frame of a scheduled effect's simulation: its particle pool and its grid.
+ *
+ * Those carry state from one frame to the next, so the window's clock alone
+ * cannot place them. A burst scheduled at bar 33 has to start there from an
+ * empty pool, and play the same way every time the scene reaches bar 33 —
+ * in the editor, on a loop, and in an export.
+ *
+ * - Entering a window RESTARTS it, from an empty pool and an unseeded grid.
+ * - Time going back inside a window restarts it too: a scrub back or a loop
+ *   wrapping, where what the pool holds is from later.
+ * - Forward, it steps by exactly how far the transport moved, at most
+ *   SIM_MAX_STEP. A paused transport steps it by zero, and an export steps it
+ *   the same way on every render.
+ * - Outside every window it does not step.
+ */
+export function advanceSim(
+  prev: SimClock,
+  windows: readonly EffectWindow[] | null,
+  sceneTime: number,
+): { reset: boolean; step: number; clock: SimClock } {
+  const window = activeWindow(windows, sceneTime)
+  if (!window) return { reset: false, step: 0, clock: { start: null, time: null } }
+  const time = sceneTime - window.start
+  const clock = { start: window.start, time }
+  if (prev.start !== window.start || prev.time === null || time < prev.time) return { reset: true, step: 0, clock }
+  return { reset: false, step: Math.min(SIM_MAX_STEP, time - prev.time), clock }
 }

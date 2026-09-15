@@ -30,7 +30,7 @@ import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
-import { effectState, type EffectWindow } from "./effect-schedule"
+import { effectState, type EffectWindow, advanceSim, type SimClock } from "./effect-schedule"
 import { parentKeySpan, type ModelParentKey } from "./parent-keys"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
@@ -1533,6 +1533,13 @@ interface EffectInstance {
    * is what makes a scheduled effect cost nothing outside its window.
    */
   weight: number
+  /** Where this effect's simulation stood last frame, while scheduled. See advanceSim. */
+  sim: SimClock
+  /** This frame's particle and grid step in seconds, from the transport. Read
+   *  only while the effect is scheduled; an unscheduled one steps by the render delta. */
+  simStep: number
+  /** Empty the particle pool and the grid before this frame's step. */
+  simReset: boolean
   /** This effect's OWN clock, as a uniform the field shader reads. Per effect
    *  because the shared one (viewU[6].x) is measured from the first installed
    *  effect's epoch, so everything later started mid-stream. Null when the
@@ -4547,6 +4554,9 @@ export class Engine {
         influence: 1,
         window: null,
         weight: 1,
+        sim: { start: null, time: null },
+        simStep: 0,
+        simReset: false,
         // Its OWN resolution, no longer the scene's: an effect that never asked
         // for full res is not promoted because a neighbour did.
         // FULL RESOLUTION UNLESS TOLD OTHERWISE.
@@ -4823,10 +4833,11 @@ export class Engine {
     const renderModule = await compile(buildParticleRenderShader(src, cast), "particle render")
     if (Array.isArray(renderModule)) return { ok: false, diagnostics: renderModule }
 
+    // COPY_DST so a scheduled effect can empty its pool when its window starts.
     const buffer = this.device.createBuffer({
       label: "particle pool",
       size: count * PARTICLE_STRIDE,
-      usage: GPUBufferUsage.STORAGE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     const uniform = this.device.createBuffer({
       label: "particle uniforms",
@@ -5092,6 +5103,14 @@ export class Engine {
     for (const e of this.effects) {
       const p = e.particles
       if (!p) continue
+      const scheduled = e.window !== null
+      // A scheduled pool that has not moved holds still: a paused transport, or
+      // a time outside every window. A dispatch at dt 0 would still run the
+      // author's step, and not every step is a function of dt.
+      if (scheduled && !e.simReset && e.simStep === 0) continue
+      // Entering its window, or going back in it: the pool starts empty, and
+      // every slot spawns on this dispatch from the effect's own local time.
+      if (e.simReset) encoder.clearBuffer(p.buffer)
       p.data[0] = this.sceneClock - e.epochScene
       // The SIMULATION runs at every weight, 0 included — only the draw stops.
       // A scheduled effect that froze while faded out would resume from the
@@ -5100,7 +5119,9 @@ export class Engine {
       p.data[4] = e.weight
       // Clamped: a backgrounded tab returns with a delta of whole seconds, and an
       // unclamped step flings every particle out of the scene in one frame.
-      p.data[1] = Math.min(0.1, Math.max(0, deltaTime))
+      // A scheduled effect steps by the transport instead, clamped the same way
+      // in advanceSim, so a pause freezes it and an export steps it exactly.
+      p.data[1] = scheduled ? e.simStep : Math.min(0.1, Math.max(0, deltaTime))
       p.counts[2] = p.count
       p.counts[3] = this.particleFrame++
       this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
@@ -5554,7 +5575,8 @@ export class Engine {
         label: `grid grid ${n}`,
         size: [size, size],
         format: SIM_FORMAT,
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+        // RENDER_ATTACHMENT so a scheduled effect can clear it when its window starts.
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
       })
     const textures: [GPUTexture, GPUTexture] = [make(0), make(1)]
     const read: [GPUTextureView, GPUTextureView] = [textures[0].createView(), textures[1].createView()]
@@ -5624,11 +5646,28 @@ export class Engine {
     for (const e of this.effects) {
     const grid = e.grid
     if (!grid) continue
+    const scheduled = e.window !== null
+    // Held still like the particles, for the same reason.
+    if (scheduled && !e.simReset && e.simStep === 0) continue
+    if (e.simReset) {
+      // Back to how install left it: both textures empty and frame 0 again,
+      // the frame an effect seeds its grid on.
+      for (const view of grid.read) {
+        encoder
+          .beginRenderPass({
+            label: "grid reset",
+            colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
+          })
+          .end()
+      }
+      grid.frame = 0
+      grid.parity = 0
+    }
     grid.data[0] = this.sceneClock - e.epochScene
     // Clamped like the particle step: a backgrounded tab returns with a delta of
     // whole seconds, and one unclamped step of an advection kernel throws the
     // whole grid off its own edge.
-    grid.data[1] = Math.min(0.1, Math.max(0, deltaTime))
+    grid.data[1] = scheduled ? e.simStep : Math.min(0.1, Math.max(0, deltaTime))
     grid.data[2] = grid.size
     grid.data[3] = grid.frame++
     this.device.queue.writeBuffer(grid.uniform, 0, grid.data.buffer as ArrayBuffer)
@@ -5727,6 +5766,11 @@ export class Engine {
     const fx = this.effects[index]
     if (!fx) return
     fx.window = windows && windows.length ? windows : null
+    // Unscheduled forgets where its simulation stood. A changed lane keeps it:
+    // advanceSim restarts the pool only if the window the transport is in now
+    // starts somewhere else, so trimming a block, or turning the influence
+    // that is sent with every lane, does not restart a burst mid-flight.
+    if (!fx.window) fx.sim = { start: null, time: null }
   }
 
   getEffectSchedule(index: number): readonly EffectWindow[] | null {
@@ -5745,12 +5789,20 @@ export class Engine {
     // Read ONCE: it walks the cast, and every effect wants the same answer.
     const transport = this.transportTime()
     for (const fx of this.effects) {
+      fx.simReset = false
       if (!fx.window || fx.window.length === 0) {
         fx.weight = fx.influence
         continue
       }
       const at = effectState(fx.window, fx.influence, transport)
       fx.weight = at.weight
+      // The particles and the grid carry state from frame to frame, so they get
+      // more than a clock: a restart on entering a window or going back in one,
+      // and a step measured on the transport. See advanceSim.
+      const sim = advanceSim(fx.sim, fx.window, transport)
+      fx.sim = sim.clock
+      fx.simStep = sim.step
+      fx.simReset = sim.reset
       // Its own clock, expressed the way the mounts read it. Every mount
       // derives time from the epoch against sceneClock, so this one write moves
       // the field, the particles, the ribbons, lightEmit and the grid together
