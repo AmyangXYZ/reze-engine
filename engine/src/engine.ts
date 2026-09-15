@@ -31,6 +31,7 @@ import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import { effectState, type EffectWindow } from "./effect-schedule"
+import { parentKeyIndex, type ModelParentKey } from "./parent-keys"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import { MIRROR_MASK_DOWNSAMPLE_WGSL, MIRROR_MAT_BYTES, mirrorShaderWgsl, mirrorShadowWgsl } from "./shaders/passes/mirror"
@@ -408,6 +409,13 @@ type Attachment = ModelAttachment & {
    *  BY REFERENCE and refilled every frame; see placeAttached. */
   rootMatrix: Float32Array
 }
+
+/** A parent key as the engine keeps it: its own copy, defaults filled in. */
+type HeldParentKey = { time: number; parent: string | null; bone: string; position: Vec3; rotation: Quat }
+
+/** A model's parent keys, sorted by time, and the one last applied, so a frame
+ *  that stays inside one hold does no work. See setModelParentKeys. */
+type ParentTrack = { keys: HeldParentKey[]; applied: number }
 
 type SunOptions = {
   /** Linear color of the sun lamp (Blender: Light > Color). */
@@ -819,6 +827,9 @@ interface ModelInstance {
    *  card for a sign in her hand, a second character for a mascot on her
    *  shoulder. See setModelParent. */
   parent: Attachment | null
+  /** Who this model hangs from over the scene, or null. While set it decides
+   *  `parent`, position and rotation every frame. See setModelParentKeys. */
+  parentKeys: ParentTrack | null
   /** This card's texture is rewritten every frame, so it is allocated with no
    *  mip chain — rebuilding one per frame is a pass per level per card, and is
    *  what a moving card was mostly costing. See setPlaneFrame. */
@@ -9875,6 +9886,83 @@ export class Engine {
   }
 
   /**
+   * Key who a model hangs from over the scene: MMD's 外部親 on the timeline,
+   * the way a sword changes hands or a ball is thrown from one to another.
+   *
+   * Each key holds from its time until the next key's. With a parent, the model
+   * rides that bone with `position` and `rotation` as the offset, exactly as
+   * setModelParent places it. With a null parent it stands on its own at that
+   * position and rotation. The first key also holds before its time. Times are
+   * transport seconds, the clock the camera VMD and effect windows read, so
+   * playback, a scrub and an offline export all switch on the same frame.
+   *
+   * A switch is instant. What carries an object smoothly from one hold to the
+   * next is its own clip, plus offsets the host writes from the pose at the
+   * moment of each switch.
+   *
+   * While keys are set they own the model's parent, position and rotation;
+   * setModelTransform still sets scale and visibility. A key naming a model that
+   * is not loaded stands the model at identity until that model arrives. Null or
+   * an empty list removes the track and leaves the model where the last key put
+   * it. Returns false for an unknown model.
+   */
+  setModelParentKeys(name: string, keys: readonly ModelParentKey[] | null): boolean {
+    const inst = this.modelInstances.get(name)
+    if (!inst) return false
+    this.updateOrderDirty = true
+    const held = (keys ?? [])
+      .filter((k) => Number.isFinite(k.time))
+      .map((k) => ({
+        time: k.time,
+        parent: k.parent,
+        bone: k.bone ?? "全ての親",
+        position: k.position ? new Vec3(k.position.x, k.position.y, k.position.z) : new Vec3(0, 0, 0),
+        rotation: k.rotation ? k.rotation.clone() : Quat.identity(),
+      }))
+      .sort((a, b) => a.time - b.time)
+    inst.parentKeys = held.length > 0 ? { keys: held, applied: -1 } : null
+    return true
+  }
+
+  /** A model's parent keys, sorted by time, or null. */
+  getModelParentKeys(name: string): ModelParentKey[] | null {
+    const track = this.modelInstances.get(name)?.parentKeys
+    if (!track) return null
+    return track.keys.map((k) => ({
+      time: k.time,
+      parent: k.parent,
+      bone: k.bone,
+      position: new Vec3(k.position.x, k.position.y, k.position.z),
+      rotation: k.rotation.clone(),
+    }))
+  }
+
+  /**
+   * Put a keyed model under the key in force now.
+   *
+   * A frame inside the hold it is already in costs a lookup and a compare. The
+   * work happens on a switch, when a model a key names arrives after the key was
+   * set, and when something re-parented the model since — the keys take it back.
+   */
+  private applyParentKeys(inst: ModelInstance): void {
+    const track = inst.parentKeys!
+    const i = parentKeyIndex(track.keys, this.transportTime())
+    const k = track.keys[i]
+    const parent = k.parent !== null && k.parent !== inst.name && this.modelInstances.has(k.parent) ? k.parent : null
+    if (i === track.applied && (inst.parent?.model ?? null) === parent) return
+    track.applied = i
+    if (parent !== null) {
+      this.setModelParent(inst.name, parent, k.bone, { position: k.position, rotation: k.rotation })
+      return
+    }
+    this.setModelParent(inst.name, null)
+    const standing = k.parent === null
+    inst.model.setPosition(standing ? new Vec3(k.position.x, k.position.y, k.position.z) : new Vec3(0, 0, 0))
+    inst.model.setRotation(standing ? k.rotation.clone() : Quat.identity())
+    inst.skinMatricesDirty = true
+  }
+
+  /**
    * The root an attached model is posed under this frame: the parent's
    * placement, its bone as posed and simulated, then the offset.
    *
@@ -9911,20 +9999,35 @@ export class Engine {
   private readonly attachScratch = new Float32Array(16)
 
   /** Instances in pose order: a parent before every model hanging from it, so
-   *  a child reads the bone as posed and simulated THIS frame. Insertion order
-   *  otherwise. Rebuilt when a model is added, removed or re-parented. */
+   *  a child reads the bone as posed and simulated THIS frame. A keyed model
+   *  (setModelParentKeys) waits for every parent its keys name and for the
+   *  unkeyed cast too: their clips are the transport clock, so the key it picks
+   *  is this frame's. Insertion order otherwise. Rebuilt when a model is added,
+   *  removed or re-parented. */
   private updateOrder: ModelInstance[] = []
   private updateOrderDirty = true
   private instancesInUpdateOrder(): ModelInstance[] {
     if (!this.updateOrderDirty) return this.updateOrder
+    const all = Array.from(this.modelInstances.values())
+    const clock = all.filter((i) => !i.isStage && !i.isPlane && !i.isProp && !i.parentKeys).map((i) => i.name)
+    const after = new Map<string, string[]>()
+    for (const inst of all) {
+      const names = new Set<string>()
+      if (inst.parent) names.add(inst.parent.model)
+      if (inst.parentKeys) {
+        for (const name of clock) names.add(name)
+        for (const k of inst.parentKeys.keys) if (k.parent !== null) names.add(k.parent)
+      }
+      names.delete(inst.name)
+      after.set(inst.name, [...names])
+    }
     const placed = new Set<string>()
     const order: ModelInstance[] = []
-    let pending = Array.from(this.modelInstances.values())
+    let pending = all
     while (pending.length > 0) {
       const rest: ModelInstance[] = []
       for (const inst of pending) {
-        const p = inst.parent?.model
-        if (p === undefined || placed.has(p) || !this.modelInstances.has(p)) {
+        if (after.get(inst.name)!.every((p) => placed.has(p) || !this.modelInstances.has(p))) {
           order.push(inst)
           placed.add(inst.name)
         } else rest.push(inst)
@@ -9957,8 +10060,8 @@ export class Engine {
     // An attached model is placed by its parent's bone; its own position and
     // rotation are held at identity so the ride is the whole placement (see
     // setModelParent). Scale and visibility are still its own.
-    if (transform.position && !inst.parent) model.setPosition(transform.position)
-    if (transform.rotation && !inst.parent) model.setRotation(transform.rotation)
+    if (transform.position && !inst.parent && !inst.parentKeys) model.setPosition(transform.position)
+    if (transform.rotation && !inst.parent && !inst.parentKeys) model.setRotation(transform.rotation)
     if (transform.scale !== undefined) model.setScale(transform.scale)
     if (transform.visible !== undefined) model.setVisible(transform.visible)
     // The root transform is baked into the skin matrices, so moving a model is a
@@ -10804,6 +10907,9 @@ export class Engine {
       // An attached model is placed from its parent's bone as posed and
       // simulated THIS frame — the order guarantees the parent came first —
       // and only then posed itself, so its clip and physics ride the placement.
+      // A keyed model first settles WHICH hold it is in this frame; the order
+      // posed the cast before it, so the transport clock has already moved.
+      if (inst.parentKeys) this.applyParentKeys(inst)
       const attached = inst.parent !== null
       if (attached) this.placeAttached(inst)
       // A stage never solves IK — nothing drives its chains — and skips the pose
@@ -11970,6 +12076,7 @@ export class Engine {
       isPlane,
       isProp,
       parent: null,
+      parentKeys: null,
       dynamicTexture,
       // Seeded true: the bind pose has to reach the GPU once before any frame.
       skinMatricesDirty: true,

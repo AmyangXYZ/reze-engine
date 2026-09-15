@@ -150,8 +150,8 @@ test("a prop keeps physics and outlines, and is not a performer", () => {
 
 test("an attached model's own placement is held at identity", () => {
   const set = engine.slice(engine.indexOf("  setModelTransform(name: string"), engine.indexOf("  getModelTransform(name: string"))
-  assert.match(set, /if \(transform\.position && !inst\.parent\)/)
-  assert.match(set, /if \(transform\.rotation && !inst\.parent\)/)
+  assert.match(set, /if \(transform\.position && !inst\.parent && !inst\.parentKeys\)/)
+  assert.match(set, /if \(transform\.rotation && !inst\.parent && !inst\.parentKeys\)/)
   assert.match(set, /if \(transform\.scale !== undefined\) model\.setScale/, "scale is still the model's own")
   const attach = engine.slice(engine.indexOf("  setModelParent("), engine.indexOf("  getModelParent("))
   assert.match(attach, /inst\.model\.setPosition\(new Vec3\(0, 0, 0\)\)/)
@@ -173,4 +173,21 @@ test("the child's scale divides the translation and nothing else", () => {
 test("removing a parent detaches its children", () => {
   const remove = engine.slice(engine.indexOf("  removeModel(name: string): void {"), engine.indexOf("  getModelNames(): string[] {"))
   assert.match(remove, /if \(other\.parent\?\.model === name\) this\.setModelParent\(other\.name, null\)/)
+})
+
+test("a keyed model picks its hold on this frame's clock, before it is placed", () => {
+  const loop = engine.slice(engine.indexOf("  private updateInstances("), engine.indexOf("  private updateVertexBuffer("))
+  const keyed = loop.indexOf("if (inst.parentKeys) this.applyParentKeys(inst)")
+  const place = loop.indexOf("this.placeAttached(inst)")
+  assert.ok(keyed > 0 && keyed < place, "the hold is chosen BEFORE the placement reads it")
+  const apply = engine.slice(engine.indexOf("  private applyParentKeys("), engine.indexOf("  private placeAttached("))
+  assert.match(apply, /parentKeyIndex\(track\.keys, this\.transportTime\(\)\)/, "the transport clock, which the camera VMD and effect windows read")
+  const order = engine.slice(engine.indexOf("  private instancesInUpdateOrder("), engine.indexOf("  setModelTransform(name: string"))
+  assert.match(order, /!i\.isStage && !i\.isPlane && !i\.isProp && !i\.parentKeys/, "a keyed model waits for the unkeyed cast, whose clips are that clock")
+  assert.match(order, /for \(const k of inst\.parentKeys\.keys\) if \(k\.parent !== null\) names\.add\(k\.parent\)/, "and for every parent its keys name")
+})
+
+test("a frame inside one hold does no work, and a stray re-parent is taken back", () => {
+  const apply = engine.slice(engine.indexOf("  private applyParentKeys("), engine.indexOf("  private placeAttached("))
+  assert.match(apply, /if \(i === track\.applied && \(inst\.parent\?\.model \?\? null\) === parent\) return/)
 })
