@@ -36,6 +36,8 @@ const _eyeHy = new Vec3(0, 0, 0)
 const _eyeHz = new Vec3(0, 0, 0)
 const _eyeDir = new Vec3(0, 0, 0)
 const _eyeGaze = new Vec3(0, 0, 0)
+/** The bones the eye solve writes: 両目 held at identity, 左目/右目 turned. */
+const EYE_BONES = ["両目", "左目", "右目"] as const
 /** Rest forward of an eye — MMD models face -Z. */
 const _eyeFwd = new Vec3(0, 0, -1)
 const _eyeQuat = Quat.identity()
@@ -1142,6 +1144,9 @@ export class Model {
    *  are on, as opposed to the fraction of the way they turn. */
   private readonly gazeDir = new Vec3(0, 0, 0)
   private gazeDirSet = false
+  /** Set when the eyes are handed back, so the next update starts them from
+   *  rest before the pose sources run — see update(). */
+  private eyesReleased = false
 
   /**
    * Eyes on a target — the camera, as the host uses it.
@@ -1161,6 +1166,7 @@ export class Model {
    */
   setEyeTracking(options: EyeTrackingOptions | null): void {
     if (!options) {
+      if (this.eyeTracking !== null) this.eyesReleased = true
       this.eyeTracking = null
       this.gazeDirSet = false
       return
@@ -2733,6 +2739,21 @@ export class Model {
           if (this.ikDisabled.has(solver.ikBoneIndex)) continue
           for (const link of solver.links) rots[link.boneIndex].setIdentity()
         }
+      }
+    }
+
+    // Eyes handed back by setEyeTracking(null) start again from rest. The solve
+    // wrote 左目/右目 and held 両目 at identity, and a clip only writes the bones
+    // it keys — most motions key no eyes, and a model with no motion keys
+    // nothing — so they kept the last tracked look for good. A clip that does
+    // key them writes its own over this below.
+    if (this.eyesReleased) {
+      this.eyesReleased = false
+      const ni = this.runtimeSkeleton.nameIndex
+      const rots = this.runtimeSkeleton.localRotations
+      for (const name of EYE_BONES) {
+        const idx = ni[name]
+        if (idx !== undefined) rots[idx].setIdentity()
       }
     }
 
