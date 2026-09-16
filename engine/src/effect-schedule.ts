@@ -166,3 +166,99 @@ export function advanceSim(
   if (prev.start !== window.start || prev.time === null || time < prev.time) return { reset: true, step: 0, clock }
   return { reset: false, step: Math.min(SIM_MAX_STEP, time - prev.time), clock }
 }
+
+/**
+ * A repeating dissolve, in seconds within one cycle.
+ *
+ * Four moments rather than a duration and a delay: every one of them is a thing
+ * you can see happen, and an author tuning this is watching for exactly those
+ * four frames.
+ */
+export interface DissolveCycle {
+  period: number
+  /** She starts to come apart. */
+  breakAt: number
+  /** Fully gone. */
+  hiddenAt: number
+  /** She starts to come back. */
+  backAt: number
+  /** Whole again. */
+  doneAt: number
+}
+
+/** The four durations an effect declares, in seconds. */
+export type DissolveTimings = { apart: number; gone: number; back: number; whole: number }
+
+/** Each duration and the name an effect gives it, as a dial or as a constant. */
+export const DISSOLVE_PARAMS = [
+  ["apart", "DISSOLVE_APART"],
+  ["gone", "DISSOLVE_GONE"],
+  ["back", "DISSOLVE_BACK"],
+  ["whole", "DISSOLVE_WHOLE"],
+] as const satisfies readonly (readonly [keyof DissolveTimings, string])[]
+
+/**
+ * The four durations an effect wrote as constants.
+ *
+ * Where an effect declares them as `#param` dials instead, these are absent and
+ * the live dial stands in — which is what lets an author retime a teleport while
+ * watching it.
+ */
+export function dissolveConstants(wgsl: string): DissolveTimings {
+  const one = (name: string): number => {
+    const m = new RegExp(`^\\s*const\\s+${name}\\s*(?::\\s*f32\\s*)?=\\s*(-?[\\d.]+)`, "m").exec(wgsl)
+    const v = m ? Number(m[1]) : 0
+    return Number.isFinite(v) && v > 0 ? v : 0
+  }
+  return { apart: one("DISSOLVE_APART"), gone: one("DISSOLVE_GONE"), back: one("DISSOLVE_BACK"), whole: one("DISSOLVE_WHOLE") }
+}
+
+/**
+ * Four durations as the four moments the engine performs, or null when they add
+ * up to nothing — a period of zero is not a dissolve that never fires, it is a
+ * number everything downstream divides by.
+ *
+ * The cycle STARTS WHOLE: the wait comes first, so it is the gap you see between
+ * teleports rather than a tail nobody can find the start of.
+ */
+export function dissolveCycleOf(t: DissolveTimings): DissolveCycle | null {
+  const apart = Math.max(0, t.apart)
+  const gone = Math.max(0, t.gone)
+  const back = Math.max(0, t.back)
+  const whole = Math.max(0, t.whole)
+  if (apart + gone + back + whole <= 0.01) return null
+  const breakAt = whole
+  const hiddenAt = breakAt + apart
+  const backAt = hiddenAt + gone
+  const doneAt = backAt + back
+  return { period: doneAt, breakAt, hiddenAt, backAt, doneAt }
+}
+
+/** How much of her is there at one moment of a cycle, 1 whole and 0 gone. */
+export function sampleDissolveCycle(c: DissolveCycle, time: number): number {
+  const period = Math.max(c.period, 1e-3)
+  const t = time - Math.floor(time / period) * period
+  if (t >= c.breakAt && t < c.hiddenAt) return 1 - (t - c.breakAt) / Math.max(c.hiddenAt - c.breakAt, 1e-4)
+  if (t >= c.hiddenAt && t < c.backAt) return 0
+  if (t >= c.backAt && t < c.doneAt) return (t - c.backAt) / Math.max(c.doneAt - c.backAt, 1e-4)
+  return 1
+}
+
+/**
+ * A scheduled effect's dissolve: whole outside every window, and inside one the
+ * cycle on that window's own clock.
+ *
+ * THE WINDOW OPENS ON THE DEPARTURE. The cycle itself starts whole, which is
+ * right for an effect that simply repeats, and wrong for a clip someone placed
+ * on a beat: they put it where the teleport happens, not three seconds before
+ * it. So the clip enters at `breakAt`, and the wait becomes the tail the motes
+ * finish falling in.
+ */
+export function scheduledDissolve(
+  windows: readonly EffectWindow[],
+  c: DissolveCycle,
+  transport: number,
+): number {
+  const w = activeWindow(windows, transport)
+  return w ? sampleDissolveCycle(c, transport - w.start + c.breakAt) : 1
+}

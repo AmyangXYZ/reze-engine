@@ -30,7 +30,19 @@ import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
-import { effectState, type EffectWindow, advanceSim, type SimClock } from "./effect-schedule"
+import {
+  advanceSim,
+  DISSOLVE_PARAMS,
+  dissolveConstants,
+  dissolveCycleOf,
+  effectState,
+  sampleDissolveCycle,
+  scheduledDissolve,
+  type DissolveCycle,
+  type DissolveTimings,
+  type EffectWindow,
+  type SimClock,
+} from "./effect-schedule"
 import { parentKeySpan, type ModelParentKey } from "./parent-keys"
 import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
@@ -745,24 +757,8 @@ interface PickDrawCall {
   bindGroup: GPUBindGroup
 }
 
-/**
- * A repeating dissolve, in seconds within one cycle.
- *
- * Four moments rather than a duration and a delay: every one of them is a thing
- * you can see happen, and an author tuning this is watching for exactly those
- * four frames.
- */
-export interface DissolveCycle {
-  period: number
-  /** She starts to come apart. */
-  breakAt: number
-  /** Fully gone. */
-  hiddenAt: number
-  /** She starts to come back. */
-  backAt: number
-  /** Whole again. */
-  doneAt: number
-}
+/** Authored in effect-schedule, beside the evaluator that performs it. */
+export type { DissolveCycle }
 
 interface ModelInstance {
   name: string
@@ -1540,6 +1536,12 @@ interface EffectInstance {
   simStep: number
   /** Empty the particle pool and the grid before this frame's step. */
   simReset: boolean
+  /**
+   * The four durations this effect's `#dissolve` takes the cast apart over, as
+   * its source wrote them. Null unless it declared one. A dial of the same name
+   * wins over the constant — see dissolveTimingsOf.
+   */
+  dissolve: DissolveTimings | null
   /** This effect's OWN clock, as a uniform the field shader reads. Per effect
    *  because the shared one (viewU[6].x) is measured from the first installed
    *  effect's epoch, so everything later started mid-stream. Null when the
@@ -4557,6 +4559,7 @@ export class Engine {
         sim: { start: null, time: null },
         simStep: 0,
         simReset: false,
+        dissolve: d.dissolve ? dissolveConstants(authored) : null,
         // Its OWN resolution, no longer the scene's: an effect that never asked
         // for full res is not promoted because a neighbour did.
         // FULL RESOLUTION UNLESS TOLD OTHERWISE.
@@ -14390,6 +14393,9 @@ export class Engine {
       if (pose) this.camera.setVmdPose(pose)
     }
 
+    // Before the cast is written, which carries every subject's dissolve to the
+    // effects reading it.
+    this.evaluateDissolves()
     this.updateCameraUniforms()
     this.updateShadowLightVP()
 
@@ -14531,7 +14537,6 @@ export class Engine {
     // and a grid stepped after them is one frame stale in everything that used it.
     // Material parameters on the scene clock, before anything reads their
     // uniforms this frame.
-    this.evaluateDissolveCycles()
     this.evaluateParamTracks()
     // FIRST among the things that read an effect, because every one of them
     // reads what this writes: the sim's clock, the particle uniform's weight,
@@ -15013,22 +15018,6 @@ export class Engine {
   }
 
   /**
-   * A repeating dissolve, on the scene clock.
-   *
-   * The alternative was a host calling setModelDissolve every frame, and it is
-   * the wrong shape twice: an exported take stepped at another rate would land
-   * on different values than the preview did, and the effect drawing the sparks
-   * would be reading a number some other clock wrote. Here the engine samples it
-   * where it samples everything else time-driven, so a take reproduces exactly
-   * and rzSubject().dissolve is the same value the material shell used on that
-   * very frame.
-   *
-   * The five numbers are seconds within one cycle: when she starts to go, when
-   * she is fully gone, when she starts to come back, and when she is whole. The
-   * gaps between them are the timing, and the hold between the middle two is how
-   * long she is away.
-   */
-  /**
    * Eyes on the camera, per model — see Model.setEyeTracking. Live: solved
    * every frame against wherever the camera is, orbit or motion alike. Null
    * gives the eyes back to the motion.
@@ -15040,6 +15029,20 @@ export class Engine {
     return true
   }
 
+  /**
+   * A repeating dissolve on one model, on the scene clock.
+   *
+   * The alternative was a host calling setModelDissolve every frame, and it is
+   * the wrong shape twice: an exported take stepped at another rate would land
+   * on different values than the preview did, and the effect drawing the sparks
+   * would be reading a number some other clock wrote. Here the engine samples it
+   * where it samples everything else time-driven, so a take reproduces exactly
+   * and rzSubject().dissolve is the same value the material shell used on that
+   * very frame.
+   *
+   * An effect that declares `#dissolve` needs none of this: it carries its own
+   * cycle and follows its own clips — see evaluateDissolves.
+   */
   setModelDissolveCycle(modelName: string, cycle: DissolveCycle | null): boolean {
     if (!this.modelInstances.has(modelName)) return false
     if (!cycle) {
@@ -15050,23 +15053,65 @@ export class Engine {
     return true
   }
 
-  /** Every dissolve cycle, at the current scene clock. Once per frame, before
-   *  the cast is written and long before any effect reads it. */
-  private evaluateDissolveCycles(): void {
-    if (this.dissolveCycles.size === 0) return
-    for (const [name, c] of this.dissolveCycles) {
-      const period = Math.max(c.period, 1e-3)
-      const t = this.sceneClock - Math.floor(this.sceneClock / period) * period
-      let v = 1
-      if (t >= c.breakAt && t < c.hiddenAt) {
-        v = 1 - (t - c.breakAt) / Math.max(c.hiddenAt - c.breakAt, 1e-4)
-      } else if (t >= c.hiddenAt && t < c.backAt) {
-        v = 0
-      } else if (t >= c.backAt && t < c.doneAt) {
-        v = (t - c.backAt) / Math.max(c.doneAt - c.backAt, 1e-4)
-      }
-      this.setModelDissolve(name, v)
+  /** The model at one cast slot — the subject rzSubject(index) reads. */
+  private castSubjectName(index: number): string | null {
+    let n = 0
+    let found: string | null = null
+    this.forEachInstance((inst) => {
+      if (found !== null || n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp) return
+      if (n === index) found = inst.name
+      n++
+    })
+    return found
+  }
+
+  /** One effect's four durations: its dials where it declares them, the
+   *  constants it wrote where it does not. */
+  private dissolveTimingsOf(fx: EffectInstance, wrote: DissolveTimings): DissolveTimings {
+    const t = { ...wrote }
+    for (const [key, name] of DISSOLVE_PARAMS) {
+      const slot = fx.paramLayout.get(name)
+      if (slot) t[key] = Math.max(0, fx.paramsData[slot.offset])
     }
+    return t
+  }
+
+  /** Models this wrote a dissolve onto last frame, so one nothing asks for any
+   *  more comes back whole instead of holding wherever it was left. */
+  private dissolveTouched = new Set<string>()
+
+  /**
+   * Every dissolve, once a frame, before the cast is written — so the value a
+   * mote reads as rzSubject(i).dissolve is the one her materials wore on that
+   * very frame, rather than the one they wore on the last.
+   *
+   * Two things ask for one. A cycle set on a model (setModelDissolveCycle) runs
+   * on the scene clock and repeats, as it always has. An effect declaring
+   * `#dissolve` takes subject 0 apart on ITS OWN terms: scheduled, the cycle on
+   * each clip's clock with her whole between clips; unscheduled, the same
+   * repeating cycle as before. Where both ask, the more dissolved wins — two
+   * answers about one body, and half a body is not one of them.
+   */
+  private evaluateDissolves(): void {
+    const want = new Map<string, number>()
+    const put = (name: string, v: number) => want.set(name, Math.min(want.get(name) ?? 1, v))
+    for (const [name, c] of this.dissolveCycles) put(name, sampleDissolveCycle(c, this.sceneClock))
+    let transport: number | null = null
+    for (const fx of this.effects) {
+      if (!fx.dissolve) continue
+      const cycle = dissolveCycleOf(this.dissolveTimingsOf(fx, fx.dissolve))
+      const subject = this.castSubjectName(0)
+      if (!cycle || !subject) continue
+      if (fx.window && fx.window.length > 0) {
+        transport ??= this.transportTime()
+        put(subject, scheduledDissolve(fx.window, cycle, transport))
+      } else {
+        put(subject, sampleDissolveCycle(cycle, this.sceneClock))
+      }
+    }
+    for (const name of this.dissolveTouched) if (!want.has(name)) this.setModelDissolve(name, 1)
+    this.dissolveTouched = new Set(want.keys())
+    for (const [name, v] of want) this.setModelDissolve(name, v)
   }
 
   /** What setModelDissolve last set, or 1 for a model that has never dissolved. */
