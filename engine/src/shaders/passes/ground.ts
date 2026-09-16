@@ -94,7 +94,7 @@ struct GroundShadowMat {
   gridLineColor: vec3f, mirror: f32,
   // farCascade: 1 while a stage is loaded, 0 otherwise. See the branch below —
   // with no stage the far map is never drawn into, so its taps are known.
-  mirrorBlur: f32, farCascade: f32, shadowSoftness: f32, _mb2: f32,
+  mirrorBlur: f32, farCascade: f32, shadowSoftness: f32, groundY: f32,
   // Every shadow caster in one sphere, refreshed per frame. w = radius; 0 means
   // nothing casts, negative means "do not use this" (a rigid caster has no
   // sphere, so a scene with a stage keeps the taps). See rzShadowPossible.
@@ -362,20 +362,21 @@ ${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ", 
       // shared projection's pair (viewZ = projB / (z - projA); the formula
       // inverts both depth conventions, see the composite's linearDepth), and
       // reconstruct the reflected image point along the ray from the MIRRORED
-      // eye through this fragment. The plane is y = 0, so mirroring the eye
-      // and the camera forward is a sign flip on y, and the image point's
-      // depth below the plane IS the reflected object's height above it.
+      // eye through this fragment. Mirroring across the floor's own plane is a
+      // sign flip on y about that height (the forward vector is a direction, so
+      // it flips alone), and the image point's depth below the plane IS the
+      // reflected object's height above it.
       let dims = vec2f(textureDimensions(mirrorDepth));
       let texel = clamp(vec2i(muv * dims), vec2i(0), vec2i(dims) - vec2i(1));
       let z = textureLoad(mirrorDepth, texel, 0);
       let viewZ = clamp(mirrorVP.params.y / (z - mirrorVP.params.x), 0.05, 100000.0);
-      let eyeM = vec3f(camera.viewPos.x, -camera.viewPos.y, camera.viewPos.z);
+      let eyeM = vec3f(camera.viewPos.x, 2.0 * material.groundY - camera.viewPos.y, camera.viewPos.z);
       let fwd = vec3f(camera.view[0][2], camera.view[1][2], camera.view[2][2]);
       let fwdM = vec3f(fwd.x, -fwd.y, fwd.z);
       let toFrag = i.worldPos - eyeM;
       let dir = toFrag * inverseSqrt(max(dot(toFrag, toFrag), 1e-8));
       let t = viewZ / max(dot(dir, fwdM), 1e-4);
-      let height = max(-(eyeM.y + dir.y * t), 0.0);
+      let height = max(material.groundY - (eyeM.y + dir.y * t), 0.0);
       // Full softness by BLUR_SPAN units above the floor — about a character's
       // height. The hardware clamps the level, so the nominal 5.0 needs no
       // knowledge of the real chain length, and blur 0 reads exactly level 0.

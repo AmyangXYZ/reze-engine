@@ -2142,6 +2142,9 @@ export class Engine {
   // because two planes would need two of every attachment below. Which one is
   // in force is mirrorPlane, refreshed by updateMirrorCamera.
   private static readonly GROUND_PLANE: readonly number[] = [0, 1, 0, 0]
+  /** Where addGround put the floor. The mirror reflects across it, so a raised
+   *  floor that kept y = 0 would reflect the scene into the wrong plane. */
+  private groundY = 0
   private mirrorPlane = new Float32Array([0, 1, 0, 0])
   private mirrorCameraData = new Float32Array(40)
   private mirrorCameraBuffer!: GPUBuffer
@@ -3292,7 +3295,9 @@ export class Engine {
       const m = this.mirrorSurfaceModel
       planeFromPointNormal(m[12], m[13], m[14], m[8], m[9], m[10], this.mirrorPlane)
     } else {
+      // The floor's own plane: up, offset to wherever addGround put it.
       this.mirrorPlane.set(Engine.GROUND_PLANE)
+      this.mirrorPlane[3] = -this.groundY
     }
     // The ground inside the mirror pass clips against this same plane — a
     // mirror shows nothing behind itself, and the floor is what is behind one.
@@ -9207,6 +9212,15 @@ export class Engine {
   addGround(options?: {
     width?: number
     height?: number
+    /**
+     * Where the plane sits on Y, in world units. 0 (default) is MMD's floor.
+     *
+     * A framing offset, not a stage: a camera motion authored for a taller or
+     * shorter character fits by moving the model and the floor together, which
+     * is cheaper than retiming the shot. What stands ON the floor does not
+     * follow it — the physics floor is model space, at the figure's own feet.
+     */
+    y?: number
     diffuseColor?: Vec3
     fadeStart?: number
     fadeEnd?: number
@@ -9246,6 +9260,7 @@ export class Engine {
     const opts = {
       width: 160,
       height: 160,
+      y: 0,
       diffuseColor: new Vec3(0.9, 0.1, 1.0),
       fadeStart: 10.0,
       fadeEnd: 80.0,
@@ -9261,7 +9276,8 @@ export class Engine {
       shadowSoftness: 0,
       ...options,
     }
-    this.createGroundGeometry(opts.width, opts.height)
+    this.groundY = opts.y
+    this.createGroundGeometry(opts.width, opts.height, opts.y)
     this.createShadowGroundResources(opts)
     this.hasGround = true
     this.groundDrawCall = {
@@ -9274,7 +9290,14 @@ export class Engine {
       // The ground belongs to no model instance, so it is not in the cull list —
       // cullIndex -1 leaves renderGround unconditional. Its box is filled in
       // anyway rather than left a lie for whoever reads this next.
-      bounds: new Float32Array([-opts.width / 2, 0, -opts.height / 2, opts.width / 2, 0, opts.height / 2]),
+      bounds: new Float32Array([
+        -opts.width / 2,
+        opts.y,
+        -opts.height / 2,
+        opts.width / 2,
+        opts.y,
+        opts.height / 2,
+      ]),
       cullIndex: -1,
     }
   }
@@ -12319,14 +12342,14 @@ export class Engine {
     }
   }
 
-  private createGroundGeometry(width: number = 100, height: number = 100) {
+  private createGroundGeometry(width: number = 100, height: number = 100, y: number = 0) {
     const halfWidth = width / 2
     const halfHeight = height / 2
 
     const vertices = new Float32Array([
       // Bottom-left
       -halfWidth,
-      0,
+      y,
       -halfHeight, // position
       0,
       1,
@@ -12336,7 +12359,7 @@ export class Engine {
 
       // Bottom-right
       halfWidth,
-      0,
+      y,
       -halfHeight, // position
       0,
       1,
@@ -12346,7 +12369,7 @@ export class Engine {
 
       // Top-right
       halfWidth,
-      0,
+      y,
       halfHeight, // position
       0,
       1,
@@ -12356,7 +12379,7 @@ export class Engine {
 
       // Top-left
       -halfWidth,
-      0,
+      y,
       halfHeight, // position
       0,
       1,
@@ -12436,6 +12459,7 @@ export class Engine {
 
   private createShadowGroundResources(opts: {
     diffuseColor: Vec3
+    y: number
     fadeStart: number
     fadeEnd: number
     shadowStrength: number
@@ -12451,6 +12475,7 @@ export class Engine {
   }) {
     const {
       diffuseColor,
+      y,
       fadeStart,
       fadeEnd,
       shadowStrength,
@@ -12491,6 +12516,9 @@ export class Engine {
     // gb[18] — shadow edge softness. Was padding; the shader reads it as the
     // Vogel disk's radius, and 0 takes the sharp nine-tap path unchanged.
     gb[18] = Math.min(Math.max(shadowSoftness, 0), 1)
+    // gb[19] — the floor's height. Was padding; the mirror branch reflects the
+    // eye across it, and a hardcoded 0 slid the reflection off a raised floor.
+    gb[19] = y
     // Which variant the draw picks. Zero is the sharp shader, which is the one
     // that existed before softness did.
     this.groundSoft = gb[18] > 0
