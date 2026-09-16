@@ -115,7 +115,7 @@ ${discard}
   // as burning away rather than as a stencil moving over her.
   var rz_burn = 0.0;
   if (material.dissolve < 0.9995) {
-    let rz_t = rz_dissolve_threshold(input.restPos);
+    let rz_t = input.faceT;
     if (rz_t > material.dissolve) { discard; }
     // Put OUT as the last of her goes. Near zero the front is wider than what
     // is left of the surface, so every surviving fragment sits inside it and

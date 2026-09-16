@@ -783,6 +783,17 @@ interface ModelInstance {
    *  outline. Kept here so that write has somewhere to go. */
   outlineUniformBuffers: GPUBuffer[]
   model: Model
+  /**
+   * Keep simulating this model's cloth while it is HIDDEN.
+   *
+   * Off by default, which is what makes a roster of resident alternate skins
+   * affordable: invisible cloth costs nothing. On for a model whose visibility
+   * is scheduled, because the frame it appears on is the frame its skirt has to
+   * be already dancing — a dress simulated from rest at the reveal snaps into
+   * place in front of the audience, and that pop is the whole reason a costume
+   * change reads as a glitch rather than as a cut.
+   */
+  simulateWhileHidden: boolean
   basePath: string
   assetReader: AssetReader
   gpuBuffers: GPUBuffer[]
@@ -11029,6 +11040,25 @@ export class Engine {
     this.forEachInstance((inst) => inst.physics?.setFloor(on))
   }
 
+  /**
+   * Keep one model's cloth simulating while it is hidden.
+   *
+   * For scheduled visibility — a costume the scene swaps to, a double that
+   * appears mid-shot. The body of a hidden model animates either way, so what
+   * this buys is the cloth: switch it on and the skirt is already moving when
+   * the model is revealed, instead of falling into place from rest in view.
+   *
+   * Per model rather than scene-wide, because it is exactly the models taking
+   * part in a swap that need it, and a scene that never swaps should not pay
+   * for cloth nobody can see.
+   */
+  setModelPhysicsWhileHidden(modelName: string, on: boolean): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    inst.simulateWhileHidden = on
+    return true
+  }
+
   getPhysicsFloor(): boolean {
     return this.physicsFloor
   }
@@ -11120,10 +11150,13 @@ export class Engine {
         inst.vertexBufferNeedsUpdate = true
       }
       // Hidden models keep animating (cheap, and a reveal must not pop a stale
-      // pose) but skip cloth simulation entirely — a roster of resident
+      // pose) but skip cloth simulation by default — a roster of resident
       // alternate skins would otherwise pay full physics for invisible cloth.
-      // Hosts that reveal after long hiding reset physics anyway (resetPhysics).
-      if (inst.physics && this.physicsEnabled && inst.model.visible) {
+      //
+      // UNLESS the host asked for it: a model whose visibility is scheduled has
+      // to arrive with its skirt already in motion, and cloth caught up at the
+      // reveal is a snap everyone sees. See setModelPhysicsWhileHidden.
+      if (inst.physics && this.physicsEnabled && (inst.model.visible || inst.simulateWhileHidden)) {
         const tPhys = performance.now()
         inst.physics.step(deltaTime, inst.model.getWorldMatrices(), inst.model.getBoneInverseBindMatrices())
         // The step published new world matrices for the simulated bones; the
@@ -12218,6 +12251,7 @@ export class Engine {
     const inst: ModelInstance = {
       name,
       model,
+      simulateWhileHidden: false,
       basePath,
       assetReader,
       gpuBuffers,
@@ -15086,7 +15120,8 @@ export class Engine {
     let n = 0
     let found: string | null = null
     this.forEachInstance((inst) => {
-      if (found !== null || n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp) return
+      if (found !== null || n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible)
+        return
       if (n === index) found = inst.name
       n++
     })
@@ -15846,9 +15881,14 @@ export class Engine {
       // video behind her and none at all around her. Four is the cap because the
       // uniform is small and a scene with five characters is not the case this
       // serves.
+      // A HIDDEN model is not a subject either, and that is not tidiness: a
+      // scene holding a costume's twin keeps it loaded and invisible, and with
+      // it in the list it takes subject 0 by load order — so Teleportation
+      // spawned its motes off a body nobody could see, and the silhouette field
+      // seeded on one. The cast is who is ON STAGE.
       let n = 0
       this.forEachInstance((inst) => {
-        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp) return
+        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
         const m = inst.model
         // The model transform is only where the model was PLACED. A motion moves
         // the character by animating bones, so an effect anchored to the

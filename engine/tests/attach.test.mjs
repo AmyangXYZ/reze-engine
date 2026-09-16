@@ -142,7 +142,7 @@ test("the pose loop runs parents first and places a child before posing it", () 
 test("a prop keeps physics and outlines, and is not a performer", () => {
   assert.match(engine, /!isStage && !isPlane && rbs\.length > 0/, "physics builds for a prop")
   assert.match(engine, /if \(!inst\.isStage && \(mat\.edgeFlag & 0x10\) !== 0/, "a prop keeps its outline")
-  assert.match(engine, /if \(n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp\) return/, "a prop is not a subject")
+  assert.match(engine, /if \(n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp \|\| !inst\.model\.visible\) return/, "a prop is not a subject")
   assert.match(engine, /if \(inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp\) continue\n      const p = inst\.model\.getAnimationProgress/, "a prop never seeds the clock")
   const hasStage = engine.slice(engine.indexOf("  hasStage(): boolean {"), engine.indexOf("  groundIsSuppressed()"))
   assert.doesNotMatch(hasStage, /isProp/, "a prop leaves the floor alone")

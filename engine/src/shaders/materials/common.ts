@@ -99,6 +99,18 @@ struct VertexOutput {
   // At rest skinMats are identity so restPos == worldPos, which is why existing noise-
   // scale constants stay valid without retuning.
   @location(3) restPos: vec3f,
+  /**
+   * This TRIANGLE's dissolve threshold.
+   *
+   * FLAT, so every fragment of a face shares the provoking vertex's value and
+   * the face goes as a unit — the mesh comes apart in triangles that light and
+   * leave in turn, rather than in a scatter that crosses them. Computed in the
+   * vertex stage from the bind-pose attribute, which is what lets the depth
+   * prepass, the shadow map and the outline hull reach the same number for the
+   * same face: one function, one input, one provoking vertex, one answer. They
+   * must agree — a pass that disagrees punches holes through her.
+   */
+  @location(4) @interpolate(flat) faceT: f32,
 };
 
 // One view-projection per shadow cascade, inner to outer — the volumes built
@@ -239,6 +251,7 @@ const COMMON_VS_WGSL = /* wgsl */ `
   output.uv = uv;
   output.worldPos = skinnedPos.xyz;
   output.restPos = position;
+  output.faceT = rz_dissolve_threshold(position);
   return output;
 }
 
@@ -297,8 +310,12 @@ export function commonFsOutWgsl(): string {
  * distance is just a fade.
  */
 export const DISSOLVE_WGSL = /* wgsl */ `
-/** Clump size, in object-space units — MMD's are roughly centimetres. */
-const RZ_DISSOLVE_GRAIN: f32 = 0.42;
+/** Clump size, in object-space units — MMD's are roughly centimetres.
+ *
+ *  Raised from 0.42: at that size the pieces are near enough to speckle that a
+ *  departure reads as a fade rather than as a body coming apart, which is the
+ *  thing the clumping exists to avoid. Hand-sized pieces are visible ones. */
+const RZ_DISSOLVE_GRAIN: f32 = 1.2;
 /** How much the clumps pull a fragment off its own grit value — the whole of
  *  the LOOK, and none of the rate. See rz_dissolve_threshold. */
 const RZ_DISSOLVE_CLUMP: f32 = 0.6;
@@ -307,7 +324,7 @@ const RZ_DISSOLVE_CLUMP: f32 = 0.6;
  *  it, and it has to be smaller than the SMALLEST material a model carries —
  *  an eye highlight, a button, a buckle — not merely small. Two and a half
  *  millimetres on a normal model, which is under all of them. */
-const RZ_DISSOLVE_GRIT: f32 = 0.06;
+const RZ_DISSOLVE_GRIT: f32 = 0.021;
 /** How wide the glowing front is, in threshold units. Thin: the front is a
  *  rim, and a wide one lights whole limbs at once. */
 const RZ_DISSOLVE_EDGE: f32 = 0.11;
