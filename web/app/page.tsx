@@ -1,105 +1,361 @@
 "use client"
 
 import Header from "@/components/header"
-import { Engine, EngineStats, LocomotionController, Model, Vec3, type StrafeClipEntry } from "reze-engine"
+import {
+  AnimationStateMachine,
+  easeInOut,
+  Engine,
+  type EngineStats,
+  LocomotionController,
+  Model,
+  Quat,
+  Vec3,
+  type AnimStateDef,
+  type MaterialPresetMap,
+  type RootMotionProfile,
+  type StopClipEntry,
+} from "reze-engine"
 import { useCallback, useEffect, useRef, useState } from "react"
+import { Bomb } from "lucide-react"
 import Loading from "@/components/loading"
-import { ASSETS } from "@/lib/assets"
+import { ASSETS, CAST } from "@/lib/assets"
 
-const VMD_ROOT = `${ASSETS}/unity-fbx-locomotion`
-const VMD_BASE = `${VMD_ROOT}/vmd`
+// One playable Reze: WASD or the wheel to run, Space or the button to dance,
+// Shift or the bomb to turn into the Bomb Devil and back, double-click her for
+// a reaction — and left alone, she entertains herself.
 
-// ai同屏连携: the player character plus two AI companions in follow formation.
-// Every character plays VMDs converted against ITS OWN measured skeleton, with the
-// pack's authored root speeds at that conversion's scale.
-const PLAYER = {
-  id: "thoth",
-  pmx: `${ASSETS}/models/托特/托特.pmx`,
-  vmdDir: VMD_BASE,
-  runSpeed: 62.7,
-  sprintSpeed: 86.3,
+/** Her two looks: one skeleton, one motion set. The first is the one she loads as. */
+const LOOKS = [
+  { id: "reze", pmx: `${CAST}/reze.pmx` },
+  { id: "reze-bomb", pmx: `${CAST}/reze-bomb.pmx` },
+]
+/** The materials the engine's name hints leave unstyled, grouped as reze-design
+ *  groups them. Every other material on both looks resolves by its name. */
+const CAST_STYLE: MaterialPresetMap = {
+  cloth_smooth: ["bozi", "choker"],
+  cloth_rough: ["Rubber", "Leather"],
 }
-const COMPANIONS = [
-  {
-    id: "izanami",
-    pmx: `${ASSETS}/models/深空之眼—伊邪那美「初雪千华」/伊邪那美誓约2.0.pmx`,
-    vmdDir: `${VMD_ROOT}/vmd-izanami`,
-    runSpeed: 61.3,
-    sprintSpeed: 84.5,
-    // formation slot in player-local space: x = player's right, z = player's forward
-    slot: { x: -14, z: -11 },
-  },
-  {
-    id: "skuld",
-    pmx: `${ASSETS}/models/深空之眼—诗蔻蒂/诗蔻蒂3.0.pmx`,
-    vmdDir: `${VMD_ROOT}/vmd-skuld`,
-    runSpeed: 61.7,
-    sprintSpeed: 85.0,
-    slot: { x: 14, z: -11 },
-  },
-]
-// Companions hold position inside the deadband; approach speed ramps in over the
-// arrive radius beyond it (analog magnitude), so they settle instead of overshooting.
-const FOLLOW_DEADBAND = 3
-const FOLLOW_ARRIVE = 8
-const FOLLOW_SPRINT_AT = 30
 
-const deg = (d: number) => (d * Math.PI) / 180
+const ANIMATIONS = `${ASSETS}/animations`
 
-// Authored stops: skid profiles measured from each clip's root motion at this
-// conversion's scale (exit at the plateau). Release at speed plays the matched
-// stop; ANY key press interrupts it instantly — anims for committed outcomes,
-// immediate response for new intent.
-const STOP_CLIPS = [
-  { clip: "Sprint_Stop_Lfoot", exitTime: 2.08, forward: [0, 13.9, 24.1, 34.2, 42.2, 47.3, 51.1, 53.5, 53.7, 52.7], gear: "sprint" as const, foot: "L" as const },
-  { clip: "Sprint_Stop_Rfoot", exitTime: 2.22, forward: [0, 13.9, 24.1, 34.2, 41, 46.7, 50.5, 53.6, 56.1, 58.5, 58.7], gear: "sprint" as const, foot: "R" as const },
-]
+// Locomotion: a stand loop, a run loop, and the stop played when a run is
+// released. The run and stop carry their authored root travel; loading lifts it
+// off センター and the controller drives the root instead.
+//
+// Measured on reze.pmx: the run's planted feet sweep the ground at 53 u/s while
+// its authored root travels 67.1 u/s (the retarget's hip ratio overshoots her
+// stride). The root runs at the foot speed, which pins her feet, and the stop's
+// authored skid shrinks by the same ratio.
+const STAND_VMD = `${ANIMATIONS}/1017ui@ui_stand.vmd`
+const RUN_VMD = `${ANIMATIONS}/Run_Lfoot (2).vmd`
+const STOP_VMD = `${ANIMATIONS}/Run_Stop_Rfoot.vmd`
+const RUN_SPEED = 53
+const FOOT_MATCH = RUN_SPEED / 67.1
+const STOP: StopClipEntry = {
+  clip: "stop",
+  // The skid settles here; the clip's remainder is the recovery into the stand.
+  exitTime: 1.57,
+  forward: [0, 8.3, 17.3, 23.4, 30, 35.2, 37.2, 39.2, 41.2, 42.1, 42].map((v) => v * FOOT_MATCH),
+  gear: "run",
+  foot: "R",
+}
 
-// The 8-direction strafe rings. Angles and speeds MEASURED from each clip's authored
-// root motion at this conversion's scale (FL/FR are the pure ±90° side clips;
-// BL/BR are slower side-step variants, unused).
-const STRAFE_RUN: StrafeClipEntry[] = [
-  { clip: "StrafeRun_F", angle: deg(0), speed: 65.4 },
-  { clip: "StrafeRun_R45", angle: deg(45), speed: 65.4 },
-  { clip: "StrafeRun_FR", angle: deg(90), speed: 60.6 },
-  { clip: "StrafeRun_R135", angle: deg(135), speed: 65.4 },
-  { clip: "StrafeRun_B", angle: deg(180), speed: 65.4 },
-  { clip: "StrafeRun_L135", angle: deg(-135), speed: 65.4 },
-  { clip: "StrafeRun_FL", angle: deg(-90), speed: 60.6 },
-  { clip: "StrafeRun_L45", angle: deg(-45), speed: 65.4 },
-]
-const STRAFE_SPRINT: StrafeClipEntry[] = [
-  { clip: "StrafeSprint_F", angle: deg(0), speed: 83.0 },
-  { clip: "StrafeSprint_R45", angle: deg(45), speed: 85.4 },
-  { clip: "StrafeSprint_FR", angle: deg(90), speed: 83.1 },
-  { clip: "StrafeSprint_R135", angle: deg(135), speed: 77.0 },
-  { clip: "StrafeSprint_B", angle: deg(180), speed: 65.3 },
-  { clip: "StrafeSprint_L135", angle: deg(-135), speed: 77.0 },
-  { clip: "StrafeSprint_FL", angle: deg(-90), speed: 83.0 },
-  { clip: "StrafeSprint_L45", angle: deg(-45), speed: 83.0 },
-]
+// Main-screen reactions, each `${ANIMATIONS}/<clip>.vmd`.
+/** Her first motion once loaded: a jump in from the side, landing on the spawn point. */
+const ENTRANCE_CLIP = "1034@main_assistant"
+/** Follows the entrance unless something interrupts it. */
+const LOGIN_CLIP = "1034@main_login"
+/** Double-click on her plays one of these. */
+const TOUCH_CLIPS = ["1034@main_touch1", "1034@main_touch2", "1034@main_touch3", "1034@main_touch4", "1034@main_quickclick"]
+/** Left still for IDLE_AUTO_AFTER seconds, she plays one of these. */
+const IDLE_CLIPS = ["1034@main_emotion", LOGIN_CLIP]
+const IDLE_AUTO_AFTER = 3
+const FLAVOR_CLIPS = [...new Set([ENTRANCE_CLIP, ...TOUCH_CLIPS, ...IDLE_CLIPS])]
+
+const DANCE_CLIP = "dance"
+const DANCE_VMD = `${ANIMATIONS}/IRIS OUT.vmd`
+const DANCE_AUDIO = `${ASSETS}/audios/IRIS OUT.m4a`
+/** Plays on every look swap, either way. The skin changes on the bang, which
+ *  lands this far in, after the fuse. */
+const BOOM_AUDIO = `${ASSETS}/audios/boom.m4a`
+const BOOM_BANG = 0.32
+
+// Action pacing. Reactions ease in and drift back to the stand slowly; the
+// dance fades in with the music; fresh movement input cuts anything short.
+const FLAVOR_FADE_IN = 0.3
+const FLAVOR_RETURN_FADE = 0.7
+const DANCE_FADE_IN = 0.4
+const DANCE_RETURN_FADE = 0.6
+const CANCEL_FADE = 0.25
+/** Seconds the song takes to fall silent when the dance is cut short. */
+const SONG_CUT_FADE = 0.15
+
+// Warm-up before the entrance: it starts once this many frames in a row arrive
+// within the budget (the first-use stalls are over), or at the cap regardless.
+const WARMUP_STEADY_FRAMES = 20
+const WARMUP_FRAME_MS = 40
+const WARMUP_MAX_MS = 8000
+
+/** The orbit centre sits this far above her root. */
+const CAMERA_OFFSET = new Vec3(0, 11.5, 0)
+/** Seconds the camera takes to move from the spawn onto her once the entrance hands over. */
+const CAMERA_GLIDE = 0.4
+
+const ACTIVE_BUTTON = "bg-white/90 text-black border-white scale-95 shadow-[0_0_28px_rgba(255,255,255,0.5)]"
+const IDLE_BUTTON =
+  "bg-white/25 text-white border-white/70 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_2px_12px_rgba(0,0,0,0.25)]"
 
 // Input keys the demo cares about — everything else never touches state.
-const INPUT_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "Space"])
-
-/** Stick travel radius in px; drag past SPRINT_AT of it to sprint. Travel close to
- *  the base radius (72) lets the knob overhang the rim at full deflection — the
- *  familiar mobile-wheel "pushed past the edge" look. */
-const STICK_RADIUS = 66
-const SPRINT_AT = 0.92
-// Keyboard throttle, race-game style: holding WASD ramps the input magnitude toward
-// the rim (sprint) and release decays it — one rule for both inputs: deflection =
-// speed, rim = sprint. Two-phase charge: snap to run fast, then a deliberate slower
-// push into the rim, so movement is responsive but sprint is intentional.
-const KB_RUN_AT = 0.75 // deflection of a full run
-const KB_TO_RUN = 0.35 // s from standstill to full run
-const KB_TO_SPRINT = 1.6 // s of continued holding from run into the rim — sprint is earned
-const KB_DECEL_TIME = 0 // instant: the stop must begin at full velocity or the seam lurches
-// Action-game two-speed rule: any real movement intent means at least a full run —
-// the idle⊕run blend band is a ramp to pass through, never a place to dwell
+const MOVE_CODES = new Set(["KeyW", "KeyA", "KeyS", "KeyD"])
+// Action-game two-speed rule: any real movement intent means a full run — the
+// stand⊕run blend band is a ramp to pass through, never a place to dwell
 // (the mid-band "slow run" reads as interpolation, not locomotion).
 const MIN_MOVE = 0.8
-const KB_TURN_PAUSE = 0.35 // s: a direction change pauses the charge until the new keys are held steadily
+
+/** What the machine is playing besides locomotion. */
+type ActionKind = "flavor" | "dance" | null
+type RootXZ = { x: number; z: number; yaw: number }
+/** A loaded look. `ready` once it is styled, posed and warmed, and can be swapped in. */
+type Look = { id: string; model: Model; ready: boolean }
+
+/** The page's audio output: one context, opened by the first user gesture. */
+class AudioOut {
+  private ctx: AudioContext | null = null
+
+  /** Create or resume the output. Called from user gestures, which is what browsers require. */
+  unlock(): AudioContext {
+    if (!this.ctx) this.ctx = new AudioContext({ latencyHint: "interactive" })
+    if (this.ctx.state !== "running") this.ctx.resume().catch(() => {})
+    return this.ctx
+  }
+
+  dispose(): void {
+    void this.ctx?.close()
+    this.ctx = null
+  }
+}
+
+/**
+ * One sound through Web Audio. It is decoded ahead of any press, and a press
+ * starts a buffer source, which sounds within the output latency. A media
+ * element can take a good fraction of a second to begin, and seeking it to
+ * catch up stalls it again.
+ */
+class Track {
+  private buffer: AudioBuffer | null = null
+  private ctx: AudioContext | null = null
+  private source: AudioBufferSourceNode | null = null
+  private gain: GainNode | null = null
+  /** Bumped by every play and stop, so a start still waiting on resume() can tell it was superseded. */
+  private token = 0
+
+  constructor(private readonly out: AudioOut) {}
+
+  get ready(): boolean {
+    return this.buffer !== null
+  }
+
+  async load(url: string): Promise<void> {
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`)
+    // Decoding needs a context but not a running one. An offline context keeps
+    // the real one from being created before a gesture allows it to start.
+    this.buffer = await new OfflineAudioContext(2, 1, 48000).decodeAudioData(await res.arrayBuffer())
+  }
+
+  /**
+   * Play from the top, restarting if already playing. With `at`, the track
+   * follows that clock (the motion is the master): it starts at `at()` seconds
+   * plus the output latency, read when sound can actually begin, so what is
+   * heard lines up with what is seen. `onHeard` receives the performance.now()
+   * time at which the start of the track reaches the speakers.
+   */
+  play({ at, onHeard }: { at?: () => number; onHeard?: (time: number) => void } = {}): void {
+    const ctx = this.out.unlock()
+    const token = ++this.token
+    const start = () => {
+      if (token !== this.token || !this.buffer) return
+      this.silence(0)
+      const gain = ctx.createGain()
+      gain.connect(ctx.destination)
+      const source = ctx.createBufferSource()
+      source.buffer = this.buffer
+      source.connect(gain)
+      source.onended = () => gain.disconnect()
+      const latency = (ctx.baseLatency || 0) + (ctx.outputLatency || 0)
+      const offset = at ? at() + latency : 0
+      source.start(0, Math.min(this.buffer.duration, Math.max(0, offset)))
+      this.ctx = ctx
+      this.source = source
+      this.gain = gain
+      if (onHeard) {
+        // The output timestamp pairs a context time with when it is audible;
+        // where a browser does not fill it in, the reported latency stands in.
+        const ts = ctx.getOutputTimestamp?.()
+        onHeard(
+          ts?.performanceTime && ts.contextTime !== undefined
+            ? ts.performanceTime + (ctx.currentTime - ts.contextTime) * 1000
+            : performance.now() + latency * 1000
+        )
+      }
+    }
+    if (ctx.state === "running") start()
+    else ctx.resume().then(start, () => {})
+  }
+
+  /** Stop, easing out over `fade` seconds. */
+  stop(fade: number): void {
+    this.token++
+    this.silence(fade)
+  }
+
+  private silence(fade: number): void {
+    const { ctx, source, gain } = this
+    this.source = null
+    this.gain = null
+    if (!ctx || !source || !gain) return
+    if (fade > 0) {
+      gain.gain.setTargetAtTime(0, ctx.currentTime, fade / 3)
+      source.stop(ctx.currentTime + fade)
+    } else {
+      source.stop()
+    }
+  }
+}
+
+/**
+ * Every look's state machine, driven in lockstep. The hidden look always wears
+ * the live pose, mid-crossfade included, so a swap is a visibility flip. The
+ * first machine answers the reads.
+ */
+class Lockstep {
+  private readonly machines: AnimationStateMachine[]
+
+  constructor(lead: AnimationStateMachine) {
+    this.machines = [lead]
+  }
+
+  get state(): string {
+    return this.machines[0].state
+  }
+
+  get stateTime(): number {
+    return this.machines[0].stateTime
+  }
+
+  go(to: string, fade?: number, atTime?: number): void {
+    for (const m of this.machines) m.go(to, fade, atTime)
+  }
+
+  update(dt: number): void {
+    for (const m of this.machines) m.update(dt)
+  }
+
+  /** Join at the lead's state and clock. A fade in progress is not carried —
+   *  a joining look is hidden until well after it would have ended. */
+  join(machine: AnimationStateMachine): void {
+    machine.go(this.state, 0, this.stateTime)
+    this.machines.push(machine)
+  }
+}
+
+/** One look's animation brain: locomotion is a delegate state (the shared
+ *  controller's blend); every action clip is a non-loop state that plays out in
+ *  full and drifts back to the stand. */
+function buildMachine(model: Model, ctl: LocomotionController): AnimationStateMachine {
+  const states: Record<string, AnimStateDef> = {
+    locomotion: { entries: () => ctl.getBlendEntries() },
+    [DANCE_CLIP]: { clip: DANCE_CLIP, loop: false },
+  }
+  for (const clip of FLAVOR_CLIPS) states[clip] = { clip, loop: false }
+  return new AnimationStateMachine(
+    model,
+    states,
+    [
+      { from: DANCE_CLIP, to: "locomotion", fade: DANCE_RETURN_FADE },
+      ...FLAVOR_CLIPS.map((clip) => ({ from: clip, to: "locomotion", fade: FLAVOR_RETURN_FADE })),
+    ],
+    { initial: "locomotion", defaultFade: 0.22 }
+  )
+}
+
+/** The stand clip's neutral センター offset. Every clip's horizontal センター
+ *  flattens to it when its travel is lifted onto the root, so fades between
+ *  clips blend without a micro-slide. */
+function standRest(model: Model): { x: number; z: number } {
+  const key = model.getClip("stand")?.boneTracks.get("センター")?.[0]?.translation
+  return { x: key?.x ?? 0, z: key?.z ?? 0 }
+}
+
+/** Load action clips and lift their authored root travel into `profiles`, so
+ *  the host moves the MODEL ROOT along it (the camera follows her, and the next
+ *  state starts wherever the clip actually went). `onLoaded` hears each clip
+ *  that lands; one that fails to load is skipped and the others still play. */
+async function loadActions(
+  model: Model,
+  clips: string[],
+  urlOf: (clip: string) => string,
+  rest: { x: number; z: number },
+  profiles: Map<string, RootMotionProfile>,
+  onLoaded: (clip: string) => void
+) {
+  await Promise.all(
+    clips.map(async (clip) => {
+      try {
+        await model.loadVmd(clip, urlOf(clip))
+      } catch (error) {
+        console.warn(`[reze] ${clip} not loaded:`, error)
+        return
+      }
+      const profile = model.extractRootMotion(clip, rest)
+      if (profile) profiles.set(clip, profile)
+      onLoaded(clip)
+    })
+  )
+}
+
+const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Resolves once `count` frames in a row each arrive within `budgetMs` of the
+ *  one before, or at `deadline` (performance.now() time), whichever is first. */
+function steadyFrames(count: number, budgetMs: number, deadline: number): Promise<void> {
+  return new Promise((resolve) => {
+    let last = performance.now()
+    let run = 0
+    const frame = (now: number) => {
+      run = now - last <= budgetMs ? run + 1 : 0
+      last = now
+      if (run >= count || now >= deadline) resolve()
+      else requestAnimationFrame(frame)
+    }
+    requestAnimationFrame(frame)
+  })
+}
+
+/** A clip-space offset (rest faces -Z) in world space, for a root heading `yaw`. */
+function clipToWorld(dx: number, dz: number, yaw: number): { x: number; z: number } {
+  const theta = yaw + Math.PI
+  const cos = Math.cos(theta)
+  const sin = Math.sin(theta)
+  return { x: dx * cos + dz * sin, z: -dx * sin + dz * cos }
+}
+
+/** A profile's horizontal offset at fractional frame f, linearly interpolated. */
+function sampleProfile(p: RootMotionProfile, f: number): { dx: number; dz: number } {
+  const n = p.frames.length
+  if (f <= p.frames[0]) return { dx: p.x[0], dz: p.z[0] }
+  if (f >= p.frames[n - 1]) return { dx: p.x[n - 1], dz: p.z[n - 1] }
+  let lo = 0
+  let hi = n - 1
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1
+    if (p.frames[mid] <= f) lo = mid
+    else hi = mid
+  }
+  const t = (f - p.frames[lo]) / (p.frames[hi] - p.frames[lo])
+  return { dx: p.x[lo] + (p.x[hi] - p.x[lo]) * t, dz: p.z[lo] + (p.z[hi] - p.z[lo]) * t }
+}
 
 /** Mobile-game movement wheel. Reports {x, y (up = +forward), active} through a ref
  *  callback; the knob is moved via direct DOM transform so dragging never re-renders.
@@ -110,11 +366,18 @@ function VirtualStick({
   display,
 }: {
   onChange: (x: number, y: number, active: boolean) => void
-  display: React.MutableRefObject<((x: number, y: number) => void) | null>
+  display: React.RefObject<((x: number, y: number) => void) | null>
 }) {
   const baseRef = useRef<HTMLDivElement>(null)
   const knobRef = useRef<HTMLDivElement>(null)
   const pointerId = useRef<number | null>(null)
+
+  /** Travel radius follows the RENDERED wheel size (responsive classes), kept
+   *  near the base radius so the knob overhangs the rim at full deflection. */
+  const travel = () => {
+    const base = baseRef.current
+    return base ? base.getBoundingClientRect().width / 2 - 6 : 66
+  }
 
   useEffect(() => {
     display.current = (x, y) => {
@@ -124,7 +387,8 @@ function VirtualStick({
         x /= len
         y /= len
       }
-      knobRef.current.style.transform = `translate(${x * STICK_RADIUS}px, ${-y * STICK_RADIUS}px)`
+      const r = travel()
+      knobRef.current.style.transform = `translate(${x * r}px, ${-y * r}px)`
     }
     return () => {
       display.current = null
@@ -136,16 +400,17 @@ function VirtualStick({
     const knob = knobRef.current
     if (!base || !knob) return
     const rect = base.getBoundingClientRect()
+    const r = rect.width / 2 - 6
     let dx = clientX - (rect.left + rect.width / 2)
     let dy = clientY - (rect.top + rect.height / 2)
     const len = Math.hypot(dx, dy)
-    if (len > STICK_RADIUS) {
-      dx *= STICK_RADIUS / len
-      dy *= STICK_RADIUS / len
+    if (len > r) {
+      dx *= r / len
+      dy *= r / len
     }
     knob.style.transitionDuration = "0ms" // dragging tracks the finger 1:1
     knob.style.transform = `translate(${dx}px, ${dy}px)`
-    onChange(dx / STICK_RADIUS, -dy / STICK_RADIUS, true)
+    onChange(dx / r, -dy / r, true)
   }
 
   const release = () => {
@@ -161,7 +426,7 @@ function VirtualStick({
   return (
     <div
       ref={baseRef}
-      className="relative w-36 h-36 rounded-full border-2 border-white/70 bg-white/15 backdrop-blur-[2px] touch-none select-none"
+      className="relative w-28 h-28 sm:w-36 sm:h-36 rounded-full border-2 border-white/70 bg-white/15 backdrop-blur-[2px] touch-none select-none"
       onPointerDown={(e) => {
         e.preventDefault()
         e.currentTarget.setPointerCapture(e.pointerId)
@@ -176,12 +441,12 @@ function VirtualStick({
       onContextMenu={(e) => e.preventDefault()}
     >
       {/* inner ring, like the classic wheel */}
-      <div className="absolute inset-0 m-auto w-16 h-16 rounded-full border border-white/50 pointer-events-none" />
+      <div className="absolute inset-0 m-auto w-12 h-12 sm:w-16 sm:h-16 rounded-full border border-white/50 pointer-events-none" />
       {/* Eased by default so keyboard pushes glide to their direction and releases
           spring back; dragging zeroes the duration inline for 1:1 tracking. */}
       <div
         ref={knobRef}
-        className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-white/70 border-2 border-white shadow-[0_0_14px_rgba(255,255,255,0.45)] pointer-events-none transition-transform duration-150 ease-out"
+        className="absolute inset-0 m-auto w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-white/70 border-2 border-white shadow-[0_0_14px_rgba(255,255,255,0.45)] pointer-events-none transition-transform duration-150 ease-out"
       />
     </div>
   )
@@ -192,86 +457,178 @@ export default function Home() {
   const engineRef = useRef<Engine | null>(null)
   const keysRef = useRef<Set<string>>(new Set())
   const stickRef = useRef({ x: 0, y: 0, active: false })
-  const actorsRef = useRef<Model[]>([])
-  const audioRef = useRef<HTMLAudioElement | null>(null)
-  // The song is fetched and decoded BEFORE the first dance press: the element
-  // exists from boot, and the first gesture anywhere (Safari gates media
-  // loading on one) triggers the actual buffering — so pressing dance starts
-  // sound with the motion instead of paying a 3MB fetch mid-dance.
-  const danceAudio = () => {
-    const a = new Audio(`${ASSETS}/audios/One More Last Time.m4a`) // AAC: a third of the WAV, same song
-    a.preload = "auto"
-    return a
-  }
-  useEffect(() => {
-    if (!audioRef.current) audioRef.current = danceAudio()
-    const audio = audioRef.current
-    const warm = () => {
-      if (audio.paused && audio.readyState < 3) audio.load()
-    }
-    window.addEventListener("pointerdown", warm, { once: true })
-    window.addEventListener("keydown", warm, { once: true })
-    return () => {
-      window.removeEventListener("pointerdown", warm)
-      window.removeEventListener("keydown", warm)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-  const dancingRef = useRef(false)
-  const danceCancelRef = useRef(false)
+  const stickDisplayRef = useRef<((x: number, y: number) => void) | null>(null)
+  /** Loaded looks, in LOOKS order; the active one is `lookRef`. */
+  const looksRef = useRef<Look[]>([])
+  const lookRef = useRef(0)
+  /** The active look's model. Every look holds the same clips. */
+  const modelRef = useRef<Model | null>(null)
+  const ctlRef = useRef<LocomotionController | null>(null)
+  const machineRef = useRef<Lockstep | null>(null)
+  /** Whether the camera rides her root yet (it holds the spawn through the entrance). */
+  const followingRef = useRef(false)
+  /** performance.now() time of a pending look swap, or -1. */
+  const swapAtRef = useRef(-1)
+  const actionRef = useRef<ActionKind>(null)
+  /** Where she IS this frame (whichever system owns the root). */
+  const rootRef = useRef<RootXZ>({ x: 0, z: 0, yaw: Math.PI })
+  /** Root anchor of the active action clip: the clip's profile plays out from here. */
+  const anchorRef = useRef<RootXZ>({ x: 0, z: 0, yaw: Math.PI })
+  /** The OUTGOING root path during an action crossfade: the previous clip's
+   *  profile keeps advancing under its fading pose (or, entering from
+   *  locomotion, the controller's decelerating position), blended with the same
+   *  easeInOut the machine uses for the pose, so root and pose agree. */
+  const fadeFromRef = useRef<{
+    clip: string | null // null = came from locomotion (follow the controller)
+    anchor: RootXZ
+    stateTime: number
+    start: number
+    fade: number
+  } | null>(null)
+  const profilesRef = useRef(new Map<string, RootMotionProfile>())
+  const lastFlavorRef = useRef<string | null>(null)
+  const lastActiveRef = useRef(0)
+  const lastSpeedRef = useRef(0)
+  const [audio] = useState(() => {
+    const out = new AudioOut()
+    return { out, song: new Track(out), boom: new Track(out) }
+  })
   const [dancing, setDancing] = useState(false)
+  const [danceReady, setDanceReady] = useState(false)
   const [spaceHeld, setSpaceHeld] = useState(false)
-  const kbThrottle = useRef({ mag: 0, dirX: 0, dirY: 1, lastKx: 0, lastKy: 0, cool: 0 })
+  const [bombed, setBombed] = useState(false)
+  const [bombReady, setBombReady] = useState(false)
+  const [swapPending, setSwapPending] = useState(false)
+  const [shiftHeld, setShiftHeld] = useState(false)
   const [engineError, setEngineError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
 
-  // ai同屏连携 showcase: one press (button or Space), all three play the dance together
-  // with the song — a synced one-shot per model. The dance can't re-trigger itself;
-  // only MOVEMENT interrupts it (WASD/wheel cancels, and you run out of the fade).
-  const startDance = useCallback(() => {
-    const actors = actorsRef.current
-    if (actors.length === 0) return
-    // Pressing again while dancing STOPS the show: cancel the one-shots, kill
-    // the music and rewind it, so the next press starts clean from the top.
-    if (dancingRef.current) {
-      if (!danceCancelRef.current) {
-        danceCancelRef.current = true
-        for (const m of actors) m.cancelOneShot(0.25)
-      }
-      if (audioRef.current) {
-        audioRef.current.pause()
-        audioRef.current.currentTime = 0
-      }
+  // The first gesture anywhere opens the audio output, so a later press starts
+  // sound at once instead of waiting on the context to come up.
+  useEffect(() => {
+    const unlock = () => audio.out.unlock()
+    const events = ["pointerdown", "keydown", "touchend"] as const
+    for (const e of events) window.addEventListener(e, unlock, { once: true })
+    return () => {
+      for (const e of events) window.removeEventListener(e, unlock)
+      audio.song.stop(0)
+      audio.boom.stop(0)
+      audio.out.dispose()
+    }
+  }, [audio])
+
+  /** Enter an action state: anchor its root path where she currently is, and
+   *  remember the outgoing path so the crossfade blends roots, not just poses. */
+  const goAction = useCallback((clip: string, kind: Exclude<ActionKind, null>, fade: number): boolean => {
+    const machine = machineRef.current
+    if (!machine || !modelRef.current?.getClip(clip)) return false
+    fadeFromRef.current = {
+      clip: machine.state === "locomotion" ? null : machine.state,
+      anchor: { ...anchorRef.current },
+      stateTime: machine.stateTime,
+      start: performance.now(),
+      fade,
+    }
+    anchorRef.current = { ...rootRef.current }
+    machine.go(clip, fade)
+    actionRef.current = kind
+    lastActiveRef.current = performance.now()
+    return true
+  }, [])
+
+  /** Break out of whatever is playing — fresh movement input owns her. The
+   *  music stops with the dance, not after its fade. */
+  const cancelAction = useCallback(() => {
+    const machine = machineRef.current
+    if (!machine || machine.state === "locomotion") return
+    if (actionRef.current === "dance") audio.song.stop(SONG_CUT_FADE)
+    machine.go("locomotion", CANCEL_FADE) // the tick's reconcile hands the root back
+  }, [audio])
+
+  /** Space / the button: start the dance with the song from the top, or stop it. */
+  const toggleDance = useCallback(() => {
+    if (actionRef.current === "dance") {
+      cancelAction()
       return
     }
-    if (!audioRef.current) audioRef.current = danceAudio()
-    const onEnd = () => {
-      // fired by the player's one-shot finishing (natural end or cancel fade done)
-      dancingRef.current = false
-      danceCancelRef.current = false
-      setDancing(false)
-      audioRef.current?.pause()
-    }
-    let ok = false
-    actors.forEach((m, i) => {
-      ok = m.playOneShot("dance", { fadeIn: 0.4, fadeOut: 0.6, onEnd: i === 0 ? onEnd : undefined }) || ok
+    if (!goAction(DANCE_CLIP, "dance", DANCE_FADE_IN)) return
+    audio.song.play({
+      at: () => {
+        const machine = machineRef.current
+        return machine?.state === DANCE_CLIP ? machine.stateTime : 0
+      },
     })
-    if (!ok) return
-    audioRef.current.currentTime = 0
-    void audioRef.current.play().catch(() => {})
-    dancingRef.current = true
-    danceCancelRef.current = false
     setDancing(true)
+  }, [goAction, cancelAction, audio])
+
+  /** Flip to the other look. Whatever she is doing carries straight on — the
+   *  hidden look already wears the pose. */
+  const swapLook = useCallback(() => {
+    const engine = engineRef.current
+    const looks = looksRef.current
+    const from = looks[lookRef.current]
+    const next = (lookRef.current + 1) % LOOKS.length
+    const to = looks[next]
+    if (!engine || !from || !to) return
+    const root = rootRef.current
+    const half = (root.yaw + Math.PI) * 0.5
+    engine.setModelTransform(to.id, {
+      position: new Vec3(root.x, 0, root.z),
+      rotation: new Quat(0, Math.sin(half), 0, Math.cos(half)),
+      visible: true,
+    })
+    engine.setModelTransform(from.id, { visible: false })
+    // Hidden looks skip physics: the incoming hair and cloth start settled on
+    // the current pose rather than wherever they were left.
+    engine.resetPhysics()
+    if (followingRef.current) engine.setCameraFollow(to.model, undefined, CAMERA_OFFSET)
+    lookRef.current = next
+    modelRef.current = to.model
+    setBombed(next === 1)
+    setSwapPending(false)
   }, [])
 
-  const stickDisplayRef = useRef<((x: number, y: number) => void) | null>(null)
+  /** Shift / the bomb button: the boom starts now and the skin changes on its
+   *  bang. Presses while a swap is pending are ignored. */
+  const pressLook = useCallback(() => {
+    const to = looksRef.current[(lookRef.current + 1) % LOOKS.length]
+    if (!machineRef.current || !to?.ready || swapAtRef.current >= 0) return
+    if (!audio.boom.ready) {
+      swapLook()
+      return
+    }
+    // Held to a second in case the sound never starts (a refused resume).
+    swapAtRef.current = performance.now() + 1000
+    audio.boom.play({ onHeard: (time) => (swapAtRef.current = time + BOOM_BANG * 1000) })
+    setSwapPending(true)
+  }, [audio, swapLook])
 
-  const onStick = useCallback((x: number, y: number, active: boolean) => {
-    stickRef.current.x = x
-    stickRef.current.y = y
-    stickRef.current.active = active
-  }, [])
+  /** A random clip from `pool` — never the one she just played, when there is a choice. */
+  const startFlavor = useCallback(
+    (pool: string[]) => {
+      const model = modelRef.current
+      if (!model) return
+      const loaded = pool.filter((clip) => model.getClip(clip))
+      const fresh = loaded.filter((clip) => clip !== lastFlavorRef.current)
+      const choices = fresh.length > 0 ? fresh : loaded
+      if (choices.length === 0) return
+      const clip = choices[Math.floor(Math.random() * choices.length)]
+      if (goAction(clip, "flavor", FLAVOR_FADE_IN)) lastFlavorRef.current = clip
+    },
+    [goAction]
+  )
+
+  const onStick = useCallback(
+    (x: number, y: number, active: boolean) => {
+      stickRef.current.x = x
+      stickRef.current.y = y
+      stickRef.current.active = active
+      // Grabbing the wheel is fresh movement intent — breaks out of any action.
+      if (active) cancelAction()
+    },
+    [cancelAction]
+  )
 
   const initEngine = useCallback(async () => {
     if (!canvasRef.current) {
@@ -280,23 +637,30 @@ export default function Home() {
     }
     try {
       const engine = new Engine(canvasRef.current, {
-        camera: { distance: 45, target: new Vec3(0, 11.5, 0) },
+        camera: { distance: 33, target: new Vec3(0, CAMERA_OFFSET.y, 0) },
         bloom: { color: new Vec3(0.75, 0.82, 1.0) },
         // reze-design's sun: azimuth 205°, elevation 21° (azElToDirection), strength 2.
         sun: { strength: 2.0, direction: new Vec3(0.3946, -0.3584, 0.8462) },
         // tailwind blue-200, display-space sRGB
         background: new Vec3(0.749, 0.859, 0.996),
+        // Double-click (desktop) / tap (touch) on her → a touch reaction. Only
+        // from rest: mid-run and mid-dance taps are ignored. Tapping during a
+        // reaction rolls a new one.
+        onRaycast: (modelName) => {
+          if (modelName !== looksRef.current[lookRef.current]?.id) return
+          const kind = actionRef.current
+          if ((kind === null && lastSpeedRef.current < 0.2) || kind === "flavor") startFlavor(TOUCH_CLIPS)
+        },
       })
       engineRef.current = engine
       await engine.init()
+      engine.setOutlineEnabled(true)
       // Perf readout lives in the header's FPS pill (click it). Dev builds keep
       // a console handle for live probing; production exposes nothing.
       if (process.env.NODE_ENV === "development") (window as unknown as { engine?: Engine }).engine = engine
 
       // Stage first: ground up and the render loop painting before any model or
-      // VMD bytes arrive — she pops in styled once ready, companions after.
-      // Room to sprint: ~10s of full sprint in any direction before the edge.
-      // Pale blue-grey stage with a fine white grid, fading into the backdrop.
+      // VMD bytes arrive — she pops in styled once ready.
       engine.addGround({
         // tailwind blue-400 in linear light
         diffuseColor: new Vec3(0.116, 0.384, 0.956),
@@ -312,76 +676,44 @@ export default function Home() {
         fadeStart: 120,
         fadeEnd: 300,
       })
-      // The cast assembles progressively: the loop ticks whoever exists, so the
-      // player is running around while companions are still downloading.
-      let controller: LocomotionController | null = null
-      const companions: { def: (typeof COMPANIONS)[number]; controller: LocomotionController; model: Model }[] = []
+
+      const actionRotation = new Quat(0, 0, 0, 1)
+      const actionPosition = new Vec3(0, 0, 0)
+      const cameraTarget = new Vec3(0, CAMERA_OFFSET.y, 0)
+      let cameraGlide = 0
+      /** Entrance time at which the login takes over, or -1 once that is moot. */
+      let loginAt = -1
       let last = performance.now()
       const gameTick = () => {
-        const ctl = controller
-        if (!ctl) return
+        // The clock ticks from the first frame, so the first armed frame's dt is
+        // one frame rather than the whole load.
         const now = performance.now()
         const dt = (now - last) / 1000
         last = now
+        const ctl = ctlRef.current
+        const machine = machineRef.current
+        const lookId = looksRef.current[lookRef.current]?.id
+        if (!ctl || !machine || !lookId) return
 
-        // Camera-relative controls, FPS-style: the mouse orbits the view and thereby
-        // steers the run — up is always away from the camera, right is screen-right.
-        // The wheel gives analog direction/magnitude (rim = sprint); WASD + Shift
-        // feed the same vector. Orbit eye sits at target + r·(sinα, ·, cosα), so
-        // screen-forward is (-sinα, -cosα) and screen-right is (-cosα, sinα).
+        // Camera-relative controls: the mouse orbits the view and thereby steers
+        // the run — up is always away from the camera, right is screen-right.
         const keys = keysRef.current
         const stick = stickRef.current
         let rawX: number
         let rawY: number
-        let sprint: boolean
         if (stick.active) {
           rawX = stick.x
           rawY = stick.y
-          sprint = Math.hypot(stick.x, stick.y) > SPRINT_AT
         } else {
-          // Keyboard throttle: held keys steer while the magnitude ramps toward the
-          // rim; release keeps the last direction and decays, so she glides down
-          // through run to a stop and the knob plays the whole story.
           const kx = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0)
           const ky = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0)
-          const t = kbThrottle.current
-          const held = kx !== 0 || ky !== 0
-          if (held) {
-            const len = Math.hypot(kx, ky)
-            t.dirX = kx / len
-            t.dirY = ky / len
-            // A different key combo interrupts the commitment: hold the charge
-            // until the new direction has been held steadily for a moment. (The
-            // first press from standstill is not a change — starts stay snappy.)
-            const changed = kx !== t.lastKx || ky !== t.lastKy
-            if (changed && (t.lastKx !== 0 || t.lastKy !== 0)) {
-              t.cool = KB_TURN_PAUSE
-              // Reversing costs momentum. Holding full throttle through a hard
-              // direction change let her sprint backwards the instant the keys
-              // said so — and the authored stop then honestly skidded four
-              // metres that way, which reads as drift. Sharper turn, bigger
-              // bite: ~none at 45°, half at 90°, most of it at 180°.
-              const prevLen = Math.hypot(t.lastKx, t.lastKy)
-              const dot = prevLen > 0 ? (kx * t.lastKx + ky * t.lastKy) / (len * prevLen) : 1
-              t.mag *= Math.max(0.25, Math.min(1, 0.5 * (1 + dot)))
-            }
-            if (t.cool > 0) {
-              t.cool -= dt
-            } else {
-              const rate = t.mag < KB_RUN_AT ? KB_RUN_AT / KB_TO_RUN : (1 - KB_RUN_AT) / KB_TO_SPRINT
-              t.mag = Math.min(1, t.mag + rate * dt)
-            }
-          } else {
-            t.mag = Math.max(0, t.mag - dt / KB_DECEL_TIME)
-            t.cool = 0
-          }
-          t.lastKx = kx
-          t.lastKy = ky
-          rawX = t.dirX * t.mag
-          rawY = t.dirY * t.mag
-          sprint = t.mag > SPRINT_AT
+          const len = Math.hypot(kx, ky)
+          rawX = len > 0 ? kx / len : 0
+          rawY = len > 0 ? ky / len : 0
           stickDisplayRef.current?.(rawX, rawY)
         }
+        // Orbit eye sits at target + r·(sinα, ·, cosα), so screen-forward is
+        // (-sinα, -cosα) and screen-right is (-cosα, sinα).
         const alpha = engine.getCameraAlpha()
         const sinA = Math.sin(alpha)
         const cosA = Math.cos(alpha)
@@ -393,126 +725,258 @@ export default function Home() {
           x *= k
           y *= k
         }
-        // Souls-style unlocked camera: input is camera-relative but the character
-        // turns toward the movement and runs — never glued to the camera's facing.
-        // (The strafe ring stays loaded for a future lock-on mode, where side-
-        // stepping is the right behavior: ctl.setFacing(targetYaw).)
-        // Movement interrupts the dance: one cancel fade, and she runs out of it.
-        if (dancingRef.current && !danceCancelRef.current && (rawX !== 0 || rawY !== 0 || stick.active)) {
-          danceCancelRef.current = true
-          audioRef.current?.pause() // music stops WITH the dance, not after the fade
-          for (const m of actorsRef.current) m.cancelOneShot(0.25) // snappy: she's running almost immediately
-        }
-        ctl.setMove(x, y, sprint)
-        const pose = ctl.update(dt)
-        engine.setModelTransform(PLAYER.id, { position: pose.position, rotation: pose.rotation })
 
-        // Companion follow AI: chase a formation slot in the player's local frame;
-        // hold inside the deadband, run beyond it, sprint when left far behind.
-        const fx = Math.sin(pose.yaw)
-        const fz = Math.cos(pose.yaw)
-        for (const { def, controller: c } of companions) {
-          const tx = pose.position.x + Math.cos(pose.yaw) * def.slot.x + fx * def.slot.z
-          const tz = pose.position.z - Math.sin(pose.yaw) * def.slot.x + fz * def.slot.z
-          const p = c.getPosition()
-          const dx = tx - p.x
-          const dz = tz - p.z
-          const dist = Math.hypot(dx, dz)
-          // Hysteresis + a decisiveness floor: a companion either WALKS or
-          // STANDS. Hovering at the deadband edge used to emit near-zero move
-          // pulses — root creep under an idle pose, i.e. feet sliding while
-          // she breathes. Now she starts only well outside the band, keeps
-          // going until she's properly inside it, and never below half throttle.
-          const live = c as LocomotionController & { __following?: boolean }
-          const start = FOLLOW_DEADBAND + 2
-          const stop = FOLLOW_DEADBAND
-          if (!dancingRef.current && (live.__following ? dist > stop : dist > start)) {
-            live.__following = true
-            const mag = Math.max(0.5, Math.min(1, (dist - stop) / FOLLOW_ARRIVE))
-            c.setMove((dx / dist) * mag, (dz / dist) * mag, dist > FOLLOW_SPRINT_AT)
-          } else {
-            live.__following = false
-            c.setMove(0, 0)
+        // Reconcile: the machine came back to locomotion (clip end, or a
+        // cancel) — hand the root, wherever the action carried it, back to the
+        // controller in the same frame locomotion resumes.
+        if (machine.state === "locomotion" && actionRef.current !== null) {
+          const root = rootRef.current
+          ctl.reset(root.x, 0, root.z, root.yaw)
+          fadeFromRef.current = null
+          if (actionRef.current === "dance") {
+            // A cancel already stopped the song; at the clip's end it eases out
+            // with the return to the stand.
+            audio.song.stop(DANCE_RETURN_FADE)
+            setDancing(false)
           }
-          const cp = c.update(dt)
-          engine.setModelTransform(def.id, { position: cp.position, rotation: cp.rotation })
+          actionRef.current = null
+          lastActiveRef.current = now
+        }
+
+        // The controller ticks every frame — with no input while an action owns
+        // the root, so momentum settles under it and held keys resume after.
+        const inLocomotion = machine.state === "locomotion"
+        ctl.setMove(inLocomotion ? x : 0, inLocomotion ? y : 0)
+        const pose = ctl.update(dt)
+
+        if (inLocomotion) {
+          rootRef.current.x = pose.position.x
+          rootRef.current.z = pose.position.z
+          rootRef.current.yaw = pose.yaw
+          engine.setModelTransform(lookId, { position: pose.position, rotation: pose.rotation })
+        } else {
+          // The action owns the root: play the clip's authored path from its
+          // anchor, facing frozen.
+          const pathAt = (clip: string, a: RootXZ, time: number) => {
+            const profile = profilesRef.current.get(clip)
+            if (!profile) return { x: a.x, z: a.z }
+            const { dx, dz } = sampleProfile(profile, time * 30)
+            const d = clipToWorld(dx, dz, a.yaw)
+            return { x: a.x + d.x, z: a.z + d.z }
+          }
+          const anchor = anchorRef.current
+          let { x: px, z: pz } = pathAt(machine.state, anchor, machine.stateTime)
+          const from = fadeFromRef.current
+          if (from) {
+            const elapsed = (now - from.start) / 1000
+            if (elapsed >= from.fade) {
+              fadeFromRef.current = null
+            } else {
+              const old =
+                from.clip === null
+                  ? { x: pose.position.x, z: pose.position.z }
+                  : pathAt(from.clip, from.anchor, from.stateTime + elapsed)
+              const w = easeInOut(elapsed / from.fade)
+              px = old.x + (px - old.x) * w
+              pz = old.z + (pz - old.z) * w
+            }
+          }
+          rootRef.current.x = px
+          rootRef.current.z = pz
+          rootRef.current.yaw = anchor.yaw
+          const half = (anchor.yaw + Math.PI) * 0.5
+          actionRotation.setXYZW(0, Math.sin(half), 0, Math.cos(half))
+          actionPosition.setXYZ(px, 0, pz)
+          engine.setModelTransform(lookId, { position: actionPosition, rotation: actionRotation })
+        }
+        lastSpeedRef.current = pose.speedLevel
+
+        // The camera holds the spawn (the origin) through the entrance, so she
+        // jumps into frame. Once locomotion has her, it glides onto her root and
+        // follows it — the gait clips don't animate 全ての親, so the camera tracks
+        // the run without inheriting センター's bob and lean.
+        if (!followingRef.current && inLocomotion) {
+          cameraGlide = Math.min(1, cameraGlide + dt / CAMERA_GLIDE)
+          if (cameraGlide >= 1) {
+            engine.setCameraFollow(modelRef.current, undefined, CAMERA_OFFSET)
+            followingRef.current = true
+          } else {
+            const w = easeInOut(cameraGlide)
+            cameraTarget.setXYZ(rootRef.current.x * w, CAMERA_OFFSET.y, rootRef.current.z * w)
+            engine.setCameraTarget(cameraTarget)
+          }
+        }
+
+        // A pending look swap lands on the frame that is on screen when the
+        // bang is heard: this tick's changes show on the next frame.
+        if (swapAtRef.current >= 0 && now + dt * 1000 >= swapAtRef.current) {
+          swapAtRef.current = -1
+          swapLook()
+        }
+
+        // The login follows the entrance, entering where the entrance would
+        // have started fading back to the stand. Anything that takes her out
+        // of the entrance first (movement, a touch, the dance) calls it off.
+        if (loginAt >= 0) {
+          if (machine.state !== ENTRANCE_CLIP) {
+            loginAt = -1
+          } else if (machine.stateTime + dt >= loginAt) {
+            loginAt = -1
+            if (goAction(LOGIN_CLIP, "flavor", FLAVOR_RETURN_FADE)) lastFlavorRef.current = LOGIN_CLIP
+          }
+        }
+
+        machine.update(dt)
+
+        // Left truly alone for a while, she entertains herself.
+        if (mag > 0.05 || stick.active || pose.speedLevel > 0.05 || actionRef.current !== null) {
+          lastActiveRef.current = now
+        } else if ((now - lastActiveRef.current) / 1000 > IDLE_AUTO_AFTER) {
+          lastActiveRef.current = now
+          startFlavor(IDLE_CLIPS)
         }
 
         setStats(engine.getStats())
       }
       engine.runRenderLoop(gameTick)
 
-      const model = await engine.loadModel(PLAYER.id, PLAYER.pmx)
-      engine.setModelTransform(PLAYER.id, { visible: false })
-      await engine.autoStyleGroups(PLAYER.id, { body: ["手"], metal: ["指甲"] })
+      const lead = LOOKS[0]
+      const model = await engine.loadModel(lead.id, lead.pmx)
+      engine.setModelTransform(lead.id, { visible: false })
+      await engine.autoStyleGroups(lead.id, CAST_STYLE)
+      looksRef.current = [{ id: lead.id, model, ready: true }]
+      modelRef.current = model
 
-      await Promise.all([
-        model.loadVmd("idle", `${PLAYER.vmdDir}/Idle.vmd`),
-        model.loadVmd("run", `${PLAYER.vmdDir}/Run_Lfoot.vmd`),
-        model.loadVmd("sprint", `${PLAYER.vmdDir}/Sprint_Lfoot.vmd`),
-        model.loadVmd("dance", `${ASSETS}/animations/One More Last Time.vmd`),
-        ...[...STRAFE_RUN, ...STRAFE_SPRINT].map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
-        ...STOP_CLIPS.map((e) => model.loadVmd(e.clip, `${PLAYER.vmdDir}/${e.clip}.vmd`)),
+      const [, , , hasEntrance] = await Promise.all([
+        model.loadVmd("stand", STAND_VMD),
+        model.loadVmd("run", RUN_VMD),
+        model.loadVmd("stop", STOP_VMD),
+        model.loadVmd(ENTRANCE_CLIP, `${ANIMATIONS}/${ENTRANCE_CLIP}.vmd`).then(
+          () => true,
+          (error) => {
+            console.warn(`[reze] ${ENTRANCE_CLIP} not loaded:`, error)
+            return false
+          }
+        ),
       ])
+      const rest = standRest(model)
+      model.extractRootMotion("run", rest)
+      model.extractRootMotion("stop", rest)
+      const entrance = hasEntrance ? model.extractRootMotion(ENTRANCE_CLIP, rest) : null
+      if (entrance) profilesRef.current.set(ENTRANCE_CLIP, entrance)
 
-      const playerCtl = new LocomotionController(
+      // Clips are parsed once, on the lead model, and shared with every other
+      // look — same skeleton, and root motion already lifted.
+      const loadedClips = new Set(["stand", "run", "stop", ...(entrance ? [ENTRANCE_CLIP] : [])])
+      const shareClip = (clip: string) => {
+        loadedClips.add(clip)
+        const data = model.getClip(clip)
+        if (!data) return
+        for (const look of looksRef.current) if (look.model !== model) look.model.loadClip(clip, data)
+      }
+
+      const ctl = new LocomotionController(
         model,
-        { idle: "idle", run: "run", sprint: "sprint", strafeRun: STRAFE_RUN, strafeSprint: STRAFE_SPRINT, stop: STOP_CLIPS },
-        { runSpeed: PLAYER.runSpeed, sprintSpeed: PLAYER.sprintSpeed }
+        { idle: "stand", run: "run", stop: [STOP] },
+        // The stop plays at its authored pace. autoApply off — the state
+        // machines own the final blend. The controller reads only clip lengths
+        // from its model, so every look shares it.
+        { runSpeed: RUN_SPEED, stopTimeScale: 1, autoApply: false }
       )
-      // Spawn facing the camera (rest facing, -Z); she turns around on the first input.
-      playerCtl.teleport(0, 0, 0, Math.PI)
-      // Follow the root (全ての親): the gait clips don't animate it, so the camera
-      // tracks the run without inheriting センター's bob and lean.
-      engine.setCameraFollow(model, undefined, new Vec3(0, 11.5, 0))
-      // Pose and place BEFORE the reveal: her first visible frame is the idle
-      // in position — no bind-pose flash, no beat standing at the origin.
-      const pose0 = playerCtl.update(1 / 60)
-      engine.setModelTransform(PLAYER.id, { position: pose0.position, rotation: pose0.rotation, visible: true })
-      actorsRef.current = [model]
-      controller = playerCtl
+      const machine = new Lockstep(buildMachine(model, ctl))
+      // Spawn at the origin facing the camera (rest facing, -Z); she turns around
+      // on the first input.
+      ctl.teleport(0, 0, 0, Math.PI)
+      const pose0 = ctl.update(1 / 60)
 
-      // AI companions: own model, own per-skeleton VMDs, own controller — steered by
-      // a follow policy through the same setMove interface the player uses.
-      await Promise.all(
-        COMPANIONS.map(async (def) => {
-          const m = await engine.loadModel(def.id, def.pmx)
-          engine.setModelTransform(def.id, { visible: false })
-          await engine.autoStyleGroups(def.id)
-          await Promise.all([
-            m.loadVmd("idle", `${def.vmdDir}/Idle.vmd`),
-            m.loadVmd("run", `${def.vmdDir}/Run_Lfoot.vmd`),
-            m.loadVmd("sprint", `${def.vmdDir}/Sprint_Lfoot.vmd`),
-            m.loadVmd("dance", `${ASSETS}/animations/One More Last Time.vmd`),
-          ])
-          const c = new LocomotionController(
-            m,
-            { idle: "idle", run: "run", sprint: "sprint" },
-            { runSpeed: def.runSpeed, sprintSpeed: def.sprintSpeed }
-          )
-          // Spawn already in formation around the player (player faces -Z at rest),
-          // posed and placed before the reveal — she joins mid-idle, not at center.
-          c.teleport(-def.slot.x, 0, -def.slot.z, Math.PI)
-          const p0 = c.update(1 / 60)
-          engine.setModelTransform(def.id, { position: p0.position, rotation: p0.rotation, visible: true })
-          companions.push({ def, controller: c, model: m })
-          actorsRef.current = [model, ...companions.map((x) => x.model)]
-        })
-      )
-
-
-
-      // One settled frame (bind pose → blended idle is a jump), then park the physics on it.
-      await new Promise((resolve) => requestAnimationFrame(resolve))
+      // Warm-up, behind the loading bar. She is drawn at the spawn fully
+      // dissolved, so every pass does its first-use work on her without a pixel
+      // showing, holding her first frame (the entrance, or the stand) while the
+      // physics settles on it. The dance, the reactions, the sounds and the
+      // Bomb Devil load meanwhile, so their parse stalls (tens of ms each) land
+      // here instead of mid-jump. The show starts once the frame pace holds
+      // steady.
+      if (entrance) machine.go(ENTRANCE_CLIP, 0)
+      machine.update(0)
+      engine.setModelDissolve(lead.id, 0)
+      engine.setModelTransform(lead.id, { position: pose0.position, rotation: pose0.rotation, visible: true })
+      await nextFrame()
       engine.resetPhysics()
 
+      // The other look: its own model and machine over the shared clips and
+      // controller, warmed the same way, then kept resident and hidden so a
+      // swap never loads anything.
+      const prepareLook = async (def: (typeof LOOKS)[number]) => {
+        const other = await engine.loadModel(def.id, def.pmx)
+        engine.setModelTransform(def.id, { visible: false })
+        await engine.autoStyleGroups(def.id, CAST_STYLE)
+        // Registered and caught up in one synchronous step, so a clip landing
+        // in between cannot be missed.
+        const look: Look = { id: def.id, model: other, ready: false }
+        looksRef.current.push(look)
+        for (const clip of loadedClips) {
+          const data = model.getClip(clip)
+          if (data) other.loadClip(clip, data)
+        }
+        machine.join(buildMachine(other, ctl))
+        engine.setModelDissolve(def.id, 0)
+        engine.setModelTransform(def.id, {
+          position: new Vec3(rootRef.current.x, 0, rootRef.current.z),
+          visible: true,
+        })
+        await steadyFrames(WARMUP_STEADY_FRAMES, WARMUP_FRAME_MS, performance.now() + WARMUP_MAX_MS)
+        engine.setModelTransform(def.id, { visible: false })
+        engine.setModelDissolve(def.id, 1)
+        look.ready = true
+        setBombReady(true)
+      }
+
+      const loads = Promise.all([
+        (async () => {
+          await Promise.all([
+            loadActions(model, [DANCE_CLIP], () => DANCE_VMD, rest, profilesRef.current, shareClip),
+            audio.song.load(DANCE_AUDIO).catch((error) => console.warn("[reze] song not loaded:", error)),
+          ])
+          setDanceReady(model.getClip(DANCE_CLIP) !== null)
+          const pending = FLAVOR_CLIPS.filter((clip) => !model.getClip(clip)) // the entrance is already in
+          await loadActions(model, pending, (clip) => `${ANIMATIONS}/${clip}.vmd`, rest, profilesRef.current, shareClip)
+        })(),
+        audio.boom.load(BOOM_AUDIO).catch((error) => console.warn("[reze] boom not loaded:", error)),
+        prepareLook(LOOKS[1]).catch((error) => console.warn(`[reze] ${LOOKS[1].id} not loaded:`, error)),
+      ])
+      const deadline = performance.now() + WARMUP_MAX_MS
+      await Promise.race([
+        loads.then(() => steadyFrames(WARMUP_STEADY_FRAMES, WARMUP_FRAME_MS, deadline)),
+        wait(WARMUP_MAX_MS),
+      ])
+
+      // Showtime: the tick takes over and she materializes into the entrance's
+      // first frame. Physics is model-space, so moving her root to the jump's
+      // start leaves the settled hair where it is.
+      ctlRef.current = ctl
+      machineRef.current = machine
+      if (entrance) {
+        // The jump starts wherever its own travel, played forward, lands her on
+        // the spawn.
+        const n = entrance.frames.length
+        const land = clipToWorld(entrance.x[n - 1], entrance.z[n - 1], Math.PI)
+        rootRef.current = { x: -land.x, z: -land.z, yaw: Math.PI }
+        engine.setModelTransform(lead.id, { position: new Vec3(-land.x, 0, -land.z) })
+        goAction(ENTRANCE_CLIP, "flavor", 0)
+        // The machine's own return to the stand starts FLAVOR_RETURN_FADE before
+        // the clip's end (its duration is (frameCount - 1) / 30).
+        const frames = model.getClip(ENTRANCE_CLIP)?.frameCount ?? 0
+        loginAt = Math.max(0, (frames - 1) / 30 - FLAVOR_RETURN_FADE)
+      }
+      engine.setModelDissolve(lead.id, 1)
+      lastActiveRef.current = performance.now()
       setEngineError(null)
+      setLoading(false)
     } catch (error) {
       setEngineError(error instanceof Error ? error.message : "Unknown error")
-    } finally {
       setLoading(false)
     }
-  }, [])
+  }, [goAction, startFlavor, swapLook, audio])
 
   useEffect(() => {
     void initEngine()
@@ -521,23 +985,40 @@ export default function Home() {
     }
   }, [initEngine])
 
-  // WASD + Shift held-key tracking. Blur clears everything so keys can't stick
-  // when the tab loses focus mid-press.
+  // WASD movement, Space dance, Shift look swap. Blur clears everything so keys
+  // can't stick when the tab loses focus mid-press.
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
-      if (!INPUT_CODES.has(e.code)) return
       if (e.code === "Space") {
         e.preventDefault() // page scroll
-        setSpaceHeld(true)
-        startDance()
+        if (!e.repeat) {
+          setSpaceHeld(true)
+          toggleDance()
+        }
         return
       }
-      keysRef.current.add(e.code)
+      if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+        if (!e.repeat) {
+          setShiftHeld(true)
+          pressLook()
+        }
+        return
+      }
+      if (MOVE_CODES.has(e.code)) {
+        keysRef.current.add(e.code)
+        // A fresh press (not a key held from before the action) breaks out of
+        // whatever is playing — movement always wins.
+        if (!e.repeat) cancelAction()
+      }
     }
     const up = (e: KeyboardEvent) => {
       if (e.code === "Space") {
         setSpaceHeld(false)
+        return
+      }
+      if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+        setShiftHeld(false)
         return
       }
       keysRef.current.delete(e.code)
@@ -545,6 +1026,7 @@ export default function Home() {
     const blur = () => {
       keysRef.current.clear()
       setSpaceHeld(false)
+      setShiftHeld(false)
     }
     window.addEventListener("keydown", down)
     window.addEventListener("keyup", up)
@@ -554,7 +1036,7 @@ export default function Home() {
       window.removeEventListener("keyup", up)
       window.removeEventListener("blur", blur)
     }
-  }, [])
+  }, [toggleDance, pressLook, cancelAction])
 
   return (
     <div className="fixed inset-0 w-full h-full overflow-hidden touch-none">
@@ -570,30 +1052,49 @@ export default function Home() {
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full touch-none pointer-events-auto z-1" />
 
       {!loading && !engineError && (
-        // Mobile-wheel thumb zone; hold WASD or drag — the rim is the sprint zone.
+        // Mobile-wheel thumb zone; hold WASD or drag — any deflection is a run.
         <div className="absolute bottom-10 left-6 sm:bottom-24 sm:left-48 z-[60] pointer-events-auto">
           <VirtualStick onChange={onStick} display={stickDisplayRef} />
         </div>
       )}
 
-      {!loading && !engineError && (
-        // Skill zone, bottom-right — the button's center lines up with the wheel
-        // knob's center (wheel center = container bottom + 72px). Space triggers and
-        // highlights it; while dancing it can't re-trigger — only movement interrupts.
-        <div className="absolute bottom-[4.5rem] right-6 sm:bottom-32 sm:right-48 z-[60] pointer-events-auto">
-          <button
-            className={`w-20 h-20 rounded-full border-2 font-mono font-semibold text-xs tracking-widest select-none touch-none transition-all duration-100 ${
-              dancing || spaceHeld
-                ? "bg-white/90 text-black border-white scale-95 shadow-[0_0_28px_rgba(255,255,255,0.5)]"
-                : "bg-white/25 text-white border-white/70 backdrop-blur-md shadow-[inset_0_1px_0_rgba(255,255,255,0.3),0_2px_12px_rgba(0,0,0,0.25)]"
-            }`}
-            onClick={startDance}
-            onContextMenu={(e) => e.preventDefault()}
-            aria-label="Dance together (Space)"
-          >
-            ♪
-            <div className="text-[9px] mt-0.5 tracking-[0.2em]">DANCE</div>
-          </button>
+      {!loading && !engineError && (danceReady || bombReady) && (
+        // Action row, bottom-right — the dance button's center lines up with the
+        // wheel's center on both breakpoints, and the bomb sits beside it. Each
+        // key highlights its button; pointerdown for game-feel latency, and no
+        // focus — a focused button would re-fire on Space.
+        <div className="absolute bottom-14 right-6 sm:bottom-32 sm:right-48 z-[60] pointer-events-auto h-20 flex items-center gap-4">
+          {bombReady && (
+            <button
+              className={`w-14 h-14 rounded-full border-2 flex items-center justify-center select-none touch-none transition-all duration-100 ${
+                bombed || shiftHeld || swapPending ? ACTIVE_BUTTON : IDLE_BUTTON
+              }`}
+              onPointerDown={(e) => {
+                e.preventDefault()
+                pressLook()
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+              aria-label="Bomb Devil (Shift)"
+            >
+              <Bomb className="w-6 h-6" />
+            </button>
+          )}
+          {danceReady && (
+            <button
+              className={`w-20 h-20 rounded-full border-2 font-mono font-semibold text-xs tracking-widest select-none touch-none transition-all duration-100 ${
+                dancing || spaceHeld ? ACTIVE_BUTTON : IDLE_BUTTON
+              }`}
+              onPointerDown={(e) => {
+                e.preventDefault()
+                toggleDance()
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+              aria-label="Dance (Space)"
+            >
+              ♪
+              <div className="text-[9px] mt-0.5 tracking-[0.2em]">DANCE</div>
+            </button>
+          )}
         </div>
       )}
     </div>

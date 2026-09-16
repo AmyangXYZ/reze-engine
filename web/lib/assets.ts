@@ -11,3 +11,8 @@
  * immutable cache header: rename, never overwrite in place.
  */
 export const ASSETS = process.env.NODE_ENV === "production" ? "https://assets.reze.one/demo/reze-engine" : ""
+
+/** The cast, shared by every site (reze.design reads the same Reze) rather than
+ *  copied into each one's folder. `next dev` reads the same model out of
+ *  `public/models/reze`. */
+export const CAST = process.env.NODE_ENV === "production" ? "https://assets.reze.one/demo/reze" : "/models/reze"
