@@ -26,7 +26,7 @@ import { ASSETS, CAST } from "@/lib/assets"
 
 /** Her two looks: one skeleton, one motion set. The first is the one she loads as. */
 const LOOKS = [
-  { id: "reze", pmx: `${CAST}/reze.pmx` },
+  { id: "reze", pmx: `${CAST}/reze-v2.pmx` },
   { id: "reze-bomb", pmx: `${CAST}/reze-bomb.pmx` },
 ]
 /** The materials the engine's name hints leave unstyled, grouped as reze-design
