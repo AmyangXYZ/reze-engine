@@ -1,6 +1,6 @@
 # Reze Engine
 
-[![npm](https://img.shields.io/npm/v/reze-engine)](https://www.npmjs.com/package/reze-engine)
+[![npm](https://img.shields.io/npm/v/reze-engine)](https://www.npmjs.com/package/reze-engine) · [**Live demo**](https://reze.one)
 
 **Zero-runtime-dependency** WebGPU engine for real-time MMD/PMX rendering — renderer, animation, IK, physics, and a multi-effect VFX system, all in TypeScript.
 
@@ -14,7 +14,7 @@ One piece of the **Reze MMD family**, covering the whole MMD workflow on the web
 | [MiKaPo](https://github.com/AmyangXYZ/MiKaPo)           | Real-time motion capture in the browser, exporting straight to VMD              |
 | [reze-rig](https://github.com/AmyangXYZ/reze-rig)       | Retarget FBX animations to MMD VMD format, Mixamo and Unity tested              |
 
-![screenshot](./screenshot.png)
+[![screenshot](./screenshot.png)](https://reze.one)
 
 ```bash
 npm install reze-engine
@@ -22,13 +22,14 @@ npm install reze-engine
 
 ## Features
 
-**MMD fidelity**
+**Models and motion**
 
 - PMX models, VMD motion with MMD's own bezier packing, IK with per-chain enable, append-inherit bones and fixed-axis twist bones, VMD export
 - Vertex / group / bone / material morphs (multiply and add), vertex morphs on a GPU compute path
 - MMD draw disciplines reproduced: author-order transparency with depth write, per-mesh interleaved outline hulls, the eyes-through-bangs stencil pass, sphere maps as graph nodes
 - In-house sequential-impulse physics for PMX rigs — rigid bodies, joints, deterministic wind, a world floor
 - Stages as environments, not characters: a stage PMX takes the same materials, graphs and style groups a character does, and keeps the bone and material morphs its author rigged for doors, lifts and colour switches — while skipping physics, IK and idle pose work, and owning the floor so the built-in ground steps aside
+- A model can ride another's bone — MMD's 外部親 — so a weapon, a phone or a second character follows a hand without being parented in the file; `setModelParentKeys` keys that parent over the scene, for a prop handed over, put down, or thrown and left to gravity
 
 **Rendering**
 
@@ -39,10 +40,13 @@ npm install reze-engine
 - Floor mirror: a planar reflection pass reusing the scene pipelines, with depth-proportional blur and the reflection composited as its own ground layer
 - HDRI worlds (`.hdr`): the sky renders through the same view transform as the scene and lights the cast via spherical-harmonic irradiance — the sun keeps the toon ramp
 - Positional lights, placed in the scene or emitted by effect shaders — stage rigs, firework bursts, a hand ribbon lighting the dancer as it passes
+- Eye tracking: a gaze that follows the camera or a point within the rig's own range, and the cast interface reports where she is looking so an effect can follow it
+- `setModelDissolve` takes a character apart in her own material — a per-triangle threshold burn with a glowing front, run identically by the colour pass, depth prepass, shadow map and outline hull, so nothing of her is left standing; `setModelPhysicsWhileHidden` keeps a hidden model's cloth moving, so a costume swapped in arrives already in motion
 
 **Effects**
 
 - N simultaneous scene effects, each one WGSL file declaring its mounts: fullscreen background/foreground, GPU particles, bone-trail ribbons, a persistent simulation grid, and lights
+- Scheduled and parameterised from the source: `setEffectSchedule` gives an effect any number of windows, each with its own clock starting at zero and its own blend in and out, while `#param` lines declare the dials a host shows — turning one writes a uniform rather than recompiling
 - Effects read the scene through data interfaces — the cast (bones, velocities, trail history), the audio analysis, MIDI notes, `.lrc` lyrics with their words rasterised for the shader to draw, and per-pixel object/material ids
 - Particles and ribbons are scene geometry: depth-tested, bloomed, and reflected in the mirror
 - Install-time compile diagnostics per effect; a broken effect fails alone
