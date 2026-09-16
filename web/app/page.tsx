@@ -11,6 +11,7 @@ import {
   Quat,
   Vec3,
   type AnimStateDef,
+  type EyeTrackingOptions,
   type MaterialPresetMap,
   type RootMotionProfile,
   type StopClipEntry,
@@ -95,6 +96,10 @@ const SONG_CUT_FADE = 0.15
 const WARMUP_STEADY_FRAMES = 20
 const WARMUP_FRAME_MS = 40
 const WARMUP_MAX_MS = 8000
+
+/** Her eyes follow the camera, as in reze-design: solved every frame toward
+ *  wherever it is, the engine's default reach. */
+const EYES: EyeTrackingOptions = {}
 
 /** The orbit centre sits this far above her root. */
 const CAMERA_OFFSET = new Vec3(0, 11.5, 0)
@@ -844,6 +849,7 @@ export default function Home() {
       const model = await engine.loadModel(lead.id, lead.pmx)
       engine.setModelTransform(lead.id, { visible: false })
       await engine.autoStyleGroups(lead.id, CAST_STYLE)
+      engine.setEyeTracking(lead.id, EYES)
       looksRef.current = [{ id: lead.id, model, ready: true }]
       modelRef.current = model
 
@@ -910,6 +916,7 @@ export default function Home() {
         const other = await engine.loadModel(def.id, def.pmx)
         engine.setModelTransform(def.id, { visible: false })
         await engine.autoStyleGroups(def.id, CAST_STYLE)
+        engine.setEyeTracking(def.id, EYES)
         // Registered and caught up in one synchronous step, so a clip landing
         // in between cannot be missed.
         const look: Look = { id: def.id, model: other, ready: false }
