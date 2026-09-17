@@ -31,7 +31,16 @@ struct CameraUniforms {
   view: mat4x4f,
   projection: mat4x4f,
   viewPos: vec3f,
-  _padding: f32,
+  /** Render-target height in device pixels. */
+  viewportHeight: f32,
+  /** The scene clock in seconds — what the time node reads. Paused with the
+   *  transport and stepped exactly by an export, so an animated material lands
+   *  in the file where it stood on screen. (No backticks in here: this WGSL
+   *  lives in a template literal and one would end it.) */
+  time: f32,
+  // NOTHING AFTER THIS. A trailing vec3f aligns to 16 and pushes the struct to
+  // 176 bytes against a 160-byte buffer, which fails validation on every
+  // pipeline at once; ending on the f32 rounds the struct to exactly 160.
 };
 
 struct Light {

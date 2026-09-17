@@ -1594,6 +1594,23 @@ interface EffectInstance {
   trails: EffectTrails | null
 }
 
+/**
+ * A light the DOCUMENT places, as setLights takes it.
+ *
+ * `aim` is what separates the two kinds: with one the light is a spot pointing
+ * that way, without one it is a point light. Angles are the whole cone in
+ * degrees, the way a fixture and every DCC states them.
+ */
+export type SceneLight = {
+  position: XYZ
+  color: XYZ
+  intensity?: number
+  radius?: number
+  aim?: XYZ
+  angle?: number
+  innerAngle?: number
+}
+
 export class Engine {
   private static instance: Engine | null = null
 
@@ -1612,7 +1629,7 @@ export class Engine {
   // `!` field here is genuinely absent until init() — this one no longer is.
   private camera: Camera
   private cameraUniformBuffer!: GPUBuffer
-  private cameraMatrixData = new Float32Array(36)
+  private cameraMatrixData = new Float32Array(40)
   // Blender-style scene config groups (resolved from EngineOptions)
   private world!: { color: Vec3; strength: number }
   private sun!: { color: Vec3; strength: number; direction: Vec3 }
@@ -9377,12 +9394,17 @@ export class Engine {
    * keep the meaning the caller gave them, which is the same rule the anchor
    * table follows. Passing none (or an empty list) turns the layer off and the
    * scene renders exactly as it did before lights existed.
+   *
+   * A light with an `aim` is a SPOT: it reaches only inside `angle`, full
+   * inside `innerAngle`, and the two are degrees from the axis the way every
+   * tool states a cone. Without one it is a point light, which the shading
+   * spells as a cone that covers everything rather than as a second case.
    */
   setLights(
     /** Structural {x,y,z} rather than the Vec3 class, the same choice effect
      *  params make: a scene document's JSON passes straight in, and so does a
      *  literal typed into a console. Vec3 satisfies it either way. */
-    lights: { position: XYZ; color: XYZ; intensity?: number; radius?: number }[] | null,
+    lights: SceneLight[] | null,
   ): void {
     const list = (lights ?? []).slice(0, MAX_LIGHTS)
     this.docLightCount = list.length
@@ -9409,7 +9431,25 @@ export class Engine {
       this.lightsData[b + 4] = Math.max(l.color.x * k, 0)
       this.lightsData[b + 5] = Math.max(l.color.y * k, 0)
       this.lightsData[b + 6] = Math.max(l.color.z * k, 0)
-      // [b + 7] is `type`, reserved: every light is a point light today.
+      // A spot only where an aim was given AND it points somewhere: a zero
+      // vector cannot be normalised, and a cone around nothing would light
+      // nothing at all — a light that vanishes because its aim was left at the
+      // default is worse than one that shines everywhere.
+      const len = l.aim ? Math.hypot(l.aim.x, l.aim.y, l.aim.z) : 0
+      this.lightsData[b + 7] = len > 0 ? 1 : 0
+      this.lightsData[b + 8] = len > 0 ? l.aim!.x / len : 0
+      this.lightsData[b + 9] = len > 0 ? l.aim!.y / len : 0
+      this.lightsData[b + 10] = len > 0 ? l.aim!.z / len : 0
+      // Half-angles in degrees, as cosines. Ordered so the outer edge is never
+      // inside the inner one — a cone written the other way round would divide
+      // by a negative span and light its own rim instead of its middle.
+      const outer = len > 0 ? Math.cos((Math.min(Math.max(l.angle ?? 45, 0), 179) / 2) * (Math.PI / 180)) : -1
+      const inner = len > 0 ? Math.cos((Math.min(Math.max(l.innerAngle ?? (l.angle ?? 45) * 0.8, 0), 179) / 2) * (Math.PI / 180)) : -1
+      this.lightsData[b + 11] = outer
+      this.lightsData[b + 12] = Math.max(inner, outer)
+      this.lightsData[b + 13] = 0
+      this.lightsData[b + 14] = 0
+      this.lightsData[b + 15] = 0
     }
     if (list.length) {
       this.device.queue.writeBuffer(
@@ -15865,6 +15905,11 @@ export class Engine {
     // shader derives the full viewport (width via projection aspect) for its
     // babylon-mmd constant-pixel edge extrusion.
     this.cameraMatrixData[35] = this.canvas.height
+    // The SCENE clock, which is what a material may animate on: it pauses with
+    // the transport and an export steps it exactly, so a ripple is in the same
+    // place in the file as it was on screen. Wall time would drift between the
+    // two. The buffer was already allocated at 40 floats; this is one of them.
+    this.cameraMatrixData[36] = this.sceneClock
     this.device.queue.writeBuffer(this.cameraUniformBuffer, 0, this.cameraMatrixData)
 
     // 360 backdrop: the composite reconstructs each pixel's view ray from the

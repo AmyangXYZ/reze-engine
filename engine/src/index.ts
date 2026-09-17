@@ -14,6 +14,7 @@ export {
   type MaterialPreset,
   type MaterialPresetMap,
   type ModelTransform,
+  type SceneLight,
   type ModelAttachment,
   type GizmoDragEvent,
   type GizmoDragCallback,

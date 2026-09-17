@@ -156,5 +156,8 @@ export function buildMirrorCamera(
   out[33] = camera[33] - t * ny
   out[34] = camera[34] - t * nz
   out[35] = camera[35]
+  // The clock, unfolded: a mirrored draw of an animated material must be at the
+  // same instant as the one it reflects, or the ripples disagree across the pane.
+  out[36] = camera[36]
   return out
 }

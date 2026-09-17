@@ -69,17 +69,27 @@ test("both surfaces that shade get the same accessors", () => {
   }
 })
 
-/** The shader's falloff, reimplemented against the same constants. */
+/** The shader's falloff and cone, reimplemented against the same constants.
+ *  `aim` and `cone` default to what a POINT light stores. */
 function contribution(light, p, n) {
+  const aim = light.aim ?? [0, 0, 0]
+  const cone = light.cone ?? [-1, -1]
   const d = [light.pos[0] - p[0], light.pos[1] - p[1], light.pos[2] - p[2]]
   const dist = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+  if (dist >= light.radius) return 0
   const inv = 1 / Math.max(dist, 1e-4)
-  const ndl = Math.max(n[0] * d[0] * inv + n[1] * d[1] * inv + n[2] * d[2] * inv, 0)
+  const toLight = [d[0] * inv, d[1] * inv, d[2] * inv]
+  const ndl = Math.max(n[0] * toLight[0] + n[1] * toLight[1] + n[2] * toLight[2], 0)
   if (ndl <= 0) return 0
   const t = Math.min(Math.max(dist / Math.max(light.radius, 1e-4), 0), 1)
   const falloff = 1 - t * t
-  return ndl * falloff * falloff
+  const axis = -(toLight[0] * aim[0] + toLight[1] * aim[1] + toLight[2] * aim[2])
+  const lit = Math.min(Math.max((axis - cone[0]) / Math.max(cone[1] - cone[0], 1e-4), 0), 1)
+  return ndl * falloff * falloff * lit * lit
 }
+
+/** The cosine pair setLights stores for a cone of `deg` degrees, inner 80% of it. */
+const coneOf = (deg) => [Math.cos(((deg / 2) * Math.PI) / 180), Math.cos(((deg * 0.8 * 0.5) * Math.PI) / 180)]
 
 test("a light's reach ENDS at its radius", () => {
   // Pure inverse-square never reaches zero, so every light would touch every
@@ -287,4 +297,52 @@ test("the header has exactly one writer", () => {
   // third is someone writing the header from a new place — the trap returning.
   const writes = [...engineSrc.matchAll(/writeBuffer\(\s*this\.lightsBuffer,\s*0,/g)].length
   assert.equal(writes, 2, `offset-0 lights-buffer writes: want init zero-fill + allocateLightSlots only, found ${writes}`)
+})
+
+test("a point light is a spot with no cone", () => {
+  // The branchless trick the whole loop rests on: aim (0,0,0) with both cosines
+  // at -1 divides by the floor and clamps to 1, so a point light pays one dot
+  // product and takes the SAME path a spot does. If this drifts, every point
+  // light in every scene goes dark at once.
+  const light = { pos: [0, 0, 0], radius: 5 }
+  const plain = contribution(light, [0, 0, 1], [0, 0, -1])
+  const spelled = contribution({ ...light, aim: [0, 0, 0], cone: [-1, -1] }, [0, 0, 1], [0, 0, -1])
+  assert.equal(plain, spelled)
+  assert.ok(plain > 0)
+})
+
+test("a spot lights inside its cone and nothing outside it", () => {
+  // A 60° lamp at the origin aimed along +z, and a wall two units down its axis.
+  const light = { pos: [0, 0, 0], radius: 10, aim: [0, 0, 1], cone: coneOf(60) }
+  const n = [0, 0, -1]
+  const axis = contribution(light, [0, 0, 2], n)
+  const inside = contribution(light, [0.3, 0, 2], n)
+  const edge = contribution(light, [1.15, 0, 2], n) // ~30° off, the outer edge
+  const outside = contribution(light, [4, 0, 2], n) // ~63°, past it
+  assert.ok(axis > 0, "the axis is lit")
+  assert.ok(inside > 0 && inside <= axis, "inside the cone, no brighter than the axis")
+  assert.ok(edge < axis * 0.5, `the edge falls off (edge ${edge.toFixed(4)} vs axis ${axis.toFixed(4)})`)
+  assert.equal(outside, 0, "past the outer angle, exactly nothing")
+})
+
+test("a spot aimed away lights nothing in front of it", () => {
+  const light = { pos: [0, 0, 0], radius: 10, aim: [0, 0, -1], cone: coneOf(60) }
+  assert.equal(contribution(light, [0, 0, 2], [0, 0, -1]), 0)
+})
+
+test("the cap clears a game stage's rig", () => {
+  // A Unity stage rip arrives with thirty-odd point lights; sixteen cut it in
+  // half. The loop runs over the count, so this bounds the buffer and the worst
+  // case rather than the ordinary one.
+  assert.ok(MAX_LIGHTS >= 33, `MAX_LIGHTS is ${MAX_LIGHTS}`)
+})
+
+test("the record holds a spot's aim and cone where the writer puts them", () => {
+  // engine.ts writes aim at b+8..10 and the cosines at b+11, b+12. These are the
+  // reads; drift shows up as a spot pointing somewhere else.
+  assert.match(wgsl, new RegExp(`fn rzLightAim\\(i: u32\\) -> vec3f \\{\\s*let b = ${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u \\+ 8u;`))
+  assert.match(wgsl, new RegExp(`fn rzLightCone\\(i: u32\\) -> vec2f \\{\\s*let b = ${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u \\+ 11u;`))
+  const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
+  assert.match(body, /if \(dist >= rzLightRadius\(i\)\) \{ continue; \}/, "out of reach is skipped before the rest")
+  assert.match(body, /aim \* aim/, "the cone edge is squared like the falloff")
 })

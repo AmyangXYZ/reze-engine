@@ -131,3 +131,30 @@ test("a bind group's buffers are created before the bind group that binds them",
     }
   }
 })
+
+test("the camera struct fits the buffer the engine allocates", () => {
+  // A trailing vec3f in CameraUniforms aligned to 16 and pushed the struct to
+  // 176 bytes against a 160-byte buffer. WebGPU rejected EVERY material
+  // pipeline at once ("bound with size 160 ... requires at least 176"), so the
+  // scene came back untextured with a wall of validation errors. Sizes are
+  // computed here the way WGSL lays them out, and compared with the engine's
+  // own allocation — the two are in different files and drifted in silence.
+  const root = dirname(fileURLToPath(import.meta.url))
+  const wgsl = readFileSync(join(root, "../src/shaders/materials/common.ts"), "utf8")
+  const body = wgsl.slice(wgsl.indexOf("struct CameraUniforms {"))
+  const fields = body.slice(0, body.indexOf("};")).match(/^\s*\w+:\s*\w+[\dx]*,$/gm) ?? []
+  const SIZE = { "mat4x4f": [64, 16], "vec4f": [16, 16], "vec3f": [12, 16], "vec2f": [8, 8], "f32": [4, 4], "u32": [4, 4], "i32": [4, 4] }
+  let at = 0
+  let align = 1
+  for (const line of fields) {
+    const type = line.trim().split(":")[1].replace(",", "").trim()
+    const [size, a] = SIZE[type] ?? [0, 1]
+    assert.ok(size, `unknown type ${type} in CameraUniforms`)
+    at = Math.ceil(at / a) * a + size
+    align = Math.max(align, a)
+  }
+  const structBytes = Math.ceil(at / align) * align
+  const decl = src.slice(src.indexOf('label: "camera uniforms"'))
+  const bufferBytes = eval(decl.match(/size:\s*([\d\s*]+),/)[1])
+  assert.equal(structBytes, bufferBytes, `CameraUniforms is ${structBytes} bytes, the buffer is ${bufferBytes}`)
+})

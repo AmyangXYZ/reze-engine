@@ -10,21 +10,26 @@ import { SCENE_TAP_STUB } from "./scene-tap"
 // renderer that bolted a second key light onto a toon shader has shipped. A
 // light here brightens; it does not restate the shading.
 //
-// So there are no per-light shadows, no area lights and no clustering. At this
-// count a flat loop in the fragment shader is cheaper than anything that would
-// avoid it, and the cap is what keeps that true.
+// So there are no per-light shadows, no area lights and no clustering. The loop
+// runs over the lights a scene HAS, not over the cap, so a scene with four pays
+// for four; the cap only bounds the buffer and the worst case.
 //
 // LAYOUT. A 4-float header (count, then padding that keeps the records
-// vec4-aligned), then MAX_LIGHTS records of 8 floats:
+// vec4-aligned), then MAX_LIGHTS records of 16 floats — four vec4s:
 //
-//   [0..2] position, world space      [3] radius
+//   [0..2] position, world space               [3] radius
 //   [4..6] colour PREMULTIPLIED by intensity   [7] type
+//   [8..10] aim, unit, pointing away from the light   [11] cos of the outer angle
+//   [12] cos of the inner angle                [13..15] spare
 //
 // Colour carries intensity because nothing reads them apart: every use is the
 // product, and storing two numbers that are only ever multiplied is two numbers
-// that can disagree. `type` is reserved — every light is a point light today
-// and the loop does not branch on it, so it is honest padding rather than a
-// switch with one case.
+// that can disagree.
+//
+// A POINT LIGHT IS A SPOT WITH NO CONE, and that is how the loop stays
+// branchless: it stores aim (0,0,0) and both cosines at -1, which makes the
+// cone term below saturate to exactly 1. `type` says which a light is for
+// anyone reading the buffer; the shading never asks.
 
 import { castDistanceStub } from "./passes/cast-distance"
 import { audioApi } from "./audio-api"
@@ -37,14 +42,15 @@ import { idApi } from "./id-api"
  *  vec4-aligned, which is what lets a future pass read them as vec4s. */
 export const LIGHT_HEADER = 4
 /** Floats per light — see the layout above. */
-export const LIGHT_STRIDE = 8
+export const LIGHT_STRIDE = 16
 /**
- * The cap, and it is a real one: the loop below runs per fragment, so this is
- * the number that decides whether lights are free or a cost. Sixteen is the
- * bounded middle tier the design settled on — enough for a stage rig, far below
- * the point where clustering would start to pay for itself.
+ * The cap. The loop below runs per fragment over the lights a scene has, so
+ * this bounds the worst case rather than the ordinary one — and it has to clear
+ * a game stage: a Unity rip of one arrives with thirty-odd point lights, which
+ * the old ceiling of sixteen cut in half. Past this the extras are dropped.
+ * Clustering is what replaces it when a scene wants hundreds.
  */
-export const MAX_LIGHTS = 16
+export const MAX_LIGHTS = 48
 /** Floats in the whole buffer. */
 export const LIGHTS_FLOATS = LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE
 
@@ -210,6 +216,19 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   _rzLightsOut[b + 4u] = c.x;
   _rzLightsOut[b + 5u] = c.y;
   _rzLightsOut[b + 6u] = c.z;
+  // An effect emits POINT lights: RzLight carries no aim, and widening it would
+  // fail to compile every emitter already written against it. The rest of the
+  // record is written anyway — these slots are reused frame to frame, and a spot
+  // the document placed here last frame would otherwise keep its cone.
+  _rzLightsOut[b + 7u] = 0.0;
+  _rzLightsOut[b + 8u] = 0.0;
+  _rzLightsOut[b + 9u] = 0.0;
+  _rzLightsOut[b + 10u] = 0.0;
+  _rzLightsOut[b + 11u] = -1.0;
+  _rzLightsOut[b + 12u] = -1.0;
+  _rzLightsOut[b + 13u] = 0.0;
+  _rzLightsOut[b + 14u] = 0.0;
+  _rzLightsOut[b + 15u] = 0.0;
 }
 `
 }
@@ -238,6 +257,19 @@ fn rzLightRadius(i: u32) -> f32 { return _rzLights[${LIGHT_HEADER}u + i * ${LIGH
 fn rzLightColor(i: u32) -> vec3f {
   let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 4u;
   return vec3f(_rzLights[b], _rzLights[b + 1u], _rzLights[b + 2u]);
+}
+
+/** Where light i points, away from itself. The zero vector for a point light. */
+fn rzLightAim(i: u32) -> vec3f {
+  let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 8u;
+  return vec3f(_rzLights[b], _rzLights[b + 1u], _rzLights[b + 2u]);
+}
+
+/** The cosines a spot fades between: x its outer edge, y its inner one. A point
+ *  light stores (-1, -1), which saturates the cone term to 1. */
+fn rzLightCone(i: u32) -> vec2f {
+  let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 11u;
+  return vec2f(_rzLights[b], _rzLights[b + 1u]);
 }
 
 /**
@@ -269,14 +301,25 @@ fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
   for (var i = 0u; i < count; i = i + 1u) {
     let d = rzLightPos(i) - p;
     let dist = length(d);
+    // Out of reach before anything else is computed. The falloff is already
+    // exactly zero at the radius, so this changes no pixel — it is what keeps a
+    // stage rig's far lamps off the bill at every fragment they do not light.
+    if (dist >= rzLightRadius(i)) { continue; }
+    let toLight = d / max(dist, 1e-4);
     // Facing the light, and nothing behind it. No wrap or half-lambert: this
     // layer adds light, and a wrapped term would lift the shadow side, which is
     // the ramp's business and not this one's.
-    let ndl = max(dot(n, d / max(dist, 1e-4)), 0.0);
+    let ndl = max(dot(n, toLight), 0.0);
     if (ndl <= 0.0) { continue; }
     let t = clamp(dist / max(rzLightRadius(i), 1e-4), 0.0, 1.0);
     let falloff = 1.0 - t * t;
-    acc = acc + rzLightColor(i) * (ndl * falloff * falloff);
+    // How far inside the cone this point sits: 1 within the inner angle, 0 past
+    // the outer one, squared for the same soft edge the falloff has. A point
+    // light's (-1, -1) divides by the floor and clamps to 1, so it pays one
+    // dot product and no branch.
+    let cone = rzLightCone(i);
+    let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
+    acc = acc + rzLightColor(i) * (ndl * falloff * falloff * aim * aim);
   }
   return acc;
 }

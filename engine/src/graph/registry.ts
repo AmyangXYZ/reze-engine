@@ -132,6 +132,16 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputs: { color: "color", alpha: "float" },
     contextOutputs: { color: "tex_color", alpha: "tex_s.a" },
   },
+  // The scene clock, in seconds. A material is otherwise a function of position
+  // alone — this is what lets one SCROLL: ripples on water, a conveyor, a sign.
+  // It is the same clock the effects read, so a paused scene holds still and an
+  // export steps it frame by frame.
+  time: {
+    inputs: {},
+    outputs: { value: "float" },
+    contextOutputs: { value: "camera.time" },
+  },
+
   geometry: {
     inputs: {},
     outputs: {
