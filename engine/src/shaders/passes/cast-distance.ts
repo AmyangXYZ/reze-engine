@@ -81,7 +81,11 @@ fn vs(@builtin(vertex_index) i: u32) -> VSOut {
  *
  * The ground, a stage and a media plane all write ids exactly as she does, so
  * seeding "anything drawn" would grow a border around the floor: a rectangle
- * round the frame rather than a sticker. Only the subject ids seed.
+ * round the frame rather than a sticker. The subject ids seed, and so do the
+ * props': a sword in her hand is part of her silhouette. A prop left out is a
+ * HOLE in the seeds wherever it covers her, and the field grows into it from
+ * her side, so the border ran round the inside of the prop instead of the
+ * outside.
  */
 export function buildCastSeedShader(samples: number): string {
   return (
@@ -92,6 +96,9 @@ const RZ_ID_SAMPLES: i32 = ${samples};
 
 @group(0) @binding(0) var _rzIdTex: texture_multisampled_2d<u32>;
 @group(0) @binding(1) var<storage, read> _rzCast: array<vec4f>;
+/** The visible props' object ids, count first. Props are not subjects, so the
+ *  cast buffer does not carry them. */
+@group(0) @binding(2) var<storage, read> _rzSeedProps: array<u32>;
 
 // The two cast accessors this pass needs, spelled out rather than pulled in.
 // CAST_API brings subjects, trails, anchors and their aliases with it, and a
@@ -106,6 +113,17 @@ fn rzSubjectCount() -> i32 {
 fn rzSubjectId(i: i32) -> u32 {
   if (i < 0 || i >= rzSubjectCount()) { return 0u; }
   return u32(_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 1].w);
+}
+/** Does this object seed the field: a subject, or a prop. */
+fn rzSeeds(o: u32, subjects: i32) -> bool {
+  for (var i = 0; i < subjects; i++) {
+    if (o == rzSubjectId(i)) { return true; }
+  }
+  let props = min(_rzSeedProps[0], arrayLength(&_rzSeedProps) - 1u);
+  for (var j = 1u; j <= props; j++) {
+    if (o == _rzSeedProps[j]) { return true; }
+  }
+  return false;
 }
 
 ${FULLSCREEN_VS}
@@ -140,9 +158,7 @@ fn fs(@builtin(position) pos: vec4f) -> SeedOut {
   for (var sample = 0; sample < RZ_ID_SAMPLES; sample++) {
     let o = textureLoad(_rzIdTex, p, sample).y;
     if (o == 0u) { continue; }
-    for (var i = 0; i < n; i++) {
-      if (o == rzSubjectId(i)) { covered += 1.0; break; }
-    }
+    if (rzSeeds(o, n)) { covered += 1.0; }
   }
   var out: SeedOut;
   out.coverage = covered / f32(RZ_ID_SAMPLES);
@@ -265,7 +281,7 @@ export function castDistanceApi(group: number, tex: number, samp: number, scale:
  *
  * There is no ceiling. A pixel on the far side of the frame gets the real
  * number. The ground, a stage and a media plane are not the cast and do not
- * seed it.
+ * seed it. A prop does: what she holds is inside her border.
  *
  * Screen pixels whatever the field's own resolution is, so an author writes the
  * width they mean and never has to know how this is built. uv is the effect's

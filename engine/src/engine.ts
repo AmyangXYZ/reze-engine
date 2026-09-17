@@ -826,9 +826,10 @@ interface ModelInstance {
   /**
    * A PROP: a PMX object a character holds or wears — a microphone, a fan, a
    * sword. The third answer beside stage and plane. It keeps what a cast member
-   * has that scenery does not (physics, outlines, its own clip) and drops what
-   * makes one a performer: no effect subject id, no seeding of the scene clock,
-   * no bone picking. Like a card it leaves the floor alone. See addProp.
+   * has that scenery does not (physics, outlines, its own clip, a place in the
+   * cast's silhouette for rzCastDistance) and drops what makes one a performer:
+   * no effect subject id, no seeding of the scene clock, no bone picking. Like a
+   * card it leaves the floor alone. See addProp.
    */
   isProp: boolean
   /** Who this model hangs from, or null. Any model can: a prop by design, a
@@ -1993,6 +1994,10 @@ export class Engine {
   private castStepBindGroups: GPUBindGroup[] = []
   private castResolveBindGroup: GPUBindGroup | null = null
   private castStepStrideBuffers: GPUBuffer[] = []
+  /** The visible props' object ids for the seed pass, count in slot 0. Grown in
+   *  powers of two; see writeCastSeedProps. */
+  private castSeedPropBuffer: GPUBuffer | null = null
+  private castSeedPropData = new Uint32Array(8)
   /** Does anything installed actually read the field? Set from the effect list. */
   private castDistanceWanted = false
 
@@ -3690,14 +3695,7 @@ export class Engine {
     const strides: number[] = []
     for (let k = 1 << Math.ceil(Math.log2(Math.max(w, h))); k >= 1; k >>= 1) strides.push(k)
 
-    this.castSeedBindGroup = this.device.createBindGroup({
-      label: "cast distance seed",
-      layout: this.castSeedPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.idView! },
-        { binding: 1, resource: { buffer: this.castBuffer } },
-      ],
-    })
+    this.createCastSeedBindGroup()
     strides.forEach((stride, i) => {
       const buf = this.device!.createBuffer({
         label: `cast distance stride ${stride}`,
@@ -3729,6 +3727,59 @@ export class Engine {
     })
   }
 
+  /** The seed pass's inputs: the id attachment, the cast, and the prop ids. */
+  private createCastSeedBindGroup(): void {
+    const device = this.device!
+    if (!this.castSeedPropBuffer) {
+      this.castSeedPropBuffer = device.createBuffer({
+        label: "cast distance prop seeds",
+        size: this.castSeedPropData.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      })
+      device.queue.writeBuffer(this.castSeedPropBuffer, 0, this.castSeedPropData)
+    }
+    this.castSeedBindGroup = device.createBindGroup({
+      label: "cast distance seed",
+      layout: this.castSeedPipeline!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.idView! },
+        { binding: 1, resource: { buffer: this.castBuffer } },
+        { binding: 2, resource: { buffer: this.castSeedPropBuffer } },
+      ],
+    })
+  }
+
+  /**
+   * Which props seed the field this frame: every visible one.
+   *
+   * A prop is not a subject — nothing follows it and no effect reads its bones —
+   * but it is part of her silhouette. Uploaded only when the list changes.
+   */
+  private writeCastSeedProps(): void {
+    let n = 0
+    this.forEachInstance((inst) => {
+      if (inst.isProp && inst.model.visible) n++
+    })
+    let data = this.castSeedPropData
+    let changed = data[0] !== n
+    if (n + 1 > data.length) {
+      data = new Uint32Array(1 << Math.ceil(Math.log2(n + 1)))
+      this.castSeedPropData = data
+      this.castSeedPropBuffer?.destroy()
+      this.castSeedPropBuffer = null
+      this.createCastSeedBindGroup()
+      changed = true
+    }
+    data[0] = n
+    let i = 1
+    this.forEachInstance((inst) => {
+      if (!inst.isProp || !inst.model.visible) return
+      if (data[i] !== inst.objectId) changed = true
+      data[i++] = inst.objectId
+    })
+    if (changed) this.device!.queue.writeBuffer(this.castSeedPropBuffer!, 0, data)
+  }
+
   /**
    * The flood, encoded once a frame before the field pass reads it.
    *
@@ -3738,6 +3789,7 @@ export class Engine {
    */
   private encodeCastDistance(encoder: GPUCommandEncoder): void {
     if (!this.castDistanceWanted || !this.castSeedBindGroup || !this.castResolveBindGroup) return
+    this.writeCastSeedProps()
     const seed = encoder.beginRenderPass({
       label: "cast distance (seed)",
       colorAttachments: [
@@ -9466,6 +9518,8 @@ export class Engine {
       inst.styleGroups.clear()
     })
     this.zeroStyleBuffer?.destroy()
+    this.castSeedPropBuffer?.destroy()
+    this.castSeedPropBuffer = null
     this.releaseCullBuffers()
     this.cullFrustaBuffer?.destroy()
     this.cullFrustaBuffer = null

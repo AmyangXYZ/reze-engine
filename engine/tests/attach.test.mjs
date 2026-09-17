@@ -148,6 +148,19 @@ test("a prop keeps physics and outlines, and is not a performer", () => {
   assert.doesNotMatch(hasStage, /isProp/, "a prop leaves the floor alone")
 })
 
+test("a prop is part of the cast's silhouette", () => {
+  // Left out of the seeds, a prop covering her is a hole the distance field grows
+  // into, and a sticker border runs round the inside of the prop.
+  const seed = readFileSync(join(here, "../src/shaders/passes/cast-distance.ts"), "utf8")
+  assert.match(seed, /@binding\(2\) var<storage, read> _rzSeedProps: array<u32>/, "the seed pass reads the prop ids")
+  assert.match(seed, /if \(rzSeeds\(o, n\)\) \{ covered \+= 1\.0; \}/, "a prop's samples count as coverage")
+  const write = engine.slice(engine.indexOf("  private writeCastSeedProps(): void {"), engine.indexOf("  private encodeCastDistance("))
+  assert.match(write, /inst\.isProp && inst\.model\.visible/, "every visible prop seeds")
+  assert.match(write, /data\[i\+\+\] = inst\.objectId/, "by the id its pixels carry")
+  assert.match(engine, /this\.writeCastSeedProps\(\)\n\s+const seed = encoder\.beginRenderPass/, "written before the seed pass runs")
+  assert.match(engine, /\{ binding: 2, resource: \{ buffer: this\.castSeedPropBuffer \} \}/, "and bound to it")
+})
+
 test("an attached model's own placement is held at identity", () => {
   const set = engine.slice(engine.indexOf("  setModelTransform(name: string"), engine.indexOf("  getModelTransform(name: string"))
   assert.match(set, /if \(transform\.position && !inst\.parent && !inst\.parentKeys\)/)
