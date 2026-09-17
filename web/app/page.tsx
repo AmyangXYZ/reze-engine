@@ -123,15 +123,51 @@ type RootXZ = { x: number; z: number; yaw: number }
 /** A loaded look. `ready` once it is styled, posed and warmed, and can be swapped in. */
 type Look = { id: string; model: Model; ready: boolean }
 
-/** The page's audio output: one context, opened by the first user gesture. */
+/**
+ * The page's audio output: one context, opened by the first user gesture.
+ *
+ * Safari wants all of this. The context is CREATED inside a gesture, because
+ * one made before any gesture starts suspended and iOS need not ever resume it.
+ * The session is declared `playback`, or iOS puts Web Audio on the ambient
+ * channel, where the ringer switch silences it while a media element would
+ * still be heard. And decoding waits for this context rather than an offline
+ * one of its own sample rate, which Safari does not reliably play back.
+ */
 class AudioOut {
   private ctx: AudioContext | null = null
+  private readonly tracks: Track[] = []
 
-  /** Create or resume the output. Called from user gestures, which is what browsers require. */
-  unlock(): AudioContext {
-    if (!this.ctx) this.ctx = new AudioContext({ latencyHint: "interactive" })
-    if (this.ctx.state !== "running") this.ctx.resume().catch(() => {})
+  register(track: Track): void {
+    this.tracks.push(track)
+  }
+
+  /** The output context, or null until a gesture has opened one. */
+  get context(): AudioContext | null {
     return this.ctx
+  }
+
+  /** Open or resume the output, and decode whatever has arrived meanwhile.
+   *  Call from user gestures, which is what browsers require. */
+  unlock(): AudioContext | null {
+    if (!this.ctx) {
+      const Ctor =
+        window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      if (!Ctor) return null
+      this.ctx = new Ctor({ latencyHint: "interactive" })
+      const session = (navigator as Navigator & { audioSession?: { type: string } }).audioSession
+      if (session) session.type = "playback"
+    }
+    this.resume()
+    for (const track of this.tracks) track.decode(this.ctx)
+    return this.ctx
+  }
+
+  /** Bring the output back after an iOS interruption (a call, a tab in the
+   *  background) without opening one where no gesture ever has. */
+  resume(): void {
+    if (this.ctx && this.ctx.state !== "running") {
+      this.ctx.resume().catch((error) => console.warn("[reze] audio output stayed", this.ctx?.state, error))
+    }
   }
 
   dispose(): void {
@@ -141,31 +177,55 @@ class AudioOut {
 }
 
 /**
- * One sound through Web Audio. It is decoded ahead of any press, and a press
- * starts a buffer source, which sounds within the output latency. A media
- * element can take a good fraction of a second to begin, and seeking it to
- * catch up stalls it again.
+ * One sound through Web Audio. Its bytes are fetched ahead of any press and
+ * decoded as soon as there is an output to decode them with, so a press starts
+ * a buffer source, which sounds within the output latency. A media element can
+ * take a good fraction of a second to begin, and seeking it to catch up stalls
+ * it again.
  */
 class Track {
+  private bytes: ArrayBuffer | null = null
   private buffer: AudioBuffer | null = null
+  private decoding: Promise<void> | null = null
   private ctx: AudioContext | null = null
   private source: AudioBufferSourceNode | null = null
   private gain: GainNode | null = null
-  /** Bumped by every play and stop, so a start still waiting on resume() can tell it was superseded. */
+  /** Bumped by every play and stop, so a start still waiting on decode or resume can tell it was superseded. */
   private token = 0
 
-  constructor(private readonly out: AudioOut) {}
+  constructor(private readonly out: AudioOut) {
+    out.register(this)
+  }
 
+  /** True once it has something to play, decoded or still in bytes. */
   get ready(): boolean {
-    return this.buffer !== null
+    return this.buffer !== null || this.bytes !== null
   }
 
   async load(url: string): Promise<void> {
     const res = await fetch(url)
     if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`)
-    // Decoding needs a context but not a running one. An offline context keeps
-    // the real one from being created before a gesture allows it to start.
-    this.buffer = await new OfflineAudioContext(2, 1, 48000).decodeAudioData(await res.arrayBuffer())
+    this.bytes = await res.arrayBuffer()
+    const ctx = this.out.context
+    if (ctx) void this.decode(ctx)
+  }
+
+  /** Decode on the output's own context. The bytes are copied, since decoding
+   *  takes them, and a failed decode can then be retried on the next gesture. */
+  decode(ctx: AudioContext): Promise<void> {
+    if (this.buffer || !this.bytes) return Promise.resolve()
+    if (!this.decoding) {
+      this.decoding = ctx.decodeAudioData(this.bytes.slice(0)).then(
+        (buffer) => {
+          this.buffer = buffer
+        },
+        (error) => {
+          this.decoding = null
+          console.warn("[reze] sound not decoded:", error)
+        }
+      )
+    }
+    return this.decoding
   }
 
   /**
@@ -177,6 +237,7 @@ class Track {
    */
   play({ at, onHeard }: { at?: () => number; onHeard?: (time: number) => void } = {}): void {
     const ctx = this.out.unlock()
+    if (!ctx) return
     const token = ++this.token
     const start = () => {
       if (token !== this.token || !this.buffer) return
@@ -204,8 +265,8 @@ class Track {
         )
       }
     }
-    if (ctx.state === "running") start()
-    else ctx.resume().then(start, () => {})
+    if (this.buffer && ctx.state === "running") start()
+    else Promise.all([this.decode(ctx), ctx.resume()]).then(start, () => {})
   }
 
   /** Stop, easing out over `fade` seconds. */
@@ -509,14 +570,21 @@ export default function Home() {
   const [loading, setLoading] = useState(true)
   const [stats, setStats] = useState<EngineStats | null>(null)
 
-  // The first gesture anywhere opens the audio output, so a later press starts
-  // sound at once instead of waiting on the context to come up.
+  // Gestures open the audio output, so a later press starts sound at once
+  // instead of waiting on the context to come up. Every gesture tries, not just
+  // the first: Safari refuses some of them, and a refusal must not be the end of
+  // it. Coming back to the tab resumes an output iOS interrupted.
   useEffect(() => {
     const unlock = () => audio.out.unlock()
+    const resume = () => {
+      if (document.visibilityState === "visible") audio.out.resume()
+    }
     const events = ["pointerdown", "keydown", "touchend"] as const
-    for (const e of events) window.addEventListener(e, unlock, { once: true })
+    for (const e of events) window.addEventListener(e, unlock)
+    document.addEventListener("visibilitychange", resume)
     return () => {
       for (const e of events) window.removeEventListener(e, unlock)
+      document.removeEventListener("visibilitychange", resume)
       audio.song.stop(0)
       audio.boom.stop(0)
       audio.out.dispose()
