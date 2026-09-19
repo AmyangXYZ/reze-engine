@@ -9956,6 +9956,7 @@ export class Engine {
     const texturePath = `plane/${name}`
     const material: Material = {
       name,
+      memo: "",
       diffuse: [1, 1, 1, 1],
       specular: [0, 0, 0],
       ambient: [0, 0, 0],
@@ -15637,7 +15638,16 @@ export class Engine {
       // alpha-blend bucket and is drawn in author order: soft haloed leaves
       // that do not occlude each other, and haze wherever cards overlap. The
       // game it came from alpha-tests exactly these materials.
-      const type = install?.alphaMode === "hashed" ? "opaque" : dc.baseType
+      // A GRAPH THAT COMPUTES OPACITY DRAWS TRANSPARENT. The phase was decided
+      // at load from the texture's alpha over this material's geometry, which
+      // cannot know about a curve the graph invents — water whose alpha runs
+      // from nothing to a mirror samples as solid and would land in the opaque
+      // phase, where the blend that makes it water never happens.
+      const type = install?.group.graph.opacity
+        ? "transparent"
+        : install?.alphaMode === "hashed"
+          ? "opaque"
+          : dc.baseType
       if (dc.type !== type) dc.type = type
       if (dc.groupId === groupId) continue
       dc.groupId = groupId

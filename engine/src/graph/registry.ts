@@ -153,6 +153,18 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       // Blender Texture Coordinate → Reflection (view ray mirrored on the normal);
       // drives env-tracking patterns like metal's voronoi sparkle.
       reflection: "vector",
+      /**
+       * How much WORLD one pixel covers here, in units.
+       *
+       * What a texture gets free from its mipmap and a procedural pattern has
+       * no way to ask for. Past the point where this exceeds a pattern's
+       * wavelength the pattern is under-sampled, and a bump taken from it is
+       * differencing two uncorrelated samples — random per 2x2 quad, which on a
+       * receding plane stretches along the depth axis and reads as scan lines.
+       * Fade a layer out as this approaches its wavelength and the surface goes
+       * quietly smooth instead, which is what distance should look like.
+       */
+      footprint: "float",
     },
     contextOutputs: {
       normal: "n",
@@ -161,6 +173,7 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       rest_pos: "input.restPos",
       uv: "vec3f(input.uv, 0.0)",
       reflection: "reflect(-v, n)",
+      footprint: "max(length(dpdx(input.worldPos)), length(dpdy(input.worldPos)))",
     },
   },
   // The scene's key light. Blender NPR presets rarely use a diffuse closure —
@@ -629,15 +642,21 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
 
   // ── View-dependent scalars ──
   fresnel: { inputs: { ior: F(1.45) }, outputs: { value: "float" }, emit: (a) => `fresnel(${a.ior}, n, v)` },
+  // The normal is an INPUT with the shading normal as its default, so these read
+  // like every other node when nothing is wired and can be handed a perturbed
+  // normal when something is. Water is why: its ripples live in a bump node, and
+  // a fresnel that quietly read the flat surface normal gave a pool whose
+  // reflection and opacity were both perfectly smooth however the bump was
+  // tuned — the ripples existed and touched nothing anybody could see.
   "layer_weight/fresnel": {
-    inputs: { blend: F(0.5) },
+    inputs: { blend: F(0.5), normal: { type: "vector", contextDefault: "n" } },
     outputs: { value: "float" },
-    emit: (a) => `layer_weight_fresnel(${a.blend}, n, v)`,
+    emit: (a) => `layer_weight_fresnel(${a.blend}, ${a.normal}, v)`,
   },
   "layer_weight/facing": {
-    inputs: { blend: F(0.5) },
+    inputs: { blend: F(0.5), normal: { type: "vector", contextDefault: "n" } },
     outputs: { value: "float" },
-    emit: (a) => `layer_weight_facing(${a.blend}, n, v)`,
+    emit: (a) => `layer_weight_facing(${a.blend}, ${a.normal}, v)`,
   },
 
   /**
@@ -716,6 +735,15 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     inputs: { strength: F(0.1), height: F(0, true), normal: V([0, 0, 0], true) },
     outputs: { vector: "vector" },
     emit: (a) => `bump_lh(${a.strength}, ${a.height}, ${a.normal}, input.worldPos)`,
+  },
+  // Its strength is a SLOPE, not a screen effect — see bump_world. Use it for
+  // anything whose detail belongs to the surface rather than to the frame:
+  // water, sand, hammered metal. `bump` holds its size on screen, which is what
+  // skin and cloth want and what water cannot use.
+  "bump/world": {
+    inputs: { strength: F(0.1), height: F(0, true), normal: V([0, 0, 0], true) },
+    outputs: { vector: "vector" },
+    emit: (a) => `bump_world(${a.strength}, ${a.height}, ${a.normal}, input.worldPos)`,
   },
 
   // ── Procedural textures ──

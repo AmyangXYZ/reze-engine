@@ -651,6 +651,28 @@ fn bump(strength: f32, height: f32, normal: vec3f, world_pos: vec3f) -> vec3f {
 }
 
 // LH engine + WebGPU fragment Y: flip dhdy contribution so height peaks read as outward bumps vs Blender reference
+// The same bump measured against the WORLD instead of the screen.
+//
+// bump_lh below takes dpdx(height) — the change across one PIXEL — and drops
+// the world size of that pixel on the floor when it normalizes the cross
+// products. Its slope is therefore per pixel, so the same surface ripples at a
+// distance, where a pixel spans metres, and goes glass-flat underfoot, where it
+// spans millimetres. For skin and cloth that reads as detail which holds its
+// size on screen, which is why it stays; for water it is the difference between
+// a pool and a mirror, because water is the thing you stand next to.
+//
+// Dividing each derivative by its own footprint gives the true world gradient:
+// view-independent, and strength becomes a real slope — 0.25 means a quarter
+// rise over a run, whatever the camera does.
+fn bump_world(strength: f32, height: f32, normal: vec3f, world_pos: vec3f) -> vec3f {
+  let dpdx_pos = dpdx(world_pos);
+  let dpdy_pos = dpdy(world_pos);
+  let dhdx = dpdx(height) / max(length(dpdx_pos), 1e-8);
+  let dhdy = dpdy(height) / max(length(dpdy_pos), 1e-8);
+  let perturbed = normalize(normal) - strength * (dhdx * normalize(cross(dpdy_pos, normal)) - dhdy * normalize(cross(normal, dpdx_pos)));
+  return normalize(perturbed);
+}
+
 fn bump_lh(strength: f32, height: f32, normal: vec3f, world_pos: vec3f) -> vec3f {
   let dhdx = dpdx(height);
   let dhdy = dpdy(height);

@@ -143,8 +143,11 @@ ${gate}
 // Tail of fs(): consumes `final_color` + locals, writes FSOut. hashed forces output
 // alpha to 1 (the discard already did the cutout); hair scales alpha for the over-eyes
 // pass when IS_OVER_EYES is compiled true.
-function epilogue(renderClass: RenderClass, alphaMode: AlphaMode): string {
-  const alphaBase = alphaMode === "hashed" ? "1.0" : "alpha"
+function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: boolean): string {
+  // A graph that computes its own opacity wins, including over hashed: hashed
+  // writes 1 because its discard already decided the cutout, and a graph asking
+  // for a curve is asking for the opposite of a cutout.
+  const alphaBase = hasOpacity ? "final_opacity" : alphaMode === "hashed" ? "1.0" : "alpha"
   // Empty while ids are off, so the epilogue is exactly what it was. The values
   // ride in the per-draw material uniform (see MaterialUniforms), which is what
   // keeps this working through the indirect-draw path.
@@ -198,6 +201,7 @@ export function assembleModule(
   alphaMode: AlphaMode,
   fsBody: string,
   includeStyleUniforms: boolean,
+  hasOpacity = false,
 ): string {
   return (
     NODES_WGSL +
@@ -211,7 +215,7 @@ export function assembleModule(
     prelude(renderClass, alphaMode) +
     fsBody +
     "\n" +
-    epilogue(renderClass, alphaMode) +
+    epilogue(renderClass, alphaMode, hasOpacity) +
     "}\n"
   )
 }

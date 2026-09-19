@@ -303,7 +303,7 @@ export class PmxLoader {
         const isSharedToonTexture = this.getUint8() === 1
         const toonTextureIndex = isSharedToonTexture ? this.getUint8() : this.getNonVertexIndex(this.textureIndexSize)
 
-        this.getText() // comment (skip)
+        const memo = this.getText()
         const vertexCount = this.getInt32()
 
         // PMX material flag bits:
@@ -311,6 +311,7 @@ export class PmxLoader {
         // Bit 4 (0x10): Edge drawing (outline)
         const mat: Material = {
           name,
+          memo,
           diffuse,
           specular,
           ambient,

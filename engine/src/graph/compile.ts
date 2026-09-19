@@ -183,6 +183,13 @@ export function validateGraph(graph: ShaderGraph, opts: CompileOptions = {}): Di
   if (!outT) d.push(err(`output "${out.node}.${out.socket}" doesn't resolve`, out.node))
   else if (outT === "vec4") d.push(err(`output "${out.node}.${out.socket}" must be color or float`, out.node))
 
+  if (graph.opacity) {
+    const opNode = nodes.get(graph.opacity.node)
+    const opT = opNode ? NODE_REGISTRY[opNode.type]?.outputs[graph.opacity.socket] : undefined
+    if (!opT) d.push(err(`opacity "${graph.opacity.node}.${graph.opacity.socket}" doesn't resolve`, graph.opacity.node))
+    else if (opT === "vec4") d.push(err(`opacity "${graph.opacity.node}.${graph.opacity.socket}" must be float or color`, graph.opacity.node))
+  }
+
   return d
 }
 
@@ -216,7 +223,11 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
   // Prune: reverse-DFS from the (possibly preview-overridden) output.
   const out = opts.previewNode ?? graph.output
   const reachable = new Set<string>()
-  const stack = [out.node]
+  // SEEDED FROM BOTH ENDS. Pruning walks back from what is used, and opacity is
+  // used — seeding only the colour output drops every node that exists to feed
+  // the alpha curve, and the graph compiles cleanly with a fresnel nobody
+  // computed. A preview override replaces the colour output, never the opacity.
+  const stack = [out.node, ...(graph.opacity && !opts.previewNode ? [graph.opacity.node] : [])]
   while (stack.length) {
     const id = stack.pop()!
     if (reachable.has(id)) continue
@@ -341,8 +352,10 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
   }
 
   lines.push(`  let final_color = ${outputExpr(out, "color")}; // @node:${out.node}`)
+  const opacity = graph.opacity && !opts.previewNode ? graph.opacity : null
+  if (opacity) lines.push(`  let final_opacity = saturate(${outputExpr(opacity, "float")}); // @node:${opacity.node}`)
 
   const fsBody = lines.join("\n")
-  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current)
+  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current, !!opacity)
   return { ok: true, wgsl, fsBody, slotMap, diagnostics, prunedNodes }
 }

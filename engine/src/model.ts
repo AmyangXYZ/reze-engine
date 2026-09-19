@@ -116,6 +116,17 @@ export interface Material {
   edgeColor: [number, number, number, number]
   edgeSize: number
   vertexCount: number
+  /**
+   * The PMX material's free-text memo.
+   *
+   * MMD shows it in the material panel and nothing reads it, which makes it the
+   * one place a converter can say what a material WAS without inventing a
+   * sidecar. A stage ported out of a game engine writes its source shader here
+   * — `SimPipeline/Scene/Ripplet`, `SimPipeline/PBR/Glass` — so a host can give
+   * the pool the water look by what it is rather than by hoping its name
+   * contains "water". Empty on a hand-authored model, which reads as no claim.
+   */
+  memo: string
 }
 
 export interface Bone {
