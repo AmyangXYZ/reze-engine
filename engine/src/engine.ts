@@ -667,6 +667,11 @@ type DrawCallType = "opaque" | "transparent" | "ground" | "opaque-outline" | "tr
 
 interface DrawCall {
   type: DrawCallType
+  /** The phase this material's own alpha put it in, before any style group had
+   *  a say. A `hashed` group moves its materials to the opaque phase, and this
+   *  is what they go back to when that group is removed — recomputing it would
+   *  mean re-sampling the texture's alpha over the geometry again. */
+  baseType: DrawCallType
   count: number
   firstIndex: number
   bindGroup: GPUBindGroup
@@ -9518,6 +9523,7 @@ export class Engine {
     this.hasGround = true
     this.groundDrawCall = {
       type: "ground",
+      baseType: "ground",
       count: 6,
       firstIndex: 0,
       bindGroup: this.groundShadowBindGroup!,
@@ -13204,6 +13210,7 @@ export class Engine {
       const type: DrawCallType = inst.isPlane ? "opaque" : isTransparent ? "transparent" : "opaque"
       inst.drawCalls.push({
         type,
+        baseType: type,
         count: indexCount,
         firstIndex: currentIndexOffset,
         bindGroup,
@@ -15620,6 +15627,18 @@ export class Engine {
       const install = wantId ? inst.styleGroups.get(wantId) : undefined
       const groupId = install ? wantId! : null
       if (groupId) inst.materialToGroup.set(dc.materialName, groupId)
+      // A HASHED GROUP DRAWS IN THE OPAQUE PHASE. Alpha-to-coverage is the
+      // transparency technique built for that phase — it is why a card already
+      // takes this route — and it is what a cutout wants: crisp edges, depth
+      // written, correct occlusion between layers.
+      //
+      // Foliage is the case that needs it. A leaf card's antialiased edges put
+      // its translucentFrac over the 2% bar, so the whole shrub lands in the
+      // alpha-blend bucket and is drawn in author order: soft haloed leaves
+      // that do not occlude each other, and haze wherever cards overlap. The
+      // game it came from alpha-tests exactly these materials.
+      const type = install?.alphaMode === "hashed" ? "opaque" : dc.baseType
+      if (dc.type !== type) dc.type = type
       if (dc.groupId === groupId) continue
       dc.groupId = groupId
       dc.bindGroup = this.createMaterialBindGroup(
