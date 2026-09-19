@@ -136,6 +136,13 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 // keeps its shadows when the crisp near volume ends. Binding 7: 6 is the
 // positional lights, 9 the BRDF LUT.
 @group(0) @binding(7) var shadowMapFar: texture_depth_2d;
+// The world's own sky, for a surface that REFLECTS it rather than merely being
+// lit by it. Equirect, in the same layout and the same linear radiance the
+// composite draws the dome from, and mipped — a rough surface reads a coarser
+// level, which is what a prefiltered environment is for. A scene with no HDRI
+// has the 1x1 fallback bound here; rzWorldSpecular checks the SH flag and
+// answers with the flat ambient instead, so nothing samples the placeholder.
+@group(0) @binding(8) var worldEnvTexture: texture_2d<f32>;
 // binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;

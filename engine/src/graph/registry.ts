@@ -640,6 +640,27 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     emit: (a) => `layer_weight_facing(${a.blend}, n, v)`,
   },
 
+  /**
+   * The world's radiance from a direction — Blender's Environment Texture, read
+   * off the scene's own sky rather than off an image a material carries.
+   *
+   * ITS DEFAULT VECTOR IS THE REFLECTION, which is the whole point: wire
+   * nothing and it answers what this surface reflects. The roughness input
+   * picks how blurred the answer is; at 0 it is a mirror.
+   *
+   * A scene with no HDRI has no sky to reflect, and this returns the flat world
+   * colour — the same value the ambient already carries, so such a scene looks
+   * exactly as it did.
+   */
+  environment: {
+    inputs: {
+      vector: { type: "vector", contextDefault: "reflect(-v, n)" },
+      roughness: F(0),
+    },
+    outputs: { color: "color" },
+    emit: (a) => `rzWorldSpecular(${a.vector}, ${a.roughness})`,
+  },
+
   // ── Lighting capture ──
   /**
    * Shader → RGB on a white diffuse closure, reduced to a scalar.

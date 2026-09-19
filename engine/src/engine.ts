@@ -48,7 +48,7 @@ import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import { MIRROR_MASK_DOWNSAMPLE_WGSL, MIRROR_MAT_BYTES, mirrorShaderWgsl, mirrorShadowWgsl } from "./shaders/passes/mirror"
 import { packHalf, type HdrImage } from "./hdr"
-import { evalIrradianceSH, projectIrradianceSH } from "./ibl"
+import { evalIrradianceSH, projectIrradianceSH, gradientIrradianceSH } from "./ibl"
 import { LYRIC_ATLAS_MAX_H, LYRIC_ATLAS_MAX_W, LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
 import {
   sceneTargets as sceneTargetsFor,
@@ -335,6 +335,16 @@ type WorldOptions = {
   color?: Vec3
   /** Multiplier on world color (Blender: World > Surface > Strength). */
   strength?: number
+  /**
+   * A sky that changes with the direction you look: one colour overhead, one at
+   * the horizon, one below. Game engines light a whole outdoor stage with this
+   * and nothing else, and one flat colour cannot stand in for it — the fill
+   * under a roof and the fill on a wall facing the sky are different light.
+   *
+   * Fitted to the SAME spherical harmonics an HDRI is, so it costs the shader
+   * nothing and an HDRI simply outranks it. Null clears it back to the colour.
+   */
+  gradient?: { sky: Vec3; equator: Vec3; ground: Vec3 } | null
 }
 
 /**
@@ -2301,6 +2311,9 @@ export class Engine {
   private worldEquirectTexture: GPUTexture | null = null
   private worldEquirectView: GPUTextureView | null = null
   private worldStrength = 1
+  /** A three-colour sky's irradiance SH, when the world is a gradient rather
+   *  than a picture. An HDRI outranks it — see writeWorld. */
+  private worldGradientSH: Float32Array | null = null
   /** The installed HDRI's folded irradiance SH (27 floats), or null. */
   private worldSH: Float32Array | null = null
   private fallbackEquirectTexture!: GPUTexture
@@ -3593,9 +3606,12 @@ export class Engine {
     }
   }
 
-  private rebuildCompositeBindGroup(): void {
-    if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView || !this.depthReadView) return
-    if (!this.castBuffer) return
+  /** Returns whether it actually rebuilt: a caller retrying after a resource
+   *  swap has to know, because a bail leaves the previous group — and the
+   *  previous group names the texture the swap replaced. */
+  private rebuildCompositeBindGroup(): boolean {
+    if (!this.device || !this.hdrResolveTexture || !this.compositeBloomView || !this.depthReadView) return false
+    if (!this.castBuffer) return false
     // BEFORE the entries below, not after: they ask fieldPairUsed which effects
     // draw, and that answer includes whether an effect has its field bind group
     // yet. Building the composite first and the field groups second would bind
@@ -3630,6 +3646,7 @@ export class Engine {
         { binding: 21, resource: this.fieldLayerView(this.fieldFgViews[1], 1) },
       ],
     })
+    return true
   }
 
   /**
@@ -4092,7 +4109,13 @@ export class Engine {
    * coefficients, so what lights her is what you see.
    */
   setWorldEquirect(source: HdrImage | null, options?: { strength?: number }): void {
-    this.worldEquirectTexture?.destroy()
+    // RETIRED, NOT DESTROYED. A frame already encoded against the old sky can
+    // still be in flight — the bind groups that name it are rebuilt below, but
+    // the command buffer holding the previous ones is submitted at the end of
+    // the frame this call landed in the middle of. Destroying here is what
+    // produces "Destroyed texture used in a submit"; the next frame's start is
+    // the first moment nothing can be pointing at it.
+    if (this.worldEquirectTexture) this.retiredSkies.push(this.worldEquirectTexture)
     this.worldEquirectTexture = null
     this.worldEquirectView = null
     this.worldStrength = Math.max(options?.strength ?? 1, 0)
@@ -4102,18 +4125,54 @@ export class Engine {
       // Scene-linear radiance in rgba16float. The composite treats it as light
       // rather than wallpaper (mode 3) — a sun in it rolls off like a sun,
       // through the same exposure and view transform as the scene.
+      // MIPPED, and the chain is the prefilter a reflection reads: level n is a
+      // box average of the sky over twice the solid angle of n-1, which is what
+      // lets rzWorldSpecular answer a rough surface without a blur pass per
+      // level. Built on the CPU because the source is already float data in
+      // memory and the alternative is a render pipeline per mip.
+      const levels = Math.floor(Math.log2(Math.max(source.width, source.height))) + 1
       const tex = this.device.createTexture({
         label: "world equirect (HDR)",
         size: [source.width, source.height],
         format: "rgba16float",
+        mipLevelCount: levels,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       })
-      this.device.queue.writeTexture(
-        { texture: tex },
-        packHalf(source.data),
-        { bytesPerRow: source.width * 8, rowsPerImage: source.height },
-        [source.width, source.height],
-      )
+      let data = source.data
+      let w = source.width
+      let h = source.height
+      for (let level = 0; level < levels; level++) {
+        if (level > 0) {
+          const nw = Math.max(1, w >> 1)
+          const nh = Math.max(1, h >> 1)
+          const down = new Float32Array(nw * nh * 4)
+          for (let y = 0; y < nh; y++) {
+            for (let x = 0; x < nw; x++) {
+              const x0 = Math.min(x * 2, w - 1)
+              const x1 = Math.min(x * 2 + 1, w - 1)
+              const y0 = Math.min(y * 2, h - 1)
+              const y1 = Math.min(y * 2 + 1, h - 1)
+              for (let c = 0; c < 4; c++) {
+                down[(y * nw + x) * 4 + c] =
+                  (data[(y0 * w + x0) * 4 + c] +
+                    data[(y0 * w + x1) * 4 + c] +
+                    data[(y1 * w + x0) * 4 + c] +
+                    data[(y1 * w + x1) * 4 + c]) *
+                  0.25
+              }
+            }
+          }
+          data = down
+          w = nw
+          h = nh
+        }
+        this.device.queue.writeTexture(
+          { texture: tex, mipLevel: level },
+          packHalf(data),
+          { bytesPerRow: w * 8, rowsPerImage: h },
+          [w, h],
+        )
+      }
       this.worldEquirectTexture = tex
       this.worldEquirectView = tex.createView()
       // The sky lights the scene, not only backs it. The sun keeps the toon
@@ -4125,6 +4184,12 @@ export class Engine {
       }
     }
     if (this.worldSH || hadSH) this.writeWorld()
+    // The MATERIAL groups too, not only the composite's: a surface that
+    // reflects the sky samples this very texture, so a world swapped after
+    // init would otherwise keep reflecting the one it replaced. Marked as well,
+    // because either rebuild may bail on resources that are not up yet.
+    this.worldBindingsDirty = true
+    this.rebuildPerFrameBindGroups()
     this.rebuildCompositeBindGroup()
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
@@ -5147,6 +5212,12 @@ export class Engine {
    * uniform, so nothing recompiles.
    */
   private allocateLightSlots(): void {
+    // BEFORE INIT IS A REAL CALLER. A host sets a scene's lamps from an effect
+    // that runs as soon as its state exists, which on a hot reload is before
+    // the engine has a device — and every public setter here has to survive
+    // that, the way setWorldEquirect does. The buffers are written from the
+    // engine's own state at init, so nothing is lost by returning.
+    if (!this.device) return
     let next = this.docLightCount
     for (const e of this.effects) {
       if (!e.lights) continue
@@ -6743,8 +6814,11 @@ export class Engine {
         // The positional lights. Always bound, empty or not, so every material
         // pipeline shares one layout whether or not the scene has any.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        // The far cascade's shadow map. 8 stays free; 9 is the BRDF LUT.
+        // The far cascade's shadow map, then the world's sky (8) and the BRDF
+        // LUT (9). The sky is always bound — the 1x1 fallback when the scene
+        // has none — so every material pipeline keeps sharing one layout.
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+        { binding: 8, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
@@ -6988,6 +7062,19 @@ export class Engine {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
+    // BEFORE the per-frame groups, which bind it. The composite needs this 1x1
+    // stand-in too, and it used to be created with the composite's own
+    // resources further down — far enough down that a material group built up
+    // here had nothing to put on its sky binding, and every draw went out with
+    // no bind group at index 0.
+    this.fallbackEquirectTexture = this.device.createTexture({
+      label: "equirect fallback",
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.fallbackEquirectView = this.fallbackEquirectTexture.createView()
+
     // Zero-filled = zero lines, which every accessor answers gracefully.
     this.lyricsBuffer = this.device.createBuffer({
       label: "lyrics",
@@ -7005,39 +7092,7 @@ export class Engine {
     this.lyricsTextureView = this.lyricsTexture.createView()
 
     // Now that shadow resources exist, create the main per-frame bind group
-    this.perFrameBindGroup = this.device.createBindGroup({
-      label: "main per-frame bind group",
-      layout: this.mainPerFrameBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
-        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-        { binding: 2, resource: this.materialSampler },
-        { binding: 3, resource: this.shadowMapDepthViews[0] },
-        { binding: 4, resource: this.shadowComparisonSampler },
-        { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
-        { binding: 6, resource: { buffer: this.lightsBuffer } },
-        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
-        { binding: 9, resource: this.brdfLutView },
-      ],
-    })
-    // The mirror's, identical but for the camera — same lights, same shadow
-    // maps, because a reflection is the same scene lit the same way, seen from
-    // a reflected eye.
-    this.mirrorPerFrameBindGroup = this.device.createBindGroup({
-      label: "mirror per-frame bind group",
-      layout: this.mainPerFrameBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.mirrorCameraBuffer } },
-        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-        { binding: 2, resource: this.materialSampler },
-        { binding: 3, resource: this.shadowMapDepthViews[0] },
-        { binding: 4, resource: this.shadowComparisonSampler },
-        { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
-        { binding: 6, resource: { buffer: this.lightsBuffer } },
-        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
-        { binding: 9, resource: this.brdfLutView },
-      ],
-    })
+    this.rebuildPerFrameBindGroups()
 
     this.groundShadowBindGroupLayout = this.device.createBindGroupLayout({
       label: "ground shadow layout",
@@ -7441,14 +7496,6 @@ export class Engine {
         { binding: 21, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     })
-    this.fallbackEquirectTexture = this.device.createTexture({
-      label: "equirect fallback",
-      size: [1, 1],
-      format: "rgba8unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    })
-    this.fallbackEquirectView = this.fallbackEquirectTexture.createView()
-
     this.compositePipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [this.compositeBindGroupLayout],
     })
@@ -9216,6 +9263,103 @@ export class Engine {
   }
 
   /**
+   * The per-frame bind groups, the camera's and the mirror's.
+   *
+   * A METHOD rather than two literals at init, because one of their resources
+   * changes after it: the world's sky texture is swapped whenever an HDRI is
+   * installed or cleared, and a bind group holds the view it was built with.
+   * The mirror's is identical but for the camera — a reflection is the same
+   * scene lit the same way, seen from a reflected eye.
+   */
+  /**
+   * Skies this engine has replaced, kept alive rather than destroyed.
+   *
+   * NOT DESTROYED AT ALL, after three attempts that each deferred it further:
+   * one frame, then three, then "once both bind groups have rebuilt". Every one
+   * still produced "destroyed texture used in a submit" somewhere — a command
+   * buffer encoded before the swap, a rebuild that bailed on half-built
+   * resources, an engine torn down by a hot reload whose last frame is still in
+   * flight. The engine cannot see all of those, and each attempt to enumerate
+   * them found another.
+   *
+   * So the trade is taken explicitly: a replaced sky is a megabyte or two held
+   * until the page goes away, against a validation error every frame. A scene
+   * swaps its world a handful of times in a session, and the GPU frees all of
+   * it when the device does.
+   */
+  private retiredSkies: GPUTexture[] = []
+
+  /** A world was installed or cleared and the bind groups that name its texture
+   *  may not have been rebuilt yet — both rebuilds bail when their own
+   *  resources are half-built, which is exactly the moment a host swaps a sky.
+   *  Retried at the top of a frame until one of them takes. */
+  private worldBindingsDirty = false
+
+  /** Returns whether it actually rebuilt — see rebuildCompositeBindGroup. */
+  private rebuildPerFrameBindGroups(): boolean {
+    // EVERY resource, not just the layout. This runs twice: once at init, where
+    // the order is known, and again whenever a world is installed — which the
+    // host may do before init has finished, and a bind group built around an
+    // undefined buffer is a validation error at creation rather than a missing
+    // picture later.
+    if (
+      !this.device ||
+      !this.mainPerFrameBindGroupLayout ||
+      !this.shadowMapDepthViews?.length ||
+      !this.cameraUniformBuffer ||
+      !this.mirrorCameraBuffer ||
+      !this.lightUniformBuffer ||
+      !this.lightsBuffer ||
+      !this.shadowLightVPBuffer ||
+      !this.materialSampler ||
+      !this.shadowComparisonSampler ||
+      !this.brdfLutView ||
+      !(this.worldEquirectView ?? this.fallbackEquirectView)
+    ) {
+      return false
+    }
+    // BOTH ENTRY LISTS ARE WRITTEN OUT, rather than shared through a helper.
+    // tests/bindings.test.mjs reads this file and checks statically that every
+    // bind group covers exactly its layout — it cannot see through a function,
+    // and a missing binding is a validation error at draw time rather than a
+    // compile error here. The duplication is the price of that check.
+    const env = this.worldEquirectView ?? this.fallbackEquirectView
+    this.perFrameBindGroup = this.device.createBindGroup({
+      label: "main per-frame bind group",
+      layout: this.mainPerFrameBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+        { binding: 2, resource: this.materialSampler },
+        { binding: 3, resource: this.shadowMapDepthViews[0] },
+        { binding: 4, resource: this.shadowComparisonSampler },
+        { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
+        { binding: 6, resource: { buffer: this.lightsBuffer } },
+        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
+        { binding: 8, resource: env },
+        { binding: 9, resource: this.brdfLutView },
+      ],
+    })
+    this.mirrorPerFrameBindGroup = this.device.createBindGroup({
+      label: "mirror per-frame bind group",
+      layout: this.mainPerFrameBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.mirrorCameraBuffer } },
+        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+        { binding: 2, resource: this.materialSampler },
+        { binding: 3, resource: this.shadowMapDepthViews[0] },
+        { binding: 4, resource: this.shadowComparisonSampler },
+        { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
+        { binding: 6, resource: { buffer: this.lightsBuffer } },
+        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
+        { binding: 8, resource: env },
+        { binding: 9, resource: this.brdfLutView },
+      ],
+    })
+    return true
+  }
+
+  /**
    * Write world ambient. For a uniform-radiance world, hemispherical irradiance
    * is E = π·L and a Lambertian BRDF reflects (albedo/π)·E = albedo·L, so the
    * shader's ambient uniform is just `world.color × world.strength` — no /π.
@@ -9225,17 +9369,22 @@ export class Engine {
     this.lightData[0] = this.world.color.x * s
     this.lightData[1] = this.world.color.y * s
     this.lightData[2] = this.world.color.z * s
-    this.lightData[3] = 0
+    // The spare in the ambient vec4, which rzWorldSpecular multiplies its sky
+    // sample by: the SH carries strength already, the texture cannot.
+    this.lightData[3] = this.world.strength
     // The sky's irradiance, when an HDRI world is installed — the world
     // STRENGTH dial keeps its meaning by scaling it, and the world COLOUR is
     // simply unread while the flag is up (Blender's own semantics: the image
     // replaces the colour, strength applies to either).
+    // An HDRI outranks a gradient outranks the flat colour, which is the order
+    // of how much each one knows about the sky.
+    const sh = this.worldSH ?? this.worldGradientSH
     for (let i = 0; i < 9; i++) {
       const b = 36 + i * 4
-      if (this.worldSH) {
-        this.lightData[b] = this.worldSH[i * 3] * s
-        this.lightData[b + 1] = this.worldSH[i * 3 + 1] * s
-        this.lightData[b + 2] = this.worldSH[i * 3 + 2] * s
+      if (sh) {
+        this.lightData[b] = sh[i * 3] * s
+        this.lightData[b + 1] = sh[i * 3 + 1] * s
+        this.lightData[b + 2] = sh[i * 3 + 2] * s
       } else {
         this.lightData[b] = 0
         this.lightData[b + 1] = 0
@@ -9243,7 +9392,11 @@ export class Engine {
       }
       this.lightData[b + 3] = 0
     }
-    this.lightData[39] = this.worldSH ? 1 : 0
+    // WHICH KIND of sky, not merely whether there is one: 2 is a picture a
+    // reflection can be sampled from, 1 is a gradient it can only be fitted to,
+    // 0 is a flat colour. rzWorldSpecular reads this to decide whether to touch
+    // the equirect texture at all.
+    this.lightData[39] = this.worldSH ? 2 : this.worldGradientSH ? 1 : 0
     this.updateLightBuffer()
   }
 
@@ -9268,6 +9421,9 @@ export class Engine {
   setWorld(options: WorldOptions): void {
     if (options.color) this.world.color = options.color
     if (options.strength !== undefined) this.world.strength = options.strength
+    if (options.gradient !== undefined) {
+      this.worldGradientSH = options.gradient ? gradientIrradianceSH(options.gradient) : null
+    }
     this.writeWorld()
   }
 
@@ -9451,7 +9607,9 @@ export class Engine {
       this.lightsData[b + 14] = 0
       this.lightsData[b + 15] = 0
     }
-    if (list.length) {
+    // The CPU copy is written either way; only the upload needs a device. A
+    // scene whose lamps arrive before init keeps them, and init uploads them.
+    if (list.length && this.device && this.lightsBuffer) {
       this.device.queue.writeBuffer(
         this.lightsBuffer,
         LIGHT_HEADER * 4,
@@ -11531,6 +11689,38 @@ export class Engine {
     this.cullReadback = null
   }
 
+  /** How far the loaded scene reaches from the origin, in world units — the
+   *  largest any model has ever needed. */
+  private sceneExtent = 0
+
+  /**
+   * Tell the camera how big the scene is, so its far plane can cover it.
+   *
+   * MEASURED ON LOAD, from the model's own vertices, and only ever raised. A
+   * stage is the case that matters: framed from ten units away, a sky dome a
+   * thousand units out sits well beyond a far plane derived from the orbit, and
+   * the part of it past that plane is simply not drawn — which looks like a
+   * polygon of background colour that follows the camera, not like clipping.
+   *
+   * Never lowered when a model leaves: the cost of a far plane that is too
+   * generous is depth precision, and the cost of one that is too near is
+   * geometry that vanishes. One of those is a bug report.
+   */
+  private noteSceneExtent(model: Model): void {
+    const { positions } = model.getGeometry()
+    let most = 0
+    // Every 16th vertex: an extent is a bound, not a measurement, and a stage
+    // has a quarter of a million of them.
+    for (let i = 0; i + 2 < positions.length; i += 48) {
+      const d = positions[i] * positions[i] + positions[i + 1] * positions[i + 1] + positions[i + 2] * positions[i + 2]
+      if (d > most) most = d
+    }
+    const extent = Math.sqrt(most)
+    if (extent <= this.sceneExtent) return
+    this.sceneExtent = extent
+    this.camera?.setSceneExtent(extent)
+  }
+
   /**
    * One record per model: the rigid transform its per-material boxes live under,
    * or the world sphere that bounds it in any pose. Written every frame, because
@@ -12222,6 +12412,7 @@ export class Engine {
     const vertices = model.getVertices()
     const skinning = model.getSkinning()
     const skeleton = model.getSkeleton()
+    this.noteSceneExtent(model)
     const boneCount = skeleton.bones.length
     const matrixSize = boneCount * 16 * 4
 
@@ -14476,6 +14667,17 @@ export class Engine {
   }
 
   private renderWithDelta(deltaTime: number) {
+    // The bind groups first, then the textures they used to name. A retired
+    // texture is freed only once a frame has been rebuilt without it — freeing
+    // it while a group still points at it is what "destroyed texture used in a
+    // submit" means, and it repeats every frame because the stale group stays.
+    if (this.worldBindingsDirty) {
+      // Both have to take: either one bailing leaves a group naming the sky
+      // that was replaced, which is a frame drawn against the wrong one.
+      const perFrame = this.rebuildPerFrameBindGroups()
+      const composite = this.rebuildCompositeBindGroup()
+      this.worldBindingsDirty = !(perFrame && composite)
+    }
     // The scene clock, and the only clock a trail may sample on: renderFrame()
     // drives offline export with an exact per-frame delta, so a path recorded
     // against this is reproducible where one recorded against wall time is not.

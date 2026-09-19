@@ -331,10 +331,12 @@ test("a spot aimed away lights nothing in front of it", () => {
 })
 
 test("the cap clears a game stage's rig", () => {
-  // A Unity stage rip arrives with thirty-odd point lights; sixteen cut it in
-  // half. The loop runs over the count, so this bounds the buffer and the worst
-  // case rather than the ordinary one.
-  assert.ok(MAX_LIGHTS >= 33, `MAX_LIGHTS is ${MAX_LIGHTS}`)
+  // A Unity stage arrives with a lamp per fixture: a resort brought 33, a lit
+  // interior brings past a hundred. The loop runs over the scene's count, so
+  // this bounds the buffer and the worst case rather than the ordinary one, and
+  // the buffer is storage — 128 records is 8 KiB.
+  assert.ok(MAX_LIGHTS >= 128, `MAX_LIGHTS is ${MAX_LIGHTS}`)
+  assert.equal(LIGHTS_FLOATS * 4, 8208)
 })
 
 test("the record holds a spot's aim and cone where the writer puts them", () => {

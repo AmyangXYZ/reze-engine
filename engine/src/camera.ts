@@ -349,10 +349,34 @@ export class Camera {
     this.target = this.target.add(panRight).add(panUp)
   }
 
-  /** Far plane grows with zoom-out so big floors / distant geometry stay visible */
+  /**
+   * How far the scene REACHES, in world units from the origin.
+   *
+   * Set by the engine when models arrive. A camera cannot derive this: a stage
+   * with a sky dome two thousand units across is still framed from ten units
+   * away, and a far plane grown only from the orbit radius cuts the sky in half
+   * — the hole tracks the camera, which reads as a polygon following the view
+   * rather than as clipping.
+   */
+  private sceneExtent = 0
+
+  setSceneExtent(units: number): void {
+    const next = Number.isFinite(units) ? Math.max(units, 0) : 0
+    if (next === this.sceneExtent) return
+    this.sceneExtent = next
+    this.updateFarFromRadius()
+  }
+
+  /** Far plane grows with zoom-out so big floors / distant geometry stay visible,
+   *  and never sits inside what the scene contains. */
   private updateFarFromRadius(): void {
     const margin = 600
-    this.far = Math.min(FAR_CAP, Math.max(FAR_MIN, this.radius * 12 + margin))
+    // The orbit's own reach, and the scene's — whichever is further. The scene
+    // term carries the orbit radius because the camera stands that far off
+    // centre, so the far side of a dome is extent + radius away.
+    const fromOrbit = this.radius * 12 + margin
+    const fromScene = this.sceneExtent > 0 ? this.sceneExtent + this.radius + margin : 0
+    this.far = Math.min(FAR_CAP, Math.max(FAR_MIN, fromOrbit, fromScene))
   }
 
   /**

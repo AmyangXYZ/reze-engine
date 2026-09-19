@@ -290,6 +290,47 @@ fn point_world_to_camera(p: vec3f) -> vec3f { return (camera.view * vec4f(p, 1.0
 // One function per slot because WGSL has no texture arrays-of-bindings here; the
 // slot is topology, exactly like a Math node's operation.
 
+/**
+ * The world's radiance arriving from a direction — what a reflection sees.
+ *
+ * The engine's ambient is irradiance: the SH fit of the sky integrated over a
+ * hemisphere, evaluated along the NORMAL. That is the right answer for diffuse
+ * light and the wrong one for a mirror, which needs radiance along the
+ * REFLECTION vector and needs it sharp. A stage ripped from a game asks for
+ * this on nearly every surface — it is what a Unity material's DEFAULT_REFLECTION
+ * keyword means — 
+ * and so does every metal the app has ever drawn.
+ *
+ * ROUGHNESS PICKS A MIP, which is the cheap prefilter: the chain is built by
+ * successive halving at upload, so a level is a box average of the sky over a
+ * widening solid angle. A cosine-lobe convolution would be more correct; the
+ * visible difference is confined to the middle of the roughness range, and the
+ * chain costs one downsample per level instead of a render pass per level.
+ *
+ * Without an HDRI there is nothing to reflect but the flat world colour, which
+ * is what the ambient already is — so the two agree and a scene without a sky
+ * texture sees no change at all.
+ */
+fn rzWorldSpecular(dir: vec3f, roughness: f32) -> vec3f {
+  // A SKY TEXTURE, or the best the scene has. The flag is 2 when an HDRI is
+  // installed, 1 when the world is a gradient fitted to the same harmonics,
+  // and 0 when it is one flat colour — and in the last two cases the ambient
+  // already answers by direction, which is a blurred sky and exactly what a
+  // world without a picture can honestly reflect.
+  if (light.sh[0].w < 1.5) { return rzWorldAmbient(normalize(dir)); }
+  let d = normalize(dir);
+  // The composite's own convention, restated: LH world with +Z forward, which
+  // is what makes a reflection line up with the dome the viewer can see.
+  let u = 0.5 + atan2(d.x, d.z) * 0.15915494309;
+  let v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) * 0.31830988618;
+  let levels = f32(textureNumLevels(worldEnvTexture) - 1u);
+  // sqrt, not linear: mip n covers roughly twice the angle of n-1, so a linear
+  // ramp spends most of its travel in the blurry end and a mirror-to-satin
+  // sweep happens entirely in the first tenth of the dial.
+  let lod = clamp(sqrt(clamp(roughness, 0.0, 1.0)) * levels, 0.0, levels);
+  return textureSampleLevel(worldEnvTexture, diffuseSampler, vec2f(u, v), lod).rgb * light.ambientColor.w;
+}
+
 fn group_tex0(uv: vec2f) -> vec4f { return textureSample(groupTexture0, diffuseSampler, uv); }
 fn group_tex1(uv: vec2f) -> vec4f { return textureSample(groupTexture1, diffuseSampler, uv); }
 fn group_tex2(uv: vec2f) -> vec4f { return textureSample(groupTexture2, diffuseSampler, uv); }

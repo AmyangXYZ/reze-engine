@@ -113,3 +113,44 @@ export function evalIrradianceSH(sh: Float32Array, n: { x: number; y: number; z:
   }
   return out
 }
+
+/**
+ * A three-colour sky as irradiance SH — the same nine coefficients an HDRI
+ * gives, so nothing downstream has to know which kind of world it is looking at.
+ *
+ * The gradient is Unity's trilight and every other engine's "ambient gradient":
+ * one colour straight up, one at the horizon, one straight down, interpolated
+ * by the direction's height. It is what lights a game stage that has no baked
+ * lighting, and it is not a decoration — the fill on a wall facing the sky and
+ * the fill under a roof differ by the whole span between sky and ground.
+ *
+ * Built by SAMPLING IT INTO A SMALL EQUIRECT and projecting that, rather than by
+ * integrating the basis functions in closed form. The analytic route is a page
+ * of coefficients that has to be rederived if the interpolation ever changes;
+ * this is six lines that reuse the projector the HDRI path is already trusted
+ * to get right, and at 64x32 the fit is exact to well under a percent because
+ * the function has no detail finer than the harmonics can hold anyway.
+ */
+type Rgb = { x: number; y: number; z: number }
+
+export function gradientIrradianceSH(g: { sky: Rgb; equator: Rgb; ground: Rgb }): Float32Array {
+  const w = 64
+  const h = 32
+  const data = new Float32Array(w * h * 4)
+  for (let y = 0; y < h; y++) {
+    // The same parameterisation projectIrradianceSH reads: v runs top to bottom
+    // and the direction's height is cos(pi v).
+    const ny = Math.cos(Math.PI * ((y + 0.5) / h))
+    const t = Math.abs(ny)
+    const a = ny >= 0 ? g.sky : g.ground
+    const c = [g.equator.x + (a.x - g.equator.x) * t, g.equator.y + (a.y - g.equator.y) * t, g.equator.z + (a.z - g.equator.z) * t]
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4
+      data[i] = c[0]
+      data[i + 1] = c[1]
+      data[i + 2] = c[2]
+      data[i + 3] = 1
+    }
+  }
+  return projectIrradianceSH({ width: w, height: h, data }, 1)
+}

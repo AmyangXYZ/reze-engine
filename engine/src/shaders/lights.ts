@@ -44,13 +44,23 @@ export const LIGHT_HEADER = 4
 /** Floats per light — see the layout above. */
 export const LIGHT_STRIDE = 16
 /**
- * The cap. The loop below runs per fragment over the lights a scene has, so
- * this bounds the worst case rather than the ordinary one — and it has to clear
- * a game stage: a Unity rip of one arrives with thirty-odd point lights, which
- * the old ceiling of sixteen cut in half. Past this the extras are dropped.
- * Clustering is what replaces it when a scene wants hundreds.
+ * The cap. The loop below runs per fragment over the lights a scene HAS, so
+ * this bounds the worst case rather than the ordinary one, and the buffer is
+ * storage rather than uniform — 128 records is 8 KiB, which costs nothing to
+ * declare and is paid for only by the scenes that fill it.
+ *
+ * Sized against the work, not against a round number: a Unity stage arrives
+ * with a lamp per fixture. One rip of a resort brought thirty-three, a lit
+ * interior brings a hundred or more, and the ceilings of sixteen and then
+ * forty-eight each cut a real scene in half. Past this the extras are dropped.
+ *
+ * What it does NOT buy: a scene that genuinely lights a fragment from a hundred
+ * lamps pays for a hundred iterations of the loop. The distance test below
+ * rejects most of them in a few instructions, which is what makes a rig of this
+ * size affordable at all; clustering is what replaces the linear walk when a
+ * scene wants every one of them close enough to matter.
  */
-export const MAX_LIGHTS = 48
+export const MAX_LIGHTS = 128
 /** Floats in the whole buffer. */
 export const LIGHTS_FLOATS = LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE
 
