@@ -254,10 +254,15 @@ test("the world and the backdrop are separate seats", () => {
   const bd = body.slice(body.indexOf("setBackdropEquirect(source"))
   assert.doesNotMatch(bd.slice(0, 2000), /projectIrradianceSH/)
 
-  // Only the world projects irradiance, and only it carries the strength dial.
+  // Only the world projects irradiance, and it projects it RAW.
   const wd = body.slice(body.indexOf("setWorldEquirect(source"), body.indexOf("setBackdropEquirect(source"))
   assert.match(wd, /this\.worldSH = projectIrradianceSH/)
-  assert.match(wd, /this\.worldStrength = Math\.max\(options\?\.strength \?\? 1, 0\)/)
+  // ONE STRENGTH, and installing a sky is not where it is decided. A second
+  // field folded into the projection made the sky's brightness depend on the
+  // order the dial and the install happened to arrive in — the same scene came
+  // up one way on upload and another on reload.
+  assert.doesNotMatch(body, /worldStrength/)
+  assert.match(body, /u\[8\] = showingWorld \? this\.world\.strength : \(bg\?\.x \?\? 0\)/)
 
   // THE BACKDROP WINS WHAT YOU SEE; the world lights regardless. With only a
   // world installed it is also the sky, which is what an HDRI alone always did.

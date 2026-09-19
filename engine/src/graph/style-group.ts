@@ -36,6 +36,20 @@ export type StyleGroup = {
    * no-op rather than a failure.
    */
   images?: (GroupImage | GroupImageSource | null)[]
+  /**
+   * The same slots, but PER MATERIAL — for a group whose members each bring
+   * their own maps.
+   *
+   * `images` belongs to the LOOK and is right when a look carries its own ramp
+   * or detail map. A converted stage is the other case: twenty-seven props, one
+   * shading model, and a different normal map on every one of them. Keyed here,
+   * they share a pipeline and differ only in what the bind group points at —
+   * the alternative is a group per material, which is a pipeline per material,
+   * which is what cost a garden stage its frame rate.
+   *
+   * A material with no entry falls back to `images`, and then to 1×1 white.
+   */
+  imagesByMaterial?: Record<string, (GroupImage | GroupImageSource | null)[]>
 }
 
 export type GroupImageSource = ImageBitmap | HTMLImageElement | HTMLCanvasElement

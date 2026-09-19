@@ -308,6 +308,8 @@ type GroupInstall = {
   /** The group's own image maps, uploaded once per apply and owned here — the
    *  install destroys them when it is replaced, so a re-apply cannot leak. */
   images?: (GPUTexture | null)[]
+  /** Per-material overrides of the above; same ownership. */
+  imagesByMaterial?: Record<string, (GPUTexture | null)[]>
   slotMap: StyleSlot[]
   /** Serialized (graph + renderClass + alphaMode) — lets applyStyleGroups skip recompiling
    *  an unchanged group. */
@@ -679,6 +681,14 @@ interface DrawCall {
   // Style group this material belongs to, or null (ungrouped → neutral base pipeline).
   // Outline/ground draw calls are never grouped and leave this null.
   groupId: string | null
+  /** The install this draw call's bind group was actually built from.
+   *
+   *  The id is not enough to decide a rebind: re-applying the SAME group id
+   *  after an edit compiles a NEW install — its own uniform buffer, its own
+   *  uploaded images — and destroys the old one. Comparing ids alone left the
+   *  draw call bound to what was just thrown away, which is why a stage looked
+   *  wrong on upload (two applies) and right after a refresh (one). */
+  boundInstall?: object | null
   // Bindings 0–3 kept so the bind group can be rebuilt when the material's group changes
   // (binding 4 must follow the group's style buffer, or the zero buffer when ungrouped).
   // Present only for material draw calls (opaque/transparent) — the grouping walk skips
@@ -2315,7 +2325,6 @@ export class Engine {
    */
   private worldEquirectTexture: GPUTexture | null = null
   private worldEquirectView: GPUTextureView | null = null
-  private worldStrength = 1
   /** A three-colour sky's irradiance SH, when the world is a gradient rather
    *  than a picture. An HDRI outranks it — see writeWorld. */
   private worldGradientSH: Float32Array | null = null
@@ -2740,13 +2749,15 @@ export class Engine {
     // exposure and view transform as the scene — a sun rolls off like a sun).
     // The camera basis at u[12..23] is refreshed per frame.
     // In modes 2 and 3 the colour slot is dead, so mode 3 carries the world
-    // STRENGTH in u[8] — Blender's world-strength dial, default 1.
+    // STRENGTH in u[8] — Blender's world-strength dial, the SAME number that
+    // scales the irradiance. A sky you can see at full brightness while it
+    // lights at two thirds is two skies.
     const bg = this.backgroundColor
     // THE BACKDROP WINS WHAT YOU SEE; the world lights regardless. With only a
     // world installed it is also the sky, which is what an HDRI alone has
     // always done.
     const showingWorld = this.backdropEquirectView === null && this.worldEquirectView !== null
-    u[8] = showingWorld ? this.worldStrength : (bg?.x ?? 0)
+    u[8] = showingWorld ? this.world.strength : (bg?.x ?? 0)
     u[9] = bg?.y ?? 0
     u[10] = bg?.z ?? 0
     // Base-layer mode only. A user effect is a separate LAYER over whichever
@@ -4113,7 +4124,7 @@ export class Engine {
    * `strength` is Blender's world-strength dial and is folded into the
    * coefficients, so what lights her is what you see.
    */
-  setWorldEquirect(source: HdrImage | null, options?: { strength?: number }): void {
+  setWorldEquirect(source: HdrImage | null): void {
     // RETIRED, NOT DESTROYED. A frame already encoded against the old sky can
     // still be in flight — the bind groups that name it are rebuilt below, but
     // the command buffer holding the previous ones is submitted at the end of
@@ -4123,7 +4134,6 @@ export class Engine {
     if (this.worldEquirectTexture) this.retiredSkies.push(this.worldEquirectTexture)
     this.worldEquirectTexture = null
     this.worldEquirectView = null
-    this.worldStrength = Math.max(options?.strength ?? 1, 0)
     const hadSH = this.worldSH !== null
     this.worldSH = null
     if (source && this.device) {
@@ -4183,10 +4193,13 @@ export class Engine {
       // The sky lights the scene, not only backs it. The sun keeps the toon
       // ramp — this is the ambient term, exactly where the flat world colour
       // used to sit.
+      // RAW irradiance. The World strength dial is applied where every other
+      // reading of it is, in writeWorld — folding it in here made the sky's
+      // brightness a function of WHEN it was installed: the dial moved
+      // afterwards rescaled the write and not the projection, and an install
+      // that landed mid-session carried a different strength from the same
+      // document reopened.
       this.worldSH = projectIrradianceSH({ ...source, data: source.data }, 4)
-      if (this.worldStrength !== 1) {
-        for (let i = 0; i < this.worldSH.length; i++) this.worldSH[i] *= this.worldStrength
-      }
     }
     if (this.worldSH || hadSH) this.writeWorld()
     // The MATERIAL groups too, not only the composite's: a surface that
@@ -10174,6 +10187,56 @@ export class Engine {
   }
 
   /**
+   * What the engine is actually about to draw, per model.
+   *
+   * Every model the engine holds, not every model the host thinks it holds —
+   * which is the point. A scene that comes up brighter after an upload than the
+   * same document does after a reload differs somewhere between the two, and
+   * the candidates are all countable: a model left behind by a replace draws its
+   * transparent surfaces a second time, and a group that compiled but claimed
+   * nothing leaves its materials on the default graph. Both are invisible from
+   * the host, which sees its own lists rather than the engine's.
+   *
+   * `grouped` counts draw calls bound to a style group; `ungrouped` is the rest,
+   * on the default graph.
+   */
+  /**
+   * What the composite is about to put behind the scene, and at what level.
+   *
+   * `mode` is the base layer: 0 transparent, 1 a flat colour, 2 an LDR 360
+   * picture, 3 the HDR world as scene-linear radiance. `level` is what mode 3
+   * is multiplied by. The whole frame's brightness turns on these two, and
+   * neither is visible from a host reading its own document — a scene that came
+   * up brighter after an upload than after a reload of the same document is one
+   * of the cases they answer.
+   */
+  getBackgroundState(): { mode: 0 | 1 | 2 | 3; level: number; backdrop: boolean; world: boolean } {
+    const showingWorld = this.backdropEquirectView === null && this.worldEquirectView !== null
+    return {
+      mode: this.backdropEquirectView ? 2 : showingWorld ? 3 : this.backgroundColor ? 1 : 0,
+      level: this.world.strength,
+      backdrop: this.backdropEquirectView !== null,
+      world: this.worldEquirectView !== null,
+    }
+  }
+
+  getDrawStats(): { model: string; materials: number; opaque: number; transparent: number; grouped: number; ungrouped: number }[] {
+    const out = []
+    for (const [name, inst] of this.modelInstances) {
+      const shaded = inst.drawCalls.filter((d) => d.baseBindGroupEntries)
+      out.push({
+        model: name,
+        materials: shaded.length,
+        opaque: shaded.filter((d) => d.type === "opaque").length,
+        transparent: shaded.filter((d) => d.type === "transparent").length,
+        grouped: shaded.filter((d) => d.groupId !== null).length,
+        ungrouped: shaded.filter((d) => d.groupId === null).length,
+      })
+    }
+    return out
+  }
+
+  /**
    * Hang a model from a bone of another — MMD's 外部親 (outside parent).
    *
    * Every frame, after the parent has been posed and simulated, the child's
@@ -11091,13 +11154,14 @@ export class Engine {
   private destroyInstall(install: GroupInstall): void {
     install.uniformBuffer.destroy()
     for (const tex of install.images ?? []) tex?.destroy()
+    for (const set of Object.values(install.imagesByMaterial ?? {})) for (const tex of set) tex?.destroy()
   }
 
   /** Upload a group's image maps. Sources are decoded images the host already
    *  holds; the engine never fetches, matching how models and motions arrive. */
-  private uploadGroupImages(group: StyleGroup): (GPUTexture | null)[] | undefined {
-    if (!group.images?.length) return undefined
-    return group.images.slice(0, 4).map((entry) => {
+  private uploadGroupImages(group: StyleGroup, slots = group.images): (GPUTexture | null)[] | undefined {
+    if (!slots?.length) return undefined
+    return slots.slice(0, 4).map((entry) => {
       if (!entry) return null
       const wrapped = "source" in entry
       const src = wrapped ? entry.source : entry
@@ -15504,7 +15568,19 @@ export class Engine {
   ): Promise<ApplyStyleGroupResult> {
     const renderClass = group.renderClass ?? "auto"
     const alphaMode = group.alphaMode ?? "opaque"
-    const signature = JSON.stringify({ g: group.graph, rc: renderClass, am: alphaMode, o: opts?.previewNode ?? null })
+    // THE MAPS ARE PART OF THE SIGNATURE, because a matching one skips the
+    // upload below and keeps whatever the install already holds. A group can
+    // arrive twice — once as the model lands and again once its sidecar has
+    // decoded — and without this the second apply refreshed the definition and
+    // silently kept the empty slots from the first.
+    const signature = JSON.stringify({
+      g: group.graph,
+      rc: renderClass,
+      am: alphaMode,
+      o: opts?.previewNode ?? null,
+      im: group.images?.length ?? 0,
+      ibm: Object.keys(group.imagesByMaterial ?? {}).sort(),
+    })
     const existing = inst.styleGroups.get(group.id)
     if (existing && existing.signature === signature) {
       existing.group = group // refresh def (label/materials) without recompiling
@@ -15578,6 +15654,11 @@ export class Engine {
       mirrorPipeline,
       uniformBuffer,
       images: this.uploadGroupImages(group),
+      imagesByMaterial: group.imagesByMaterial
+        ? Object.fromEntries(
+            Object.entries(group.imagesByMaterial).map(([name, slots]) => [name, this.uploadGroupImages(group, slots) ?? []]),
+          )
+        : undefined,
       slotMap: result.slotMap,
       signature,
     })
@@ -15649,13 +15730,16 @@ export class Engine {
           ? "opaque"
           : dc.baseType
       if (dc.type !== type) dc.type = type
-      if (dc.groupId === groupId) continue
+      // Rebind when the INSTALL changed, not merely when the id did.
+      const bound = install ?? null
+      if (dc.groupId === groupId && dc.boundInstall === bound) continue
       dc.groupId = groupId
+      dc.boundInstall = bound
       dc.bindGroup = this.createMaterialBindGroup(
         `material: ${dc.materialName}`,
         dc.baseBindGroupEntries,
         install ? install.uniformBuffer : this.zeroStyleBuffer,
-        install?.images,
+        install?.imagesByMaterial?.[dc.materialName] ?? install?.images,
       )
     }
     this.sortDrawCalls(inst)

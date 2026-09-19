@@ -217,6 +217,38 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // PMX material's diffuse color (the authored base tint). Multiply the diffuse texture
   // by this for the MMD-correct base — untextured materials carry their color here, so a
   // texture-only base would render them white.
+  // WHAT THE SURFACE IS MADE OF, when whoever wrote the model said so.
+  //
+  // PMX carries a specular colour its own renderer barely uses, and a stage
+  // converted out of a game engine packs its material's (metal, roughness,
+  // occlusion) there — the same triple that game's property map holds, averaged
+  // per material. One shared look can then read it and a whole stage keeps ONE
+  // pipeline, where a look per material was what cost a garden its frame rate.
+  //
+  // A hand-authored PMX leaves it at whatever its exporter wrote, so a graph
+  // that reads this is choosing to trust the model. Nothing else does.
+  // How opaque the PMX said this material is, before its texture's alpha is
+  // multiplied in. A graph that computes its own opacity still wants it: glass
+  // is see-through by the amount its author chose and a mirror at a grazing
+  // angle, and without this every pane in a stage gets the same transparency
+  // whatever its material says.
+  material_alpha: {
+    inputs: {},
+    outputs: { value: "float" },
+    contextOutputs: { value: "material.alpha" },
+  },
+
+  material_specular: {
+    inputs: {},
+    outputs: { color: "color" },
+    contextOutputs: { color: "material.specular" },
+  },
+  material_shininess: {
+    inputs: {},
+    outputs: { value: "float" },
+    contextOutputs: { value: "material.shininess" },
+  },
+
   material_diffuse: {
     inputs: {},
     outputs: { color: "color" },
