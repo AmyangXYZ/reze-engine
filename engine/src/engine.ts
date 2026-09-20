@@ -10948,6 +10948,39 @@ export class Engine {
    * It projects boneMarkerPositions, the same points the overlay draws markers
    * at, so the hit box cannot drift away from the circle you are aiming at.
    */
+  /**
+   * Where a world point lands on the canvas, in CSS pixels, or null when it is
+   * behind the camera.
+   *
+   * THE SAME PROJECTION pickBone hit-tests with, deliberately: a host that draws
+   * its own markers over the canvas — a DOM icon per lamp, a label on a bone —
+   * has to agree with the engine about where a thing IS, and a second
+   * derivation of the view-projection is a second thing to keep in step. The
+   * pixels are CSS pixels relative to the canvas, which is the space a
+   * MouseEvent speaks once getBoundingClientRect is subtracted, and the space
+   * an absolutely positioned element wants.
+   *
+   * `depth` is the clip w — distance along the view axis, for sorting overlapping
+   * markers front to back. Nothing here tests occlusion: a marker for something
+   * buried inside geometry is usually the marker you most need to find.
+   */
+  worldToScreen(p: { x: number; y: number; z: number }): { x: number; y: number; depth: number } | null {
+    if (!this.camera) return null
+    const width = this.canvas.clientWidth
+    const height = this.canvas.clientHeight
+    if (width <= 0 || height <= 0) return null
+    const vp = this.camera.getProjectionMatrix().multiply(this.camera.getViewMatrix()).values
+    const cw = vp[3] * p.x + vp[7] * p.y + vp[11] * p.z + vp[15]
+    if (cw <= 1e-6) return null
+    const cx = vp[0] * p.x + vp[4] * p.y + vp[8] * p.z + vp[12]
+    const cy = vp[1] * p.x + vp[5] * p.y + vp[9] * p.z + vp[13]
+    return {
+      x: ((cx / cw) * 0.5 + 0.5) * width,
+      y: (1 - ((cy / cw) * 0.5 + 0.5)) * height,
+      depth: cw,
+    }
+  }
+
   pickBone(
     x: number,
     y: number,
