@@ -1428,15 +1428,24 @@ interface EffectParticles {
   counts: Uint32Array
   compute: GPUComputePipeline
   computeLayout: GPUBindGroupLayout
-  computeBind: GPUBindGroup
+  /** Indexed by the effect's GRID PARITY, so the pool samples the grid the grid
+   *  pass wrote this frame. Both entries are identical without a grid. */
+  computeBinds: [GPUBindGroup, GPUBindGroup]
+  /** The cutout's depth prepass, when the effect defined particleCover. Drawn
+   *  first, with the same bind group; `render` then tests equal. */
+  depth: GPURenderPipeline | null
   render: GPURenderPipeline
   renderLayout: GPUBindGroupLayout
-  renderBind: GPUBindGroup
+  renderBinds: [GPUBindGroup, GPUBindGroup]
   /** Same draw, the MIRRORED camera: how particles join the floor mirror. The
    *  billboards face whichever eye is bound, so one extra bind group is the
    *  whole cost. */
-  mirrorRenderBind: GPUBindGroup
-  rebind: () => { computeBind: GPUBindGroup; renderBind: GPUBindGroup; mirrorRenderBind: GPUBindGroup }
+  mirrorRenderBinds: [GPUBindGroup, GPUBindGroup]
+  rebind: () => {
+    computeBinds: [GPUBindGroup, GPUBindGroup]
+    renderBinds: [GPUBindGroup, GPUBindGroup]
+    mirrorRenderBinds: [GPUBindGroup, GPUBindGroup]
+  }
 }
 
 /**
@@ -1501,9 +1510,10 @@ interface EffectTrails {
   data: Float32Array
   pipeline: GPURenderPipeline
   layout: GPUBindGroupLayout
-  bind: GPUBindGroup
+  /** Indexed by the effect's GRID PARITY, like the particle pool's. */
+  binds: [GPUBindGroup, GPUBindGroup]
   /** The mirrored camera's view of the same ribbons — the floor mirror's. */
-  mirrorBind: GPUBindGroup
+  mirrorBinds: [GPUBindGroup, GPUBindGroup]
   /** The effect's declared parameters, or null when it declares none.
    *
    *  Kept for the same reason `layout` is: both bind groups are REBUILT on every
@@ -1675,6 +1685,8 @@ interface EffectInstance {
    * wins over the constant — see dissolveTimingsOf.
    */
   dissolve: DissolveTimings | null
+  /** `#ground`: the floor this effect asks for — colour, linear, and grain. */
+  ground: { color: Vec3; noise: number } | null
   /** This effect's OWN clock, as a uniform the field shader reads. Per effect
    *  because the shared one (viewU[6].x) is measured from the first installed
    *  effect's epoch, so everything later started mid-stream. Null when the
@@ -2063,7 +2075,12 @@ export class Engine {
    * prefix sum and readback a compacted draw list would need every frame.
    */
   /** Ceiling for `#particles`. Past this an author is asking for a stall. */
-  private static readonly MAX_PARTICLES = 65536
+  // Raised for the lawn: 65536 blades at real density is a 40-unit patch and
+  // an 80-unit one wants four hundred thousand. A cutout pool's cost is
+  // bounded by the pixels it covers, not by the count — the step is one
+  // compute invocation per slot, the pool buffer is 48 bytes each (24 MB at
+  // the cap), and a culled blade is a degenerate quad the rasteriser drops.
+  private static readonly MAX_PARTICLES = 524288
   private particleFrame = 0
   /**
    * The installed effect's persistent grid, or null when it declared none.
@@ -4306,9 +4323,9 @@ export class Engine {
     for (const e of this.effects) {
       if (e.particles) {
         const b = e.particles.rebind()
-        e.particles.computeBind = b.computeBind
-        e.particles.renderBind = b.renderBind
-        e.particles.mirrorRenderBind = b.mirrorRenderBind
+        e.particles.computeBinds = b.computeBinds
+        e.particles.renderBinds = b.renderBinds
+        e.particles.mirrorRenderBinds = b.mirrorRenderBinds
       }
       if (e.grid) e.grid.binds = [this.gridBindGroup(e.grid, 0), this.gridBindGroup(e.grid, 1)]
       if (e.lights) e.lights.bind = this.lightEmitBindGroup(e.lights.layout, e.lights.uniform, e.lights.params)
@@ -4852,15 +4869,18 @@ export class Engine {
       trails?.uniform.destroy()
       return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration, readsCast: false }
     }
-    if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, d, anchors, alias, paramsFor)
-      if (!built.ok) return abandon(built.diagnostics)
-      particles = built.state
-    }
+    // THE GRID FIRST. Particles and ribbons READ it — a blade of grass reads the
+    // bend a foot left there — so the textures have to exist before their bind
+    // groups are built. Nothing reads them back, so the grid depends on neither.
     if (gridEntryPoint(wgsl)) {
       const built = await this.buildSim(wgsl, d, anchors, alias, paramsFor)
       if (!built.ok) return abandon(built.diagnostics)
       grid = built.state
+    }
+    if (wantsParticles) {
+      const built = await this.buildParticles(wgsl, d, anchors, alias, paramsFor, grid)
+      if (!built.ok) return abandon(built.diagnostics)
+      particles = built.state
     }
     if (wantsTrails) {
       // Only anchors that asked for `trail` have a path to draw; a ribbon on a
@@ -4869,7 +4889,7 @@ export class Engine {
       if (trailSlots === 0) {
         return abandon(["a ribbon effect needs at least one #anchor <bone> trail"])
       }
-      const built = await this.buildTrails(wgsl, d, anchors, alias, paramsFor)
+      const built = await this.buildTrails(wgsl, d, anchors, alias, paramsFor, grid)
       if (!built.ok) return abandon(built.diagnostics)
       trails = built.state
     }
@@ -4949,6 +4969,7 @@ export class Engine {
         simStep: 0,
         simReset: false,
         dissolve: d.dissolve ? dissolveConstants(authored) : null,
+        ground: d.ground ? { color: new Vec3(...d.ground.color), noise: d.ground.noise } : null,
         // Its OWN resolution, no longer the scene's: an effect that never asked
         // for full res is not promoted because a neighbour did.
         // FULL RESOLUTION UNLESS TOLD OTHERWISE.
@@ -5209,11 +5230,23 @@ export class Engine {
     /** The effect's declared dials. Spliced into both stages and bound at 7,
      *  the same binding the composite gives them. */
     params: EffectParamsBinding,
+    /** This effect's own grid, already built, or null when it declared none.
+     *  Read-only here: the pool samples it, the grid pass owns it. */
+    grid: EffectGrid | null,
   ): Promise<{ ok: true; state: EffectParticles } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
     const count = Math.min(d.particles || 1024, Engine.MAX_PARTICLES)
-    const src = { wgsl, count, blend: d.particleBlend, bloom: d.bloom, paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING) }
+    const src = {
+      wgsl,
+      count,
+      blend: d.particleBlend,
+      bloom: d.bloom,
+      paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING),
+      gridSize: grid?.size ?? 0,
+      cover: particleEntryPoints(wgsl).cover,
+    }
+    const prepass = src.blend === "cutout" && src.cover
     // Sparks want to spawn where a trail is, so the particle stages see the same
     // cast buffer the trail draw reads.
     const cast = {
@@ -5282,22 +5315,35 @@ export class Engine {
           // Only when the effect declared any: WGSL has no empty struct, so a
           // param-less effect must not carry the decl OR the binding.
           ...(params.buffer ? [{ binding: 7, visibility, buffer: { type: "uniform" as const } }] : []),
+          // The grid, ALWAYS — the accessor is compiled in unconditionally, and a
+          // binding the shader declares must exist in the layout whether the
+          // author calls it or not. With no grid it is the 1x1 of zeroes.
+          { binding: 8, visibility, texture: { sampleType: "float" as const } },
+          { binding: 9, visibility, sampler: { type: "filtering" as const } },
         ],
       })
+    /** One per GRID PARITY, for the reason rebuildFieldBindGroup gives: the grid
+     *  alternates which texture is current, and rebuilding a single group every
+     *  frame is waste for a change that only ever toggles between two known
+     *  states. Both entries are the same view when there is no grid. */
     const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer) =>
-      this.device.createBindGroup({
-        layout,
-        entries: [
-          { binding: 0, resource: { buffer } },
-          { binding: 1, resource: { buffer: uniform } },
-          { binding: 2, resource: { buffer: camera } },
-          { binding: 3, resource: { buffer: this.castBuffer } },
-          { binding: 4, resource: { buffer: this.audioBuffer } },
-          { binding: 5, resource: { buffer: this.midiBuffer } },
-          { binding: 6, resource: { buffer: this.lyricsBuffer } },
-          ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
-        ],
-      })
+      [0, 1].map((parity) =>
+        this.device.createBindGroup({
+          layout,
+          entries: [
+            { binding: 0, resource: { buffer } },
+            { binding: 1, resource: { buffer: uniform } },
+            { binding: 2, resource: { buffer: camera } },
+            { binding: 3, resource: { buffer: this.castBuffer } },
+            { binding: 4, resource: { buffer: this.audioBuffer } },
+            { binding: 5, resource: { buffer: this.midiBuffer } },
+            { binding: 6, resource: { buffer: this.lyricsBuffer } },
+            ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
+            { binding: 8, resource: grid ? grid.read[parity] : this.simFallbackView },
+            { binding: 9, resource: this.simSampler },
+          ],
+        }),
+      ) as [GPUBindGroup, GPUBindGroup]
 
     const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE)
     const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT)
@@ -5306,7 +5352,12 @@ export class Engine {
     // a glow does not claim coverage it never occluded. The MASK sums with it —
     // otherwise an additive effect could never reach the bloom gate. Both live
     // in scene-contract as the "particle-additive" class.
+    //
+    // Cutout blends exactly like alpha and differs only in depth and coverage,
+    // below — so it shares alpha's targets rather than adding a class whose
+    // blends would be a copy.
     const targets = sceneTargetsFor(src.blend === "additive" ? "particle-additive" : "particle", this.sceneFormats)
+    const cutout = src.blend === "cutout"
 
     this.device.pushErrorScope("validation")
     try {
@@ -5315,15 +5366,41 @@ export class Engine {
         layout: this.device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
         compute: { module: computeModule, entryPoint: "main" },
       })
+      const renderLayoutObj = this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] })
+      // The prepass, when the effect gave the cutout a cheap shape: coverage to
+      // depth, colour targets at writeMask 0 (the depth-prepass class), and
+      // the shading pass below then tests EQUAL and writes no depth.
+      const depth = prepass
+        ? await this.device.createRenderPipelineAsync({
+            label: "particle depth prepass pipeline",
+            layout: renderLayoutObj,
+            vertex: { module: renderModule, entryPoint: "vs" },
+            fragment: { module: renderModule, entryPoint: "fsDepth", targets: sceneTargetsFor("depth-prepass", this.sceneFormats) },
+            primitive: { topology: "triangle-list", cullMode: "none" },
+            depthStencil: { format: this.depthFormat, depthWriteEnabled: true, depthCompare: this.depthAhead },
+            multisample: { count: Engine.MULTISAMPLE_COUNT },
+          })
+        : null
       const render = await this.device.createRenderPipelineAsync({
         label: "particle render pipeline",
-        layout: this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] }),
+        layout: renderLayoutObj,
         vertex: { module: renderModule, entryPoint: "vs" },
         fragment: { module: renderModule, entryPoint: "fs", targets },
         primitive: { topology: "triangle-list", cullMode: "none" },
         // Tested but not WRITTEN: particles are transparent, so writing depth
         // would make whichever quad drew first occlude the ones behind it.
-        depthStencil: { format: this.depthFormat, depthWriteEnabled: false, depthCompare: this.depthAhead },
+        //
+        // Except a CUTOUT, which is opaque where it is drawn at all. Its alpha
+        // becomes per-sample coverage (in the shader — see FSOut.samples, the
+        // HDR target has no alpha for the hardware path), so its edges stay
+        // antialiased under MSAA while its depth is real — and a blade behind
+        // another blade is then rejected at the depth test rather than shaded
+        // and blended under it.
+        // For a lawn stacked ten blades deep that is the difference between
+        // shading ten layers and shading about three.
+        depthStencil: prepass
+          ? { format: this.depthFormat, depthWriteEnabled: false, depthCompare: "equal" }
+          : { format: this.depthFormat, depthWriteEnabled: cutout, depthCompare: this.depthAhead },
         multisample: { count: Engine.MULTISAMPLE_COUNT },
       })
       const scoped = await this.device.popErrorScope()
@@ -5345,15 +5422,16 @@ export class Engine {
           counts: uniformView.uints,
           compute,
           computeLayout,
-          computeBind: bindFor(computeLayout, this.cameraUniformBuffer),
+          computeBinds: bindFor(computeLayout, this.cameraUniformBuffer),
+          depth,
           render,
           renderLayout,
-          renderBind: bindFor(renderLayout, this.cameraUniformBuffer),
-          mirrorRenderBind: bindFor(renderLayout, this.mirrorCameraBuffer),
+          renderBinds: bindFor(renderLayout, this.cameraUniformBuffer),
+          mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer),
           rebind: () => ({
-            computeBind: bindFor(computeLayout, this.cameraUniformBuffer),
-            renderBind: bindFor(renderLayout, this.cameraUniformBuffer),
-            mirrorRenderBind: bindFor(renderLayout, this.mirrorCameraBuffer),
+            computeBinds: bindFor(computeLayout, this.cameraUniformBuffer),
+            renderBinds: bindFor(renderLayout, this.cameraUniformBuffer),
+            mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer),
           }),
         },
       }
@@ -5553,7 +5631,7 @@ export class Engine {
       this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
       const cp = encoder.beginComputePass({ label: "particles" })
       cp.setPipeline(p.compute)
-      cp.setBindGroup(0, p.computeBind)
+      cp.setBindGroup(0, p.computeBinds[e.grid?.parity ?? 0])
       cp.dispatchWorkgroups(Math.ceil(p.count / 64))
       cp.end()
     }
@@ -5564,8 +5642,15 @@ export class Engine {
     for (const e of this.effects) {
       const p = e.particles
       if (!p || e.weight === 0) continue
+      const parity = e.grid?.parity ?? 0
+      const bind = view === "mirror" ? p.mirrorRenderBinds[parity] : p.renderBinds[parity]
+      if (p.depth) {
+        pass.setPipeline(p.depth)
+        pass.setBindGroup(0, bind)
+        pass.draw(6, p.count)
+      }
       pass.setPipeline(p.render)
-      pass.setBindGroup(0, view === "mirror" ? p.mirrorRenderBind : p.renderBind)
+      pass.setBindGroup(0, bind)
       pass.draw(6, p.count)
     }
   }
@@ -5590,6 +5675,9 @@ export class Engine {
     alias: number[],
     /** The effect's declared dials, spliced and bound at 7 as everywhere else. */
     params: EffectParamsBinding,
+    /** This effect's own grid, already built, or null. Ribbons read it; the grid
+     *  pass owns it. */
+    grid: EffectGrid | null,
   ): Promise<{ ok: true; state: EffectTrails } | { ok: false; diagnostics: string[] }> {
     // `slots` here is how many RIBBONS to draw — one per trailed anchor — which
     // is a different number from the anchor ADDRESS SPACE the accessors index
@@ -5600,7 +5688,15 @@ export class Engine {
     // nothing before: ribbon i was read as anchor slot i.
     const ribbonSlots = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
     const slots = ribbonSlots.length
-    const src = { wgsl, slots, ribbonSlots, blend: d.particleBlend, bloom: d.bloom, paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING) }
+    const src = {
+      wgsl,
+      slots,
+      ribbonSlots,
+      blend: (d.particleBlend === "additive" ? "additive" : "alpha") as "alpha" | "additive",
+      bloom: d.bloom,
+      paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING),
+      gridSize: grid?.size ?? 0,
+    }
     const code = buildTrailShader(src, {
       subjects: MAX_EFFECT_SUBJECTS,
       samples: TRAIL_SAMPLES,
@@ -5647,6 +5743,13 @@ export class Engine {
         ...(params.buffer
           ? [{ binding: 7, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" as const } }]
           : []),
+        // The grid, always — compiled in whether the author calls it or not.
+        {
+          binding: 8,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "float" as const },
+        },
+        { binding: 9, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: { type: "filtering" as const } },
       ],
     })
     // TWO targets, the scene pass's own: HDR colour and the aux (bloom mask,
@@ -5692,30 +5795,8 @@ export class Engine {
           data: new Float32Array(4),
           pipeline,
           layout,
-          bind: this.device.createBindGroup({
-            layout,
-            entries: [
-              { binding: 0, resource: { buffer: this.castBuffer } },
-              { binding: 1, resource: { buffer: uniform } },
-              { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
-              { binding: 4, resource: { buffer: this.audioBuffer } },
-              { binding: 5, resource: { buffer: this.midiBuffer } },
-              { binding: 6, resource: { buffer: this.lyricsBuffer } },
-              ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
-            ],
-          }),
-          mirrorBind: this.device.createBindGroup({
-            layout,
-            entries: [
-              { binding: 0, resource: { buffer: this.castBuffer } },
-              { binding: 1, resource: { buffer: uniform } },
-              { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
-              { binding: 4, resource: { buffer: this.audioBuffer } },
-              { binding: 5, resource: { buffer: this.midiBuffer } },
-              { binding: 6, resource: { buffer: this.lyricsBuffer } },
-              ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
-            ],
-          }),
+          binds: this.trailBindGroups(layout, uniform, params.buffer, this.cameraUniformBuffer, grid),
+          mirrorBinds: this.trailBindGroups(layout, uniform, params.buffer, this.mirrorCameraBuffer, grid),
         },
       }
     } catch (e) {
@@ -5776,7 +5857,8 @@ export class Engine {
         this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
       }
       pass.setPipeline(t.pipeline)
-      pass.setBindGroup(0, view === "mirror" ? t.mirrorBind : t.bind)
+      const parity = e.grid?.parity ?? 0
+      pass.setBindGroup(0, view === "mirror" ? t.mirrorBinds[parity] : t.binds[parity])
       pass.draw(6, t.slots * live * (TRAIL_SAMPLES - 1) * TRAIL_SUBDIVISIONS)
     }
   }
@@ -5904,32 +5986,43 @@ export class Engine {
     // one, so it has to be part of every group built against that layout —
     // including this one. Omitting it here is not a missing uniform, it is a
     // group WebGPU refuses outright, which takes the whole frame down.
-    const paramsEntry = t.params ? [{ binding: EFFECT_PARAMS_BINDING, resource: { buffer: t.params } }] : []
-    t.bind = this.device.createBindGroup({
-      layout: t.layout,
-      entries: [
-        { binding: 0, resource: { buffer: this.castBuffer } },
-        { binding: 1, resource: { buffer: t.uniform } },
-        { binding: 2, resource: { buffer: this.cameraUniformBuffer } },
-        { binding: 4, resource: { buffer: this.audioBuffer } },
-        { binding: 5, resource: { buffer: this.midiBuffer } },
-        { binding: 6, resource: { buffer: this.lyricsBuffer } },
-        ...paramsEntry,
-      ],
-    })
-    t.mirrorBind = this.device.createBindGroup({
-      layout: t.layout,
-      entries: [
-        { binding: 0, resource: { buffer: this.castBuffer } },
-        { binding: 1, resource: { buffer: t.uniform } },
-        { binding: 2, resource: { buffer: this.mirrorCameraBuffer } },
-        { binding: 4, resource: { buffer: this.audioBuffer } },
-        { binding: 5, resource: { buffer: this.midiBuffer } },
-        { binding: 6, resource: { buffer: this.lyricsBuffer } },
-        ...paramsEntry,
-      ],
-    })
+    t.binds = this.trailBindGroups(t.layout, t.uniform, t.params, this.cameraUniformBuffer, e.grid)
+    t.mirrorBinds = this.trailBindGroups(t.layout, t.uniform, t.params, this.mirrorCameraBuffer, e.grid)
     }
+  }
+
+  /**
+   * A ribbon's bind group, ONE PER GRID PARITY.
+   *
+   * One author for both the build and the rebind, because they drifted once
+   * already: the params binding is part of the LAYOUT whenever the effect
+   * declared one, so it has to be part of every group built against that
+   * layout, and a group missing it is not a missing uniform but one WebGPU
+   * refuses outright, taking the whole frame down.
+   */
+  private trailBindGroups(
+    layout: GPUBindGroupLayout,
+    uniform: GPUBuffer,
+    params: GPUBuffer | null,
+    camera: GPUBuffer,
+    grid: EffectGrid | null,
+  ): [GPUBindGroup, GPUBindGroup] {
+    return [0, 1].map((parity) =>
+      this.device.createBindGroup({
+        layout,
+        entries: [
+          { binding: 0, resource: { buffer: this.castBuffer } },
+          { binding: 1, resource: { buffer: uniform } },
+          { binding: 2, resource: { buffer: camera } },
+          { binding: 4, resource: { buffer: this.audioBuffer } },
+          { binding: 5, resource: { buffer: this.midiBuffer } },
+          { binding: 6, resource: { buffer: this.lyricsBuffer } },
+          ...(params ? [{ binding: EFFECT_PARAMS_BINDING, resource: { buffer: params } }] : []),
+          { binding: 8, resource: grid ? grid.read[parity] : this.simFallbackView },
+          { binding: 9, resource: this.simSampler },
+        ],
+      }),
+    ) as [GPUBindGroup, GPUBindGroup]
   }
 
   private releaseParticles(): void {
@@ -12247,6 +12340,45 @@ export class Engine {
   /** The ground's uniform block, kept so the caster sphere can be refreshed in
    *  it every frame rather than rebuilding the buffer (addGround allocates). */
   private groundMaterialData: Float32Array | null = null
+  /** What addGround was given, so an effect's `#ground` can be lifted again
+   *  without rebuilding the floor. */
+  private groundBaseColor = new Vec3(1, 1, 1)
+  private groundBaseNoise = 0
+
+  /**
+   * Dress the floor in whatever the installed effects ask for.
+   *
+   * The LAST effect declaring `#ground` wins, faded by its own weight so a
+   * scheduled lawn brings its soil in with it and takes it away again. Three
+   * floats at the top of the ground block, written only when they change —
+   * the same bargain writeGroundCasterSphere strikes, for the same reason.
+   */
+  private writeGroundDress(): void {
+    const gb = this.groundMaterialData
+    if (!gb || !this.groundShadowMaterialBuffer) return
+    let want = this.groundBaseColor
+    let noise = this.groundBaseNoise
+    for (const e of this.effects) {
+      if (!e.ground || e.weight <= 0) continue
+      const w = e.weight
+      want = new Vec3(
+        want.x + (e.ground.color.x - want.x) * w,
+        want.y + (e.ground.color.y - want.y) * w,
+        want.z + (e.ground.color.z - want.z) * w,
+      )
+      noise += (e.ground.noise - noise) * w
+    }
+    if (gb[0] === want.x && gb[1] === want.y && gb[2] === want.z && gb[10] === noise) return
+    gb[0] = want.x
+    gb[1] = want.y
+    gb[2] = want.z
+    gb[10] = noise
+    // Two writes rather than one over the span: the seven floats between hold
+    // the fades and the shadow strength, and this is not the place that owns
+    // them.
+    this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 0, gb.subarray(0, 3) as Float32Array<ArrayBuffer>)
+    this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 40, gb.subarray(10, 11) as Float32Array<ArrayBuffer>)
+  }
 
   /**
    * Push this frame's caster sphere into the ground's uniform.
@@ -13221,6 +13353,8 @@ export class Engine {
     // keeping the uniform vec4-aligned.
     const gb = new Float32Array(24)
     this.groundMaterialData = gb
+    this.groundBaseColor = new Vec3(diffuseColor.x, diffuseColor.y, diffuseColor.z)
+    this.groundBaseNoise = noiseStrength
     gb[0] = diffuseColor.x
     gb[1] = diffuseColor.y
     gb[2] = diffuseColor.z
@@ -15242,6 +15376,7 @@ export class Engine {
     if (hasModels) this.dispatchCull(encoder)
     // After the cull, which is what recomputes the spheres it unions.
     this.writeGroundCasterSphere()
+    this.writeGroundDress()
 
     // After the cull, because a rebuild there can reallocate the argument
     // buffers and a bundle captures the buffer it recorded against.

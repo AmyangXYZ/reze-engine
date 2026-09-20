@@ -1,4 +1,5 @@
 import { castDistanceStub } from "./cast-distance"
+import { gridReadApi } from "./grid"
 import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
@@ -75,7 +76,9 @@ fn _rzCastLive() -> i32 {
 }
 
 /** How the author's quads combine with the scene. */
-type ParticleBlend = "alpha" | "additive"
+/** `cutout` shades exactly like `alpha`; the difference is entirely in the
+ *  pipeline — depth write on, alpha-to-coverage on. See directives.ts. */
+type ParticleBlend = "alpha" | "additive" | "cutout"
 
 type ParticleSource = {
   /** The author's WGSL verbatim. */
@@ -89,6 +92,18 @@ type ParticleSource = {
    *  rule reads the same dial the shading does, and rain's fall speed is used
    *  in the compute half. */
   paramsDecl: string
+  /** The effect defines `particleCover(p, uv) -> f32`: the shape alone, cheap.
+   *  A cutout then draws TWICE — coverage to depth first, then the shading at
+   *  depthCompare equal — so the lighting runs only for the visible layer. A
+   *  discard forbids the hardware's own early rejection on a tile-based GPU,
+   *  where every stacked fragment is otherwise shaded in full; the prepass is
+   *  the shape of that rejection, done by hand and cheaply. */
+  cover: boolean
+  /** The side of this effect's grid, or 0 when it declared none. Particles READ
+   *  the grid; the kernel that steps it lives in the grid pass. A blade of grass
+   *  bending where a foot pressed is the whole case: the bend has to persist and
+   *  recover, which is memory, and memory is what the grid is for. */
+  gridSize: number
 }
 
 /** Bytes per particle. Explicitly padded — see the struct below. */
@@ -148,12 +163,14 @@ fn rzProject(p: vec3f) -> vec3f {
 fn rzCamPos() -> vec3f { return cam.camPos; }
 `
 
-/** Does the source define the particle contract? All three are required together. */
-export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean } {
+/** Does the source define the particle contract? All three are required
+ *  together; `cover` is optional and only means anything to a cutout. */
+export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean; cover: boolean } {
   return {
     init: /\bfn\s+particleInit\s*\(/.test(wgsl),
     step: /\bfn\s+particleStep\s*\(/.test(wgsl),
     shade: /\bfn\s+particleShade\s*\(/.test(wgsl),
+    cover: /\bfn\s+particleCover\s*\(/.test(wgsl),
   }
 }
 
@@ -182,6 +199,11 @@ ${src.paramsDecl}
     audioApi(0, 4) +
     midiApi(0, 5) +
     lyricsApi(0, 6) +
+    // Always, even with no grid — then it samples a 1x1 of zeroes. Same reason
+    // composite compiles it unconditionally, plus one this module owns: an
+    // effect's whole file is spliced here, so a `gridStep` written for the grid
+    // pass has to RESOLVE here too, and the stubs that let it are in here.
+    gridReadApi(0, 8, 9, src.gridSize) +
     PRELUDE +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
@@ -230,7 +252,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 export function buildParticleRenderShader(src: ParticleSource, cast: CastLayout): string {
   return (
     `override BLOOM: bool = ${src.bloom ? "true" : "false"};
-override ADDITIVE: bool = ${src.blend === "additive" ? "true" : "false"};\n` +
+override ADDITIVE: bool = ${src.blend === "additive" ? "true" : "false"};
+override CUTOUT: bool = ${src.blend === "cutout" ? "true" : "false"};
+// A cutout with a prepass: the depth is already written and this pass draws at
+// depthCompare equal, so it neither discards nor masks — the depth test IS the
+// coverage, per sample, and a shader with no discard keeps the hardware's
+// early rejection.
+override PREPASSED: bool = ${src.blend === "cutout" && src.cover ? "true" : "false"};\n` +
     PARTICLE_STRUCT_WGSL +
     CAMERA_STRUCT +
     PARTICLE_UNIFORMS +
@@ -245,6 +273,11 @@ ${src.paramsDecl}
     audioApi(0, 4) +
     midiApi(0, 5) +
     lyricsApi(0, 6) +
+    // Always, even with no grid — then it samples a 1x1 of zeroes. Same reason
+    // composite compiles it unconditionally, plus one this module owns: an
+    // effect's whole file is spliced here, so a `gridStep` written for the grid
+    // pass has to RESOLVE here too, and the stubs that let it are in here.
+    gridReadApi(0, 8, 9, src.gridSize) +
     PRELUDE +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
@@ -301,6 +334,12 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
 
 struct FSOut {
   @location(0) color: vec4f,
+  // Which of the pixel's MSAA samples this fragment covers. Alpha-to-coverage
+  // by hand: the hardware kind reads alpha off the first colour target, and
+  // the HDR target is rg11b10, which has no alpha to read. Every particle
+  // writes it; a blended one writes all four, which is what not declaring it
+  // would have meant.
+  @builtin(sample_mask) samples: u32,
   // The scene's aux target: (bloom mask, coverage). Materials write it, so a
   // particle that skipped it would punch a hole in the mask of whatever it drew
   // over.
@@ -328,8 +367,25 @@ fn fs(in: VSOut) -> FSOut {
   c.a *= pu.weight;
   // Weight 0 therefore discards every fragment, so an effect faded out costs
   // nothing past the vertex stage even on the frame the draw is still issued.
-  if (c.a <= 0.0) { discard; }
+  // Not after a prepass: that pass already decided coverage into depth, and
+  // a discard here would cost this pass the early rejection it exists for.
+  if (!PREPASSED && c.a <= 0.0) { discard; }
   var out: FSOut;
+  out.samples = 0xFu;
+  if (PREPASSED) {
+    c.a = 1.0;
+  } else if (CUTOUT) {
+    // Alpha becomes coverage: 0..4 of the pixel's samples, and the fragment is
+    // then opaque wherever it lands. The pattern is turned by pixel position
+    // so a half-covered edge is not the same two samples on every pixel along
+    // it, which is what makes a2c edges look dithered rather than stepped.
+    let n = u32(clamp(c.a, 0.0, 1.0) * 4.0 + 0.5);
+    if (n == 0u) { discard; }
+    let low = (1u << n) - 1u;
+    let turn = (u32(in.clip.x) + u32(in.clip.y)) & 3u;
+    out.samples = ((low << turn) | (low >> (4u - turn))) & 0xFu;
+    c.a = 1.0;
+  }
   // PREMULTIPLIED: the scene's colour target blends with srcFactor \"one\", so a
   // straight-alpha fragment would come out over-bright wherever it is
   // translucent — which is most of a soft particle.
@@ -350,6 +406,30 @@ fn fs(in: VSOut) -> FSOut {
   out.mask = vec4f(mg.x, mg.y, 0.0, c.a);
 ${sceneIdPadWgsl("out")}  return out;
 }
+` +
+    (src.blend === "cutout" && src.cover
+      ? /* wgsl */ `
+/**
+ * The prepass: the shape to depth, nothing to colour. Every output is still
+ * declared — the pipeline takes the colour targets at writeMask 0 — and the
+ * sample mask is exactly what the single-pass cutout would have written, so
+ * the shading pass's equal test lands on the same samples.
+ */
+@fragment
+fn fsDepth(in: VSOut) -> FSOut {
+  let p = particles[in.id];
+  let a = particleCover(p, in.uv) * pu.weight;
+  let n = u32(clamp(a, 0.0, 1.0) * 4.0 + 0.5);
+  if (n == 0u) { discard; }
+  let low = (1u << n) - 1u;
+  let turn = (u32(in.clip.x) + u32(in.clip.y)) & 3u;
+  var out: FSOut;
+  out.samples = ((low << turn) | (low >> (4u - turn))) & 0xFu;
+  out.color = vec4f(0.0);
+  out.mask = vec4f(0.0);
+${sceneIdPadWgsl("out")}  return out;
+}
 `
+      : "")
   )
 }

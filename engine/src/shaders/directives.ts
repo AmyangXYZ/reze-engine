@@ -48,13 +48,27 @@ export type EffectDirectives = {
   /** The field layer composites additively rather than over. */
   additiveLayer: boolean
   /** Particle blend, which is a different axis from the field layer's. */
-  particleBlend: "alpha" | "additive"
+  /** `cutout` is alpha WITH DEPTH: the pipeline writes depth and turns the
+   *  fragment's alpha into MSAA sample coverage, so a blade of grass behind
+   *  another is rejected by the depth test instead of blended under it. What
+   *  every real grass renderer does, and the only thing that bounds a dense
+   *  lawn's cost by the pixels it covers rather than by how deep it stacks. */
+  particleBlend: "alpha" | "additive" | "cutout"
   particles: number
   lights: number
   grid: number
   bloom: boolean
   /** This effect takes the cast apart — the host reads the timing. */
   dissolve: boolean
+  /** `#ground #rrggbb [noise]`: how this effect DRESSES THE FLOOR while it is
+   *  installed — a colour as linear RGB, and the strength of the ground's own
+   *  grain (0 flat, 1 strong), which is what keeps soil from being a swatch.
+   *  A lawn wants earth under it, and the earth has to be the engine's own
+   *  ground rather than a layer painted over the frame: the ground is geometry
+   *  in the scene pass, so a shadow lands on it and it tone-maps with
+   *  everything else. The scene's own floor returns when the effect goes.
+   *  Null when the file declares none. */
+  ground: { color: [number, number, number]; noise: number } | null
   /**
    * This effect IS a mirror: a plane in the scene showing a true reflection of
    * it, folded and re-rendered by the engine.
@@ -101,6 +115,7 @@ const SPEC = {
   dissolve: 0,
   mirror: 0,
   duration: 1,
+  ground: "rest",
 } as const
 
 /** A line that declares something, and what it declares. Exported because an
@@ -155,6 +170,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     grid: 0,
     bloom: false,
     dissolve: false,
+    ground: null,
     mirror: false,
     duration: 0,
   }
@@ -240,15 +256,32 @@ export function parseDirectives(wgsl: string): DirectiveResult {
         d.additiveLayer = true
         return
       case "blend":
-        if (args[0] !== "additive") {
-          errors.push(`${at}: #blend takes "additive" — alpha is the default`)
+        if (args[0] !== "additive" && args[0] !== "cutout") {
+          errors.push(`${at}: #blend takes "additive" or "cutout" — alpha is the default`)
           return
         }
-        d.particleBlend = "additive"
+        d.particleBlend = args[0]
         return
       case "bloom":
         d.bloom = true
         return
+      case "ground": {
+        const m = /^#([0-9a-fA-F]{6})$/.exec(args[0] ?? "")
+        const noise = args[1] === undefined ? 0 : num(args[1])
+        if (!m || args.length > 2 || noise === null) {
+          errors.push(`${at}: #ground takes a colour like #4b4026 and optionally a grain strength 0..1`)
+          return
+        }
+        const v = parseInt(m[1], 16)
+        // sRGB in the file, linear in the uniform — the same transfer the
+        // ground's own colour goes through on the way in.
+        const lin = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4))
+        d.ground = {
+          color: [lin(((v >> 16) & 255) / 255), lin(((v >> 8) & 255) / 255), lin((v & 255) / 255)],
+          noise: Math.min(Math.max(noise, 0), 1),
+        }
+        return
+      }
       case "dissolve":
         d.dissolve = true
         return

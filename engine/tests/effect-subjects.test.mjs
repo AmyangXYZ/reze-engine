@@ -94,7 +94,7 @@ test("ribbons are instanced by the effect's own subjects", () => {
   // The trail shader decodes [ribbon][subject][segment] out of tu.subjects. Size
   // the draw by the scene's cast instead and a ribbon aimed at one dancer draws
   // four, three of them reading another character's path.
-  const draw = engine.slice(engine.indexOf("private drawTrails("), engine.indexOf("private drawTrails(") + 2000)
+  const draw = engine.slice(engine.indexOf("private drawTrails("), engine.indexOf("private drawTrails(") + 2400)
   assert.match(draw, /const live = Math\.max\(1, e\.subjectCount\)/)
   assert.match(draw, /t\.data\[1\] = live/)
   assert.match(draw, /pass\.draw\(6, t\.slots \* live \*/)

@@ -1,4 +1,5 @@
 import { castDistanceStub } from "./cast-distance"
+import { gridReadApi } from "./grid"
 import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
@@ -39,6 +40,9 @@ type TrailSource = {
   /** Additive, like most glowing ribbons, or straight alpha. */
   blend: "alpha" | "additive"
   bloom: boolean
+  /** The side of this effect's grid, or 0 when it declared none. See the note
+   *  on the same field in particles.ts: a ribbon reads the grid, never steps it. */
+  gridSize: number
 }
 
 /**
@@ -291,6 +295,10 @@ fn rzTurnRadius(a: vec3f, b: vec3f, c: vec3f) -> f32 {
     audioApi(0, 4) +
     midiApi(0, 5) +
     lyricsApi(0, 6) +
+    // Always, with or without a grid — and required either way, because an
+    // effect's whole file is spliced here and a `gridStep` written for the grid
+    // pass has to resolve in this module too.
+    gridReadApi(0, 8, 9, src.gridSize) +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
     idApi(false, 0, 0) + castDistanceStub() +
