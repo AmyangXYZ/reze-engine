@@ -99,6 +99,8 @@ const EXCEPTIONS = {
   rzTrailAt: "same",
   rzTurnRadius: "same",
   RZ_REF_SPAN: "the ribbon's line-integral reference span",
+  rzKnot: "the ribbon spline's centripetal knot spacing",
+  rzSplineTangents: "the ribbon spline's Hermite tangent pair",
   RZ_TRAIL_MAX_STEP: "the trail builder's cut detector; nothing outside that pass has a span to test",
   RZ_SLOTS: "how many ribbons THIS module draws; RZ_TRAIL_SLOTS is the author-facing count",
   // The lyric atlas texture is bound only where lines get DRAWN — the field

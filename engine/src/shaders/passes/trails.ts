@@ -179,18 +179,62 @@ fn _rzCastLive() -> i32 {
   }
   return n;
 }
+/**
+ * CENTRIPETAL knot spacing: the square root of the chord.
+ *
+ * The whole reason the spline below is not the textbook one-liner. Uniform
+ * Catmull-Rom takes the tangent at p1 to be (p2 - p0)/2 — a quantity that knows
+ * nothing about how far apart those samples actually are. Trails are sampled at
+ * a FIXED RATE, so a hand that accelerates leaves one segment far longer than
+ * its neighbours, and a tangent sized for the long one applied over the short
+ * one swings the curve far outside the control polygon: the ribbon bulges out
+ * to a place no sample ever was, which reads as the trail teleporting, and it
+ * happens precisely on the quick moves.
+ *
+ * Spacing the knots by sqrt(chord) — alpha = 0.5, the centripetal variant — is
+ * the standard cure, and it is the only alpha proven to produce no cusp and no
+ * self-intersection whatever the samples do.
+ */
+fn rzKnot(a: vec3f, b: vec3f) -> f32 {
+  return max(sqrt(distance(a, b)), 1e-4);
+}
+
+/** The two Hermite tangents of the segment p1..p2, sized by real chord lengths. */
+fn rzSplineTangents(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f) -> mat2x3f {
+  let d0 = rzKnot(p0, p1);
+  let d1 = rzKnot(p1, p2);
+  let d2 = rzKnot(p2, p3);
+  let m1 = ((p1 - p0) / d0 - (p2 - p0) / (d0 + d1) + (p2 - p1) / d1) * d1;
+  let m2 = ((p2 - p1) / d1 - (p3 - p1) / (d1 + d2) + (p3 - p2) / d2) * d1;
+  return mat2x3f(m1, m2);
+}
+
 /** Catmull-Rom through four samples — passes through p1 and p2. */
 fn rzSpline(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, t: f32) -> vec3f {
+  let m = rzSplineTangents(p0, p1, p2, p3);
   let t2 = t * t;
   let t3 = t2 * t;
-  return 0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 +
-                (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+  return (2.0 * t3 - 3.0 * t2 + 1.0) * p1
+       + (t3 - 2.0 * t2 + t) * m[0]
+       + (-2.0 * t3 + 3.0 * t2) * p2
+       + (t3 - t2) * m[1];
 }
-/** Its derivative — the ribbon's direction, smooth by construction. */
+
+/**
+ * Its derivative — the ribbon's direction, smooth by construction.
+ *
+ * Still exact at the knots, which is what the shared edge depends on: at t = 1
+ * this is m2 and at t = 0 it is m1, and the two segments meeting at a sample
+ * derive those from the same three points. They differ only by a positive
+ * scale, and this normalises, so both quads get the identical direction.
+ */
 fn rzSplineTangent(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, t: f32) -> vec3f {
+  let m = rzSplineTangents(p0, p1, p2, p3);
   let t2 = t * t;
-  let d = 0.5 * ((-p0 + p2) + 2.0 * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t +
-                 3.0 * (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t2);
+  let d = (6.0 * t2 - 6.0 * t) * p1
+        + (3.0 * t2 - 4.0 * t + 1.0) * m[0]
+        + (-6.0 * t2 + 6.0 * t) * p2
+        + (3.0 * t2 - 2.0 * t) * m[1];
   if (length(d) < 1e-6) { return vec3f(0.0, 1.0, 0.0); }
   return normalize(d);
 }
