@@ -120,6 +120,10 @@ const SUB: i32 = ${TRAIL_SUBDIVISIONS};
 // scaling width pinches the strip shut at exactly the moments a hand decelerates,
 // which is every turn — and a ribbon that closes to nothing at each turn reads as
 // dark breaks in the middle of it.
+/** How far a bone may travel between two trail samples, as a fraction of its
+ *  owner's bounding radius. Generous on purpose: a hard swing covers a fraction
+ *  of this, and the only things above it are cuts. */
+const RZ_TRAIL_MAX_STEP: f32 = 0.5;
 const RZ_REF_SPAN: f32 = 0.37;
 
 struct CameraU {
@@ -313,9 +317,28 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   // where the hand slows — aggregation the width taper never clamps, because
   // width follows AGE, not speed. Where the hand is not moving there is no path,
   // and a path effect should draw nothing there at all.
+  // AND A GATE AT THE OTHER END, for the same reason. The minimum says "the
+  // hand is not moving"; this says "the hand did not move THERE". A bone cannot
+  // cross a sizeable fraction of its owner between two samples, so a span that
+  // large is not a motion — it is a cut: a seek, a clip boundary, a model
+  // repositioned, a motion that jumps. Joined anyway, the two samples either
+  // side are bridged by one enormous quad flung across the gap and drawn at full
+  // strength, which is the "trail teleports on a fast move" report. A path
+  // effect should draw nothing across a discontinuity, exactly as it draws
+  // nothing where there is no path.
+  //
+  // Measured against the subject's own bounding radius rather than in world
+  // units, so it holds for a doll and for a giant, and it is checked in WORLD
+  // space rather than in pixels — a camera cut moves every projected point at
+  // once and must not shred every ribbon on screen.
+  //
+  // Zero radius means the cast slot is not live, and then there is nothing to
+  // measure against: the test stands down rather than rejecting everything.
+  let reach = rzSubject(subject).bounds.w * RZ_TRAIL_MAX_STEP;
   let c1 = cam.proj * cam.view * vec4f(p1, 1.0);
   let c2 = cam.proj * cam.view * vec4f(p2, 1.0);
   if (c1.w <= 0.01 || c2.w <= 0.01 ||
+      (reach > 0.0 && distance(p1, p2) > reach) ||
       distance(c1.xy / c1.w * toPx, c2.xy / c2.w * toPx) < 0.7 * (H / 1080.0)) {
     out.clip = vec4f(0.0, 0.0, -2.0, 1.0);
     out.uv = vec2f(0.0);
