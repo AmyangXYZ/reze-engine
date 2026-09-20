@@ -4,7 +4,7 @@ import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl, ribbonSlotWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
-import { CAST_API } from "../cast-api"
+import { CAST_API, subjectMaskApi } from "../cast-api"
 import { EFFECT_SUBJECT_VEC4S } from "../cast-layout"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
@@ -94,6 +94,7 @@ export function buildTrailShader(
   },
 ): string {
   return (
+    subjectMaskApi("u32(tu.mask)") +
     CAST_API +
     trailSlotsApi(src.slots) +
     EFFECT_MATH_API +
@@ -129,17 +130,21 @@ struct CameraU {
 }
 struct TrailU {
   time: f32,
-  // How many subjects the cast ACTUALLY holds this frame, not the four the
-  // layout has room for. The instance count is sized by this on the CPU and
-  // decoded by it here, and the two must use the same number or the flattened
-  // [ribbon][subject][segment] index lands on the wrong ribbon. It is a uniform
-  // rather than the RZ_SUBJECTS constant precisely because it changes when a
-  // model is added or removed, and recompiling every trail shader for that
-  // would be absurd.
+  // How many subjects THIS EFFECT ribbons this frame, not the four the layout
+  // has room for and not the whole cast. The instance count is sized by this on
+  // the CPU and decoded by it here, and the two must use the same number or the
+  // flattened [ribbon][subject][segment] index lands on the wrong ribbon. It is
+  // a uniform rather than the RZ_SUBJECTS constant precisely because it changes
+  // when a model is added, removed, hidden or taken off this effect's list, and
+  // recompiling every trail shader for that would be absurd.
+  //
+  // The subject it decodes is the effect's OWN index, which is what rzTrail
+  // takes — so a ribbon aimed at one dancer draws one ribbon, on her.
   subjects: f32,
   /** The effect's evaluated influence, applied at the one output site below. */
   weight: f32,
-  _pad2: f32,
+  /** Which cast slots this effect is on, one bit each — see subjectMaskApi. */
+  mask: f32,
 }
 ${src.paramsDecl}
 @group(0) @binding(0) var<storage, read> _rzCast: array<vec4f>;
@@ -163,7 +168,7 @@ fn rzProject(p: vec3f) -> vec3f {
   return vec3f(clip.xy / w * 0.5 + 0.5, clip.w);
 }
 fn rzCamPos() -> vec3f { return cam.camPos; }
-fn rzSubjectCount() -> i32 {
+fn _rzCastLive() -> i32 {
   var n = 0;
   for (var i = 0; i < RZ_SUBJECTS; i++) {
     if (_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 2].w > 0.0) { n = i + 1; }

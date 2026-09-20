@@ -1,4 +1,5 @@
 import { SCENE_TAP_STUB } from "./scene-tap"
+import { subjectMaskApi } from "./cast-api"
 // Positional lights, as data — the sibling of the cast, audio and score
 // interfaces, and shaped like them: one shared buffer, read through accessors,
 // never touched directly.
@@ -149,15 +150,18 @@ export function buildLightEmitShader(
 // read_write HERE and read-only in the material shaders. Different passes, so
 // the two never coexist: this compute runs before the scene pass that reads it.
 @group(0) @binding(0) var<storage, read_write> _rzLightsOut: array<f32>;
-// (time, base slot, count, weight) — see buildLightEmitShader on why the base
-// is here and not in the text.
-@group(0) @binding(1) var<uniform> _rzLightU: vec4f;
+// [0] (time, base slot, count, weight) — see buildLightEmitShader on why the
+// base is here and not in the text — and [1].x the subject mask, which is the
+// only thing the second vec4 is for: an emitter reads the cast through the same
+// accessors its drawing half does, so a rig aimed at one dancer must see one.
+@group(0) @binding(1) var<uniform> _rzLightU: array<vec4f, 2>;
 // The camera block and the cast — the two buffers the scene API reads. Same
 // contents the field and grid modules bind, so an effect's lightEmit sees the
 // scene exactly as its drawing half does.
 @group(0) @binding(2) var<uniform> viewU: array<vec4<f32>, 15>;
 @group(0) @binding(3) var<storage, read> _rzCast: array<vec4f>;
 ${sceneApi}
+${subjectMaskApi("u32(_rzLightU[1].x)")}
 ${SCENE_TAP_STUB}
 // Audio and score at 4 and 5, the same bindings the particle and trail modules
 // put them on. A lamp that pulses on the beat or lights on a note is the whole
@@ -171,7 +175,7 @@ ${lyricsApi(0, 6)}
 // grows a lamp at its tip compiles its ribbon code in this module too. The math
 // helpers and the Particle struct are NOT repeated — they arrive with the scene
 // API above, and a second copy is a redefinition error in engine code.
-${clockApi("_rzLightU.x", "0.0")}
+${clockApi("_rzLightU[0].x", "0.0")}
 // Canvas height — the same number the drawing modules read out of their camera
 // struct, both written from canvas.height, so this name means ONE value in
 // every module. Verified against the writers, not assumed: cameraMatrixData[35]
@@ -192,12 +196,12 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   // The dispatch is sized to the count, but a workgroup is 64 wide and the
   // count rarely is — the tail must not write into the next effect's slots.
-  if (i >= u32(_rzLightU.z)) { return; }
+  if (i >= u32(_rzLightU[0].z)) { return; }
   // Time is a PARAMETER, not an rzTime() call: this same source compiles
   // inside the field, particle, trail and grid modules, and those already
   // define rzTime differently or not at all. A parameter needs nothing from
   // the module it lands in, which is why the field mounts take theirs too.
-  let l = lightEmit(i, _rzLightU.x);
+  let l = lightEmit(i, _rzLightU[0].x);
   // SANITIZED at the one write site, because lightEmit is HOSTED USER CODE and
   // this buffer feeds every fragment of every material: one NaN position would
   // poison the whole frame, and WGSL leaves max(NaN, 0) indeterminate, so it
@@ -211,8 +215,8 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   // Weight rides along with the sanitisation, which is already the one place
   // this buffer is written: a lamp at half weight is half as bright, and one
   // at zero never reaches here because the dispatch is skipped.
-  let c = select(vec3f(0.0), max(l.color * l.intensity, vec3f(0.0)), finite) * _rzLightU.w;
-  let b = ${LIGHT_HEADER}u + (u32(_rzLightU.y) + i) * ${LIGHT_STRIDE}u;
+  let c = select(vec3f(0.0), max(l.color * l.intensity, vec3f(0.0)), finite) * _rzLightU[0].w;
+  let b = ${LIGHT_HEADER}u + (u32(_rzLightU[0].y) + i) * ${LIGHT_STRIDE}u;
   _rzLightsOut[b] = select(0.0, l.pos.x, finite);
   _rzLightsOut[b + 1u] = select(0.0, l.pos.y, finite);
   _rzLightsOut[b + 2u] = select(0.0, l.pos.z, finite);
@@ -220,7 +224,7 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   // weight above it. Scaling it with the fade would shrink a dimming lamp's
   // reach, which is a different thing than dimming it; zeroing it at nothing
   // is what lets a material's distance cull drop the slot entirely.
-  _rzLightsOut[b + 3u] = select(0.0, max(l.radius, 0.0), finite && _rzLightU.w > 0.0);
+  _rzLightsOut[b + 3u] = select(0.0, max(l.radius, 0.0), finite && _rzLightU[0].w > 0.0);
   // Colour carries intensity, exactly as the CPU writer stores it — one product,
   // one place, so the two producers cannot disagree about what a slot means.
   _rzLightsOut[b + 4u] = c.x;

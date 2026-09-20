@@ -481,6 +481,19 @@ export type EffectResult = {
    *  the host does with an effect should come from the effect, not from a
    *  second parse that can drift from it. */
   duration: number
+  /**
+   * Does this effect read the CAST — a subject, a bone anchor, a trail, the
+   * distance field?
+   *
+   * What decides whether aiming it at particular models means anything, and so
+   * whether a host should offer that control at all. Rain falls on the scene and
+   * a glitch is on the lens; a ribbon, a sigil or a silhouette is on somebody.
+   *
+   * Reported here for the same reason `params` is: the engine has already read
+   * the source to build the module, and a host re-deriving this from the same
+   * text is a second answer free to disagree with the one that renders.
+   */
+  readsCast: boolean
 }
 
 type CameraOptions = {
@@ -1359,6 +1372,29 @@ function paramValue(p: EffectParamDecl, given: EffectParamValue | undefined): Ef
   return typeof p.value === "number" ? p.value : 0
 }
 
+/**
+ * Which models an effect is on, as it is kept: names, deduplicated, or null for
+ * the whole cast.
+ *
+ * AN EMPTY LIST IS THE WHOLE CAST, not nobody. An effect on nobody is a dark
+ * effect with no sign of why, and there are already two ways to say that on
+ * purpose — influence 0 and a schedule with no window here. A host that filters
+ * a target list down to nothing (every named model deleted, say) gets the
+ * default back instead of a scene with a mystery in it.
+ */
+function normalizeSubjects(list: readonly string[] | null | undefined): readonly string[] | null {
+  if (!list || list.length === 0) return null
+  const seen = [...new Set(list.filter((n) => typeof n === "string" && n.length > 0))]
+  return seen.length === 0 ? null : seen
+}
+
+/** One target set as a comparable string — `*` is the whole cast. Sorted, so two
+ *  effects naming the same models in a different order share one distance field
+ *  rather than paying for the same flood twice. */
+function castSubjectKey(subjects: readonly string[] | null): string {
+  return subjects ? [...subjects].sort().join("\u0000") : "*"
+}
+
 const EFFECT_PARAMS_BINDING = 7
 const EFFECT_PARAMS_BINDING_GRID = 9
 
@@ -1417,6 +1453,25 @@ interface EffectGrid {
   /** The effect's declared dials, or null. Held HERE as well as on the instance
    *  because the rebind path rebuilds this bind group from the grid alone. */
   params: GPUBuffer | null
+}
+
+/**
+ * One distance-to-cast field: the flood for ONE set of models.
+ *
+ * `subjects` is the key effects are matched on — null for the whole cast, which
+ * is what an unaimed effect reads and what every scene had before an effect could
+ * be aimed. Two effects on the same models share the field and its cost.
+ */
+interface CastDistanceVariant {
+  subjects: readonly string[] | null
+  /** The seed mask this holds, so a frame that changed nothing writes nothing. */
+  mask: number
+  uniform: GPUBuffer
+  data: Float32Array
+  seedBind: GPUBindGroup
+  texture: GPUTexture
+  view: GPUTextureView
+  resolveBind: GPUBindGroup
 }
 
 /**
@@ -1541,6 +1596,35 @@ interface EffectInstance {
   /** Does this source read the distance-to-cast field? Parsed at install for the
    *  same reason readsIds is, and it turns the whole flood on by itself. */
   readsCastDistance: boolean
+  /** Does this source read the cast AT ALL — a subject, an anchor, a trail, the
+   *  distance field? Reported back at install, because it is what decides
+   *  whether aiming this effect at particular models means anything: Rain falls
+   *  on the scene, not on anybody. */
+  readsCast: boolean
+  /**
+   * WHICH MODELS this effect is on, by name, or null for the whole cast.
+   *
+   * Names rather than cast slots, because a slot is not a property of a model:
+   * the cast is every visible character in load order, so hiding one moves
+   * everybody after them up. Resolved to a mask in the one loop that assigns the
+   * slots (see updateCastBuffer), which is what makes the two impossible to
+   * disagree.
+   *
+   * A name that is not in the cast is simply not in the mask — a model still
+   * loading, or one the scene has since removed. An effect whose every named
+   * model is gone sees no subjects and draws nothing, which is the honest answer
+   * and a visible one: the host's own list shows what it is aimed at.
+   */
+  subjects: readonly string[] | null
+  /** The above as the shaders read it: one bit per cast slot, recomputed every
+   *  frame. 0xf — the whole cast — while `subjects` is null. */
+  subjectMask: number
+  /** How many subjects this effect actually HAS this frame: the mask's bits,
+   *  counted against the live cast. What sizes the ribbons' instance count. */
+  subjectCount: number
+  /** Which distance field this effect reads, indexed into castDistanceVariants.
+   *  Effects aimed at the same models share one flood. */
+  distVariant: number
   /** Bones this source asked for, in ITS OWN declaration order. The scene table
    *  maps these onto shared addresses; this list is what it is rebuilt from. */
   anchors: { bone: string; trail: boolean }[]
@@ -2022,8 +2106,27 @@ export class Engine {
   private castSeedViews: (GPUTextureView | null)[] = [null, null]
   private castCoverageTexture: GPUTexture | null = null
   private castCoverageView: GPUTextureView | null = null
-  private castDistTexture: GPUTexture | null = null
-  private castDistView: GPUTextureView | null = null
+  /**
+   * One field per distinct set of models — the seeds, the flood and the resolve
+   * run once for each.
+   *
+   * WHY IT CANNOT BE FILTERED AFTERWARDS. The field answers "how far is the
+   * nearest cast pixel", and that is a function of every pixel around this one.
+   * Ask it about a smaller cast and the answer is a different number, not a
+   * subset of the same one — the nearest pixel of the model you left out was the
+   * answer, and the true distance to the one you kept is unknown. An effect on
+   * one dancer would have its aura bitten out wherever the other one passed
+   * nearer. So a target set is a field.
+   *
+   * The PING-PONG IS SHARED, and that is most of the memory: the seeds and the
+   * coverage are scratch within one variant's chain, so the variants take turns
+   * in them and only the resolved r16float distance is per set. What a second set
+   * costs is the FLOOD — log2(resolution) full-res passes — which is the honest
+   * price of the second answer and the reason nothing here tries to be clever
+   * about it. A scene where every silhouette effect is aimed at the same models,
+   * which is nearly all of them, builds exactly one.
+   */
+  private castDistanceVariants: CastDistanceVariant[] = []
   /** 1x1 holding half-float 65504, bound whenever the pass is not running: an
    *  effect keyed on distance then finds the cast unreachably far and draws
    *  nothing, rather than the accessor being a name that does not exist. */
@@ -2032,10 +2135,12 @@ export class Engine {
   private castSeedPipeline: GPURenderPipeline | null = null
   private castStepPipeline: GPURenderPipeline | null = null
   private castResolvePipeline: GPURenderPipeline | null = null
-  private castSeedBindGroup: GPUBindGroup | null = null
   private castStepBindGroups: GPUBindGroup[] = []
-  private castResolveBindGroup: GPUBindGroup | null = null
   private castStepStrideBuffers: GPUBuffer[] = []
+  /** Which of the two seed textures the last flood pass wrote — the one every
+   *  variant's resolve reads. Parity of the pass count, recorded where the
+   *  passes are counted. */
+  private castResolveReadsSeed = 0
   /** The visible props' object ids for the seed pass, count in slot 0. Grown in
    *  powers of two; see writeCastSeedProps. */
   private castSeedPropBuffer: GPUBuffer | null = null
@@ -2347,6 +2452,9 @@ export class Engine {
   /** Subjects the cast actually holds, set while it is filled. The ribbons size
    *  their instance count by this rather than by the four-subject cap. */
   private castSubjectCount = 0
+  /** Model name → cast slot, rebuilt as the cast is written. What turns "this
+   *  effect is on 今汐" into a bit the shaders can read. */
+  private castSlotOf = new Map<string, number>()
   private effects: EffectInstance[] = []
   /** The first installed effect, for the many places that legitimately want
    *  "is anything installed" or the singleton API's one effect. */
@@ -3698,18 +3806,14 @@ export class Engine {
   private createCastDistanceTargets(): void {
     for (const t of this.castSeedTextures) t?.destroy()
     this.castCoverageTexture?.destroy()
-    this.castDistTexture?.destroy()
     for (const b of this.castStepStrideBuffers) b.destroy()
+    this.releaseCastDistanceVariants()
     this.castSeedTextures = [null, null]
     this.castSeedViews = [null, null]
     this.castCoverageTexture = null
     this.castCoverageView = null
-    this.castDistTexture = null
-    this.castDistView = null
     this.castStepStrideBuffers = []
     this.castStepBindGroups = []
-    this.castSeedBindGroup = null
-    this.castResolveBindGroup = null
     if (!this.device || !this.castDistanceWanted || this.fieldFullW === 0) return
     if (!this.castSeedPipeline || !this.castStepPipeline || !this.castResolvePipeline) return
 
@@ -3731,13 +3835,6 @@ export class Engine {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     })
     this.castCoverageView = this.castCoverageTexture.createView()
-    this.castDistTexture = this.device.createTexture({
-      label: "cast distance",
-      size: [w, h],
-      format: CAST_DIST_FORMAT,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.castDistView = this.castDistTexture.createView()
 
     // The flood starts at half the longest side and halves to one. That is what
     // makes it exact everywhere rather than out to some radius: every seed gets
@@ -3745,7 +3842,6 @@ export class Engine {
     const strides: number[] = []
     for (let k = 1 << Math.ceil(Math.log2(Math.max(w, h))); k >= 1; k >>= 1) strides.push(k)
 
-    this.createCastSeedBindGroup()
     strides.forEach((stride, i) => {
       const buf = this.device!.createBuffer({
         label: `cast distance stride ${stride}`,
@@ -3767,19 +3863,40 @@ export class Engine {
         }),
       )
     })
-    this.castResolveBindGroup = this.device.createBindGroup({
-      label: "cast distance resolve",
-      layout: this.castResolvePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.castSeedViews[strides.length % 2]! },
-        { binding: 1, resource: this.castCoverageView! },
-      ],
-    })
+    // WHICH seed texture the resolve reads: the one the last flood pass wrote,
+    // and that is the parity of the pass count. Shared by every variant, since
+    // they take turns in the same pair.
+    this.castResolveReadsSeed = strides.length % 2
+    this.buildCastDistanceVariants(w, h)
   }
 
-  /** The seed pass's inputs: the id attachment, the cast, and the prop ids. */
-  private createCastSeedBindGroup(): void {
+  /** Every variant's own resources, gone. The shared scratch is not touched:
+   *  a target set changing does not resize the frame. */
+  private releaseCastDistanceVariants(): void {
+    for (const v of this.castDistanceVariants) {
+      v.texture.destroy()
+      v.uniform.destroy()
+    }
+    this.castDistanceVariants = []
+  }
+
+  /**
+   * One field per distinct target set among the effects that read one, and each
+   * effect pointed at its own.
+   *
+   * Built from the effect list rather than accumulated, so a removed effect takes
+   * its flood with it and the untargeted default is not kept alive by nobody.
+   */
+  private buildCastDistanceVariants(w: number, h: number): void {
     const device = this.device!
+    // The seed pass reads the id attachment, so there is nothing to build before
+    // the scene has one. Effects then read the 1x1 "unreachably far" fallback,
+    // which is what an effect keyed on distance already sees while no flood is
+    // running — and the next createFieldTargets builds the real thing.
+    if (!this.idView || !this.castCoverageView) {
+      this.releaseCastDistanceVariants()
+      return
+    }
     if (!this.castSeedPropBuffer) {
       this.castSeedPropBuffer = device.createBuffer({
         label: "cast distance prop seeds",
@@ -3788,15 +3905,82 @@ export class Engine {
       })
       device.queue.writeBuffer(this.castSeedPropBuffer, 0, this.castSeedPropData)
     }
-    this.castSeedBindGroup = device.createBindGroup({
-      label: "cast distance seed",
-      layout: this.castSeedPipeline!.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.idView! },
-        { binding: 1, resource: { buffer: this.castBuffer } },
-        { binding: 2, resource: { buffer: this.castSeedPropBuffer } },
-      ],
-    })
+    this.releaseCastDistanceVariants()
+    for (const e of this.effects) {
+      if (!e.readsCastDistance) continue
+      const key = castSubjectKey(e.subjects)
+      const at = this.castDistanceVariants.findIndex((v) => castSubjectKey(v.subjects) === key)
+      if (at >= 0) {
+        e.distVariant = at
+        continue
+      }
+      e.distVariant = this.castDistanceVariants.length
+      const data = new Float32Array([0xf, 0, 0, 0])
+      const uniform = device.createBuffer({
+        label: `cast distance seeds (${key})`,
+        size: data.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      device.queue.writeBuffer(uniform, 0, data.buffer as ArrayBuffer)
+      const texture = device.createTexture({
+        label: `cast distance (${key})`,
+        size: [w, h],
+        format: CAST_DIST_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.castDistanceVariants.push({
+        subjects: e.subjects,
+        // 0xf is what the buffer above was written with; the first frame's
+        // updateSubjectMasks narrows it to the live cast.
+        mask: 0xf,
+        uniform,
+        data,
+        seedBind: device.createBindGroup({
+          label: `cast distance seed (${key})`,
+          layout: this.castSeedPipeline!.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.idView! },
+            { binding: 1, resource: { buffer: this.castBuffer } },
+            { binding: 2, resource: { buffer: this.castSeedPropBuffer } },
+            { binding: 3, resource: { buffer: uniform } },
+          ],
+        }),
+        texture,
+        view: texture.createView(),
+        resolveBind: device.createBindGroup({
+          label: `cast distance resolve (${key})`,
+          layout: this.castResolvePipeline!.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.castSeedViews[this.castResolveReadsSeed]! },
+            { binding: 1, resource: this.castCoverageView! },
+          ],
+        }),
+      })
+    }
+  }
+
+  /**
+   * The target sets changed — an effect was aimed somewhere else.
+   *
+   * Rebuilds the variants and the field bind groups that name their textures.
+   * Nothing recompiles: which field an effect reads is a binding, not a constant
+   * in its module.
+   */
+  private syncCastDistanceVariants(): void {
+    if (!this.device || !this.castDistanceWanted || this.fieldFullW === 0) return
+    const before = this.castDistanceVariants.map((v) => castSubjectKey(v.subjects)).join("|")
+    const want = [...new Set(this.effects.filter((e) => e.readsCastDistance).map((e) => castSubjectKey(e.subjects)))].join("|")
+    if (before === want) return
+    const w = Math.max(1, Math.ceil(this.fieldFullW / CAST_FIELD_DIV))
+    const h = Math.max(1, Math.ceil(this.fieldFullH / CAST_FIELD_DIV))
+    this.buildCastDistanceVariants(w, h)
+    this.rebuildFieldBindGroup()
+  }
+
+  /** The field this effect reads, or the 1x1 "unreachably far" fallback while no
+   *  flood is running. */
+  private castDistViewFor(owner: EffectInstance): GPUTextureView {
+    return this.castDistanceVariants[owner.distVariant]?.view ?? this.castDistFallbackView!
   }
 
   /**
@@ -3817,7 +4001,13 @@ export class Engine {
       this.castSeedPropData = data
       this.castSeedPropBuffer?.destroy()
       this.castSeedPropBuffer = null
-      this.createCastSeedBindGroup()
+      // Every variant's seed group names that buffer, so they are all rebuilt —
+      // at the size the frame is now, which is where the shared scratch is.
+      this.buildCastDistanceVariants(
+        Math.max(1, Math.ceil(this.fieldFullW / CAST_FIELD_DIV)),
+        Math.max(1, Math.ceil(this.fieldFullH / CAST_FIELD_DIV)),
+      )
+      this.rebuildFieldBindGroup()
       changed = true
     }
     data[0] = n
@@ -3838,39 +4028,45 @@ export class Engine {
    * whole point of paying for it in passes rather than in per-pixel search.
    */
   private encodeCastDistance(encoder: GPUCommandEncoder): void {
-    if (!this.castDistanceWanted || !this.castSeedBindGroup || !this.castResolveBindGroup) return
+    if (!this.castDistanceWanted || this.castDistanceVariants.length === 0) return
     this.writeCastSeedProps()
-    const seed = encoder.beginRenderPass({
-      label: "cast distance (seed)",
-      colorAttachments: [
-        { view: this.castSeedViews[0]!, loadOp: "clear", clearValue: { r: -1, g: -1, b: 0, a: 0 }, storeOp: "store" },
-        { view: this.castCoverageView!, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" },
-      ],
-    })
-    seed.setPipeline(this.castSeedPipeline!)
-    seed.setBindGroup(0, this.castSeedBindGroup)
-    seed.draw(3)
-    seed.end()
-
-    this.castStepBindGroups.forEach((group, i) => {
-      const pass = encoder.beginRenderPass({
-        label: "cast distance (flood)",
-        colorAttachments: [{ view: this.castSeedViews[(i + 1) % 2]!, loadOp: "clear", clearValue: { r: -1, g: -1, b: 0, a: 0 }, storeOp: "store" }],
+    // One chain per target set, in turn through the shared seed pair. Serial and
+    // not overlapped on purpose: the second chain overwrites the first's scratch,
+    // and the only thing that has to survive is the resolved distance, which is
+    // each variant's own texture.
+    for (const v of this.castDistanceVariants) {
+      const seed = encoder.beginRenderPass({
+        label: "cast distance (seed)",
+        colorAttachments: [
+          { view: this.castSeedViews[0]!, loadOp: "clear", clearValue: { r: -1, g: -1, b: 0, a: 0 }, storeOp: "store" },
+          { view: this.castCoverageView!, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" },
+        ],
       })
-      pass.setPipeline(this.castStepPipeline!)
-      pass.setBindGroup(0, group)
-      pass.draw(3)
-      pass.end()
-    })
+      seed.setPipeline(this.castSeedPipeline!)
+      seed.setBindGroup(0, v.seedBind)
+      seed.draw(3)
+      seed.end()
 
-    const resolve = encoder.beginRenderPass({
-      label: "cast distance (resolve)",
-      colorAttachments: [{ view: this.castDistView!, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" }],
-    })
-    resolve.setPipeline(this.castResolvePipeline!)
-    resolve.setBindGroup(0, this.castResolveBindGroup)
-    resolve.draw(3)
-    resolve.end()
+      this.castStepBindGroups.forEach((group, i) => {
+        const pass = encoder.beginRenderPass({
+          label: "cast distance (flood)",
+          colorAttachments: [{ view: this.castSeedViews[(i + 1) % 2]!, loadOp: "clear", clearValue: { r: -1, g: -1, b: 0, a: 0 }, storeOp: "store" }],
+        })
+        pass.setPipeline(this.castStepPipeline!)
+        pass.setBindGroup(0, group)
+        pass.draw(3)
+        pass.end()
+      })
+
+      const resolve = encoder.beginRenderPass({
+        label: "cast distance (resolve)",
+        colorAttachments: [{ view: v.view, loadOp: "clear", clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: "store" }],
+      })
+      resolve.setPipeline(this.castResolvePipeline!)
+      resolve.setBindGroup(0, v.resolveBind)
+      resolve.draw(3)
+      resolve.end()
+    }
   }
 
   private createFieldTargets(): void {
@@ -3991,7 +4187,7 @@ export class Engine {
           ...(this.idView ? [{ binding: 23, resource: this.idView }] : []),
           { binding: 17, resource: grid },
           { binding: 18, resource: this.simSampler },
-          { binding: 26, resource: this.castDistView ?? this.castDistFallbackView! },
+          { binding: 26, resource: this.castDistViewFor(owner) },
           { binding: 27, resource: this.hdrResolveTexture.createView() },
           { binding: 28, resource: this.simSampler },
           // The other effects' layers, for rzSceneFrame — see the loop below.
@@ -4323,7 +4519,7 @@ export class Engine {
     alias: number[],
   ): Promise<{ ok: true; instance: EffectInstance; warnings: string[] } | EffectResult> {
     const noMounts = { background: false, foreground: false }
-    if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts, params: [], duration: 0 }
+    if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts, params: [], duration: 0, readsCast: false }
 
     // WHAT THE FILE DECLARES, read once. Everything below takes it from `d`
     // rather than running a regex of its own — eight parsers over one file was
@@ -4334,7 +4530,7 @@ export class Engine {
     // nothing to be lenient about; the old spelling lived in comments, where a
     // typo was indistinguishable from prose and could only ever be warned about.
     const parsed = parseDirectives(authored)
-    if (parsed.errors.length) return { ok: false, diagnostics: parsed.errors, mounts: noMounts, params: [], duration: 0 }
+    if (parsed.errors.length) return { ok: false, diagnostics: parsed.errors, mounts: noMounts, params: [], duration: 0, readsCast: false }
     const d = parsed.directives
     // The compiler sees the file with its directive lines BLANKED, so every
     // diagnostic below still names the line the author is looking at.
@@ -4358,7 +4554,7 @@ export class Engine {
       return { ok: false, diagnostics: [
           `a ribbon effect needs both fn trailWidth(u: f32, age: f32) -> f32 and ` +
             `fn trailShade(u: f32, v: f32, age: f32, weight: f32, slot: i32) -> vec4f`,
-        ], mounts: noMounts, params: [], duration: 0 }
+        ], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
     if (wantsParticles && !(pe.init && pe.step && pe.shade)) {
       const missing = [
@@ -4366,7 +4562,7 @@ export class Engine {
         pe.step ? null : "fn particleStep(p: Particle, dt: f32) -> Particle",
         pe.shade ? null : "fn particleShade(p: Particle, uv: vec2f) -> vec4f",
       ].filter(Boolean)
-      return { ok: false, diagnostics: [`a particle effect also needs ${missing.join(" and ")}`], mounts: noMounts, params: [], duration: 0 }
+      return { ok: false, diagnostics: [`a particle effect also needs ${missing.join(" and ")}`], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
     // One file, one kind — for now.
     //
@@ -4384,7 +4580,7 @@ export class Engine {
       return { ok: false, diagnostics: [
           "an effect declares field mounts (background/foreground) or particles, not both — " +
             "split them into two effects",
-        ], mounts: noMounts, params: [], duration: 0 }
+        ], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
     // lightEmit counts as a mount on its own: a pure lighting rig draws nothing
     // and is still an effect — it is how a scene gets stage lights without also
@@ -4400,7 +4596,7 @@ export class Engine {
             "the ribbon pair (trailWidth/trailShade), " +
             "fn lightEmit(i: u32) -> RzLight with #lights <n>, " +
             "or #mirror",
-        ], mounts: noMounts, params: [], duration: 0 }
+        ], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
     const mounts = { background: hasBackground, foreground: hasForeground }
 
@@ -4457,7 +4653,7 @@ export class Engine {
     let cursor = 0
     for (const p of d.params) {
       if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(p.name)) {
-        return { ok: false, diagnostics: [`invalid param name "${p.name}" (must be a WGSL identifier)`], mounts, params: d.params, duration: d.duration }
+        return { ok: false, diagnostics: [`invalid param name "${p.name}" (must be a WGSL identifier)`], mounts, params: d.params, duration: d.duration, readsCast: false }
       }
       // KIND comes from the declaration, never from the runtime type of the
       // value: a caller handing a number to a colour must not silently turn a
@@ -4514,7 +4710,7 @@ export class Engine {
     this.device.pushErrorScope("validation")
     const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
     const scopeErr = await this.device.popErrorScope()
-    if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts, params: d.params, duration: d.duration }
+    if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts, params: d.params, duration: d.duration, readsCast: false }
 
     // Declared like every other mount property: by what the source says, not by
     // a setting somewhere else that an author cannot see from the file.
@@ -4533,7 +4729,7 @@ export class Engine {
         .filter((m) => m.type === "error")
         .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
       if (diagnostics.length === 0 && fieldScopeErr) diagnostics.push(fieldScopeErr.message)
-      if (diagnostics.length > 0) return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration }
+      if (diagnostics.length > 0) return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration, readsCast: false }
       try {
         fieldPipeline = await this.device.createRenderPipelineAsync({
           label: "field layer pipeline",
@@ -4564,7 +4760,7 @@ export class Engine {
           multisample: { count: 1 },
         })
       } catch (e) {
-        return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration }
+        return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration, readsCast: false }
       }
     }
     let identity: GPURenderPipeline
@@ -4588,7 +4784,7 @@ export class Engine {
         make(true, "composite pipeline (effect, gamma!=1)"),
       ])
     } catch (e) {
-      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration }
+      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration, readsCast: false }
     }
 
     // Built BEFORE the swap: a particle stage that fails to compile has to leave
@@ -4642,7 +4838,7 @@ export class Engine {
       grid?.textures[1].destroy()
       grid?.uniform.destroy()
       trails?.uniform.destroy()
-      return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration }
+      return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration, readsCast: false }
     }
     if (wantsParticles) {
       const built = await this.buildParticles(wgsl, d, anchors, alias, paramsFor)
@@ -4714,6 +4910,19 @@ export class Engine {
         // attachment would be stored exactly as often as before.
         readsIds: /\brz(?:ObjectAt|MaterialAt)\s*\(/.test(wgsl),
         readsCastDistance: castDistanceUsed(wgsl),
+        // Every route to the cast, in one test, and the author's own source for
+        // the reason readsIds gives. `#anchor` counts: a file declaring one asks
+        // the engine to record a bone for it, whether or not the accessor is
+        // spelled out in a line this matches.
+        readsCast: /\brz(?:Subject|SubjectCount|SubjectId|Anchor|Trail|TrailCount|CastDistance)\s*\(/.test(wgsl) ||
+          anchors.length > 0,
+        // Aimed at nobody in particular — the whole cast, which is what every
+        // effect did before it could be aimed. A host narrows it afterwards, the
+        // way it sets influence and a schedule.
+        subjects: null,
+        subjectMask: 0xf,
+        subjectCount: 0,
+        distVariant: 0,
         anchors,
         // The effect's own clock starts now. Per effect so that one installed
         // later still gets a frame where rzGridFrame() is 0 and can seed.
@@ -4787,14 +4996,24 @@ export class Engine {
    * Null or empty clears everything.
    */
   async setEffects(
-    list: { wgsl: string; params?: Record<string, EffectParamValue> }[] | null,
+    list:
+      | {
+          wgsl: string
+          params?: Record<string, EffectParamValue>
+          /** Which models this one is on, by name. Omitted or null = the whole
+           *  cast. It rides the install for the reason `params` does: an effect
+           *  aimed at one dancer should not spend its first frame on all four,
+           *  which on a ribbon or a sigil reads as a flash. */
+          subjects?: readonly string[] | null
+        }[]
+      | null,
   ): Promise<EffectResult[]> {
     const noMounts = { background: false, foreground: false }
     // Clearing an engine that has nothing yet is already done; only an install
     // needs the device.
     if (!this.device) {
       if (!list || list.length === 0) return []
-      return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts, params: [], duration: 0 }]
+      return [{ ok: false, diagnostics: ["setEffects requires init() to have run"], mounts: noMounts, params: [], duration: 0, readsCast: false }]
     }
 
     const requested = list ?? []
@@ -4845,6 +5064,7 @@ export class Engine {
         results.push(built)
         continue
       }
+      built.instance.subjects = normalizeSubjects(requested[i].subjects)
       instances.push(built.instance)
       results.push({
         ok: true,
@@ -4854,6 +5074,9 @@ export class Engine {
         // but will never fire. Same channel as the dropped-anchor note below.
         diagnostics: built.warnings,
         mounts: { background: built.instance.hasBackground, foreground: built.instance.hasForeground },
+        // Whether aiming this one at particular models means anything. Read off
+        // the instance the engine just built, not off a second parse.
+        readsCast: built.instance.readsCast,
       })
     }
     // An anchor the cap refused is worth saying out loud on the effect that
@@ -4885,6 +5108,11 @@ export class Engine {
       this.createCastDistanceTargets()
       // The field bind groups name the distance texture, and it has just been
       // created or destroyed — they are rebuilt below with the new list anyway.
+    } else {
+      // The answer did not change, but WHO the fields are built from may have:
+      // this list's effects are aimed wherever the install said, and the old
+      // list's variants belong to effects that are gone.
+      this.syncCastDistanceVariants()
     }
     // The new list's emitters need their slots before the next frame reads them.
     this.allocateLightSlots()
@@ -4949,10 +5177,10 @@ export class Engine {
     const noMounts = { background: false, foreground: false }
     if (wgsl === null) {
       await this.setEffects(null)
-      return { ok: true, diagnostics: [], mounts: noMounts, params: [], duration: 0 }
+      return { ok: true, diagnostics: [], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
     const [result] = await this.setEffects([{ wgsl, params }])
-    return result ?? { ok: false, diagnostics: ["effect failed to install"], mounts: noMounts, params: [], duration: 0 }
+    return result ?? { ok: false, diagnostics: ["effect failed to install"], mounts: noMounts, params: [], duration: 0, readsCast: false }
   }
 
   private async buildParticles(
@@ -5012,7 +5240,7 @@ export class Engine {
     })
     const uniform = this.device.createBuffer({
       label: "particle uniforms",
-      // Two vec4-sized rows: (time, dt, count, frame) and (weight, _, _, _).
+      // Two vec4-sized rows: (time, dt, count, frame) and (weight, subjects, _, _).
       // The first was exactly full, and weight has to live in the same buffer
       // as the clock or a frame could draw one without the other.
       size: 32,
@@ -5176,7 +5404,10 @@ export class Engine {
     const info = await module.getCompilationInfo()
     const diagnostics = info.messages.filter((m) => m.type === "error").map((m) => `${m.lineNum}:${m.linePos} ${m.message}`)
     if (diagnostics.length) return { ok: false, diagnostics }
-    const data = new Float32Array(4)
+    // Two vec4s: (time, base slot, count, weight) and the subject mask — an
+    // emitter reads the cast through the same accessors its drawing half does,
+    // so it needs the same answer about who this effect is on.
+    const data = new Float32Array(8)
     const uniform = this.device.createBuffer({
       label: "light emit uniform",
       size: data.byteLength,
@@ -5267,6 +5498,9 @@ export class Engine {
       // per effect now, so every mount in one file agrees by construction.
       l.data[0] = this.sceneClock - e.epochScene
       l.data[3] = e.weight
+      // Which characters this rig is on — the second vec4. A lamp that follows a
+      // hand follows the hand of the model the effect is aimed at.
+      l.data[4] = e.subjectMask
       this.device.queue.writeBuffer(l.uniform, 0, l.data.buffer as ArrayBuffer)
       const cp = encoder.beginComputePass({ label: "light emit" })
       cp.setPipeline(l.pipeline)
@@ -5294,6 +5528,9 @@ export class Engine {
       // state it left rather than the one it would have reached, so fading one
       // back in would rewind it.
       p.data[4] = e.weight
+      // Which characters this pool spawns off — rzSubjectCount() in particleInit
+      // counts these, not the cast.
+      p.data[5] = e.subjectMask
       // Clamped: a backgrounded tab returns with a delta of whole seconds, and an
       // unclamped step flings every particle out of the scene in one frame.
       // A scheduled effect steps by the transport instead, clamped the same way
@@ -5514,11 +5751,16 @@ export class Engine {
       // The shader decodes [ribbon][subject][segment] with the same number out
       // of its uniform, so the two cannot drift: change one without the other
       // and ribbons land on the wrong subject rather than merely costing more.
-      const live = Math.max(1, this.castSubjectCount)
+      // THIS EFFECT'S subjects, not the scene's: a ribbon aimed at one dancer
+      // draws one ribbon. The shader decodes [ribbon][subject][segment] out of
+      // the same number, and the subject it decodes is the effect's own index —
+      // which is exactly what rzTrail takes.
+      const live = Math.max(1, e.subjectCount)
       if (view === "camera") {
         t.data[0] = this.sceneClock - e.epochScene
         t.data[1] = live
         t.data[2] = e.weight
+        t.data[3] = e.subjectMask
         this.device.queue.writeBuffer(t.uniform, 0, t.data.buffer as ArrayBuffer)
       }
       pass.setPipeline(t.pipeline)
@@ -5556,6 +5798,10 @@ export class Engine {
       if (!e.fieldClock) continue
       this.fieldClockScratch[0] = this.sceneClock - e.epochScene
       this.fieldClockScratch[1] = e.weight
+      // Which characters this effect is on. In the clock block because that is
+      // the one uniform a field mount already has per effect, and both are the
+      // same kind of thing: what is true of THIS effect this frame.
+      this.fieldClockScratch[2] = e.subjectMask
       this.device.queue.writeBuffer(e.fieldClock, 0, this.fieldClockScratch.buffer as ArrayBuffer)
     }
     // ONE PASS PER RESOLUTION, N draws each, in document order — a pair is
@@ -5759,7 +6005,9 @@ export class Engine {
     const read: [GPUTextureView, GPUTextureView] = [textures[0].createView(), textures[1].createView()]
     const uniform = this.device.createBuffer({
       label: "grid uniforms",
-      size: 16,
+      // Two vec4s: (time, dt, size, frame) and the subject mask, which WGSL pads
+      // out to the second one whether or not anything else joins it.
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
 
@@ -5789,7 +6037,7 @@ export class Engine {
           layout,
           binds: [bindFor(0), bindFor(1)],
           uniform,
-          data: new Float32Array(4),
+          data: new Float32Array(8),
           parity: 0,
           frame: 0,
           params: params.buffer,
@@ -5847,6 +6095,7 @@ export class Engine {
     grid.data[1] = scheduled ? e.simStep : Math.min(0.1, Math.max(0, deltaTime))
     grid.data[2] = grid.size
     grid.data[3] = grid.frame++
+    grid.data[4] = e.subjectMask
     this.device.queue.writeBuffer(grid.uniform, 0, grid.data.buffer as ArrayBuffer)
     const cp = encoder.beginComputePass({ label: "grid" })
     cp.setPipeline(grid.pipeline)
@@ -5920,6 +6169,45 @@ export class Engine {
 
   getEffectInfluence(index: number): number {
     return this.effects[index]?.influence ?? 0
+  }
+
+  /**
+   * WHICH MODELS one effect is on, by name. Null is the whole cast, which is
+   * what an effect starts as and what every effect did before this existed.
+   *
+   * The filter lands in the INDEX SPACE the shaders read, not in the shaders: the
+   * effect's rzSubjectCount() counts only the models named, and rzSubject(0),
+   * rzAnchor(0, …) and rzTrail(0, …) are the first of them. So a file written
+   * against the whole cast — every shipped built-in — is aimed by this without a
+   * line changing, and one that hardcodes subject 0 follows the model it is aimed
+   * at rather than whoever happened to load first.
+   *
+   * Names, because a cast SLOT is not a property of a model: the cast is every
+   * visible character in load order, so hiding one moves everybody after them up
+   * a slot. They resolve in the loop that assigns the slots, once a frame.
+   *
+   * A name the cast does not hold is simply not in the mask — a model still
+   * loading, or one since removed. It is not an error and not a warning: the
+   * cast changes under a scene all the time, and a target is a claim about the
+   * scene rather than about this frame of it.
+   *
+   * Aiming an effect that reads no cast at all (rain, a glitch, a tone curve)
+   * does nothing, and that is why the install reports `readsCast` — so a host
+   * can decline to offer the control rather than offer one that does nothing.
+   */
+  setEffectSubjects(index: number, models: readonly string[] | null): void {
+    const fx = this.effects[index]
+    if (!fx) return
+    fx.subjects = normalizeSubjects(models)
+    // The distance field is built per distinct target set, so changing one may
+    // add or drop a whole flood — and the field bind groups name the texture it
+    // resolves into.
+    if (fx.readsCastDistance) this.syncCastDistanceVariants()
+  }
+
+  /** What one effect is aimed at, or null for the whole cast. */
+  getEffectSubjects(index: number): readonly string[] | null {
+    return this.effects[index]?.subjects ?? null
   }
 
   /**
@@ -15484,14 +15772,20 @@ export class Engine {
   }
 
   /** The model at one cast slot — the subject rzSubject(index) reads. */
-  private castSubjectName(index: number): string | null {
+  private castSubjectName(index: number, subjects: readonly string[] | null = null): string | null {
     let n = 0
+    let local = 0
     let found: string | null = null
     this.forEachInstance((inst) => {
       if (found !== null || n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible)
         return
-      if (n === index) found = inst.name
       n++
+      // The effect's OWN index, which is what its shaders count in: an effect
+      // aimed at the third dancer finds her at 0, so a #dissolve on it takes HER
+      // apart rather than whoever stands at the head of the cast.
+      if (subjects && !subjects.includes(inst.name)) return
+      if (local === index) found = inst.name
+      local++
     })
     return found
   }
@@ -15518,9 +15812,10 @@ export class Engine {
    *
    * Two things ask for one. A cycle set on a model (setModelDissolveCycle) runs
    * on the scene clock and repeats, as it always has. An effect declaring
-   * `#dissolve` takes subject 0 apart on ITS OWN terms: scheduled, the cycle on
-   * each clip's clock with her whole between clips; unscheduled, the same
-   * repeating cycle as before. Where both ask, the more dissolved wins — two
+   * `#dissolve` takes ITS OWN subject 0 apart on its own terms — the first model
+   * it is aimed at, the head of the cast when it is aimed at nobody in
+   * particular: scheduled, the cycle on each clip's clock with her whole between
+   * clips; unscheduled, the same repeating cycle as before. Where both ask, the more dissolved wins — two
    * answers about one body, and half a body is not one of them.
    */
   private evaluateDissolves(): void {
@@ -15531,7 +15826,7 @@ export class Engine {
     for (const fx of this.effects) {
       if (!fx.dissolve) continue
       const cycle = dissolveCycleOf(this.dissolveTimingsOf(fx, fx.dissolve))
-      const subject = this.castSubjectName(0)
+      const subject = this.castSubjectName(0, fx.subjects)
       if (!cycle || !subject) continue
       if (fx.window && fx.window.length > 0) {
         transport ??= this.transportTime()
@@ -16301,9 +16596,16 @@ export class Engine {
       // spawned its motes off a body nobody could see, and the silhouette field
       // seeded on one. The cast is who is ON STAGE.
       let n = 0
+      this.castSlotOf.clear()
       this.forEachInstance((inst) => {
         if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
         const m = inst.model
+        // WHO IS IN WHICH SLOT, recorded here because here is where it is
+        // decided. An effect is aimed by model name, and a name only becomes a
+        // bit in a mask once this loop has said where that model sits — a slot
+        // is a position in the cast, not a property of a model, and a hidden
+        // model moves everybody after it up one.
+        this.castSlotOf.set(inst.name, n)
         // The model transform is only where the model was PLACED. A motion moves
         // the character by animating bones, so an effect anchored to the
         // transform never follows anyone anywhere — it sits at the spawn point
@@ -16334,6 +16636,8 @@ export class Engine {
       // drawTrails. Recorded rather than recomputed: this loop is the one place
       // that knows how many subjects the cast actually ended up holding.
       this.castSubjectCount = n
+      // Each effect's own view of that cast, before any mount reads it.
+      this.updateSubjectMasks()
       this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
       // Only what an effect declared, and only while one is installed. A scene
       // with no effect writes nothing here at all.
@@ -16350,6 +16654,59 @@ export class Engine {
         this.device.queue.writeBuffer(this.castBuffer, 0, this.castData, 0, used * 4)
         this.castLastMs = performance.now()
       }
+    }
+  }
+
+  /**
+   * Every effect's own view of the cast, once a frame, right after the slots are
+   * assigned and before any mount reads them.
+   *
+   * The mask is what the shaders see: CAST_API counts its bits for
+   * rzSubjectCount() and walks them for rzSubject(i), so an effect aimed at the
+   * third dancer alone finds her at index 0. `subjectCount` is the same number on
+   * the CPU, for the one thing that needs it there — the ribbons' instance count,
+   * which must agree with what the trail shader decodes or a ribbon lands on the
+   * wrong body.
+   *
+   * Recomputed rather than cached against a version: it is four models, a map
+   * lookup each, and the alternative is a cache that has to be invalidated from
+   * every place a model can be added, removed, hidden or renamed.
+   */
+  private updateSubjectMasks(): void {
+    const live = this.castSubjectCount
+    const all = live === 0 ? 0 : (1 << live) - 1
+    for (const e of this.effects) {
+      let mask = 0xf
+      if (e.subjects) {
+        mask = 0
+        for (const name of e.subjects) {
+          const slot = this.castSlotOf.get(name)
+          if (slot !== undefined) mask |= 1 << slot
+        }
+      }
+      e.subjectMask = mask
+      let n = 0
+      for (let i = 0; i < live; i++) if (mask & (1 << i)) n++
+      e.subjectCount = n
+    }
+    // The floods, one per distinct target set. Their masks are written here for
+    // the same reason the effects' are: the slots have just been decided.
+    for (const v of this.castDistanceVariants) {
+      let mask = 0xf
+      if (v.subjects) {
+        mask = 0
+        for (const name of v.subjects) {
+          const slot = this.castSlotOf.get(name)
+          if (slot !== undefined) mask |= 1 << slot
+        }
+      }
+      // Bounded by the live cast, so a mask naming a slot nobody occupies cannot
+      // seed off a stale entry in the buffer.
+      const want = mask & all
+      if (v.mask === want) continue
+      v.mask = want
+      v.data[0] = want
+      this.device.queue.writeBuffer(v.uniform, 0, v.data.buffer as ArrayBuffer)
     }
   }
 

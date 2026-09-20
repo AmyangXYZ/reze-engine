@@ -461,7 +461,9 @@ test("the subject id and the pick id are the same number", () => {
   // same field off the instance. Two derivations of one id are two that drift,
   // and then a mask selects a different model than a click does.
   assert.match(engine, /cd\[b \+ 7\] = inst\.objectId/, "the cast must carry the object id")
-  assert.match(fieldWith(true), new RegExp(`return u32\\(_rzCast\\[i \\* ${EFFECT_SUBJECT_VEC4S} \\+ 1\\]\\.w\\)`), "rzSubjectId must read that same slot")
+  // `g` is the cast slot rzSubjectId mapped the effect's own index to — the one
+  // thing between them, and the reason a mask and a click still agree.
+  assert.match(fieldWith(true), new RegExp(`return u32\\(_rzCast\\[g \\* ${EFFECT_SUBJECT_VEC4S} \\+ 1\\]\\.w\\)`), "rzSubjectId must read that same slot")
 })
 
 test("only the ground blends premultiplied, and only because it premultiplies", () => {

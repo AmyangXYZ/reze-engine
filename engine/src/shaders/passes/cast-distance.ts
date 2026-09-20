@@ -86,6 +86,14 @@ fn vs(@builtin(vertex_index) i: u32) -> VSOut {
  * HOLE in the seeds wherever it covers her, and the field grows into it from
  * her side, so the border ran round the inside of the prop instead of the
  * outside.
+ *
+ * WHICH SUBJECTS SEED IS A MASK, because an effect can be aimed at some of the
+ * cast and this field is how a screen-space look knows where anybody is. The
+ * distance to a model left out of the mask is not "large", it is a different
+ * question — so a field is built per distinct target set rather than filtered
+ * afterwards. The props are not masked: a prop belongs to whoever is holding it,
+ * and the engine does not know who that is. It seeds either way, which is the
+ * side that keeps a border whole.
  */
 export function buildCastSeedShader(samples: number): string {
   return (
@@ -99,6 +107,8 @@ const RZ_ID_SAMPLES: i32 = ${samples};
 /** The visible props' object ids, count first. Props are not subjects, so the
  *  cast buffer does not carry them. */
 @group(0) @binding(2) var<storage, read> _rzSeedProps: array<u32>;
+/** (subject mask, _, _, _) — which cast slots this field is built from. */
+@group(0) @binding(3) var<uniform> _rzSeedU: vec4f;
 
 // The two cast accessors this pass needs, spelled out rather than pulled in.
 // CAST_API brings subjects, trails, anchors and their aliases with it, and a
@@ -114,9 +124,11 @@ fn rzSubjectId(i: i32) -> u32 {
   if (i < 0 || i >= rzSubjectCount()) { return 0u; }
   return u32(_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 1].w);
 }
-/** Does this object seed the field: a subject, or a prop. */
+/** Does this object seed the field: a MASKED subject, or a prop. */
 fn rzSeeds(o: u32, subjects: i32) -> bool {
+  let mask = u32(_rzSeedU.x);
   for (var i = 0; i < subjects; i++) {
+    if ((mask & (1u << u32(i))) == 0u) { continue; }
     if (o == rzSubjectId(i)) { return true; }
   }
   let props = min(_rzSeedProps[0], arrayLength(&_rzSeedProps) - 1u);

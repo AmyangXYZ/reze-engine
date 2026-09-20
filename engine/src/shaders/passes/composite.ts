@@ -1,7 +1,7 @@
 import { RZ_LIGHT_STRUCT_WGSL } from "../lights"
 import { sceneTapApi } from "../scene-tap"
 import { anchorAliasWgsl } from "../anchor-table"
-import { CAST_API } from "../cast-api"
+import { CAST_API, CAST_MASK_ALL, subjectMaskApi } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
@@ -337,8 +337,9 @@ fn rzResolution() -> vec2f { return viewU[6].zw; }
 /** The camera's world position. */
 fn rzCameraPos() -> vec3f { return viewU[10].xyz; }
 
-/** How many characters are in the scene, up to four. */
-fn rzSubjectCount() -> i32 { return i32(viewU[10].w); }
+/** How many characters the SCENE holds, up to four — the number the cast api
+ *  narrows to this effect's own subjects. See subjectMaskApi. */
+fn _rzCastLive() -> i32 { return i32(viewU[10].w); }
 
 /**
  * A world point as the camera sees it: xy the uv it lands on, z its distance
@@ -407,8 +408,14 @@ fn bgSubjectCount() -> i32 { return rzSubjectCount(); }
  * Clamped rather than bounds-checked: an effect looping past the count reads the
  * last subject instead of sampling whatever follows the array, which is a wrong
  * ripple rather than an undefined one.
+ *
+ * THE INDEX IS THE EFFECT'S OWN, like every other cast accessor — Dry Ice, Water,
+ * Holy Light and Bloody Ash all read this one and all of them should place their
+ * fog, their ripple and their shaft under the model the scene aimed them at. The
+ * mapping is the identity for an effect aimed at nobody in particular, which is
+ * every scene published before one could be aimed.
  */
-fn rzSubjectHip(i: i32) -> vec3f { return viewU[11 + clamp(i, 0, 3)].xyz; }
+fn rzSubjectHip(i: i32) -> vec3f { return viewU[11 + clamp(_rzSubjectSlot(i), 0, 3)].xyz; }
 
 fn bgSubjectPos(i: i32) -> vec3f { return rzSubjectHip(i); }
 
@@ -659,7 +666,13 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
   // The composite is STATIC either way now: the user's code compiles in the
   // field module alone, and the composite only decides whether to sample it.
   return COMPOSITE_HEAD +
-    EFFECT_SCENE_API + anchorAliasWgsl(effect?.alias ?? []) + audioApi(0, 13) + midiApi(0, 19) + lyricsApi(0, 24) + body
+    EFFECT_SCENE_API +
+    subjectMaskApi(CAST_MASK_ALL) +
+    anchorAliasWgsl(effect?.alias ?? []) +
+    audioApi(0, 13) +
+    midiApi(0, 19) +
+    lyricsApi(0, 24) +
+    body
 }
 
 /**
@@ -691,6 +704,9 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
   return (
     COMPOSITE_HEAD +
     EFFECT_SCENE_API +
+    // Which characters this effect is on, out of its own clock block — see the
+    // declaration of _rzFieldClock below for why that buffer is per effect.
+    subjectMaskApi("u32(_rzFieldClock.z)") +
     anchorAliasWgsl(effect.alias ?? []) +
     audioApi(0, 13) +
     midiApi(0, 19) +
@@ -727,7 +743,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
  * whose lightEmit read its own epoch disagreed with its own background()
  * about what time it was. One buffer per effect, one answer.
  */
-@group(0) @binding(22) var<uniform> _rzFieldClock: vec4f;   // (time, weight, _, _)
+@group(0) @binding(22) var<uniform> _rzFieldClock: vec4f;   // (time, weight, subject mask, _)
 
 /** A filter's own straight-alpha output over the premultiplied layers it read
  *  (the layer blend state, restated) and the additive form of the same. */

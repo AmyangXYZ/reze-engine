@@ -4,7 +4,7 @@ import { audioApi } from "../audio-api"
 import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
-import { CAST_API } from "../cast-api"
+import { CAST_API, subjectMaskApi } from "../cast-api"
 import { EFFECT_SUBJECT_VEC4S } from "../cast-layout"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
@@ -54,12 +54,12 @@ export type CastLayout = {
  *  a kernel that displaces fog has to know where the dancer's feet are. */
 function castApi(cast: CastLayout): string {
   return (
-    // rzSubjectCount FIRST, because CAST_API is written against it and this
-    // module has no view uniform to read the engine's count out of. Scanning
-    // for a subject whose bounding sphere has a radius is the same answer by a
+    // _rzCastLive FIRST, because CAST_API is written against it and this module
+    // has no view uniform to read the engine's count out of. Scanning for a
+    // subject whose bounding sphere has a radius is the same answer by a
     // different route — the seam is named at the top of cast-api.ts.
     `
-fn rzSubjectCount() -> i32 {
+fn _rzCastLive() -> i32 {
   var n = 0;
   for (var i = 0; i < RZ_SUBJECTS; i++) {
     if (_rzCast[i * ${EFFECT_SUBJECT_VEC4S} + 2].w > 0.0) { n = i + 1; }
@@ -67,6 +67,7 @@ fn rzSubjectCount() -> i32 {
   return n;
 }
 ` +
+    subjectMaskApi("u32(pu.subjects)") +
     CAST_API +
     trailSlotsApi(cast.trailCount) +
     anchorAliasWgsl(cast.alias)
@@ -111,7 +112,8 @@ struct ParticleU {
   frame: u32,
   /** The effect's evaluated influence, applied at the one output site below. */
   weight: f32,
-  _pad0: f32,
+  /** Which cast slots this effect is on, one bit each — see subjectMaskApi. */
+  subjects: f32,
   _pad1: f32,
   _pad2: f32,
 }

@@ -157,7 +157,10 @@ test("a prop is part of the cast's silhouette", () => {
   const write = engine.slice(engine.indexOf("  private writeCastSeedProps(): void {"), engine.indexOf("  private encodeCastDistance("))
   assert.match(write, /inst\.isProp && inst\.model\.visible/, "every visible prop seeds")
   assert.match(write, /data\[i\+\+\] = inst\.objectId/, "by the id its pixels carry")
-  assert.match(engine, /this\.writeCastSeedProps\(\)\n\s+const seed = encoder\.beginRenderPass/, "written before the seed pass runs")
+  // Before the seed pass, which is now one per target set — the props seed every
+  // one of them, because a prop belongs to whoever is holding it and the engine
+  // does not know who that is.
+  assert.match(engine, /this\.writeCastSeedProps\(\)\n(?:.*\n)*?\s+const seed = encoder\.beginRenderPass/, "written before the seed pass runs")
   assert.match(engine, /\{ binding: 2, resource: \{ buffer: this\.castSeedPropBuffer \} \}/, "and bound to it")
 })
 

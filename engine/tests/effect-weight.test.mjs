@@ -128,11 +128,11 @@ fn lightEmit(i: u32, time: f32) -> RzLight {
   const src = buildLightEmitShader(emit, EFFECT_SCENE_API + anchorAliasWgsl([0]), { trailCount: 2 })
   // Colour, because this buffer is summed by every material that reads it —
   // there is no alpha here to scale instead.
-  assert.match(src, /let c = select\(vec3f\(0\.0\), max\(l\.color \* l\.intensity, vec3f\(0\.0\)\), finite\) \* _rzLightU\.w;/)
+  assert.match(src, /let c = select\(vec3f\(0\.0\), max\(l\.color \* l\.intensity, vec3f\(0\.0\)\), finite\) \* _rzLightU\[0\]\.w;/)
   // Radius is zeroed at weight 0 and untouched above it: a dimming lamp keeps
   // its reach, and one that is off can be culled by distance like a slot that
   // was never filled.
-  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\.w > 0\.0\);/)
+  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\[0\]\.w > 0\.0\);/)
 })
 
 // The engine's own frame path, read as source. These cannot be run here — they

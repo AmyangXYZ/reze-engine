@@ -170,8 +170,8 @@ test("the emit shader writes the slots the material shader reads", () => {
   const src = buildLightEmitShader(EMIT, API, CAST)
   // Same stride and header on both sides of the buffer, expressed against the
   // same constants — this is the seam where a writer and a reader drift.
-  assert.match(src, new RegExp(`let b = ${LIGHT_HEADER}u \\+ \\(u32\\(_rzLightU\\.y\\) \\+ i\\) \\* ${LIGHT_STRIDE}u;`))
-  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\.w > 0\.0\);/)
+  assert.match(src, new RegExp(`let b = ${LIGHT_HEADER}u \\+ \\(u32\\(_rzLightU\\[0\\]\\.y\\) \\+ i\\) \\* ${LIGHT_STRIDE}u;`))
+  assert.match(src, /_rzLightsOut\[b \+ 3u\] = select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\[0\]\.w > 0\.0\);/)
   // Colour x intensity, the same product the CPU writer stores — through the
   // sanitized local, since the raw product is what the guard exists to check.
   assert.match(src, /_rzLightsOut\[b \+ 4u\] = c\.x;/)
@@ -182,7 +182,7 @@ test("the emit shader guards its dispatch tail", () => {
   const src = buildLightEmitShader(EMIT, API, CAST)
   // A workgroup is 64 wide and a count rarely is. Without this the tail threads
   // write into whatever slots follow — another effect's lights, silently.
-  assert.match(src, /if \(i >= u32\(_rzLightU\.z\)\) \{ return; \}/)
+  assert.match(src, /if \(i >= u32\(_rzLightU\[0\]\.z\)\) \{ return; \}/)
 })
 
 test("time is a PARAMETER, so the same source compiles in every module", () => {
@@ -190,7 +190,7 @@ test("time is a PARAMETER, so the same source compiles in every module", () => {
   // spliced into the field, particle, trail or grid module too — where
   // lightEmit is dead code that still has to resolve. Those modules already
   // define rzTime differently, so lightEmit's SIGNATURE must not need it.
-  assert.match(buildLightEmitShader(EMIT, API, CAST), /let l = lightEmit\(i, _rzLightU\.x\);/)
+  assert.match(buildLightEmitShader(EMIT, API, CAST), /let l = lightEmit\(i, _rzLightU\[0\]\.x\);/)
 })
 
 test("the emit module hosts the whole file, so the whole API resolves in it", () => {
@@ -257,7 +257,7 @@ test("RzLight resolves in every module a source is spliced into", () => {
 
 test("the slot base is a uniform, never baked into the text", () => {
   const src = buildLightEmitShader(EMIT, API, CAST)
-  assert.match(src, /u32\(_rzLightU\.y\)/)
+  assert.match(src, /u32\(_rzLightU\[0\]\.y\)/)
   // Baking it would mean recompiling every emitting effect whenever a scene
   // gained or lost a document light — a shader rebuild triggered by moving a
   // lamp. The builder takes no base at all, so it cannot regress to that.
@@ -281,7 +281,7 @@ test("the emit write is sanitized: hosted code cannot poison the frame", () => {
   assert.match(src, /let finite = l\.pos\.x == l\.pos\.x/, "the NaN self-equality check must guard the write")
   assert.match(src, /select\(vec3f\(0\.0\), max\(l\.color \* l\.intensity, vec3f\(0\.0\)\), finite\)/,
     "colour must be clamped at zero — this layer is additive, and negative light darkens")
-  assert.match(src, /select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\.w > 0\.0\)/)
+  assert.match(src, /select\(0\.0, max\(l\.radius, 0\.0\), finite && _rzLightU\[0\]\.w > 0\.0\)/)
 })
 
 test("the header has exactly one writer", () => {

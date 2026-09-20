@@ -41,7 +41,9 @@ test("the subject id and the subject count read the slots the engine writes", as
   const stride = EFFECT_SUBJECT_VEC4S
   // writeCastEntry puts the object id in the hip vec4's w, and the bounds (w =
   // radius, always > 0 for a present subject) one slot further on.
-  assert.match(CAST_API, new RegExp(`_rzCast\\[i \\* ${stride} \\+ 1\\]\\.w`), "rzSubjectId reads the hip vec4's w")
+  // `g`, not `i`: the index an effect passes is its OWN, and every accessor maps
+  // it through _rzSubjectSlot before touching the buffer.
+  assert.match(CAST_API, new RegExp(`_rzCast\\[g \\* ${stride} \\+ 1\\]\\.w`), "rzSubjectId reads the hip vec4's w")
   const engine = readFileSync(join(here, "../src/engine.ts"), "utf8")
   assert.match(engine, /cd\[b \+ 7\] = inst\.objectId/, "the engine writes the id at slot 1, w")
   assert.match(engine, /cd\[b \+ 11\] = height \* 0\.75/, "and the bounds radius at slot 2, w")

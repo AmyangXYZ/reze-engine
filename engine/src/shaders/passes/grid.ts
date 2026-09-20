@@ -3,6 +3,7 @@ import { lyricsApi } from "../lyrics-api"
 import { anchorAliasWgsl } from "../anchor-table"
 import { midiApi } from "../midi-api"
 import { EFFECT_SCENE_API } from "./composite"
+import { subjectMaskApi } from "../cast-api"
 import { SCENE_TAP_STUB } from "../scene-tap"
 import { type CastLayout } from "./particles"
 import { clockApi, trailSlotsApi, viewportApi } from "./hosted-api"
@@ -91,6 +92,11 @@ struct SimU {
   dt: f32,
   size: f32,
   frame: f32,
+  /** Which cast slots this effect is on, one bit each — see subjectMaskApi. */
+  mask: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 }
 `
 
@@ -140,6 +146,9 @@ fn rzGridPrev(uv: vec2f) -> vec4f {
 }
 ` +
     EFFECT_SCENE_API +
+    // Which characters this kernel is on. A wake follows the feet it was aimed
+    // at, and a grid the whole cast walks through is the default.
+    subjectMaskApi("u32(su.mask)") +
     SCENE_TAP_STUB +
     // The alias _rzSlot, which the scene API's accessors route through. Every
     // module embedding EFFECT_SCENE_API must splice this; the sim module was
