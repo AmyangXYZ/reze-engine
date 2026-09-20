@@ -449,6 +449,18 @@ type SunOptions = {
   strength?: number
   /** Direction sunlight travels (points FROM sun TO scene, Blender: -light.rotation.Z). */
   direction?: Vec3
+  /**
+   * How much shadow the sun casts: 1 full, 0 none, and anything between.
+   *
+   * THE SCENE'S ONLY SHADOW SWITCH. Positional lamps are diffuse-only — they
+   * have no shadow term — so this is not "the sun's shadow" beside others, it is
+   * every shadow the renderer has, on the ground catcher and on the cast alike.
+   *
+   * The map is still rendered at 0. It costs a pass nobody reads, and it buys a
+   * toggle that is instant and a dial that is continuous; rebuilding the shadow
+   * pipeline on a switch would make the cheap thing expensive to change.
+   */
+  shadow?: number
 }
 
 /** An effect param: number → f32, vector-like → vec3f (see setEffect).
@@ -9714,7 +9726,10 @@ export class Engine {
     this.lightData[base] = normalized.x
     this.lightData[base + 1] = normalized.y
     this.lightData[base + 2] = normalized.z
-    this.lightData[base + 3] = 0
+    // The direction vec4's spare w, which was a constant 0: how much shadow this
+    // light casts. Only the sun casts at all, so only index 0 is ever read —
+    // sampleShadow in materials/common.ts takes it from lights[0].
+    this.lightData[base + 3] = this.sunShadow
     this.lightData[base + 4] = this.sun.color.x
     this.lightData[base + 5] = this.sun.color.y
     this.lightData[base + 6] = this.sun.color.z
@@ -9737,6 +9752,7 @@ export class Engine {
   setSun(options: SunOptions): void {
     if (options.color) this.sun.color = options.color
     if (options.strength !== undefined) this.sun.strength = options.strength
+    if (options.shadow !== undefined) this.sunShadow = Math.min(Math.max(options.shadow, 0), 1)
     if (options.direction) {
       this.sun.direction = options.direction
       this.shadowLightVPDirty = true
@@ -13363,6 +13379,8 @@ export class Engine {
    *  light frustum tests as shadowed, painting a hard-edged patch the shape of the
    *  frustum onto an otherwise empty floor. */
   private shadowMapPopulated = true
+  /** How much shadow the sun casts — see SunOptions.shadow. Full until told. */
+  private sunShadow = 1
   private shadowLightVPDirty = true
   // Last shadow-volume center, to skip recomputes while nothing moves.
   private readonly shadowCenter = new Vec3(0, 11, 0)

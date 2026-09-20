@@ -215,17 +215,29 @@ ${pcf9("shadowMapFar", `1.0 / ${SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapS
 }
 
 fn sampleShadow(worldPos: vec3f, n: vec3f) -> f32 {
+  // THE SCENE'S ONE SHADOW SWITCH, and it lives on the sun because the sun is
+  // the only thing that casts. Positional lamps are diffuse-only — rzLightsDiffuse
+  // has no shadow term at all — so turning this off turns off every shadow there
+  // is, on the ground and on the cast alike. Gated here rather than by not
+  // rendering the map: the map is also what the ground catcher reads, and a host
+  // that wants a figure lit with no shadow still wants everything else about the
+  // frame unchanged.
+  //
+  // Lit is the answer when it is off. Returning 0 would be "fully shadowed",
+  // which is the opposite of what a disabled shadow means.
+  let cast = light.lights[0].direction.w;
+  if (cast <= 0.0) { return 1.0; }
   if (dot(n, -light.lights[0].direction.xyz) <= 0.0) { return 0.0; }
   let biasedPos = worldPos + n * 0.08;
   let c0 = lightVP.viewProj[0] * vec4f(biasedPos, 1.0);
   let n0 = c0.xyz / max(c0.w, 1e-6);
   if (all(abs(n0.xy) < vec2f(0.98)) && n0.z > 0.0 && n0.z < 1.0) {
-    return sampleShadowNear(n0);
+    return mix(1.0, sampleShadowNear(n0), cast);
   }
   let c1 = lightVP.viewProj[1] * vec4f(biasedPos, 1.0);
   let n1 = c1.xyz / max(c1.w, 1e-6);
   if (all(abs(n1.xy) < vec2f(0.98)) && n1.z > 0.0 && n1.z < 1.0) {
-    return sampleShadowFar(n1);
+    return mix(1.0, sampleShadowFar(n1), cast);
   }
   // Outside every cascade there is no occlusion information; lit is the only
   // honest answer.
