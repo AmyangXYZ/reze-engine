@@ -9,6 +9,7 @@ import { type CastLayout } from "./particles"
 import { clockApi, trailSlotsApi, viewportApi } from "./hosted-api"
 import { idApi } from "../id-api"
 import { sceneLightApi } from "../scene-light-api"
+import { pointsApi } from "../points-api"
 
 // A persistent grid an effect can step and read: the one thing an effect could
 // not have before, which is MEMORY.
@@ -170,6 +171,7 @@ fn rzGrid(uv: vec2f) -> vec4f { return rzGridPrev(uv); }
     // id-api.ts. The author's whole file compiles here, so the names must exist.
     idApi(false, 0, 0) +
     sceneLightApi(false, 0, 0) +
+    pointsApi(false) +
     // Inlined rather than imported from cast-distance, and NOT for tidiness.
     //
     // This module and composite.ts import each other — grid takes

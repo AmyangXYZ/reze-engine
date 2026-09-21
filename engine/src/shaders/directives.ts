@@ -57,6 +57,9 @@ export type EffectDirectives = {
   particles: number
   lights: number
   grid: number
+  /** `#points <prefix>`: every bone on every model whose name starts with it,
+   *  as rzPoint(i) in the particle stages. Null when the file declares none. */
+  points: string | null
   bloom: boolean
   /** This effect takes the cast apart — the host reads the timing. */
   dissolve: boolean
@@ -111,6 +114,7 @@ const SPEC = {
   particles: 1,
   lights: 1,
   grid: 1,
+  points: 1,
   bloom: 0,
   dissolve: 0,
   mirror: 0,
@@ -168,6 +172,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     particles: 0,
     lights: 0,
     grid: 0,
+    points: null,
     bloom: false,
     dissolve: false,
     ground: null,
@@ -284,6 +289,9 @@ export function parseDirectives(wgsl: string): DirectiveResult {
       }
       case "dissolve":
         d.dissolve = true
+        return
+      case "points":
+        d.points = args[0]
         return
       case "mirror":
         d.mirror = true

@@ -23,8 +23,10 @@ export const EFFECT_SUBJECT_VEC4S = 4
  *
  * 8 was reachable, and quietly: two effects each wanting two hands, two feet and
  * a head is ten, so the second one silently lost its ribbons to a diagnostic
- * nobody was reading. 16 is double the headroom for 131KB of storage buffer,
- * where 8 cost 66KB.
+ * nobody was reading. 16 held until an effect traced a HAND: an outline through
+ * every finger reads fifteen bones a hand, thirty for the pair, before any other
+ * effect in the scene asks for one. 48 is that and room beside it, for 393KB of
+ * storage buffer where 16 cost 131KB.
  *
  * The cost really is only that. The per-frame upload is bounded by the last
  * TRAILED slot, not by this cap (see the writeBuffer in updateCastBuffer), so a
@@ -39,7 +41,7 @@ export const EFFECT_SUBJECT_VEC4S = 4
  * scene's anchor count grows, which is a different feature from raising a number
  * that was never load-bearing.
  */
-export const EFFECT_ANCHORS = 16
+export const EFFECT_ANCHORS = 48
 /**
  * Path samples kept per trailed anchor — 128 at the 60Hz sampling rate is a
  * ~2.1 second ribbon.

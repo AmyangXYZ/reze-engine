@@ -140,6 +140,11 @@ export interface Bone {
   appendMove?: boolean
   /** 軸制限: this bone rotates ONLY about this axis (the twist bones use it). */
   fixedAxis?: [number, number, number]
+  /** Where the bone's tail sits at rest, as an offset from its head — the
+   *  direction a PMX editor draws it pointing. PMX states it either as that
+   *  offset or as another bone to point at; both arrive here as the offset.
+   *  An effect reading named points takes it as the point's length and way. */
+  tail?: [number, number, number]
   /** 変形階層: MMD poses whole layers in order, not bones in array order.
    *  Parsed but not yet honoured — distinct from Model's `deformOrder`, which is
    *  this engine's parent-before-child traversal. */
@@ -1094,6 +1099,13 @@ export class Model {
     const idx = this.runtimeSkeleton.nameIndex[boneName]
     if (idx === undefined || idx < 0) return null
     return this.runtimeSkeleton.worldMatrices[idx].values
+  }
+
+  /** A bone's posed matrix by INDEX — model space, column-major, the live
+   *  array. For walking bones that share a name, which the name lookup
+   *  collapses to one. Null past the end. */
+  getBoneWorldMatrixAt(index: number): Float32Array | null {
+    return this.runtimeSkeleton.worldMatrices[index]?.values ?? null
   }
 
   // World bone origin (world matrix col3); unknown name → null

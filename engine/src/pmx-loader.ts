@@ -357,6 +357,8 @@ export class PmxLoader {
         ikLinks?: IKLink[]
         fixedAxis?: [number, number, number]
         deformLayer?: number
+        tailOffset?: [number, number, number]
+        tailBone?: number
       }
       const abs: AbsBone[] = new Array(count)
       // PMX 2.x bone flags (best-effort common masks)
@@ -378,14 +380,14 @@ export class PmxLoader {
         const deformLayer = this.getInt32() // 変形階層
         const flags = this.getUint16()
 
-        // Tail: bone index or offset vector3
+        // Tail: bone index or offset vector3. Kept either way — the bone it
+        // names is resolved to an offset once every head is known.
+        let tailOffset: [number, number, number] | undefined
+        let tailBone: number | undefined
         if ((flags & FLAG_TAIL_IS_BONE) !== 0) {
-          this.getNonVertexIndex(this.boneIndexSize)
+          tailBone = this.getNonVertexIndex(this.boneIndexSize)
         } else {
-          // tail offset vec3
-          this.getFloat32()
-          this.getFloat32()
-          this.getFloat32()
+          tailOffset = [this.getFloat32(), this.getFloat32(), this.getFloat32()]
         }
 
         // Append transform (inherit/ratio)
@@ -475,10 +477,14 @@ export class PmxLoader {
           ikIteration,
           ikLimitAngle,
           ikLinks,
+          tailOffset,
+          tailBone,
         }
       }
       for (let i = 0; i < count; i++) {
         const a = abs[i]
+        const to = a.tailBone !== undefined && a.tailBone >= 0 && a.tailBone < count ? abs[a.tailBone] : null
+        const tail: [number, number, number] | undefined = to ? [to.x - a.x, to.y - a.y, to.z - a.z] : a.tailOffset
         const boneData: Bone = {
           name: a.name,
           parentIndex: a.parent,
@@ -497,6 +503,7 @@ export class PmxLoader {
           ikIteration: a.ikIteration,
           ikLimitAngle: a.ikLimitAngle,
           ikLinks: a.ikLinks,
+          ...(tail ? { tail } : {}),
         }
         bones.push(boneData)
       }

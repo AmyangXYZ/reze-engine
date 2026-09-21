@@ -11,6 +11,7 @@ import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewpor
 import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 import { idApi } from "../id-api"
 import { sceneLightApi } from "../scene-light-api"
+import { pointsApi } from "../points-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
 // Its own shader MODULE rather than more source spliced into composite.ts, for
@@ -109,6 +110,8 @@ type ParticleSource = {
 
 /** Where the shading stage's five scene-light bindings start — see scene-light-api.ts. */
 export const PARTICLE_LIGHT_BINDING = 10
+/** The effect's named points (`#points`), in both stages — see points-api.ts. */
+export const PARTICLE_POINTS_BINDING = 15
 
 /** Bytes per particle. Explicitly padded — see the struct below. */
 export const PARTICLE_STRIDE = 48
@@ -212,6 +215,8 @@ ${src.paramsDecl}
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
     idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) +
+    // The named points, for real: particleInit is where a flame is put on a wick.
+    pointsApi(true, 0, PARTICLE_POINTS_BINDING) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `
@@ -289,6 +294,7 @@ ${src.paramsDecl}
     // The sun's shadow and the world's ambient, for real: the shadow pass has
     // run by the time this draws, inside the scene pass. See scene-light-api.ts.
     sceneLightApi(true, 0, PARTICLE_LIGHT_BINDING) +
+    pointsApi(true, 0, PARTICLE_POINTS_BINDING) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `

@@ -59,6 +59,7 @@ import {
   type SceneFormats,
 } from "./shaders/passes/scene-contract"
 import {
+  LIGHT_GRID_BASE,
   LIGHT_HEADER,
   LIGHT_STRIDE,
   LIGHTS_FLOATS,
@@ -66,6 +67,7 @@ import {
   buildLightEmitShader,
   hasLightEmit,
 } from "./shaders/lights"
+import { buildLightGrid } from "./light-grid"
 import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
 import { outlineShaderWgsl, RZ_OUTLINE_DISSOLVE_OFFSET } from "./shaders/passes/outline"
 import { transparentDepthPrepassWgsl } from "./shaders/passes/depth-prepass"
@@ -114,9 +116,12 @@ import {
   buildParticleComputeShader,
   buildParticleRenderShader,
   PARTICLE_LIGHT_BINDING,
+  PARTICLE_POINTS_BINDING,
   particleEntryPoints,
   PARTICLE_STRIDE,
 } from "./shaders/passes/particles"
+import { MAX_EFFECT_POINTS, POINTS_FLOATS } from "./shaders/points-api"
+import { bonesWithPrefix, pointsData, writeBonePoint } from "./effect-points"
 import {
   SIM_FORMAT,
   GRID_MAX,
@@ -1447,6 +1452,10 @@ interface EffectParticles {
     renderBinds: [GPUBindGroup, GPUBindGroup]
     mirrorRenderBinds: [GPUBindGroup, GPUBindGroup]
   }
+  /** `#points`: the bone-name prefix and the buffer its matches are written
+   *  to each frame. Null when the effect declared none — it then reads the
+   *  engine's empty fallback. */
+  points: { prefix: string; buffer: GPUBuffer; data: Float32Array } | null
 }
 
 /**
@@ -2498,9 +2507,20 @@ export class Engine {
    *  Allocated once at full size and zero-filled, so "no lights" is a count of
    *  zero rather than an absent binding. */
   private lightsBuffer!: GPUBuffer
-  private lightsData!: Float32Array<ArrayBuffer>
-  /** Just the header, for rewriting the total without touching a record. */
+  /** What a particle effect with no `#points` reads at its points binding: a
+   *  count of zero. One buffer for all of them — nothing ever writes it. */
+  private pointsFallback!: GPUBuffer
+  /** Per model, per prefix, the bones `#points` matched. A rig's bones never
+   *  change after load, so the names are walked once rather than every frame. */
+  private pointBones = new WeakMap<Model, Map<string, number[]>>()
+  /** The CPU copy, from construction rather than init: a host sets a scene's
+   *  lamps as soon as its state exists, which can be before the device. */
+  private lightsData = new Float32Array(LIGHTS_FLOATS)
+  /** The same bytes as words — the grid's lamp bits are u32, not floats. */
+  private lightsWords = new Uint32Array(this.lightsData.buffer)
+  /** Just the header: the counts and the grid's placement. */
   private lightHeader = new Float32Array(LIGHT_HEADER)
+  private lightHeaderWords = new Uint32Array(this.lightHeader.buffer)
   /** How many of the slots belong to the DOCUMENT. Effects get what follows. */
   private docLightCount = 0
   private castData!: Float32Array<ArrayBuffer>
@@ -4864,6 +4884,7 @@ export class Engine {
       paramsBuffer?.destroy()
       particles?.buffer.destroy()
       particles?.uniform.destroy()
+      particles?.points?.buffer.destroy()
       grid?.textures[0].destroy()
       grid?.textures[1].destroy()
       grid?.uniform.destroy()
@@ -5248,6 +5269,17 @@ export class Engine {
       cover: particleEntryPoints(wgsl).cover,
     }
     const prepass = src.blend === "cutout" && src.cover
+    const points = d.points
+      ? {
+          prefix: d.points,
+          buffer: this.device.createBuffer({
+            label: `points "${d.points}"`,
+            size: POINTS_FLOATS * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          }),
+          data: pointsData(),
+        }
+      : null
     // Sparks want to spawn where a trail is, so the particle stages see the same
     // cast buffer the trail draw reads.
     const cast = {
@@ -5274,9 +5306,15 @@ export class Engine {
     }
 
     const computeModule = await compile(buildParticleComputeShader(src, cast), "particle compute")
-    if (Array.isArray(computeModule)) return { ok: false, diagnostics: computeModule }
+    if (Array.isArray(computeModule)) {
+      points?.buffer.destroy()
+      return { ok: false, diagnostics: computeModule }
+    }
     const renderModule = await compile(buildParticleRenderShader(src, cast), "particle render")
-    if (Array.isArray(renderModule)) return { ok: false, diagnostics: renderModule }
+    if (Array.isArray(renderModule)) {
+      points?.buffer.destroy()
+      return { ok: false, diagnostics: renderModule }
+    }
 
     // COPY_DST so a scheduled effect can empty its pool when its window starts.
     const buffer = this.device.createBuffer({
@@ -5321,6 +5359,9 @@ export class Engine {
           // author calls it or not. With no grid it is the 1x1 of zeroes.
           { binding: 8, visibility, texture: { sampleType: "float" as const } },
           { binding: 9, visibility, sampler: { type: "filtering" as const } },
+          // The named points, ALWAYS, for the grid's reason: the accessor is
+          // compiled in whether or not the effect declared #points.
+          { binding: PARTICLE_POINTS_BINDING, visibility, buffer: { type: "read-only-storage" as const } },
           // The scene's light, for rzShadow and rzWorldAmbient — the shading
           // stage only; the compute module compiles the stubs. See
           // scene-light-api.ts.
@@ -5354,6 +5395,7 @@ export class Engine {
             ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
             { binding: 8, resource: grid ? grid.read[parity] : this.simFallbackView },
             { binding: 9, resource: this.simSampler },
+            { binding: PARTICLE_POINTS_BINDING, resource: { buffer: points?.buffer ?? this.pointsFallback } },
             ...(shadow
               ? [
                   { binding: PARTICLE_LIGHT_BINDING, resource: { buffer: this.lightUniformBuffer } },
@@ -5429,6 +5471,7 @@ export class Engine {
       if (scoped) {
         buffer.destroy()
         uniform.destroy()
+        points?.buffer.destroy()
         return { ok: false, diagnostics: [scoped.message] }
       }
       return {
@@ -5455,12 +5498,14 @@ export class Engine {
             renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true),
             mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true),
           }),
+          points,
         },
       }
     } catch (e) {
       await this.device.popErrorScope()
       buffer.destroy()
       uniform.destroy()
+      points?.buffer.destroy()
       return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
     }
   }
@@ -5591,6 +5636,7 @@ export class Engine {
       this.device.queue.writeBuffer(e.lights.uniform, 0, e.lights.data.buffer as ArrayBuffer)
     }
     this.lightHeader[0] = Math.min(next, MAX_LIGHTS)
+    this.lightHeader[1] = this.docLightCount
     this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightHeader)
   }
 
@@ -5651,12 +5697,42 @@ export class Engine {
       p.counts[2] = p.count
       p.counts[3] = this.particleFrame++
       this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
+      if (p.points) this.writePoints(p.points)
       const cp = encoder.beginComputePass({ label: "particles" })
       cp.setPipeline(p.compute)
       cp.setBindGroup(0, p.computeBinds[e.grid?.parity ?? 0])
       cp.dispatchWorkgroups(Math.ceil(p.count / 64))
       cp.end()
     }
+  }
+
+  /**
+   * Every bone matching an effect's `#points` prefix, on every visible model,
+   * posed and placed this frame. Every frame rather than on load: a candle a
+   * character carries moves with the hand, and a stage can be moved.
+   *
+   * The order is the models' order, then rig order — stable while nothing is
+   * added or removed, so particle i stays on point i and a flame does not
+   * jump to another wick between frames.
+   */
+  private writePoints(points: { prefix: string; buffer: GPUBuffer; data: Float32Array }): void {
+    let n = 0
+    for (const inst of this.modelInstances.values()) {
+      const m = inst.model
+      if (!m.visible) continue
+      let byPrefix = this.pointBones.get(m)
+      if (!byPrefix) this.pointBones.set(m, (byPrefix = new Map()))
+      let bones = byPrefix.get(points.prefix)
+      const rig = m.getSkeleton().bones
+      if (!bones) byPrefix.set(points.prefix, (bones = bonesWithPrefix(rig, points.prefix)))
+      for (const i of bones) {
+        if (n >= MAX_EFFECT_POINTS) break
+        const world = m.getBoneWorldMatrixAt(i)
+        if (world) writeBonePoint(points.data, n++, world, rig[i].tail, m)
+      }
+    }
+    points.data[0] = n
+    this.device.queue.writeBuffer(points.buffer, 0, points.data.buffer as ArrayBuffer, 0, (4 + n * 8) * 4)
   }
 
   /** Draw the pool. Inside the scene pass, so it is depth-tested and pre-bloom. */
@@ -6051,6 +6127,7 @@ export class Engine {
     for (const e of this.effects) {
       e.particles?.buffer.destroy()
       e.particles?.uniform.destroy()
+      e.particles?.points?.buffer.destroy()
       e.particles = null
     }
   }
@@ -7488,15 +7565,21 @@ export class Engine {
 
     // BEFORE the bind group below, which binds it. Full size from the start:
     // every material pipeline binds this, so sizing it to the light count would
-    // mean rebuilding bind groups whenever a scene gained a lamp. Zero-filled,
-    // and float 0 is a count of 0.
-    this.lightsData = new Float32Array(LIGHTS_FLOATS)
+    // mean rebuilding bind groups whenever a scene gained a lamp. Uploaded from
+    // the CPU copy, which holds any lamps set before the device existed; the
+    // header after it, from the one writer that owns it.
     this.lightsBuffer = this.device.createBuffer({
       label: "positional lights",
       size: this.lightsData.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(this.lightsBuffer, 0, this.lightsData)
+    this.allocateLightSlots()
+    this.pointsFallback = this.device.createBuffer({
+      label: "no points",
+      size: 16,
+      usage: GPUBufferUsage.STORAGE,
+    })
     // BEFORE the per-frame groups, which bind it. The composite needs this 1x1
     // stand-in too, and it used to be created with the composite's own
     // resources further down — far enough down that a material group built up
@@ -10047,6 +10130,20 @@ export class Engine {
       this.lightsData[b + 14] = 0
       this.lightsData[b + 15] = 0
     }
+    // The grid, from the records as STORED — normalised aim, clamped reach, the
+    // cosines in f32 — so it indexes exactly what the shader will evaluate.
+    const grid = buildLightGrid(
+      list.map((_, i) => {
+        const b = LIGHT_HEADER + i * LIGHT_STRIDE
+        const d = this.lightsData
+        return { x: d[b], y: d[b + 1], z: d[b + 2], radius: d[b + 3], ax: d[b + 8], ay: d[b + 9], az: d[b + 10], cosOuter: d[b + 11] }
+      }),
+    )
+    this.lightHeader.set(grid.origin, 4)
+    this.lightHeader[7] = 1 / grid.cell
+    this.lightHeaderWords.set(grid.dims, 8)
+    this.lightHeaderWords.set(grid.outside, 12)
+    this.lightsWords.set(grid.cells, LIGHT_GRID_BASE)
     // The CPU copy is written either way; only the upload needs a device. A
     // scene whose lamps arrive before init keeps them, and init uploads them.
     if (list.length && this.device && this.lightsBuffer) {
@@ -10056,6 +10153,13 @@ export class Engine {
         this.lightsData.buffer as ArrayBuffer,
         LIGHT_HEADER * 4,
         list.length * LIGHT_STRIDE * 4,
+      )
+      this.device.queue.writeBuffer(
+        this.lightsBuffer,
+        LIGHT_GRID_BASE * 4,
+        this.lightsData.buffer as ArrayBuffer,
+        LIGHT_GRID_BASE * 4,
+        grid.cells.byteLength,
       )
     }
     // The effects' bases move when the document's count does; the header —

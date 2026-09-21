@@ -7,6 +7,7 @@ import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLE
 import { audioApi } from "../audio-api"
 import { idApi } from "../id-api"
 import { sceneLightApi } from "../scene-light-api"
+import { pointsApi } from "../points-api"
 import { castDistanceApi, CAST_FIELD_DIV } from "./cast-distance"
 import { lyricsApi, lyricsTextApi } from "../lyrics-api"
 import { midiApi } from "../midi-api"
@@ -724,6 +725,7 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     trailSlotsApi(effect.trailCount) +
     idApi(effect.ids === true, 0, 23) +
     sceneLightApi(false, 0, 0) +
+    pointsApi(false) +
     // Distance to the cast, in SCREEN pixels: the field is half-res, so a field
     // texel is CAST_FIELD_DIV of them and the accessor scales on the way out.
     // An author writes the width they mean and never learns how it is built.

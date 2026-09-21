@@ -11,17 +11,26 @@ import { subjectMaskApi } from "./cast-api"
 // renderer that bolted a second key light onto a toon shader has shipped. A
 // light here brightens; it does not restate the shading.
 //
-// So there are no per-light shadows, no area lights and no clustering. The loop
-// runs over the lights a scene HAS, not over the cap, so a scene with four pays
-// for four; the cap only bounds the buffer and the worst case.
+// So there are no per-light shadows and no area lights. A fragment walks the
+// DOCUMENT's lamps through a world-space grid (see light-grid.ts): its cell
+// names the lamps that can reach it, so a stage rig of fifty costs each pixel
+// the handful standing near it. The lamps an EFFECT emits are placed by a
+// compute pass every frame, which the grid never sees, and are walked in full.
 //
-// LAYOUT. A 4-float header (count, then padding that keeps the records
-// vec4-aligned), then MAX_LIGHTS records of 16 floats — four vec4s:
+// LAYOUT, in 32-bit words, read by the shader as vec4u. A 16-word header:
+//
+//   [0] light count (f32)       [1] how many are the document's (f32)
+//   [4..6] grid origin (f32)    [7] 1 / cell edge (f32)
+//   [8..10] grid dims (u32)     [12..15] the OUTSIDE mask (u32 bits)
+//
+// then MAX_LIGHTS records of 16 floats — four vec4s:
 //
 //   [0..2] position, world space               [3] radius
 //   [4..6] colour PREMULTIPLIED by intensity   [7] type
 //   [8..10] aim, unit, pointing away from the light   [11] cos of the outer angle
 //   [12] cos of the inner angle                [13..15] spare
+//
+// then the grid: LIGHT_MASK_WORDS words of lamp bits per cell.
 //
 // Colour carries intensity because nothing reads them apart: every use is the
 // product, and storing two numbers that are only ever multiplied is two numbers
@@ -39,10 +48,11 @@ import { lyricsApi } from "./lyrics-api"
 import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
 import { idApi } from "./id-api"
 import { sceneLightApi, worldAmbientWgsl } from "./scene-light-api"
+import { pointsApi } from "./points-api"
 
-/** Floats before the first record. One is the count; the rest keep the records
- *  vec4-aligned, which is what lets a future pass read them as vec4s. */
-export const LIGHT_HEADER = 4
+/** Words before the first record: the counts, the grid's placement and the
+ *  outside mask, four vec4s — see the layout above. */
+export const LIGHT_HEADER = 16
 /** Floats per light — see the layout above. */
 export const LIGHT_STRIDE = 16
 /**
@@ -56,15 +66,20 @@ export const LIGHT_STRIDE = 16
  * interior brings a hundred or more, and the ceilings of sixteen and then
  * forty-eight each cut a real scene in half. Past this the extras are dropped.
  *
- * What it does NOT buy: a scene that genuinely lights a fragment from a hundred
- * lamps pays for a hundred iterations of the loop. The distance test below
- * rejects most of them in a few instructions, which is what makes a rig of this
- * size affordable at all; clustering is what replaces the linear walk when a
- * scene wants every one of them close enough to matter.
+ * A fragment pays for the document lamps its grid cell names, so the cost
+ * follows how many reach a place rather than how many the scene holds. It is
+ * also why the cap is 128: one vec4u of bits per cell.
  */
 export const MAX_LIGHTS = 128
-/** Floats in the whole buffer. */
-export const LIGHTS_FLOATS = LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE
+/** Words of lamp bits per grid cell — one bit per lamp the cap allows. */
+export const LIGHT_MASK_WORDS = MAX_LIGHTS / 32
+/** The grid's cell budget. 32k cells over a stage a couple of hundred units
+ *  across is a cell of about four — finer than the lamps it separates. */
+export const LIGHT_GRID_CELLS = 32768
+/** Where the grid starts, in words. */
+export const LIGHT_GRID_BASE = LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE
+/** Words in the whole buffer: header, records, grid. */
+export const LIGHTS_FLOATS = LIGHT_GRID_BASE + LIGHT_GRID_CELLS * LIGHT_MASK_WORDS
 
 /**
  * The RzLight struct, declared in EVERY module a user's source is spliced into.
@@ -164,7 +179,7 @@ ${viewportApi("viewU[6].w")}
 ${trailSlotsApi(cast.trailCount)}
 // The id accessors, stubbed: this module cannot read an attachment the
 // scene pass writes. See id-api.ts — the author's whole file compiles here.
-${idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0)}
+${idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) + pointsApi(false)}
 // The dials the author declared, if any. A lamp is exactly the thing someone
 // retunes — its colour and its reach — so an emitter reads params like every
 // other mount rather than being the one place a #param resolves to nothing.
@@ -229,51 +244,55 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
 
 /** The rz*Light accessors, with the buffer declared at the given binding. */
 export function lightsApi(group: number, binding: number): string {
+  const R = LIGHT_HEADER / 4
+  const S = LIGHT_STRIDE / 4
   return /* wgsl */ `
-@group(${group}) @binding(${binding}) var<storage, read> _rzLights: array<f32>;
+// vec4u, so a record is four loads and a cell's lamp bits are one. Floats come
+// out through bitcast; the bits must NOT pass through f32 on the way, where a
+// mask that happens to spell a NaN is not guaranteed to survive a load.
+@group(${group}) @binding(${binding}) var<storage, read> _rzLights: array<vec4u>;
 
 const RZ_MAX_LIGHTS: u32 = ${MAX_LIGHTS}u;
 
 /** How many positional lights the scene has. Zero is the ordinary case. */
-fn rzLightCount() -> u32 { return min(u32(_rzLights[0]), RZ_MAX_LIGHTS); }
+fn rzLightCount() -> u32 { return min(u32(bitcast<f32>(_rzLights[0].x)), RZ_MAX_LIGHTS); }
+
+/** How many of them the document placed — the ones the grid indexes. */
+fn _rzLightDocCount() -> u32 { return min(u32(bitcast<f32>(_rzLights[0].y)), rzLightCount()); }
+
+/** One vec4 of light i's record. */
+fn _rzLightVec(i: u32, k: u32) -> vec4f { return bitcast<vec4f>(_rzLights[${R}u + i * ${S}u + k]); }
 
 /** Light i's world position. */
-fn rzLightPos(i: u32) -> vec3f {
-  let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u;
-  return vec3f(_rzLights[b], _rzLights[b + 1u], _rzLights[b + 2u]);
-}
+fn rzLightPos(i: u32) -> vec3f { return _rzLightVec(i, 0u).xyz; }
 
 /** How far light i reaches. Its falloff is zero AT this distance, not merely
- *  small, so the light has a bound a cull can be derived from later. */
-fn rzLightRadius(i: u32) -> f32 { return _rzLights[${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 3u]; }
+ *  small, which is the bound the grid is built from. */
+fn rzLightRadius(i: u32) -> f32 { return _rzLightVec(i, 0u).w; }
 
 /** Light i's colour, already multiplied by its intensity. */
-fn rzLightColor(i: u32) -> vec3f {
-  let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 4u;
-  return vec3f(_rzLights[b], _rzLights[b + 1u], _rzLights[b + 2u]);
-}
+fn rzLightColor(i: u32) -> vec3f { return _rzLightVec(i, 1u).xyz; }
 
 /** Where light i points, away from itself. The zero vector for a point light. */
-fn rzLightAim(i: u32) -> vec3f {
-  let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 8u;
-  return vec3f(_rzLights[b], _rzLights[b + 1u], _rzLights[b + 2u]);
-}
+fn rzLightAim(i: u32) -> vec3f { return _rzLightVec(i, 2u).xyz; }
 
 /** The cosines a spot fades between: x its outer edge, y its inner one. A point
  *  light stores (-1, -1), which saturates the cone term to 1. */
-fn rzLightCone(i: u32) -> vec2f {
-  let b = ${LIGHT_HEADER}u + i * ${LIGHT_STRIDE}u + 11u;
-  return vec2f(_rzLights[b], _rzLights[b + 1u]);
+fn rzLightCone(i: u32) -> vec2f { return vec2f(_rzLightVec(i, 2u).w, _rzLightVec(i, 3u).x); }
+
+/** The document lamps that can reach p: its grid cell's bits, or the outside
+ *  mask beyond the grid. Written so a NaN position fails the inside test. */
+fn _rzLightCellMask(p: vec3f) -> vec4u {
+  let g = bitcast<vec4f>(_rzLights[1]);
+  let dims = _rzLights[2].xyz;
+  let c = floor((p - g.xyz) * g.w);
+  if (!(all(c >= vec3f(0.0)) && all(c < vec3f(dims)))) { return _rzLights[3]; }
+  let ci = vec3u(c);
+  return _rzLights[${LIGHT_GRID_BASE / 4}u + (ci.z * dims.y + ci.y) * dims.x + ci.x];
 }
 
 /**
- * Every positional light's contribution at a surface point, as light — not as a
- * finished colour. Multiply by whatever the surface's albedo is.
- *
- * WITH NO LIGHTS THIS RETURNS EXACTLY ZERO and the loop never runs, so a scene
- * that declares none is arithmetically identical to one compiled before lights
- * existed. That is the property the whole feature is gated on: adding this to
- * every material must cost nothing until someone asks for a light.
+ * One light's contribution at a surface point.
  *
  * FALLOFF IS RELATIVE TO THE RADIUS, and deliberately not physical.
  *
@@ -287,33 +306,67 @@ fn rzLightCone(i: u32) -> vec2f {
  * zero, and the curve between them is the same shape whatever the scene's
  * scale. Both dials now mean what they say, which for a composer beats being
  * right about photons. (1 - t²)² — smooth at both ends, exactly 0 at the
- * radius, so the bound a cull could be derived from is still real.
+ * radius, so the bound the grid is built from is real.
+ */
+fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
+  let pr = _rzLightVec(i, 0u);
+  let d = pr.xyz - p;
+  let dist = length(d);
+  // Out of reach before anything else is computed. The grid is conservative —
+  // a cell's bit means the lamp CAN reach part of it — so this still runs.
+  if (dist >= pr.w) { return vec3f(0.0); }
+  let toLight = d / max(dist, 1e-4);
+  // Facing the light, and nothing behind it. No wrap or half-lambert: this
+  // layer adds light, and a wrapped term would lift the shadow side, which is
+  // the ramp's business and not this one's.
+  let ndl = max(dot(n, toLight), 0.0);
+  if (ndl <= 0.0) { return vec3f(0.0); }
+  let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
+  let falloff = 1.0 - t * t;
+  // How far inside the cone this point sits: 1 within the inner angle, 0 past
+  // the outer one, squared for the same soft edge the falloff has. A point
+  // light's (-1, -1) divides by the floor and clamps to 1, so it pays one
+  // dot product and no branch.
+  let cone = rzLightCone(i);
+  let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
+  return rzLightColor(i) * (ndl * falloff * falloff * aim * aim);
+}
+
+/** The lamps named by one word of a cell's bits, lowest first. */
+fn _rzLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f) -> vec3f {
+  var acc = vec3f(0.0);
+  var bits = bits0;
+  loop {
+    if (bits == 0u) { break; }
+    let i = base + firstTrailingBit(bits);
+    bits = bits & (bits - 1u);
+    acc = acc + _rzLightOne(i, p, n);
+  }
+  return acc;
+}
+
+/**
+ * Every positional light's contribution at a surface point, as light — not as a
+ * finished colour. Multiply by whatever the surface's albedo is.
+ *
+ * WITH NO LIGHTS THIS RETURNS EXACTLY ZERO and neither walk runs, so a scene
+ * that declares none is arithmetically identical to one compiled before lights
+ * existed. That is the property the whole feature is gated on: adding this to
+ * every material must cost nothing until someone asks for a light.
  */
 fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
   var acc = vec3f(0.0);
   let count = rzLightCount();
-  for (var i = 0u; i < count; i = i + 1u) {
-    let d = rzLightPos(i) - p;
-    let dist = length(d);
-    // Out of reach before anything else is computed. The falloff is already
-    // exactly zero at the radius, so this changes no pixel — it is what keeps a
-    // stage rig's far lamps off the bill at every fragment they do not light.
-    if (dist >= rzLightRadius(i)) { continue; }
-    let toLight = d / max(dist, 1e-4);
-    // Facing the light, and nothing behind it. No wrap or half-lambert: this
-    // layer adds light, and a wrapped term would lift the shadow side, which is
-    // the ramp's business and not this one's.
-    let ndl = max(dot(n, toLight), 0.0);
-    if (ndl <= 0.0) { continue; }
-    let t = clamp(dist / max(rzLightRadius(i), 1e-4), 0.0, 1.0);
-    let falloff = 1.0 - t * t;
-    // How far inside the cone this point sits: 1 within the inner angle, 0 past
-    // the outer one, squared for the same soft edge the falloff has. A point
-    // light's (-1, -1) divides by the floor and clamps to 1, so it pays one
-    // dot product and no branch.
-    let cone = rzLightCone(i);
-    let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
-    acc = acc + rzLightColor(i) * (ndl * falloff * falloff * aim * aim);
+  let docs = _rzLightDocCount();
+  // The document's lamps: only those the grid says can reach this cell.
+  if (docs > 0u) {
+    let m = _rzLightCellMask(p);
+    acc = acc + _rzLightWord(m.x, 0u, p, n) + _rzLightWord(m.y, 32u, p, n) +
+      _rzLightWord(m.z, 64u, p, n) + _rzLightWord(m.w, 96u, p, n);
+  }
+  // The effects' lamps, which move every frame on the GPU: all of them.
+  for (var i = docs; i < count; i = i + 1u) {
+    acc = acc + _rzLightOne(i, p, n);
   }
   return acc;
 }

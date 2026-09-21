@@ -15,40 +15,59 @@
 import { test } from "node:test"
 import { readFileSync } from "node:fs"
 import assert from "node:assert/strict"
-import { LIGHT_HEADER, LIGHT_STRIDE, LIGHTS_FLOATS, MAX_LIGHTS, lightsApi } from "../dist/shaders/lights.js"
+import { LIGHT_GRID_BASE, LIGHT_GRID_CELLS, LIGHT_HEADER, LIGHT_MASK_WORDS, LIGHT_STRIDE, LIGHTS_FLOATS, MAX_LIGHTS, lightsApi } from "../dist/shaders/lights.js"
+import { buildLightGrid } from "../dist/light-grid.js"
 import { COMMON_MATERIAL_PRELUDE_WGSL } from "../dist/shaders/materials/common.js"
 import { groundShaderWgsl } from "../dist/shaders/passes/ground.js"
 
 const wgsl = lightsApi(0, 6)
 
-test("the buffer is exactly the header plus the records", () => {
-  assert.equal(LIGHTS_FLOATS, LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE)
-  // vec4-aligned, both of them: a later pass wanting to read these as vec4s
-  // must not have to repack the buffer to do it.
+test("the buffer is the header, the records, then the grid", () => {
+  assert.equal(LIGHT_GRID_BASE, LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE)
+  assert.equal(LIGHTS_FLOATS, LIGHT_GRID_BASE + LIGHT_GRID_CELLS * LIGHT_MASK_WORDS)
+  // vec4-aligned, all three: the shader reads the buffer as vec4u.
   assert.equal(LIGHT_HEADER % 4, 0, "the header must not push the records off a vec4 boundary")
   assert.equal(LIGHT_STRIDE % 4, 0, "a record must be a whole number of vec4s")
+  assert.equal(LIGHT_GRID_BASE % 4, 0, "the grid must start on a vec4")
+})
+
+test("a cell's lamp bits are one vec4u, and the shader walks all four words", () => {
+  // The walk is unrolled over m.x..m.w. Raising the cap past 128 without
+  // widening both would drop lamps 128 and up in silence.
+  assert.equal(LIGHT_MASK_WORDS, 4)
+  assert.equal(MAX_LIGHTS, LIGHT_MASK_WORDS * 32)
+  const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
+  for (const [w, base] of [["x", 0], ["y", 32], ["z", 64], ["w", 96]]) {
+    assert.match(body, new RegExp(`_rzLightWord\\(m\\.${w}, ${base}u, p, n\\)`))
+  }
 })
 
 test("the accessors read the slots the writer writes", () => {
   // The engine writes position at b+0..2, radius at b+3, colour at b+4..6.
   // These are the reads. They are in two files and can drift apart in silence —
   // the symptom would be a light with someone else's radius.
-  assert.match(wgsl, new RegExp(`fn rzLightPos\\(i: u32\\) -> vec3f \\{\\s*let b = ${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u;`))
-  assert.match(wgsl, new RegExp(`fn rzLightRadius\\(i: u32\\) -> f32 \\{ return _rzLights\\[${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u \\+ 3u\\]`))
-  assert.match(wgsl, new RegExp(`let b = ${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u \\+ 4u;`))
+  assert.match(wgsl, new RegExp(`return bitcast<vec4f>\\(_rzLights\\[${LIGHT_HEADER / 4}u \\+ i \\* ${LIGHT_STRIDE / 4}u \\+ k\\]\\)`))
+  assert.match(wgsl, /fn rzLightPos\(i: u32\) -> vec3f \{ return _rzLightVec\(i, 0u\)\.xyz; \}/)
+  assert.match(wgsl, /fn rzLightRadius\(i: u32\) -> f32 \{ return _rzLightVec\(i, 0u\)\.w; \}/)
+  assert.match(wgsl, /fn rzLightColor\(i: u32\) -> vec3f \{ return _rzLightVec\(i, 1u\)\.xyz; \}/)
 })
 
 test("the count is clamped in the shader, not only by the writer", () => {
   // The buffer is fixed size. A count past the cap — a stale write, a caller
   // reaching in — would read past the records into whatever follows, so the
   // shader clamps rather than trusting the number it was handed.
-  assert.match(wgsl, /return min\(u32\(_rzLights\[0\]\), RZ_MAX_LIGHTS\)/)
+  assert.match(wgsl, /return min\(u32\(bitcast<f32>\(_rzLights\[0\]\.x\)\), RZ_MAX_LIGHTS\)/)
+  // And the document's share can never exceed the whole.
+  assert.match(wgsl, /return min\(u32\(bitcast<f32>\(_rzLights\[0\]\.y\)\), rzLightCount\(\)\)/)
 })
 
 test("the loop is bounded by the count, so zero lights runs nothing", () => {
   const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
   assert.match(body, /let count = rzLightCount\(\);/)
-  assert.match(body, /for \(var i = 0u; i < count; i = i \+ 1u\)/)
+  // The grid is consulted only when the document placed lamps, and the
+  // effects' walk starts where the document's end: with none, neither runs.
+  assert.match(body, /if \(docs > 0u\) \{/)
+  assert.match(body, /for \(var i = docs; i < count; i = i \+ 1u\)/)
   // Starts at zero and only ever accumulates inside the loop, so with no
   // lights it returns exactly vec3f(0.0) — and adding that to a colour is an
   // exact float operation, which is what makes "bit-identical" true rather
@@ -65,7 +84,7 @@ test("both surfaces that shade get the same accessors", () => {
   assert.match(groundShaderWgsl(), /let lamps = rzLightsDiffuse\(i\.worldPos, n\);/)
   // Same binding in both, or one of them reads the wrong buffer.
   for (const src of [COMMON_MATERIAL_PRELUDE_WGSL, groundShaderWgsl()]) {
-    assert.match(src, /@group\(0\) @binding\(6\) var<storage, read> _rzLights: array<f32>;/)
+    assert.match(src, /@group\(0\) @binding\(6\) var<storage, read> _rzLights: array<vec4u>;/)
   }
 })
 
@@ -336,15 +355,119 @@ test("the cap clears a game stage's rig", () => {
   // this bounds the buffer and the worst case rather than the ordinary one, and
   // the buffer is storage — 128 records is 8 KiB.
   assert.ok(MAX_LIGHTS >= 128, `MAX_LIGHTS is ${MAX_LIGHTS}`)
-  assert.equal(LIGHTS_FLOATS * 4, 8208)
+  // Header, 128 records, and 32k cells of four words — about half a megabyte,
+  // bound once to every material.
+  assert.equal(LIGHTS_FLOATS * 4, 532544)
 })
 
 test("the record holds a spot's aim and cone where the writer puts them", () => {
   // engine.ts writes aim at b+8..10 and the cosines at b+11, b+12. These are the
   // reads; drift shows up as a spot pointing somewhere else.
-  assert.match(wgsl, new RegExp(`fn rzLightAim\\(i: u32\\) -> vec3f \\{\\s*let b = ${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u \\+ 8u;`))
-  assert.match(wgsl, new RegExp(`fn rzLightCone\\(i: u32\\) -> vec2f \\{\\s*let b = ${LIGHT_HEADER}u \\+ i \\* ${LIGHT_STRIDE}u \\+ 11u;`))
-  const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
-  assert.match(body, /if \(dist >= rzLightRadius\(i\)\) \{ continue; \}/, "out of reach is skipped before the rest")
+  // Word 8 is the third vec4's x; 11 its w; 12 the fourth vec4's x.
+  assert.match(wgsl, /fn rzLightAim\(i: u32\) -> vec3f \{ return _rzLightVec\(i, 2u\)\.xyz; \}/)
+  assert.match(wgsl, /fn rzLightCone\(i: u32\) -> vec2f \{ return vec2f\(_rzLightVec\(i, 2u\)\.w, _rzLightVec\(i, 3u\)\.x\); \}/)
+  const body = wgsl.slice(wgsl.indexOf("fn _rzLightOne"))
+  assert.match(body, /if \(dist >= pr\.w\) \{ return vec3f\(0\.0\); \}/, "out of reach is skipped before the rest")
   assert.match(body, /aim \* aim/, "the cone edge is squared like the falloff")
+})
+
+// ── The grid ──
+
+/** A lamp as setLights stores it, and as the grid builder reads it back. */
+function lamp(pos, radius, aim, deg) {
+  if (!aim) return { x: pos[0], y: pos[1], z: pos[2], radius, ax: 0, ay: 0, az: 0, cosOuter: -1, pos, cone: [-1, -1] }
+  const len = Math.hypot(...aim)
+  const a = aim.map((v) => v / len)
+  const cone = coneOf(deg)
+  return { x: pos[0], y: pos[1], z: pos[2], radius, ax: a[0], ay: a[1], az: a[2], cosOuter: cone[0], pos, aim: a, cone }
+}
+
+/** The shader's lookup, in f32 where the shader is: the header stores the
+ *  origin and 1/cell as floats. */
+function maskAt(grid, p) {
+  const f = Math.fround
+  const inv = f(1 / grid.cell)
+  const c = [0, 1, 2].map((k) => Math.floor(f(f(p[k] - f(grid.origin[k])) * inv)))
+  const inside = c.every((v, k) => v >= 0 && v < grid.dims[k])
+  if (!inside) return grid.outside
+  const at = ((c[2] * grid.dims[1] + c[1]) * grid.dims[0] + c[0]) * LIGHT_MASK_WORDS
+  return grid.cells.subarray(at, at + LIGHT_MASK_WORDS)
+}
+const has = (mask, i) => ((mask[i >> 5] >>> (i & 31)) & 1) === 1
+
+/** Deterministic, so a failure reproduces. */
+function rng(seed) {
+  let s = seed >>> 0
+  return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296)
+}
+
+test("the grid never drops a lamp from a point it lights", () => {
+  // The one property the grid must hold: conservative. A bit missing from a
+  // cell is a hole in the light; a spare bit costs a few instructions.
+  // x340-shaped: a cluster of small lamps, a few mid-sized, and stage spots
+  // reaching hundreds of units from far outside the cluster.
+  const r = rng(7)
+  const lamps = []
+  for (let i = 0; i < 40; i++) lamps.push(lamp([r() * 60 - 30, r() * 10, r() * 60 - 30], 3 + r() * 8))
+  for (let i = 0; i < 6; i++) lamps.push(lamp([r() * 200 - 100, 20 + r() * 20, r() * 200 - 100], 20 + r() * 30))
+  for (let i = 0; i < 6; i++) {
+    lamps.push(lamp([-120 + r() * 40, 50, 60 + r() * 60], 307, [0.6 + r() * 0.2, -0.7, r() * 0.6 - 0.3], 40 + r() * 50))
+  }
+  const grid = buildLightGrid(lamps)
+  let lit = 0
+  for (let s = 0; s < 40000; s++) {
+    const p = [r() * 500 - 250, r() * 80 - 10, r() * 500 - 250]
+    const m = maskAt(grid, p)
+    lamps.forEach((l, i) => {
+      // Facing the lamp head-on, so N·L never hides a missing bit.
+      const d = [l.x - p[0], l.y - p[1], l.z - p[2]]
+      const len = Math.hypot(...d) || 1
+      if (contribution(l, p, d.map((v) => v / len)) > 0) {
+        lit++
+        assert.ok(has(m, i), `lamp ${i} lights (${p.map((v) => v.toFixed(2))}) but its bit is missing`)
+      }
+    })
+  }
+  assert.ok(lit > 10000, `the sample must actually hit lit points (hit ${lit})`)
+})
+
+test("the grid actually separates lamps", () => {
+  // Conservative is trivially satisfied by setting every bit; that would be
+  // correct and exactly as slow as before. Two lamps far apart must not share
+  // the cells around either one.
+  const grid = buildLightGrid([lamp([0, 0, 0], 5), lamp([100, 0, 0], 5)])
+  assert.ok(has(maskAt(grid, [1, 0, 0]), 0) && !has(maskAt(grid, [1, 0, 0]), 1))
+  assert.ok(has(maskAt(grid, [99, 0, 0]), 1) && !has(maskAt(grid, [99, 0, 0]), 0))
+  // A spot claims the cells in its beam and not the ones behind it.
+  const spot = buildLightGrid([lamp([0, 0, 0], 50, [0, -1, 0], 30), lamp([0, 0, 0], 5)])
+  assert.ok(has(maskAt(spot, [0, -20, 0]), 0), "down the beam")
+  assert.ok(!has(maskAt(spot, [0, 20, 0]), 0), "behind the lamp")
+})
+
+test("the grid stays inside its cell budget and places a lone lamp", () => {
+  const r = rng(3)
+  const many = Array.from({ length: 128 }, () => lamp([r() * 1000, r() * 1000, r() * 1000], 1 + r() * 400))
+  const grid = buildLightGrid(many)
+  assert.ok(grid.dims[0] * grid.dims[1] * grid.dims[2] <= LIGHT_GRID_CELLS)
+  assert.equal(grid.cells.length, grid.dims[0] * grid.dims[1] * grid.dims[2] * LIGHT_MASK_WORDS)
+  const one = buildLightGrid([lamp([5, 5, 5], 2)])
+  assert.ok(has(maskAt(one, [5, 5, 5]), 0))
+})
+
+test("no lamps is an empty grid, and a lamp with no reach sets nothing", () => {
+  const none = buildLightGrid([])
+  assert.deepEqual(none.dims, [0, 0, 0])
+  assert.equal(none.cells.length, 0)
+  const dark = buildLightGrid([lamp([0, 0, 0], 0), lamp([10, 0, 0], 4)])
+  assert.ok(!has(maskAt(dark, [0, 0, 0]), 0))
+  assert.ok(!has(dark.outside, 0))
+})
+
+test("the shader and the builder agree on the cell order", () => {
+  // x fastest, then y, then z — the builder's index and the shader's. Drift
+  // here shows as lamps lighting the wrong corner of the stage.
+  assert.match(wgsl, /\(ci\.z \* dims\.y \+ ci\.y\) \* dims\.x \+ ci\.x/)
+  assert.match(wgsl, new RegExp(`_rzLights\\[${LIGHT_GRID_BASE / 4}u \\+ `))
+  const src = readFileSync(new URL("../src/light-grid.ts", import.meta.url), "utf8")
+  assert.match(src, /\(\(z \* dims\[1\] \+ y\) \* dims\[0\] \+ x\) \* LIGHT_MASK_WORDS/)
 })
