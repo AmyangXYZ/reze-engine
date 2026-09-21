@@ -118,6 +118,9 @@ import {
   PARTICLE_LIGHT_BINDING,
   PARTICLE_POINTS_BINDING,
   particleEntryPoints,
+  PARTICLE_INDIRECT_BINDING,
+  PARTICLE_INDIRECT_BYTES,
+  PARTICLE_INDIRECT_DRAW_OFFSET,
   PARTICLE_STRIDE,
 } from "./shaders/passes/particles"
 import { MAX_EFFECT_POINTS, POINTS_FLOATS } from "./shaders/points-api"
@@ -1451,11 +1454,16 @@ interface EffectParticles {
     computeBinds: [GPUBindGroup, GPUBindGroup]
     renderBinds: [GPUBindGroup, GPUBindGroup]
     mirrorRenderBinds: [GPUBindGroup, GPUBindGroup]
+    countBinds: [GPUBindGroup, GPUBindGroup] | null
   }
   /** `#points`: the bone-name prefix and the buffer its matches are written
    *  to each frame. Null when the effect declared none — it then reads the
    *  engine's empty fallback. */
   points: { prefix: string; buffer: GPUBuffer; data: Float32Array } | null
+  /** `particleCount`: the kernel that writes the frame's live count and the
+   *  indirect arguments it writes them to. Null when the effect declared none —
+   *  the whole pool is then stepped and drawn. */
+  live: { pipeline: GPUComputePipeline; indirect: GPUBuffer; binds: [GPUBindGroup, GPUBindGroup] } | null
 }
 
 /**
@@ -2085,12 +2093,13 @@ export class Engine {
    * prefix sum and readback a compacted draw list would need every frame.
    */
   /** Ceiling for `#particles`. Past this an author is asking for a stall. */
-  // Raised for the lawn: 65536 blades at real density is a 40-unit patch and
-  // an 80-unit one wants four hundred thousand. A cutout pool's cost is
+  // Raised for the lawn: an 80-unit field at 36 blades a unit wants seven
+  // hundred thousand, and a turf one three million. A cutout pool's cost is
   // bounded by the pixels it covers, not by the count — the step is one
-  // compute invocation per slot, the pool buffer is 48 bytes each (24 MB at
-  // the cap), and a culled blade is a degenerate quad the rasteriser drops.
-  private static readonly MAX_PARTICLES = 524288
+  // compute invocation per slot, the pool buffer is 48 bytes each (96 MiB at
+  // the cap, under the 128 MiB a storage binding may be without asking for
+  // more), and a culled blade is a degenerate quad the rasteriser drops.
+  private static readonly MAX_PARTICLES = 2097152
   private particleFrame = 0
   /**
    * The installed effect's persistent grid, or null when it declared none.
@@ -2654,7 +2663,9 @@ export class Engine {
   // GPU texture can't be read back cheaply, and PMX diffuse alpha is usually 1.0
   // even for see-through cloth: the translucency lives in the texture).
   private textureAlphaCache = new Map<string, { a: Uint8ClampedArray; w: number; h: number } | null>()
-  private mipBlitPipeline: GPURenderPipeline | null = null
+  /** One per format: a render pipeline is bound to its target's format, and
+   *  material textures are sRGB while a group's data maps are not. */
+  private mipBlitPipelines = new Map<GPUTextureFormat, GPURenderPipeline>()
   private mipBlitSampler: GPUSampler | null = null
   private _nextDefaultModelId = 0
 
@@ -4347,6 +4358,7 @@ export class Engine {
         e.particles.computeBinds = b.computeBinds
         e.particles.renderBinds = b.renderBinds
         e.particles.mirrorRenderBinds = b.mirrorRenderBinds
+        if (e.particles.live && b.countBinds) e.particles.live.binds = b.countBinds
       }
       if (e.grid) e.grid.binds = [this.gridBindGroup(e.grid, 0), this.gridBindGroup(e.grid, 1)]
       if (e.lights) e.lights.bind = this.lightEmitBindGroup(e.lights.layout, e.lights.uniform, e.lights.params)
@@ -4885,6 +4897,7 @@ export class Engine {
       particles?.buffer.destroy()
       particles?.uniform.destroy()
       particles?.points?.buffer.destroy()
+      particles?.live?.indirect.destroy()
       grid?.textures[0].destroy()
       grid?.textures[1].destroy()
       grid?.uniform.destroy()
@@ -5267,6 +5280,7 @@ export class Engine {
       paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING),
       gridSize: grid?.size ?? 0,
       cover: particleEntryPoints(wgsl).cover,
+      live: particleEntryPoints(wgsl).count,
     }
     const prepass = src.blend === "cutout" && src.cover
     const points = d.points
@@ -5332,6 +5346,16 @@ export class Engine {
     })
     const uniformBytes = new ArrayBuffer(32)
     const uniformView = { floats: new Float32Array(uniformBytes), uints: new Uint32Array(uniformBytes) }
+    // The live count's arguments — written by rzCount, read by the step's
+    // dispatch and the quads' draws. Zero until the first step, so a pool
+    // drawn before it has stepped draws nothing rather than everything.
+    const indirect = src.live
+      ? this.device.createBuffer({
+          label: "particle indirect",
+          size: PARTICLE_INDIRECT_BYTES,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT,
+        })
+      : null
 
     // Visibility is per LAYOUT, not shared: a read_write storage buffer may not be
     // visible to the vertex stage at all (WebGPU forbids it — a vertex shader
@@ -5339,7 +5363,7 @@ export class Engine {
     // Declaring one set of flags for both layouts is what made the pipeline
     // layout invalid, and the error surfaces later and unhelpfully as "invalid
     // due to a previous error".
-    const layoutFor = (storage: GPUBufferBindingType, visibility: number, shadow: boolean) =>
+    const layoutFor = (storage: GPUBufferBindingType, visibility: number, shadow: boolean, withIndirect: boolean) =>
       this.device.createBindGroupLayout({
         entries: [
           { binding: 0, visibility, buffer: { type: storage } },
@@ -5374,13 +5398,21 @@ export class Engine {
                 { binding: PARTICLE_LIGHT_BINDING + 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" as const } },
               ]
             : []),
+          // The live count's arguments, for the COUNT kernel's layout alone. The
+          // step's layout must not carry them: a bound group's entries count
+          // toward a pass's usage whether the shader reads them or not, and a
+          // buffer may not be writable storage and indirect arguments in one
+          // pass.
+          ...(withIndirect
+            ? [{ binding: PARTICLE_INDIRECT_BINDING, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" as const } }]
+            : []),
         ],
       })
     /** One per GRID PARITY, for the reason rebuildFieldBindGroup gives: the grid
      *  alternates which texture is current, and rebuilding a single group every
      *  frame is waste for a change that only ever toggles between two known
      *  states. Both entries are the same view when there is no grid. */
-    const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer, shadow: boolean) =>
+    const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer, shadow: boolean, withIndirect: boolean) =>
       [0, 1].map((parity) =>
         this.device.createBindGroup({
           layout,
@@ -5405,12 +5437,14 @@ export class Engine {
                   { binding: PARTICLE_LIGHT_BINDING + 4, resource: this.shadowComparisonSampler },
                 ]
               : []),
+            ...(withIndirect && indirect ? [{ binding: PARTICLE_INDIRECT_BINDING, resource: { buffer: indirect } }] : []),
           ],
         }),
       ) as [GPUBindGroup, GPUBindGroup]
 
-    const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE, false)
-    const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, true)
+    const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE, false, false)
+    const countLayout = indirect ? layoutFor("storage", GPUShaderStage.COMPUTE, false, true) : null
+    const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, true, false)
 
     // Additive keeps the destination and adds to it, and leaves alpha alone, so
     // a glow does not claim coverage it never occluded. The MASK sums with it —
@@ -5425,11 +5459,24 @@ export class Engine {
 
     this.device.pushErrorScope("validation")
     try {
+      const computePipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [computeLayout] })
       const compute = await this.device.createComputePipelineAsync({
         label: "particle compute pipeline",
-        layout: this.device.createPipelineLayout({ bindGroupLayouts: [computeLayout] }),
+        layout: computePipelineLayout,
         compute: { module: computeModule, entryPoint: "main" },
       })
+      const live =
+        indirect && countLayout
+          ? {
+              pipeline: await this.device.createComputePipelineAsync({
+                label: "particle count pipeline",
+                layout: this.device.createPipelineLayout({ bindGroupLayouts: [countLayout] }),
+                compute: { module: computeModule, entryPoint: "rzCount" },
+              }),
+              indirect,
+              binds: bindFor(countLayout, this.cameraUniformBuffer, false, true),
+            }
+          : null
       const renderLayoutObj = this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] })
       // The prepass, when the effect gave the cutout a cheap shape: coverage to
       // depth, colour targets at writeMask 0 (the depth-prepass class), and
@@ -5472,6 +5519,7 @@ export class Engine {
         buffer.destroy()
         uniform.destroy()
         points?.buffer.destroy()
+        indirect?.destroy()
         return { ok: false, diagnostics: [scoped.message] }
       }
       return {
@@ -5487,18 +5535,20 @@ export class Engine {
           counts: uniformView.uints,
           compute,
           computeLayout,
-          computeBinds: bindFor(computeLayout, this.cameraUniformBuffer, false),
+          computeBinds: bindFor(computeLayout, this.cameraUniformBuffer, false, false),
           depth,
           render,
           renderLayout,
-          renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true),
-          mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true),
+          renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true, false),
+          mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true, false),
           rebind: () => ({
-            computeBinds: bindFor(computeLayout, this.cameraUniformBuffer, false),
-            renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true),
-            mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true),
+            computeBinds: bindFor(computeLayout, this.cameraUniformBuffer, false, false),
+            renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true, false),
+            mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true, false),
+            countBinds: countLayout ? bindFor(countLayout, this.cameraUniformBuffer, false, true) : null,
           }),
           points,
+          live,
         },
       }
     } catch (e) {
@@ -5506,6 +5556,7 @@ export class Engine {
       buffer.destroy()
       uniform.destroy()
       points?.buffer.destroy()
+      indirect?.destroy()
       return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
     }
   }
@@ -5698,10 +5749,22 @@ export class Engine {
       p.counts[3] = this.particleFrame++
       this.device.queue.writeBuffer(p.uniform, 0, p.data.buffer as ArrayBuffer)
       if (p.points) this.writePoints(p.points)
+      const bind = p.computeBinds[e.grid?.parity ?? 0]
+      if (p.live) {
+        // The frame's live count first, in a pass of its own: a buffer may
+        // not be written as storage and read as indirect arguments inside one
+        // pass, and a pass is the synchronization scope.
+        const count = encoder.beginComputePass({ label: "particle count" })
+        count.setPipeline(p.live.pipeline)
+        count.setBindGroup(0, p.live.binds[e.grid?.parity ?? 0])
+        count.dispatchWorkgroups(1)
+        count.end()
+      }
       const cp = encoder.beginComputePass({ label: "particles" })
       cp.setPipeline(p.compute)
-      cp.setBindGroup(0, p.computeBinds[e.grid?.parity ?? 0])
-      cp.dispatchWorkgroups(Math.ceil(p.count / 64))
+      cp.setBindGroup(0, bind)
+      if (p.live) cp.dispatchWorkgroupsIndirect(p.live.indirect, 0)
+      else cp.dispatchWorkgroups(Math.ceil(p.count / 64))
       cp.end()
     }
   }
@@ -5742,14 +5805,19 @@ export class Engine {
       if (!p || e.weight === 0) continue
       const parity = e.grid?.parity ?? 0
       const bind = view === "mirror" ? p.mirrorRenderBinds[parity] : p.renderBinds[parity]
+      // The live count's quads when the effect declared one, else the pool's.
+      const draw = () => {
+        if (p.live) pass.drawIndirect(p.live.indirect, PARTICLE_INDIRECT_DRAW_OFFSET)
+        else pass.draw(6, p.count)
+      }
       if (p.depth) {
         pass.setPipeline(p.depth)
         pass.setBindGroup(0, bind)
-        pass.draw(6, p.count)
+        draw()
       }
       pass.setPipeline(p.render)
       pass.setBindGroup(0, bind)
-      pass.draw(6, p.count)
+      draw()
     }
   }
 
@@ -6128,6 +6196,7 @@ export class Engine {
       e.particles?.buffer.destroy()
       e.particles?.uniform.destroy()
       e.particles?.points?.buffer.destroy()
+      e.particles?.live?.indirect.destroy()
       e.particles = null
     }
   }
@@ -11725,9 +11794,11 @@ export class Engine {
       const src = wrapped ? entry.source : entry
       const width = Math.max(1, "naturalWidth" in src ? src.naturalWidth : src.width)
       const height = Math.max(1, "naturalHeight" in src ? src.naturalHeight : src.height)
+      const mipLevelCount = wrapped && entry.mipmaps ? Math.floor(Math.log2(Math.max(width, height))) + 1 : 1
       const tex = this.device.createTexture({
         label: `group map: ${group.id}`,
         size: [width, height],
+        mipLevelCount,
         // Colour maps decode to linear on sample, the way material textures do;
         // data maps must not, or every threshold packed in their channels moves.
         format: wrapped && entry.srgb ? "rgba8unorm-srgb" : "rgba8unorm",
@@ -11738,6 +11809,7 @@ export class Engine {
         { texture: tex, premultipliedAlpha: wrapped && entry.premultiplied === true },
         [width, height],
       )
+      if (mipLevelCount > 1) this.generateMipmaps(tex, mipLevelCount)
       return tex
     })
   }
@@ -14241,24 +14313,28 @@ export class Engine {
   // Bilinear box-filter downsample per level. Reads srgb view (hardware linearizes on sample,
   // re-encodes on write), so intensities are filtered in linear space — matching EEVEE/Blender.
   private generateMipmaps(texture: GPUTexture, mipLevelCount: number) {
-    if (!this.mipBlitPipeline || !this.mipBlitSampler) {
+    if (!this.mipBlitSampler) {
       this.mipBlitSampler = this.device.createSampler({
         magFilter: "linear",
         minFilter: "linear",
         addressModeU: "clamp-to-edge",
         addressModeV: "clamp-to-edge",
       })
+    }
+    let pipeline = this.mipBlitPipelines.get(texture.format)
+    if (!pipeline) {
       const module = this.device.createShaderModule({
         label: "mipmap blit",
         code: MIPMAP_BLIT_SHADER_WGSL,
       })
-      this.mipBlitPipeline = this.device.createRenderPipeline({
-        label: "mipmap blit pipeline",
+      pipeline = this.device.createRenderPipeline({
+        label: `mipmap blit pipeline (${texture.format})`,
         layout: "auto",
         vertex: { module, entryPoint: "vs" },
-        fragment: { module, entryPoint: "fs", targets: [{ format: "rgba8unorm-srgb" }] },
+        fragment: { module, entryPoint: "fs", targets: [{ format: texture.format }] },
         primitive: { topology: "triangle-list" },
       })
+      this.mipBlitPipelines.set(texture.format, pipeline)
     }
 
     const encoder = this.device.createCommandEncoder({ label: "mipgen" })
@@ -14266,7 +14342,7 @@ export class Engine {
       const srcView = texture.createView({ baseMipLevel: level - 1, mipLevelCount: 1 })
       const dstView = texture.createView({ baseMipLevel: level, mipLevelCount: 1 })
       const bindGroup = this.device.createBindGroup({
-        layout: this.mipBlitPipeline.getBindGroupLayout(0),
+        layout: pipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: srcView },
           { binding: 1, resource: this.mipBlitSampler },
@@ -14277,7 +14353,7 @@ export class Engine {
           { view: dstView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
         ],
       })
-      pass.setPipeline(this.mipBlitPipeline)
+      pass.setPipeline(pipeline)
       pass.setBindGroup(0, bindGroup)
       pass.draw(3)
       pass.end()

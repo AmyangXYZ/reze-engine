@@ -80,7 +80,18 @@ export type GroupImageSource = ImageBitmap | HTMLImageElement | HTMLCanvasElemen
  * converts to the destination's tagged alpha mode, so a premultiplied ImageBitmap
  * copied into an untagged texture is un-premultiplied again on the way in.
  */
-export type GroupImage = { source: GroupImageSource; srgb?: boolean; premultiplied?: boolean }
+export type GroupImage = {
+  source: GroupImageSource
+  srgb?: boolean
+  premultiplied?: boolean
+  /**
+   * Give it a mip chain. For a map TILED across a surface — a relief map, a
+   * water's ripples — whose far tiles otherwise shrink to a pixel each and
+   * sample as noise that sparkles with every camera move. Off by default: a
+   * ramp read at a computed coordinate would blur at its own terminator.
+   */
+  mipmaps?: boolean
+}
 
 export type GroupDiagnostic = { groupId: string; diagnostics: Diagnostic[]; ok: boolean }
 

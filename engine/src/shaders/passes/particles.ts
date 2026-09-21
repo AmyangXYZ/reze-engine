@@ -101,6 +101,15 @@ type ParticleSource = {
    *  where every stacked fragment is otherwise shaded in full; the prepass is
    *  the shape of that rejection, done by hand and cheaply. */
   cover: boolean
+  /** The effect defines `particleCount() -> u32`: how many of the pool are
+   *  live this frame, as a function of its dials. The step is dispatched and
+   *  the quads drawn for that many slots and no more, through indirect
+   *  arguments a one-thread kernel writes first. A pool sized for its densest
+   *  setting then costs its current setting: a lawn's spare 1.3M slots were
+   *  read, written and issued as degenerate quads every frame, and that
+   *  traffic alone was a third of the frame. The live slots are always the
+   *  first N — an author whose live set is not a prefix has no use for this. */
+  live: boolean
   /** The side of this effect's grid, or 0 when it declared none. Particles READ
    *  the grid; the kernel that steps it lives in the grid pass. A blade of grass
    *  bending where a foot pressed is the whole case: the bend has to persist and
@@ -112,6 +121,12 @@ type ParticleSource = {
 export const PARTICLE_LIGHT_BINDING = 10
 /** The effect's named points (`#points`), in both stages — see points-api.ts. */
 export const PARTICLE_POINTS_BINDING = 15
+/** The indirect arguments a `particleCount` effect writes — compute stage only.
+ *  Eight u32: the step's dispatch (groups, 1, 1, pad) then the quads' draw
+ *  (6, count, 0, 0), so the draw reads at byte 16. */
+export const PARTICLE_INDIRECT_BINDING = 16
+export const PARTICLE_INDIRECT_BYTES = 32
+export const PARTICLE_INDIRECT_DRAW_OFFSET = 16
 
 /** Bytes per particle. Explicitly padded — see the struct below. */
 export const PARTICLE_STRIDE = 48
@@ -171,13 +186,15 @@ fn rzCamPos() -> vec3f { return cam.camPos; }
 `
 
 /** Does the source define the particle contract? All three are required
- *  together; `cover` is optional and only means anything to a cutout. */
-export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean; cover: boolean } {
+ *  together; `cover` is optional and only means anything to a cutout, and
+ *  `count` is optional and bounds the frame's work — see particleCount. */
+export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean; cover: boolean; count: boolean } {
   return {
     init: /\bfn\s+particleInit\s*\(/.test(wgsl),
     step: /\bfn\s+particleStep\s*\(/.test(wgsl),
     shade: /\bfn\s+particleShade\s*\(/.test(wgsl),
     cover: /\bfn\s+particleCover\s*\(/.test(wgsl),
+    count: /\bfn\s+particleCount\s*\(/.test(wgsl),
   }
 }
 
@@ -217,8 +234,29 @@ ${src.paramsDecl}
     idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) +
     // The named points, for real: particleInit is where a flame is put on a wick.
     pointsApi(true, 0, PARTICLE_POINTS_BINDING) +
+    (src.live
+      ? `@group(0) @binding(${PARTICLE_INDIRECT_BINDING}) var<storage, read_write> _rzIndirect: array<u32, 8>;\n`
+      : "") +
     "\n// ── user effect ──\n" +
     src.wgsl +
+    (src.live
+      ? /* wgsl */ `
+// The frame's live count, from the author's dials, into the arguments the
+// step dispatch and both draws read. One thread; runs before the step.
+@compute @workgroup_size(1)
+fn rzCount() {
+  let n = min(particleCount(), pu.count);
+  _rzIndirect[0] = (n + 63u) / 64u;
+  _rzIndirect[1] = 1u;
+  _rzIndirect[2] = 1u;
+  _rzIndirect[3] = 0u;
+  _rzIndirect[4] = 6u;
+  _rzIndirect[5] = n;
+  _rzIndirect[6] = 0u;
+  _rzIndirect[7] = 0u;
+}
+`
+      : "") +
     /* wgsl */ `
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
