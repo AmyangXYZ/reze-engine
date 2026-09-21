@@ -38,6 +38,7 @@ import { midiApi } from "./midi-api"
 import { lyricsApi } from "./lyrics-api"
 import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
 import { idApi } from "./id-api"
+import { sceneLightApi, worldAmbientWgsl } from "./scene-light-api"
 
 /** Floats before the first record. One is the count; the rest keep the records
  *  vec4-aligned, which is what lets a future pass read them as vec4s. */
@@ -84,29 +85,8 @@ struct RzLight {
 }
 `
 
-/**
- * The world's light at a surface facing n — the flat colour, or the installed
- * HDRI's irradiance (sh[0].w = 1), evaluated from folded SH coefficients (see
- * ibl.ts for the folding; the shader is a plain polynomial in the normal).
- *
- * One string included by every module that declares LightUniforms with the sh
- * block — the hosted-api lesson: a helper defined in some modules and not
- * others is a compile error waiting for the first file that crosses them.
- */
-export const WORLD_AMBIENT_WGSL = /* wgsl */ `
-fn rzWorldAmbient(n: vec3f) -> vec3f {
-  if (light.sh[0].w < 0.5) { return light.ambientColor.xyz; }
-  let x = n.x;
-  let y = n.y;
-  let z = n.z;
-  let c = light.sh[0].xyz
-    + light.sh[1].xyz * y + light.sh[2].xyz * z + light.sh[3].xyz * x
-    + light.sh[4].xyz * (x * y) + light.sh[5].xyz * (y * z)
-    + light.sh[6].xyz * (3.0 * z * z - 1.0) + light.sh[7].xyz * (x * z)
-    + light.sh[8].xyz * (x * x - y * y);
-  return max(c, vec3f(0.0));
-}
-`
+/** rzWorldAmbient against the materials' and the ground's `light` uniform. */
+export const WORLD_AMBIENT_WGSL = worldAmbientWgsl("light")
 
 /** Does this source define the emit mount? */
 export function hasLightEmit(wgsl: string): boolean {
@@ -184,7 +164,7 @@ ${viewportApi("viewU[6].w")}
 ${trailSlotsApi(cast.trailCount)}
 // The id accessors, stubbed: this module cannot read an attachment the
 // scene pass writes. See id-api.ts — the author's whole file compiles here.
-${idApi(false, 0, 0) + castDistanceStub()}
+${idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0)}
 // The dials the author declared, if any. A lamp is exactly the thing someone
 // retunes — its colour and its reach — so an emitter reads params like every
 // other mount rather than being the one place a #param resolves to nothing.

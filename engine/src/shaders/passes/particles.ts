@@ -10,6 +10,7 @@ import { EFFECT_SUBJECT_VEC4S } from "../cast-layout"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
 import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 import { idApi } from "../id-api"
+import { sceneLightApi } from "../scene-light-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
 // Its own shader MODULE rather than more source spliced into composite.ts, for
@@ -105,6 +106,9 @@ type ParticleSource = {
    *  recover, which is memory, and memory is what the grid is for. */
   gridSize: number
 }
+
+/** Where the shading stage's five scene-light bindings start — see scene-light-api.ts. */
+export const PARTICLE_LIGHT_BINDING = 10
 
 /** Bytes per particle. Explicitly padded — see the struct below. */
 export const PARTICLE_STRIDE = 48
@@ -207,7 +211,7 @@ ${src.paramsDecl}
     PRELUDE +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
-    idApi(false, 0, 0) + castDistanceStub() +
+    idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `
@@ -282,6 +286,9 @@ ${src.paramsDecl}
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
     idApi(false, 0, 0) + castDistanceStub() +
+    // The sun's shadow and the world's ambient, for real: the shadow pass has
+    // run by the time this draws, inside the scene pass. See scene-light-api.ts.
+    sceneLightApi(true, 0, PARTICLE_LIGHT_BINDING) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `

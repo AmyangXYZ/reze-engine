@@ -1,6 +1,7 @@
 import { sceneFsOutWgsl } from "../passes/scene-contract"
 import { lightsApi } from "../lights"
 import { SHADOW_CASCADES } from "../../shadow-cascades"
+import { pcf9 } from "../scene-light-api"
 import { WORLD_AMBIENT_WGSL } from "../lights"
 
 // Shared WGSL blocks concatenated by every material shader.
@@ -175,8 +176,8 @@ fn safe_normal(nIn: vec3f) -> vec3f {
 `;
 
 // ─── Shadow sampler (3×3 PCF, cascade-selected) ─────────────────────
-// Normal-bias 0.08, depth-bias 0.001 NDC. Unrolled — Safari's Metal backend
-// doesn't unroll nested shadow loops reliably. Texel sizes are interpolated
+// Normal-bias 0.08, depth-bias 0.001 NDC; the kernel is pcf9 in scene-light-api.ts,
+// shared with effects. Texel sizes are interpolated
 // from SHADOW_CASCADES so they cannot go stale the way the hardcoded 1/2048
 // once did (PCF taps landed TWO texels apart after the map grew to 4096,
 // quantizing self-shadow edges into crawling gray squares).
@@ -188,21 +189,6 @@ fn safe_normal(nIn: vec3f) -> vec3f {
 // far plane the comparison failed against every stored depth, silently
 // shadowing any stage deeper than the box.
 
-const pcf9 = (map: string, ts: string) => /* wgsl */ `
-  let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-  let cmpZ = ndc.z - 0.001;
-  let ts = ${ts};
-  let s00 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(-ts, -ts), cmpZ);
-  let s10 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(0.0, -ts), cmpZ);
-  let s20 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f( ts, -ts), cmpZ);
-  let s01 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(-ts, 0.0), cmpZ);
-  let s11 = textureSampleCompareLevel(${map}, shadowSampler, suv, cmpZ);
-  let s21 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f( ts, 0.0), cmpZ);
-  let s02 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(-ts,  ts), cmpZ);
-  let s12 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f(0.0,  ts), cmpZ);
-  let s22 = textureSampleCompareLevel(${map}, shadowSampler, suv + vec2f( ts,  ts), cmpZ);
-  return (s00 + s10 + s20 + s01 + s11 + s21 + s02 + s12 + s22) * (1.0 / 9.0);
-`
 
 const SAMPLE_SHADOW_WGSL = /* wgsl */ `
 

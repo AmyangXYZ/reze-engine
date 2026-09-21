@@ -82,7 +82,7 @@ test("particles carry weight in their uniform and apply it before the discard", 
   // BEFORE the discard, so weight 0 kills every fragment rather than shading it
   // and multiplying the result out to nothing.
   assert.ok(
-    src.indexOf("c.a *= pu.weight;") < src.indexOf("if (c.a <= 0.0) { discard; }"),
+    src.indexOf("c.a *= pu.weight;") < src.indexOf("if (!PREPASSED && c.a <= 0.0) { discard; }"),
     "weight must be applied before the alpha discard",
   )
 })

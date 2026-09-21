@@ -113,6 +113,7 @@ import {
 import {
   buildParticleComputeShader,
   buildParticleRenderShader,
+  PARTICLE_LIGHT_BINDING,
   particleEntryPoints,
   PARTICLE_STRIDE,
 } from "./shaders/passes/particles"
@@ -5300,7 +5301,7 @@ export class Engine {
     // Declaring one set of flags for both layouts is what made the pipeline
     // layout invalid, and the error surfaces later and unhelpfully as "invalid
     // due to a previous error".
-    const layoutFor = (storage: GPUBufferBindingType, visibility: number) =>
+    const layoutFor = (storage: GPUBufferBindingType, visibility: number, shadow: boolean) =>
       this.device.createBindGroupLayout({
         entries: [
           { binding: 0, visibility, buffer: { type: storage } },
@@ -5320,13 +5321,25 @@ export class Engine {
           // author calls it or not. With no grid it is the 1x1 of zeroes.
           { binding: 8, visibility, texture: { sampleType: "float" as const } },
           { binding: 9, visibility, sampler: { type: "filtering" as const } },
+          // The scene's light, for rzShadow and rzWorldAmbient — the shading
+          // stage only; the compute module compiles the stubs. See
+          // scene-light-api.ts.
+          ...(shadow
+            ? [
+                { binding: PARTICLE_LIGHT_BINDING, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" as const } },
+                { binding: PARTICLE_LIGHT_BINDING + 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" as const } },
+                { binding: PARTICLE_LIGHT_BINDING + 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" as const } },
+                { binding: PARTICLE_LIGHT_BINDING + 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" as const } },
+                { binding: PARTICLE_LIGHT_BINDING + 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" as const } },
+              ]
+            : []),
         ],
       })
     /** One per GRID PARITY, for the reason rebuildFieldBindGroup gives: the grid
      *  alternates which texture is current, and rebuilding a single group every
      *  frame is waste for a change that only ever toggles between two known
      *  states. Both entries are the same view when there is no grid. */
-    const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer) =>
+    const bindFor = (layout: GPUBindGroupLayout, camera: GPUBuffer, shadow: boolean) =>
       [0, 1].map((parity) =>
         this.device.createBindGroup({
           layout,
@@ -5341,12 +5354,21 @@ export class Engine {
             ...(params.buffer ? [{ binding: 7, resource: { buffer: params.buffer } }] : []),
             { binding: 8, resource: grid ? grid.read[parity] : this.simFallbackView },
             { binding: 9, resource: this.simSampler },
+            ...(shadow
+              ? [
+                  { binding: PARTICLE_LIGHT_BINDING, resource: { buffer: this.lightUniformBuffer } },
+                  { binding: PARTICLE_LIGHT_BINDING + 1, resource: { buffer: this.shadowLightVPBuffer } },
+                  { binding: PARTICLE_LIGHT_BINDING + 2, resource: this.shadowMapDepthViews[0] },
+                  { binding: PARTICLE_LIGHT_BINDING + 3, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
+                  { binding: PARTICLE_LIGHT_BINDING + 4, resource: this.shadowComparisonSampler },
+                ]
+              : []),
           ],
         }),
       ) as [GPUBindGroup, GPUBindGroup]
 
-    const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE)
-    const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT)
+    const computeLayout = layoutFor("storage", GPUShaderStage.COMPUTE, false)
+    const renderLayout = layoutFor("read-only-storage", GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, true)
 
     // Additive keeps the destination and adds to it, and leaves alpha alone, so
     // a glow does not claim coverage it never occluded. The MASK sums with it —
@@ -5422,16 +5444,16 @@ export class Engine {
           counts: uniformView.uints,
           compute,
           computeLayout,
-          computeBinds: bindFor(computeLayout, this.cameraUniformBuffer),
+          computeBinds: bindFor(computeLayout, this.cameraUniformBuffer, false),
           depth,
           render,
           renderLayout,
-          renderBinds: bindFor(renderLayout, this.cameraUniformBuffer),
-          mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer),
+          renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true),
+          mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true),
           rebind: () => ({
-            computeBinds: bindFor(computeLayout, this.cameraUniformBuffer),
-            renderBinds: bindFor(renderLayout, this.cameraUniformBuffer),
-            mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer),
+            computeBinds: bindFor(computeLayout, this.cameraUniformBuffer, false),
+            renderBinds: bindFor(renderLayout, this.cameraUniformBuffer, true),
+            mirrorRenderBinds: bindFor(renderLayout, this.mirrorCameraBuffer, true),
           }),
         },
       }
@@ -7387,8 +7409,10 @@ export class Engine {
       },
     })
 
+    // The matrices, then one vec4: the caster sphere, which effects' rzShadow
+    // tests before any tap. The materials and the ground bind the matrices only.
     this.shadowLightVPBuffer = this.device.createBuffer({
-      size: 64 * SHADOW_CASCADES.length,
+      size: 64 * SHADOW_CASCADES.length + 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.shadowCascadeVPBuffers = SHADOW_CASCADES.map((_, i) =>
@@ -12380,6 +12404,22 @@ export class Engine {
     this.device.queue.writeBuffer(this.groundShadowMaterialBuffer, 40, gb.subarray(10, 11) as Float32Array<ArrayBuffer>)
   }
 
+  /** The caster sphere as last written after the cascade matrices; NaN so the
+   *  first frame always writes. */
+  private shadowCastersWritten = new Float32Array([NaN, NaN, NaN, NaN])
+
+  /**
+   * The same sphere, into the cascade block after its matrices — rzShadow's
+   * copy. There whether or not a ground exists: a lawn is often the only floor.
+   */
+  private writeShadowCasters(): void {
+    const w = this.shadowCastersWritten
+    const c = this.casterSphere
+    if (w[0] === c[0] && w[1] === c[1] && w[2] === c[2] && w[3] === c[3]) return
+    w.set(c)
+    this.device.queue.writeBuffer(this.shadowLightVPBuffer, 64 * SHADOW_CASCADES.length, c as Float32Array<ArrayBuffer>)
+  }
+
   /**
    * Push this frame's caster sphere into the ground's uniform.
    *
@@ -15376,6 +15416,7 @@ export class Engine {
     if (hasModels) this.dispatchCull(encoder)
     // After the cull, which is what recomputes the spheres it unions.
     this.writeGroundCasterSphere()
+    this.writeShadowCasters()
     this.writeGroundDress()
 
     // After the cull, because a rebuild there can reallocate the argument
