@@ -866,6 +866,8 @@ interface ModelInstance {
   shadowDrawCalls: DrawCall[]
   shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
+  /** Its own fill, when setModelFill gave it one. */
+  fillBuffer: GPUBuffer | null
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
   /** Environment geometry added via addStage — no physics, no IK, and it
@@ -1958,6 +1960,8 @@ export class Engine {
   } | null = null
   private mainPerFrameBindGroupLayout!: GPUBindGroupLayout
   private mainPerInstanceBindGroupLayout!: GPUBindGroupLayout
+  /** What a model with no fill of its own binds: zero light. */
+  private noFillBuffer!: GPUBuffer
   private mainPerMaterialBindGroupLayout!: GPUBindGroupLayout
   private outlinePerFrameBindGroupLayout!: GPUBindGroupLayout
   private outlinePerMaterialBindGroupLayout!: GPUBindGroupLayout
@@ -7302,6 +7306,12 @@ export class Engine {
       [1, 1],
     )
 
+    this.noFillBuffer = this.device.createBuffer({
+      label: "model fill (none)",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM,
+    })
+
     // Generic shared-toon ramp: lit white down to a soft cool shadow tone with
     // a tight terminator around the midpoint, approximating MMD's toon ramps.
     const TOON_H = 64
@@ -7412,6 +7422,8 @@ export class Engine {
           visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
+        // The model's own fill — see setModelFill.
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
     // group 2: per-material (textures + material uniforms) — bound per draw call.
@@ -10730,6 +10742,54 @@ export class Engine {
     this.modelInstances.set(newName, inst)
   }
 
+  /**
+   * Light one model with more than the world gives it: a FILL, linear RGB added
+   * to its ambient everywhere on it. Null takes it away again.
+   *
+   * A game lights its stage and its characters apart. Aether Gazer's rooms are
+   * lit by their lamps and a near-black ambient, while its characters take a
+   * flat base light of their own — so a stage whose World is right for the room
+   * leaves a face turned from the lamps in the dark. This is that second light,
+   * for the models the host counts as cast.
+   */
+  setModelFill(name: string, fill: Vec3 | null): boolean {
+    const inst = this.modelInstances.get(name)
+    if (!inst || !this.device) return false
+    if (!fill) {
+      if (!inst.fillBuffer) return true
+      const retired = inst.fillBuffer
+      inst.fillBuffer = null
+      inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, null)
+      this.bundlesDirty = true
+      // Retired once the GPU is done with it: an encoded frame may still name it.
+      void this.device.queue.onSubmittedWorkDone().then(() => retired.destroy())
+      return true
+    }
+    if (!inst.fillBuffer) {
+      inst.fillBuffer = this.device.createBuffer({
+        label: `${name}: fill`,
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, inst.fillBuffer)
+      this.bundlesDirty = true
+    }
+    this.device.queue.writeBuffer(inst.fillBuffer, 0, new Float32Array([fill.x, fill.y, fill.z, 0]))
+    return true
+  }
+
+  /** The per-model group: its skinning matrices and its fill, or the zero stand-in. */
+  private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, fill: GPUBuffer | null): GPUBindGroup {
+    return this.device.createBindGroup({
+      label: `${name}: main per-instance bind group`,
+      layout: this.mainPerInstanceBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: skinMatrixBuffer } },
+        { binding: 1, resource: { buffer: fill ?? this.noFillBuffer } },
+      ],
+    })
+  }
+
   removeModel(name: string): void {
     const inst = this.modelInstances.get(name)
     if (!inst) return
@@ -10759,6 +10819,7 @@ export class Engine {
     for (const buf of inst.gpuBuffers) {
       buf.destroy()
     }
+    inst.fillBuffer?.destroy()
     // Per-group StyleUniforms buffers aren't in gpuBuffers (allocated post-load).
     for (const install of inst.styleGroups.values()) this.destroyInstall(install)
     this.modelInstances.delete(name)
@@ -13264,11 +13325,7 @@ export class Engine {
       }),
     )
 
-    const mainPerInstanceBindGroup = this.device.createBindGroup({
-      label: `${name}: main per-instance bind group`,
-      layout: this.mainPerInstanceBindGroupLayout,
-      entries: [{ binding: 0, resource: { buffer: skinMatrixBuffer } }],
-    })
+    const mainPerInstanceBindGroup = this.perInstanceBindGroup(name, skinMatrixBuffer, null)
 
     const pickPerInstanceBindGroup = this.device.createBindGroup({
       label: `${name}: pick per-instance bind group`,
@@ -13307,6 +13364,7 @@ export class Engine {
       shadowDrawCalls: [],
       shadowBindGroups,
       mainPerInstanceBindGroup,
+      fillBuffer: null,
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
       isStage,

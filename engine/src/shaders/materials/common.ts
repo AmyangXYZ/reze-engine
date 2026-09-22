@@ -146,6 +146,9 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 @group(0) @binding(8) var worldEnvTexture: texture_2d<f32>;
 // binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
+// Light this model receives beyond the world's — see Engine.setModelFill. Zero
+// for a model nobody gave one, which leaves its ambient exactly the world's.
+@group(1) @binding(1) var<uniform> modelFill: vec4f;
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
 // Reserved for future sphere/toon graph nodes; graphs that don't read them get the

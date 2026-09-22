@@ -133,7 +133,7 @@ ${gate}
   let sun = light.lights[0].color.xyz * light.lights[0].color.w;
   // The world: flat colour, or the HDRI's irradiance at this normal — which
   // is what makes a loaded sky actually light her instead of only backing her.
-  let amb = rzWorldAmbient(n);
+  let amb = rzWorldAmbient(n) + modelFill.rgb;
   let shadow = sampleShadow(input.worldPos, n);
   let tex_color = tex_s.rgb;
 
