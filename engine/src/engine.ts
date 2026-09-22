@@ -44,7 +44,7 @@ import {
   type SimClock,
 } from "./effect-schedule"
 import { parentKeySpan, type ModelParentKey } from "./parent-keys"
-import { SHADOW_CASCADES, buildShadowVP } from "./shadow-cascades"
+import { SHADOW_CASCADES, buildShadowCascades, type ShadowBounds, type ShadowView } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import { MIRROR_MASK_DOWNSAMPLE_WGSL, MIRROR_MAT_BYTES, mirrorShaderWgsl, mirrorShadowWgsl } from "./shaders/passes/mirror"
 import { packHalf, type HdrImage } from "./hdr"
@@ -866,8 +866,10 @@ interface ModelInstance {
   shadowDrawCalls: DrawCall[]
   shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
-  /** Its own fill, when setModelFill gave it one. */
-  fillBuffer: GPUBuffer | null
+  /** Its own light — fill and sun — when setModelFill or setModelSun gave it
+   *  one: a 32-byte ModelLight, and the CPU copy it is written from. */
+  lightBuffer: GPUBuffer | null
+  modelLight: Float32Array | null
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
   /** Environment geometry added via addStage — no physics, no IK, and it
@@ -2459,7 +2461,7 @@ export class Engine {
   private depthReadView: GPUTextureView | null = null
   private compositeUniformBuffer!: GPUBuffer
   // [exposure, invGamma, _, _,  bloomTint.x, bloomTint.y, bloomTint.z, bloomIntensity]
-  // 11 × vec4f — see the viewU comment in composite.ts. The last one is the
+  // 15 × vec4f — see the viewU comment in composite.ts. The last one is the
   // camera's world position, which is what lets a foreground effect turn the
   // depth it is handed into a PLACE (bgWorldPos) rather than a distance.
   private readonly compositeUniformData = new Float32Array(60)
@@ -7307,8 +7309,8 @@ export class Engine {
     )
 
     this.noFillBuffer = this.device.createBuffer({
-      label: "model fill (none)",
-      size: 16,
+      label: "model light (none)",
+      size: 32,
       usage: GPUBufferUsage.UNIFORM,
     })
 
@@ -7422,7 +7424,7 @@ export class Engine {
           visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
-        // The model's own fill — see setModelFill.
+        // The model's own light — see setModelFill and setModelSun.
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
@@ -8018,7 +8020,7 @@ export class Engine {
     // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      // 11 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
+      // 15 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
       // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray ·
       // (time, _, canvas width, canvas height) for user effects · three grade
       // vectors (CDL offset+contrast, power+saturation, slope+flag) · camera
@@ -10753,39 +10755,66 @@ export class Engine {
    * for the models the host counts as cast.
    */
   setModelFill(name: string, fill: Vec3 | null): boolean {
+    return this.writeModelLight(name, 0, fill)
+  }
+
+  /**
+   * A model's own sun: the colour and strength the scene's sun has FOR THIS
+   * MODEL, in place of the scene's. Null gives it the scene's sun back.
+   *
+   * The other half of lighting a stage and its cast apart. A game's stage is
+   * lit by its own daylight — Aether Gazer's kitchen at twenty times white —
+   * while its characters take a key light of their own that the stage never
+   * states. So a stage carries the sun it was lit by, and the scene's sun
+   * stays the cast's. Direction and shadow are still the scene's: one sun
+   * casts, and it casts the same way on both.
+   */
+  setModelSun(name: string, sun: Vec3 | null): boolean {
+    return this.writeModelLight(name, 4, sun)
+  }
+
+  /** One half of a model's light, at `at` (0 the fill, 4 the sun) in its
+   *  ModelLight; w says whether that half is set. Both null releases the
+   *  buffer and the model takes the shared zero stand-in again. */
+  private writeModelLight(name: string, at: 0 | 4, value: Vec3 | null): boolean {
     const inst = this.modelInstances.get(name)
     if (!inst || !this.device) return false
-    if (!fill) {
-      if (!inst.fillBuffer) return true
-      const retired = inst.fillBuffer
-      inst.fillBuffer = null
+    const light = inst.modelLight ?? new Float32Array(8)
+    light.set(value ? [value.x, value.y, value.z, 1] : [0, 0, 0, 0], at)
+    const any = light[3] > 0 || light[7] > 0
+    if (!any) {
+      if (!inst.lightBuffer) return true
+      const retired = inst.lightBuffer
+      inst.lightBuffer = null
+      inst.modelLight = null
       inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, null)
       this.bundlesDirty = true
       // Retired once the GPU is done with it: an encoded frame may still name it.
       void this.device.queue.onSubmittedWorkDone().then(() => retired.destroy())
       return true
     }
-    if (!inst.fillBuffer) {
-      inst.fillBuffer = this.device.createBuffer({
-        label: `${name}: fill`,
-        size: 16,
+    inst.modelLight = light
+    if (!inst.lightBuffer) {
+      inst.lightBuffer = this.device.createBuffer({
+        label: `${name}: light`,
+        size: 32,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       })
-      inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, inst.fillBuffer)
+      inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, inst.lightBuffer)
       this.bundlesDirty = true
     }
-    this.device.queue.writeBuffer(inst.fillBuffer, 0, new Float32Array([fill.x, fill.y, fill.z, 0]))
+    this.device.queue.writeBuffer(inst.lightBuffer, 0, light.buffer as ArrayBuffer)
     return true
   }
 
-  /** The per-model group: its skinning matrices and its fill, or the zero stand-in. */
-  private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, fill: GPUBuffer | null): GPUBindGroup {
+  /** The per-model group: its skinning matrices and its light, or the zero stand-in. */
+  private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, light: GPUBuffer | null): GPUBindGroup {
     return this.device.createBindGroup({
       label: `${name}: main per-instance bind group`,
       layout: this.mainPerInstanceBindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: skinMatrixBuffer } },
-        { binding: 1, resource: { buffer: fill ?? this.noFillBuffer } },
+        { binding: 1, resource: { buffer: light ?? this.noFillBuffer } },
       ],
     })
   }
@@ -10819,7 +10848,7 @@ export class Engine {
     for (const buf of inst.gpuBuffers) {
       buf.destroy()
     }
-    inst.fillBuffer?.destroy()
+    inst.lightBuffer?.destroy()
     // Per-group StyleUniforms buffers aren't in gpuBuffers (allocated post-load).
     for (const install of inst.styleGroups.values()) this.destroyInstall(install)
     this.modelInstances.delete(name)
@@ -12511,6 +12540,55 @@ export class Engine {
     }
     if (this.cullModelBuffer) this.device.queue.writeBuffer(this.cullModelBuffer, 0, data.buffer as ArrayBuffer)
     this.updateCasterSphere(data)
+    this.updateShadowSceneBounds(data, flags)
+  }
+
+  /**
+   * The box around everything visible, from the same numbers the cull reads:
+   * a rigid model's per-draw boxes through its matrix, a posed model's sphere.
+   * The shadow cascades reach along the light across it.
+   */
+  private updateShadowSceneBounds(data: Float32Array, flags: Uint32Array): void {
+    let minX = Infinity, minY = Infinity, minZ = Infinity
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+    for (let i = 0; i < this.cullDraws.length; i++) {
+      const f = i * 8
+      const mi = this.cullMetaU32[f + 3]
+      const o = mi * Engine.CULL_MODEL_FLOATS
+      const mf = flags[o + 20]
+      if ((mf & Engine.CULL_MODEL_VISIBLE) === 0) continue
+      if ((mf & Engine.CULL_MODEL_RIGID) !== 0) {
+        const cx = (this.cullMetaF32[f] + this.cullMetaF32[f + 4]) * 0.5
+        const cy = (this.cullMetaF32[f + 1] + this.cullMetaF32[f + 5]) * 0.5
+        const cz = (this.cullMetaF32[f + 2] + this.cullMetaF32[f + 6]) * 0.5
+        const ex = (this.cullMetaF32[f + 4] - this.cullMetaF32[f]) * 0.5
+        const ey = (this.cullMetaF32[f + 5] - this.cullMetaF32[f + 1]) * 0.5
+        const ez = (this.cullMetaF32[f + 6] - this.cullMetaF32[f + 2]) * 0.5
+        const wx = data[o] * cx + data[o + 4] * cy + data[o + 8] * cz + data[o + 12]
+        const wy = data[o + 1] * cx + data[o + 5] * cy + data[o + 9] * cz + data[o + 13]
+        const wz = data[o + 2] * cx + data[o + 6] * cy + data[o + 10] * cz + data[o + 14]
+        const gx = Math.abs(data[o]) * ex + Math.abs(data[o + 4]) * ey + Math.abs(data[o + 8]) * ez
+        const gy = Math.abs(data[o + 1]) * ex + Math.abs(data[o + 5]) * ey + Math.abs(data[o + 9]) * ez
+        const gz = Math.abs(data[o + 2]) * ex + Math.abs(data[o + 6]) * ey + Math.abs(data[o + 10]) * ez
+        minX = Math.min(minX, wx - gx); maxX = Math.max(maxX, wx + gx)
+        minY = Math.min(minY, wy - gy); maxY = Math.max(maxY, wy + gy)
+        minZ = Math.min(minZ, wz - gz); maxZ = Math.max(maxZ, wz + gz)
+      } else {
+        const r = data[o + 19]
+        if (!(r > 0)) continue
+        minX = Math.min(minX, data[o + 16] - r); maxX = Math.max(maxX, data[o + 16] + r)
+        minY = Math.min(minY, data[o + 17] - r); maxY = Math.max(maxY, data[o + 17] + r)
+        minZ = Math.min(minZ, data[o + 18] - r); maxZ = Math.max(maxZ, data[o + 18] + r)
+      }
+    }
+    if (!Number.isFinite(minX)) {
+      this.shadowSceneBounds = null
+      return
+    }
+    const b = this.shadowSceneBounds ?? { min: [0, 0, 0], max: [0, 0, 0] }
+    b.min[0] = minX; b.min[1] = minY; b.min[2] = minZ
+    b.max[0] = maxX; b.max[1] = maxY; b.max[2] = maxZ
+    this.shadowSceneBounds = b
   }
 
   /**
@@ -13364,7 +13442,8 @@ export class Engine {
       shadowDrawCalls: [],
       shadowBindGroups,
       mainPerInstanceBindGroup,
-      fillBuffer: null,
+      lightBuffer: null,
+      modelLight: null,
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
       isStage,
@@ -13790,25 +13869,60 @@ export class Engine {
   /** How much shadow the sun casts — see SunOptions.shadow. Full until told. */
   private sunShadow = 1
   private shadowLightVPDirty = true
-  // Last shadow-volume center, to skip recomputes while nothing moves.
-  private readonly shadowCenter = new Vec3(0, 11, 0)
+  /** The cascades as last uploaded, to skip the upload while nothing moved:
+   *  the fit snaps to the map's texels, so a still camera fits the same box. */
+  private readonly shadowLightVPLast = new Float32Array(16 * SHADOW_CASCADES.length)
+  /** Everything drawn, in world space, as writeCullModels last saw it. The
+   *  cascades reach along the light from its nearest face to its farthest, so
+   *  a window frame behind the camera casts onto the floor in front of it. */
+  private shadowSceneBounds: ShadowBounds = null
+  private readonly shadowView: ShadowView = {
+    eye: { x: 0, y: 0, z: 0 },
+    right: { x: 1, y: 0, z: 0 },
+    up: { x: 0, y: 1, z: 0 },
+    forward: { x: 0, y: 0, z: 1 },
+    fov: 1,
+    aspect: 1,
+    near: 1,
+    far: 100,
+    focus: 10,
+  }
 
   private updateShadowLightVP() {
-    // The volumes follow the camera target so a character carried far from the
-    // origin by code-driven root motion stays inside the lit frustum. The
-    // volume MATH lives in shadow-cascades.ts, where it is testable without a
-    // GPU; this method owns only the dirty-tracking and the upload.
+    // THE CASCADES FOLLOW THE CAMERA — fitted every frame to what it sees, the
+    // way Blender's sun shadow is, with their depth fitted to the scene. The
+    // fit MATH lives in shadow-cascades.ts, where it is testable without a
+    // GPU; this method gathers the view and owns the upload.
+    const v = this.shadowView
+    const view = this.camera.getViewMatrix().values
+    const eye = this.camera.getEyePosition()
+    v.eye.x = eye.x
+    v.eye.y = eye.y
+    v.eye.z = eye.z
+    // lookAt writes the basis as the view's rows: right, up, forward.
+    v.right.x = view[0]
+    v.right.y = view[4]
+    v.right.z = view[8]
+    v.up.x = view[1]
+    v.up.y = view[5]
+    v.up.z = view[9]
+    v.forward.x = view[2]
+    v.forward.y = view[6]
+    v.forward.z = view[10]
+    v.fov = this.camera.fov
+    v.aspect = this.camera.aspect
+    v.near = this.camera.near
+    v.far = this.camera.far
     const t = this.camera.target
-    const moved =
-      Math.abs(t.x - this.shadowCenter.x) > 1e-3 ||
-      Math.abs(t.y - this.shadowCenter.y) > 1e-3 ||
-      Math.abs(t.z - this.shadowCenter.z) > 1e-3
-    if (!this.shadowLightVPDirty && !moved) return
-    this.shadowLightVPDirty = false
-    this.shadowCenter.setXYZ(t.x, t.y, t.z)
+    v.focus = Math.hypot(t.x - eye.x, t.y - eye.y, t.z - eye.z)
 
+    buildShadowCascades(v, this.sun.direction, this.shadowSceneBounds, this.shadowLightVPMatrix)
+    let same = !this.shadowLightVPDirty
+    for (let i = 0; same && i < this.shadowLightVPMatrix.length; i++) same = this.shadowLightVPMatrix[i] === this.shadowLightVPLast[i]
+    if (same) return
+    this.shadowLightVPDirty = false
+    this.shadowLightVPLast.set(this.shadowLightVPMatrix)
     for (let i = 0; i < SHADOW_CASCADES.length; i++) {
-      buildShadowVP(t, this.sun.direction, SHADOW_CASCADES[i], this.shadowLightVPMatrix, i * 16)
       this.device.queue.writeBuffer(this.shadowCascadeVPBuffers[i], 0, this.shadowLightVPMatrix, i * 16, 16)
     }
     this.device.queue.writeBuffer(this.shadowLightVPBuffer, 0, this.shadowLightVPMatrix)

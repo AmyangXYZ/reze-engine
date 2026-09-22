@@ -130,10 +130,10 @@ ${discard}
   let v = normalize(camera.viewPos - input.worldPos);${flip}
 ${gate}
   let l = -light.lights[0].direction.xyz;
-  let sun = light.lights[0].color.xyz * light.lights[0].color.w;
+  let sun = select(light.lights[0].color.xyz * light.lights[0].color.w, modelLight.sun.rgb, modelLight.sun.w > 0.5);
   // The world: flat colour, or the HDRI's irradiance at this normal — which
   // is what makes a loaded sky actually light her instead of only backing her.
-  let amb = rzWorldAmbient(n) + modelFill.rgb;
+  let amb = rzWorldAmbient(n) + modelLight.fill.rgb;
   let shadow = sampleShadow(input.worldPos, n);
   let tex_color = tex_s.rgb;
 

@@ -1,68 +1,139 @@
-// The shadow volumes, as data — a list the engine iterates rather than one
-// hardcoded box, so a second cascade is a list entry and not a rewrite.
-//
-// Pure math, its own module for the same reason param-track.ts is: the engine
-// class needs a GPU to construct, and the one thing that ever goes WRONG with a
-// shadow volume is arithmetic — a snap that stops snapping, an eye that lands
-// inside the near plane. Headless tests can hold this half to golden values.
-//
-// The arithmetic is the shipped single-volume code, operation for operation:
-// float addition is not associative, so "the same formula, reordered" is not
-// the same matrix, and cascade 0 must be BIT-IDENTICAL to the volume every
-// published scene was lit by.
-
 import { Mat4, Vec3 } from "./math"
 
-type ShadowCascade = {
-  /** World units across the ortho box, both axes. */
-  span: number
-  /** How far behind the target the light's eye sits, along -sunDir. */
-  back: number
-  /** Ortho near/far, in world units from that eye. */
-  near: number
-  far: number
+/**
+ * THE SUN'S SHADOW FOLLOWS THE CAMERA, the way Blender's does.
+ *
+ * Each cascade is fitted every frame to a slice of the view frustum: the near
+ * one to the stretch around what the camera is looking at, the far one to the
+ * whole of what it sees. Whatever is in view is in a cascade, and whatever
+ * could throw a shadow onto it is in the cascade's depth range, which is fitted
+ * to the scene's bounds along the light. A room forty metres across with its
+ * window frames behind the camera shadows its floor as the game does; a lone
+ * dancer on an empty floor keeps a crisp near map.
+ *
+ * The earlier shape was two fixed boxes around the camera target, 64 and 256
+ * units across, and a stage reached past them: the floor near the windows lay
+ * outside every box and was drawn lit, the shadows stopping at the box's edge
+ * in a straight line.
+ *
+ * INVARIANT the sampler and the cull both lean on: the outer cascade CONTAINS
+ * the inner one. The sampler falls from cascade 0 to 1 at the box edge, which
+ * is only seamless if 1 covers where 0 ends, and the cull tests the OUTERMOST
+ * frustum alone. Both hold because the outer slice is the whole frustum, of
+ * which the inner slice is a part, and both take the same depth range.
+ * tests/shadow-cascades.test.mjs pins it.
+ */
+export type ShadowCascade = {
   /** Texels per side of this cascade's map — sets the snap quantum. */
   mapSize: number
 }
 
-/**
- * The list, inner to outer. INVARIANT the sampler and the cull both lean on:
- * each cascade's box must CONTAIN the previous one (same snapped target, wider
- * span, deeper reach), because
- *
- *   - the sampler falls from cascade i to i+1 at the box edge, which is only
- *     seamless if i+1 covers where i ends, and
- *   - the cull tests ONE frustum — the outermost — and the rasterizer clips
- *     each cascade to its own box. That is the same argument that made
- *     single-volume shadow culling exact: anything rejected was contributing
- *     nothing anywhere. Concentric containment is what keeps it true for a
- *     LIST. tests/shadow-cascades.test.mjs pins it.
- */
-export const SHADOW_CASCADES: readonly ShadowCascade[] = [
-  // The shipped volume: 64 units at 4096² ≈ 64 texels/unit — crisp contact
-  // shadows on the ground catcher (2048 read visibly blurry).
-  { span: 64, back: 72, near: 1, far: 140, mapSize: 4096 },
-  // The stage volume: 4× the span on each side, so a set piece 100 units out
-  // still throws and receives shade instead of popping lit at the near box's
-  // edge. 2048² over 256 units ≈ 8 texels/unit — soft, and read at distances
-  // where soft is what a shadow looks like anyway. 16 MB where the near map
-  // is 64. Depth reach scales with the span (same eye direction, deeper box),
-  // keeping the containment invariant checkable from the specs alone.
-  { span: 256, back: 288, near: 1, far: 560, mapSize: 2048 },
-]
+export const SHADOW_CASCADES: readonly ShadowCascade[] = [{ mapSize: 4096 }, { mapSize: 2048 }]
+
+/** How far past the camera's point of interest the near cascade reaches, in
+ *  world units: the dancer and the floor around her, at the near map's texel. */
+export const NEAR_REACH = 40
+
+/** The view the cascades are fitted to: the camera's eye and basis (world
+ *  space, left-handed, +Z forward as the projection is), its vertical field of
+ *  view, aspect and clip planes, and how far away the thing it looks at is. */
+export type ShadowView = {
+  eye: { x: number; y: number; z: number }
+  right: { x: number; y: number; z: number }
+  up: { x: number; y: number; z: number }
+  forward: { x: number; y: number; z: number }
+  fov: number
+  aspect: number
+  near: number
+  far: number
+  /** Distance from the eye to the camera target, along the view. */
+  focus: number
+}
+
+/** World-space box around everything drawn, or null for an empty scene. */
+export type ShadowBounds = { min: [number, number, number]; max: [number, number, number] } | null
+
+type XYZ = { x: number; y: number; z: number }
 
 /**
- * One cascade's view-projection, following the camera target.
- *
- * The target is snapped to this cascade's OWN texel quantum in the light's
- * right/up plane, so a moving volume doesn't shimmer its shadow edges while
- * running — each cascade snaps to its own grid, coarser maps snapping coarser.
+ * Where each cascade's slice of the view starts and ends, as distances along
+ * the view: [near, split] and [near, farFit]. The far end is where the scene
+ * ends, so an empty floor with a dancer on it keeps a short, sharp frustum
+ * rather than the camera's far plane.
+ */
+export function cascadeSlices(view: ShadowView, bounds: ShadowBounds): [number, number][] {
+  let farFit = view.near + 200
+  if (bounds) {
+    let deepest = 0
+    for (let i = 0; i < 8; i++) {
+      const cx = (i & 1 ? bounds.max : bounds.min)[0] - view.eye.x
+      const cy = (i & 2 ? bounds.max : bounds.min)[1] - view.eye.y
+      const cz = (i & 4 ? bounds.max : bounds.min)[2] - view.eye.z
+      deepest = Math.max(deepest, cx * view.forward.x + cy * view.forward.y + cz * view.forward.z)
+    }
+    farFit = deepest + 1
+  }
+  farFit = Math.min(view.far, Math.max(view.near + 1, farFit))
+  const split = Math.min(farFit, Math.max(view.near + 8, view.focus + NEAR_REACH))
+  return [
+    [view.near, split],
+    [view.near, farFit],
+  ]
+}
+
+/** The bounding sphere of a frustum slice: on the view axis, at the depth that
+ *  balances the near and far rectangles' corners. */
+function sliceSphere(view: ShadowView, n: number, f: number): { center: Vec3; radius: number } {
+  const t = Math.tan(view.fov / 2)
+  const k2 = t * t * (1 + view.aspect * view.aspect)
+  let depth: number
+  let radius: number
+  if (k2 >= (f - n) / (f + n)) {
+    depth = f
+    radius = f * Math.sqrt(k2)
+  } else {
+    depth = 0.5 * (f + n) * (1 + k2)
+    radius = 0.5 * Math.sqrt((f - n) * (f - n) + 2 * (f * f + n * n) * k2 + (f + n) * (f + n) * k2 * k2)
+  }
+  const center = new Vec3(
+    view.eye.x + view.forward.x * depth,
+    view.eye.y + view.forward.y * depth,
+    view.eye.z + view.forward.z * depth,
+  )
+  return { center, radius }
+}
+
+/** The eight corners of a slice, for tests and for the fit's own checks. */
+export function sliceCorners(view: ShadowView, n: number, f: number): XYZ[] {
+  const out: XYZ[] = []
+  for (const d of [n, f]) {
+    const h = d * Math.tan(view.fov / 2)
+    const w = h * view.aspect
+    for (const sy of [-1, 1])
+      for (const sx of [-1, 1])
+        out.push({
+          x: view.eye.x + view.forward.x * d + view.right.x * w * sx + view.up.x * h * sy,
+          y: view.eye.y + view.forward.y * d + view.right.y * w * sx + view.up.y * h * sy,
+          z: view.eye.z + view.forward.z * d + view.right.z * w * sx + view.up.z * h * sy,
+        })
+  }
+  return out
+}
+
+/**
+ * One cascade's view-projection: an orthographic box around the slice's
+ * sphere, snapped to the map's texel grid in the light's right/up plane so a
+ * moving camera doesn't shimmer its shadow edges, and reaching along the light
+ * from the nearest thing in the scene to the farthest, so everything that
+ * could cast into the slice does.
  *
  * Writes the 16 floats into `out` at `offset` and returns `out`.
  */
-export function buildShadowVP(
-  target: { x: number; y: number; z: number },
-  sunDirection: { x: number; y: number; z: number },
+export function fitShadowVP(
+  view: ShadowView,
+  slice: [number, number],
+  sunDirection: XYZ,
+  bounds: ShadowBounds,
   cascade: ShadowCascade,
   out: Float32Array,
   offset: number,
@@ -70,28 +141,49 @@ export function buildShadowVP(
   const dir = new Vec3(sunDirection.x, sunDirection.y, sunDirection.z)
   dir.normalize()
   const up = Math.abs(dir.y) > 0.99 ? new Vec3(0, 0, -1) : new Vec3(0, 1, 0)
-
-  const t = new Vec3(target.x, target.y, target.z)
   const right = Vec3.crossInto(up, dir, new Vec3(0, 0, 0)).normalize()
   const upv = Vec3.crossInto(dir, right, new Vec3(0, 0, 0))
-  const texel = cascade.span / cascade.mapSize
-  const tr = Math.round(t.dot(right) / texel) * texel
-  const tu = Math.round(t.dot(upv) / texel) * texel
-  const td = t.dot(dir)
+
+  const { center, radius } = sliceSphere(view, slice[0], slice[1])
+  // A texel of the map, in world units; the radius is rounded up onto the
+  // grid too, so the box's size does not drift with the fov by fractions.
+  const texel = Math.max((2 * radius) / cascade.mapSize, 1e-4)
+  const half = Math.ceil(radius / texel) * texel
+  const tr = Math.round(center.dot(right) / texel) * texel
+  const tu = Math.round(center.dot(upv) / texel) * texel
+  const td = center.dot(dir)
   const snapped = new Vec3(
     right.x * tr + upv.x * tu + dir.x * td,
     right.y * tr + upv.y * tu + dir.y * td,
     right.z * tr + upv.z * tu + dir.z * td,
   )
 
-  const eye = new Vec3(snapped.x - dir.x * cascade.back, snapped.y - dir.y * cascade.back, snapped.z - dir.z * cascade.back)
-  const view = Mat4.lookAt(eye, snapped, up)
-  const half = cascade.span / 2
-  // The shadow map keeps the NON-reversed convention (orthographicLh maps z to
-  // [0,1] front-to-back) — reversing it buys nothing for an ortho box and the
-  // +2 pipeline depth bias is signed against this direction.
-  const proj = Mat4.orthographicLh(-half, half, -half, half, cascade.near, cascade.far)
-  const vp = proj.multiply(view)
-  out.set(vp.values, offset)
+  // Along the light: from the scene's nearest point to its farthest, with a
+  // margin so a caster on the box's own face is not clipped. With nothing to
+  // fit, the sphere itself.
+  let zmin = td - half
+  let zmax = td + half
+  if (bounds) {
+    for (let i = 0; i < 8; i++) {
+      const z =
+        (i & 1 ? bounds.max : bounds.min)[0] * dir.x + (i & 2 ? bounds.max : bounds.min)[1] * dir.y + (i & 4 ? bounds.max : bounds.min)[2] * dir.z
+      zmin = Math.min(zmin, z)
+      zmax = Math.max(zmax, z)
+    }
+  }
+  const margin = 2 + 0.02 * (zmax - zmin)
+  const back = td - zmin + margin
+  const far = back + (zmax - td) + margin
+  const eye = new Vec3(snapped.x - dir.x * back, snapped.y - dir.y * back, snapped.z - dir.z * back)
+  const viewM = Mat4.lookAt(eye, snapped, up)
+  const proj = Mat4.orthographicLh(-half, half, -half, half, 1, far + 1)
+  out.set(proj.multiply(viewM).values, offset)
+  return out
+}
+
+/** Every cascade's view-projection in a row, inner to outer. */
+export function buildShadowCascades(view: ShadowView, sunDirection: XYZ, bounds: ShadowBounds, out: Float32Array): Float32Array {
+  const slices = cascadeSlices(view, bounds)
+  for (let i = 0; i < SHADOW_CASCADES.length; i++) fitShadowVP(view, slices[i], sunDirection, bounds, SHADOW_CASCADES[i], out, i * 16)
   return out
 }

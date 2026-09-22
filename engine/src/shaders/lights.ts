@@ -302,8 +302,13 @@ fn _rzLightCellMask(p: vec3f) -> vec4u {
  * A LIGHT FALLS OFF AS THE INVERSE SQUARE, the curve Unity, Unreal, Blender and
  * glTF all light with: intensity / max(d², RZ_LAMP_NEAR²), so its intensity is
  * the brightness one unit away, windowed by (1 − (d/R)⁴)² so it is exactly zero
- * at its radius and the bound the grid is built from is real. A lamp imported
- * from a game carries the game's own numbers.
+ * at its radius and the bound the grid is built from is real.
+ *
+ * THE UNITS ARE BLENDER'S. Intensity is radiant intensity, a point light's
+ * power over 4π, and a Lambertian surface returns albedo × irradiance / π —
+ * the π the sun term already carries. So a stage exported from Blender lights
+ * here as it lit there, and a lamp's intensity is what Blender's exporter
+ * writes in candela over 683.
  */
 fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   let pr = _rzLightVec(i, 0u);
@@ -354,6 +359,10 @@ fn _rzLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f) -> vec3f {
  * every material must cost nothing until someone asks for a light.
  */
 fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
+  return _rzLightsIrradiance(p, n) * (1.0 / 3.141592653589793);
+}
+
+fn _rzLightsIrradiance(p: vec3f, n: vec3f) -> vec3f {
   var acc = vec3f(0.0);
   let count = rzLightCount();
   let docs = _rzLightDocCount();
