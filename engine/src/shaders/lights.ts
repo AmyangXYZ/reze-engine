@@ -253,6 +253,11 @@ export function lightsApi(group: number, binding: number): string {
 @group(${group}) @binding(${binding}) var<storage, read> _rzLights: array<vec4u>;
 
 const RZ_MAX_LIGHTS: u32 = ${MAX_LIGHTS}u;
+// A lamp's bulb, in world units: the inverse square is held flat inside it,
+// so the spike beside the lamp is finite. Aether Gazer's lamps are
+// 0.1 m across (their shapeRadius, capping 1/d² at 1/0.1), which at MMD scale
+// is 2.5 units.
+const RZ_LAMP_NEAR: f32 = 2.5;
 
 /** How many positional lights the scene has. Zero is the ordinary case. */
 fn rzLightCount() -> u32 { return min(u32(bitcast<f32>(_rzLights[0].x)), RZ_MAX_LIGHTS); }
@@ -294,19 +299,11 @@ fn _rzLightCellMask(p: vec3f) -> vec4u {
 /**
  * One light's contribution at a surface point.
  *
- * FALLOFF IS RELATIVE TO THE RADIUS, and deliberately not physical.
- *
- * The first version windowed a real inverse-square, and it was unusable: 1/d²
- * is measured in world units, an MMD character is about 18 of them tall, so a
- * lamp two metres off her shoulder divided by 37 and an intensity of 4 landed
- * as 0.06 — invisible. Radius and intensity were fighting, and intensity had no
- * scale a person could learn.
- *
- * So: intensity is the brightness AT the light, radius is where it reaches
- * zero, and the curve between them is the same shape whatever the scene's
- * scale. Both dials now mean what they say, which for a composer beats being
- * right about photons. (1 - t²)² — smooth at both ends, exactly 0 at the
- * radius, so the bound the grid is built from is real.
+ * A LIGHT FALLS OFF AS THE INVERSE SQUARE, the curve Unity, Unreal, Blender and
+ * glTF all light with: intensity / max(d², RZ_LAMP_NEAR²), so its intensity is
+ * the brightness one unit away, windowed by (1 − (d/R)⁴)² so it is exactly zero
+ * at its radius and the bound the grid is built from is real. A lamp imported
+ * from a game carries the game's own numbers.
  */
 fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   let pr = _rzLightVec(i, 0u);
@@ -322,14 +319,16 @@ fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   let ndl = max(dot(n, toLight), 0.0);
   if (ndl <= 0.0) { return vec3f(0.0); }
   let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
-  let falloff = 1.0 - t * t;
+  let t2 = t * t;
+  let window = 1.0 - t2 * t2;
+  let falloff = window * window / max(dist * dist, RZ_LAMP_NEAR * RZ_LAMP_NEAR);
   // How far inside the cone this point sits: 1 within the inner angle, 0 past
   // the outer one, squared for the same soft edge the falloff has. A point
   // light's (-1, -1) divides by the floor and clamps to 1, so it pays one
   // dot product and no branch.
   let cone = rzLightCone(i);
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
-  return rzLightColor(i) * (ndl * falloff * falloff * aim * aim);
+  return rzLightColor(i) * (ndl * falloff * aim * aim);
 }
 
 /** The lamps named by one word of a cell's bits, lowest first. */

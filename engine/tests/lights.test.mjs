@@ -90,6 +90,7 @@ test("both surfaces that shade get the same accessors", () => {
 
 /** The shader's falloff and cone, reimplemented against the same constants.
  *  `aim` and `cone` default to what a POINT light stores. */
+const LAMP_NEAR = 2.5
 function contribution(light, p, n) {
   const aim = light.aim ?? [0, 0, 0]
   const cone = light.cone ?? [-1, -1]
@@ -101,10 +102,10 @@ function contribution(light, p, n) {
   const ndl = Math.max(n[0] * toLight[0] + n[1] * toLight[1] + n[2] * toLight[2], 0)
   if (ndl <= 0) return 0
   const t = Math.min(Math.max(dist / Math.max(light.radius, 1e-4), 0), 1)
-  const falloff = 1 - t * t
+  const falloff = (1 - t ** 4) ** 2 / Math.max(dist * dist, LAMP_NEAR * LAMP_NEAR)
   const axis = -(toLight[0] * aim[0] + toLight[1] * aim[1] + toLight[2] * aim[2])
   const lit = Math.min(Math.max((axis - cone[0]) / Math.max(cone[1] - cone[0], 1e-4), 0), 1)
-  return ndl * falloff * falloff * lit * lit
+  return ndl * falloff * lit * lit
 }
 
 /** The cosine pair setLights stores for a cone of `deg` degrees, inner 80% of it. */
@@ -135,16 +136,13 @@ test("the falloff is finite at the source", () => {
   assert.ok(Number.isFinite(v) && v <= 1.0, `contribution at the source was ${v}`)
 })
 
-test("intensity is usable at the scale a scene is actually built at", () => {
-  // The bug this replaced: a windowed real inverse-square is measured in world
-  // units, an MMD character is ~18 of them tall, and a lamp a couple of units
-  // off her shoulder divided by nearly 40. Intensity 4 landed as 0.06 and
-  // nothing on screen changed. A light well inside its own radius has to
-  // deliver most of its intensity, or the dial is a lie.
+test("a light falls off as the inverse square, flat inside its bulb", () => {
   const light = { pos: [0, 12, -6], radius: 25 }
   const chest = contribution(light, [0, 12, 0], [0, 0, -1])
-  assert.ok(chest > 0.5, `six units in, a 25-unit light delivered ${chest.toFixed(3)} of its intensity`)
-  // And still nothing at all past the radius.
+  const expected = (1 - (6 / 25) ** 4) ** 2 / 36
+  assert.ok(Math.abs(chest - expected) < 1e-9, `six units in, ${chest} rather than ${expected}`)
+  const touching = contribution(light, [0, 12, -5.5], [0, 0, -1])
+  assert.ok(Math.abs(touching - (1 - (0.5 / 25) ** 4) ** 2 / (LAMP_NEAR * LAMP_NEAR)) < 1e-9, "inside the bulb it is held flat")
   assert.equal(contribution(light, [0, 12, 20], [0, 0, -1]), 0)
 })
 
