@@ -28,7 +28,7 @@ npm install reze-engine
 - Vertex / group / bone / material morphs (multiply and add), vertex morphs on a GPU compute path
 - MMD draw disciplines reproduced: author-order transparency with depth write, per-mesh interleaved outline hulls, the eyes-through-bangs stencil pass, sphere maps as graph nodes
 - In-house sequential-impulse physics for PMX rigs — rigid bodies, joints, deterministic wind, a world floor
-- Stages as environments, not characters: a stage PMX takes the same materials, graphs and style groups a character does, and keeps the bone and material morphs its author rigged for doors, lifts and colour switches — while skipping physics, IK and idle pose work, and owning the floor so the built-in ground steps aside
+- Stages as environments, not characters: a stage PMX takes the same materials, graphs and style groups a character does, and keeps the bone and material morphs its author rigged for doors, lifts and colour switches — while skipping physics, IK and idle pose work, and owning the floor so the built-in ground steps aside. A stage keeps the light it was built under: `setModelSun` and `setModelFill` give one model its own sun colour and fill apart from the scene's, so a room ported from a game is lit by its own daylight while the cast keeps the scene's key
 - A model can ride another's bone — MMD's 外部親 — so a weapon, a phone or a second character follows a hand without being parented in the file; `setModelParentKeys` keys that parent over the scene, for a prop handed over, put down, or thrown and left to gravity
 
 **Rendering**
@@ -36,10 +36,10 @@ npm install reze-engine
 - Shader-graph materials: every look is a Blender-style node graph compiled to WGSL; style groups bind any materials to any graph; ungrouped materials render a Principled BSDF default
 - HDR pipeline end to end — bloom, 4× MSAA, three view transforms (Filmic, Standard, AgX from Blender's own LUT), bladed-bokeh depth of field
 - Colour grading over the tonemapped image: ASC CDL slope / offset / power with contrast and saturation, uniforms-only so dragging a slider rebuilds no pipeline — and the background layer stays ungraded, so a grade shapes the scene without staining the sky behind it
-- Two concentric shadow cascades: crisp contact shadows on the cast, coverage for a full stage
+- Two shadow cascades fitted to the camera every frame, the way Blender's are: the near one to the stretch around what it looks at, the far one to everything it sees, both reaching along the light to the scene's bounds — so a stage's window frames shadow its floor to the far wall, and a lone dancer keeps a crisp near map
 - Floor mirror: a planar reflection pass reusing the scene pipelines, with depth-proportional blur and the reflection composited as its own ground layer
-- HDRI worlds (`.hdr`): the sky renders through the same view transform as the scene and lights the cast via spherical-harmonic irradiance — the sun keeps the toon ramp
-- Positional lights, placed in the scene or emitted by effect shaders — stage rigs, firework bursts, a hand ribbon lighting the dancer as it passes
+- HDRI worlds (`.hdr`): the sky renders through the same view transform as the scene and lights the cast via spherical-harmonic irradiance — the sun keeps the toon ramp — and a Principled surface reflects it along the reflection vector at a level its roughness picks, so a polished floor mirrors the room and a metal mirrors the sky
+- Positional lights, placed in the scene or emitted by effect shaders — stage rigs, firework bursts, a hand ribbon lighting the dancer as it passes — lit by Blender's law: inverse square windowed to zero at the lamp's reach, Lambert over π, a lamp's intensity its candela over 683 and the sun's its W/m², so a scene built in Blender lights here as it lit there. Every lamp that reaches a Principled surface puts its highlight on it; forty candles on a polished floor are forty glints
 - Eye tracking: a gaze that follows the camera or a point within the rig's own range, and the cast interface reports where she is looking so an effect can follow it
 - `setModelDissolve` takes a character apart in her own material — a per-triangle threshold burn with a glowing front, run identically by the colour pass, depth prepass, shadow map and outline hull, so nothing of her is left standing; `setModelPhysicsWhileHidden` keeps a hidden model's cloth moving, so a costume swapped in arrives already in motion
 
