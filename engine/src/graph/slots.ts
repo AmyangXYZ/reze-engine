@@ -144,6 +144,9 @@ ${gate}
   let amb = rzWorldAmbient(n) + modelLight.fill.rgb;
   let shadow = sampleShadow(input.worldPos, n);
   let tex_color = tex_s.rgb;
+  // The normal the lamps' diffuse layer is lit by, for a principled walk to
+  // compute it on the way (rzLightsDiffuseOnce). n is final from here on.
+  _rzLampN = n;
 
 `
 }
@@ -178,7 +181,7 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // so the fix has an address — when graphs gain an optional albedo output
   // (material-track era), it lands here and every light is corrected at once,
   // instead of a hunt through the epilogue's string templates.
-  const LIT = ` + rzLightsDiffuse(input.worldPos, n) * albedo`
+  const LIT = ` + rzLightsDiffuseOnce(input.worldPos, n) * albedo`
   const ALBEDO = `  let albedo = tex_color;
 `
   // The dissolve's burning edge, ADDED after the graph and after the lights —

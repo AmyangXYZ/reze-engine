@@ -16995,29 +16995,41 @@ export class Engine {
    * each for a reason that would change pixels: EYE front-culls and gates on a
    * bone read, and pre-filled hair depth over the socket would depth-reject
    * the eye before it could write the stencil the see-through-hair pass needs
-   * — which is also why HAIR stays out entirely. HASHED alpha (stockings)
-   * discards by a position hash this pass does not run, so priming it would
-   * punch its cutout into the depth buffer at the wrong texels. They all still
-   * BENEFIT: their fragments early-z against the primed depth of whatever
-   * plain opaque surface sits in front of them.
+   * — which is also why HAIR stays out entirely. They all still BENEFIT:
+   * their fragments early-z against the primed depth of whatever plain opaque
+   * surface sits in front of them.
+   *
+   * HASHED alpha primes through the SOLID pipeline (cutoff 1.0). Its colour
+   * pass discards by a position hash this pass does not run, but that threshold
+   * is clamped to at most 1, so a texel at alpha exactly 1 survives it always —
+   * those are the only texels the solid prime claims, and it can never punch
+   * the cutout into the wrong ones. A stage's foliage and railings are mostly
+   * such texels, and without the prime every room surface behind them shaded
+   * its full lamp walk and was then painted over.
    */
   private drawOpaqueDepthPrepass(
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
-    let bound = false
+    let bound: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
       if (draw.type !== "opaque") continue
+      let pipeline = this.depthPrepassPipeline
       if (draw.groupId) {
         const install = inst.styleGroups.get(draw.groupId)
-        if (install && !(install.renderClass === "auto" && install.alphaMode === "opaque")) continue
+        if (install && install.renderClass !== "auto") continue
+        if (install?.alphaMode === "hashed") pipeline = this.solidPrepassPipeline
+        else if (install && install.alphaMode !== "opaque") continue
       }
-      if (!bound) {
-        pass.setPipeline(this.depthPrepassPipeline)
-        pass.setBindGroup(0, view.perFrame)
-        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
-        bound = true
+      if (bound !== pipeline) {
+        pass.setPipeline(pipeline)
+        // One layout for both prepass pipelines, so groups 0 and 1 carry over.
+        if (!bound) {
+          pass.setBindGroup(0, view.perFrame)
+          pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        }
+        bound = pipeline
       }
       pass.setBindGroup(2, draw.bindGroup)
       this.issueDraw(pass, draw, view.args)

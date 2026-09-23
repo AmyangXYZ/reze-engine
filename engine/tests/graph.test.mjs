@@ -172,7 +172,7 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
   // the two ENDS of the expression rather than the whole of it, because pinning
   // the whole of it is what made this test fail the first time anything was
   // added to the epilogue — which the note it replaces predicted.
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuseOnce(input.worldPos, n) * albedo"))
   assert.ok(r.wgsl.includes(", 1.0);"))
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
 })
@@ -193,7 +193,7 @@ test("eye graph: default Principled + emission, rear-gate from renderClass", () 
   )
   // Slot-owned: rear-view gate in the prelude, standard alpha epilogue.
   assert.ok(r.wgsl.includes("if (dot(faceDir, v) < -0.15) { discard; }"))
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuse(input.worldPos, n) * albedo"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuseOnce(input.worldPos, n) * albedo"))
   assert.ok(r.wgsl.includes(", alpha);"))
 })
 

@@ -997,50 +997,74 @@ fn principled_specular(ior: f32, level: f32) -> f32 {
 // It walks the light grid a second time — the lamps THIS CELL can see, which
 // is what the grid is for — and with no lamps at all neither walk runs.
 
-fn _rzLampSpecOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
+// The walk also yields the DIFFUSE layer, against the prelude's normal
+// (_rzLampN, not the mapped N) and in the order rzLightsDiffuse sums it, so the
+// epilogue's rzLightsDiffuseOnce is that function's exact answer without a
+// second pass over the grid. See lights.ts.
+struct _RzLampPair { d: vec3f, s: vec3f };
+
+fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> _RzLampPair {
+  var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
   let pr = _rzLightVec(i, 0u);
   let d = pr.xyz - p;
   let dist = length(d);
-  if (dist >= pr.w) { return vec3f(0.0); }
+  if (dist >= pr.w) { return out; }
   let toLight = d / max(dist, 1e-4);
+  let ndlD = max(dot(_rzLampN, toLight), 0.0);
   let ndl = dot(n, toLight);
-  if (ndl <= 0.0) { return vec3f(0.0); }
+  if (ndlD <= 0.0 && ndl <= 0.0) { return out; }
   let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
   let t2 = t * t;
   let window = 1.0 - t2 * t2;
   let falloff = window * window / max(dist * dist, RZ_LAMP_NEAR * RZ_LAMP_NEAR);
   let cone = rzLightCone(i);
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
-  return rzLightColor(i) * (bsdf_ggx(n, toLight, v, ndl, ndv, roughness) * falloff * aim * aim);
+  let c = rzLightColor(i);
+  if (ndlD > 0.0) { out.d = c * (ndlD * falloff * aim * aim); }
+  if (ndl > 0.0) { out.s = c * (bsdf_ggx(n, toLight, v, ndl, ndv, roughness) * falloff * aim * aim); }
+  return out;
 }
 
-fn _rzLampSpecWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
-  var acc = vec3f(0.0);
+fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> _RzLampPair {
+  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
   var bits = bits0;
   loop {
     if (bits == 0u) { break; }
     let i = base + firstTrailingBit(bits);
     bits = bits & (bits - 1u);
-    acc = acc + _rzLampSpecOne(i, p, n, v, ndv, roughness);
+    let one = _rzLampOne(i, p, n, v, ndv, roughness);
+    acc.d = acc.d + one.d;
+    acc.s = acc.s + one.s;
   }
   return acc;
 }
 
 fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
-  var acc = vec3f(0.0);
+  var d = vec3f(0.0);
+  var s = vec3f(0.0);
   let count = rzLightCount();
   let docs = _rzLightDocCount();
   if (docs > 0u) {
     let m = _rzLightCellMask(p);
-    acc = acc + _rzLampSpecWord(m.x, 0u, p, n, v, ndv, roughness) +
-      _rzLampSpecWord(m.y, 32u, p, n, v, ndv, roughness) +
-      _rzLampSpecWord(m.z, 64u, p, n, v, ndv, roughness) +
-      _rzLampSpecWord(m.w, 96u, p, n, v, ndv, roughness);
+    let wx = _rzLampWord(m.x, 0u, p, n, v, ndv, roughness);
+    let wy = _rzLampWord(m.y, 32u, p, n, v, ndv, roughness);
+    let wz = _rzLampWord(m.z, 64u, p, n, v, ndv, roughness);
+    let ww = _rzLampWord(m.w, 96u, p, n, v, ndv, roughness);
+    d = d + wx.d + wy.d + wz.d + ww.d;
+    s = s + wx.s + wy.s + wz.s + ww.s;
   }
   for (var i = docs; i < count; i = i + 1u) {
-    acc = acc + _rzLampSpecOne(i, p, n, v, ndv, roughness);
+    let one = _rzLampOne(i, p, n, v, ndv, roughness);
+    d = d + one.d;
+    s = s + one.s;
   }
-  return acc;
+  // The first closure's walk speaks for the fragment; a second principled in
+  // the same graph shares p and the prelude normal, so its answer is the same.
+  if (!_rzLampDiffuseSet) {
+    _rzLampDiffuse = d * (1.0 / 3.141592653589793);
+    _rzLampDiffuseSet = true;
+  }
+  return s;
 }
 
 struct PrincipledIn {

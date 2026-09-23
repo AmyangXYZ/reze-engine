@@ -362,6 +362,21 @@ fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
   return _rzLightsIrradiance(p, n) * (1.0 / 3.141592653589793);
 }
 
+// ONE WALK PER FRAGMENT. A principled closure walks the lamps for its specular
+// anyway, and every lamp's reach, falloff and cone are the same numbers the
+// diffuse layer needs — so that walk computes both, against the normal the
+// material prelude recorded here, and leaves the diffuse for the epilogue.
+// Walking the grid twice was ~60% of a lit stage's frame.
+var<private> _rzLampN: vec3f;
+var<private> _rzLampDiffuse: vec3f;
+var<private> _rzLampDiffuseSet: bool = false;
+
+/** rzLightsDiffuse(p, _rzLampN), taken from a principled walk when one ran. */
+fn rzLightsDiffuseOnce(p: vec3f, n: vec3f) -> vec3f {
+  if (_rzLampDiffuseSet) { return _rzLampDiffuse; }
+  return rzLightsDiffuse(p, n);
+}
+
 fn _rzLightsIrradiance(p: vec3f, n: vec3f) -> vec3f {
   var acc = vec3f(0.0);
   let count = rzLightCount();
