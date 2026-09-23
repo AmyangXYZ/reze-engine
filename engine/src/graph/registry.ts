@@ -848,7 +848,7 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       const bsdf =
         `eval_principled(PrincipledIn(${a.base_color}, ${a.metallic}, ` +
         `${spec}, ${a.roughness}, ` +
-        `${a.spec_clamp}, ${a.sheen_weight}, ${a.sheen_tint}), ${a.normal}, l, v, sun, amb, shadow)`
+        `${a.spec_clamp}, ${a.sheen_weight}, ${a.sheen_tint}), ${a.normal}, l, v, sun, amb, shadow, input.worldPos)`
       // v2 defaults Emission Strength to 0, which is the overwhelming case. Emit
       // the term only when it can do something, so the common shader carries no
       // dead add and the output stays readable.

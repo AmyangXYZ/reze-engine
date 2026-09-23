@@ -979,6 +979,70 @@ fn principled_specular(ior: f32, level: f32) -> f32 {
   return (r * r * 2.0 * max(level, 0.0)) / 0.08;
 }
 
+// ─── The scene's lamps, on a PBR closure ───────────────────────────
+//
+// A lamp reaches a material as rzLightsDiffuse, added outside the graph and
+// multiplied by the raw texture: Lambert and nothing else, because that layer
+// cannot know what the surface is. On a principled closure it can. A floor at
+// roughness 0.23 under forty candles carries forty glints, and a metal
+// REFLECTS a lamp instead of having it painted on — without this a ported
+// stage is a photograph of itself, lit but never shining.
+//
+// Same reach as _rzLightOne: the inverse square past RZ_LAMP_NEAR, the
+// (1 − (d/R)⁴)² window that makes the radius real, the squared cone. N·L is
+// inside bsdf_ggx. Declared here for bsdf_ggx and resolved against the lights
+// API the material prelude brings; the ground pass takes that API without
+// this file and is untouched.
+//
+// It walks the light grid a second time — the lamps THIS CELL can see, which
+// is what the grid is for — and with no lamps at all neither walk runs.
+
+fn _rzLampSpecOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
+  let pr = _rzLightVec(i, 0u);
+  let d = pr.xyz - p;
+  let dist = length(d);
+  if (dist >= pr.w) { return vec3f(0.0); }
+  let toLight = d / max(dist, 1e-4);
+  let ndl = dot(n, toLight);
+  if (ndl <= 0.0) { return vec3f(0.0); }
+  let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
+  let t2 = t * t;
+  let window = 1.0 - t2 * t2;
+  let falloff = window * window / max(dist * dist, RZ_LAMP_NEAR * RZ_LAMP_NEAR);
+  let cone = rzLightCone(i);
+  let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
+  return rzLightColor(i) * (bsdf_ggx(n, toLight, v, ndl, ndv, roughness) * falloff * aim * aim);
+}
+
+fn _rzLampSpecWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
+  var acc = vec3f(0.0);
+  var bits = bits0;
+  loop {
+    if (bits == 0u) { break; }
+    let i = base + firstTrailingBit(bits);
+    bits = bits & (bits - 1u);
+    acc = acc + _rzLampSpecOne(i, p, n, v, ndv, roughness);
+  }
+  return acc;
+}
+
+fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
+  var acc = vec3f(0.0);
+  let count = rzLightCount();
+  let docs = _rzLightDocCount();
+  if (docs > 0u) {
+    let m = _rzLightCellMask(p);
+    acc = acc + _rzLampSpecWord(m.x, 0u, p, n, v, ndv, roughness) +
+      _rzLampSpecWord(m.y, 32u, p, n, v, ndv, roughness) +
+      _rzLampSpecWord(m.z, 64u, p, n, v, ndv, roughness) +
+      _rzLampSpecWord(m.w, 96u, p, n, v, ndv, roughness);
+  }
+  for (var i = docs; i < count; i = i + 1u) {
+    acc = acc + _rzLampSpecOne(i, p, n, v, ndv, roughness);
+  }
+  return acc;
+}
+
 struct PrincipledIn {
   base: vec3f,
   metallic: f32,
@@ -992,7 +1056,7 @@ struct PrincipledIn {
 fn eval_principled(
   p: PrincipledIn,
   N: vec3f, L: vec3f, V: vec3f,
-  sun_rgb: vec3f, amb_rgb: vec3f, shadow: f32
+  sun_rgb: vec3f, amb_rgb: vec3f, shadow: f32, wp: vec3f
 ) -> vec3f {
   let NL = max(dot(N, L), 0.0);
   let NV = max(dot(N, V), 1e-4);
@@ -1011,8 +1075,11 @@ fn eval_principled(
   // Direct glossy — bsdf_ggx already includes NL; no F applied here (tinted after
   // accum with reflection_color). ltc_brdf_scale rescales direct to match the
   // split-sum indirect path, matching EEVEE closure_eval_glossy_lib behavior.
-  let spec_direct_raw = bsdf_ggx(N, L, V, NL, NV, p.roughness)
-                       * sun_rgb * shadow * ltc_brdf_scale_from_lut(lut);
+  // The sun, and every lamp that reaches this point. One clamp over the pair:
+  // a candle a hand's width from a polished floor is a firefly otherwise.
+  let spec_direct_raw = (bsdf_ggx(N, L, V, NL, NV, p.roughness) * sun_rgb * shadow
+                        + rzLampsSpecular(wp, N, V, NV, p.roughness))
+                       * ltc_brdf_scale_from_lut(lut);
   let spec_direct = min(spec_direct_raw, vec3f(p.spec_clamp));
   // Indirect specular reads the world ALONG THE REFLECTION, at a roughness-
   // picked level — EEVEE's probe_evaluate_world_spec, where the diffuse half
