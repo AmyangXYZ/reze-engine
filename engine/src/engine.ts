@@ -6723,8 +6723,17 @@ export class Engine {
 
   // Step 1: Get WebGPU device and context
   async init() {
+    // SPLIT, because the four steps below want opposite fixes and on a cold
+    // machine one of them is the whole open. Acquiring the device is the
+    // browser's business and nothing here can hurry it; building the pipelines
+    // is this engine compiling ~20 of them, which a warm shader cache serves
+    // for free and a first visit — or a private window — pays for in full.
+    // Measured at 53s on one such open, with the scene load behind it taking
+    // 5.7s, and no way to tell which step that was.
+    const t0 = performance.now()
     const adapter = await navigator.gpu?.requestAdapter()
     if (!adapter) throw new Error("WebGPU is not supported in this browser.")
+    const tAdapter = performance.now()
     const wantFeature: GPUFeatureName = "rg11b10ufloat-renderable"
     const hasRg11b10 = adapter.features.has(wantFeature)
     // Float depth WITH stencil, which the eye/hair stencil interplay needs. It is
@@ -6751,6 +6760,7 @@ export class Engine {
     if (!device) {
       throw new Error("WebGPU is not supported in this browser.")
     }
+    const tDevice = performance.now()
     this.device = device
     // Every validation error this device ever raises, kept.
     //
@@ -6794,6 +6804,7 @@ export class Engine {
     // Gated by MRT_IDS as well, which is the master switch: the probe says
     // CAN, and that says SHOULD.
     setMrtIds(Engine.MRT_IDS && (await this.probeMultisampledIds()))
+    const tProbe = performance.now()
     if (hasTimestamp) {
       this.timestampQuerySet = device.createQuerySet({
         label: "pass timings",
@@ -6834,8 +6845,15 @@ export class Engine {
 
     this.setupCamera()
     this.setupLighting()
+    const tPipelines = performance.now()
     this.createPipelines()
     this.setupResize()
+    const ms = (a: number, b: number) => Math.round(b - a)
+    console.info(
+      `[reze] init ${ms(t0, performance.now())}ms — adapter ${ms(t0, tAdapter)}ms · ` +
+        `device ${ms(tAdapter, tDevice)}ms · probe ${ms(tDevice, tProbe)}ms · ` +
+        `pipelines ${ms(tPipelines, performance.now())}ms`,
+    )
     Engine.instance = this
   }
 
@@ -12898,6 +12916,7 @@ export class Engine {
 
     const camView = this.sceneView("camera")
     const opaque = this.device.createRenderBundleEncoder({ label: "opaque phase", ...scene })
+    this.forEachInstance((inst) => this.renderModelOpaqueDepth(opaque, inst, camView))
     this.forEachInstance((inst) => this.renderModelOpaquePhase(opaque, inst, camView))
     this.opaqueBundle = opaque.finish({ label: "opaque phase" })
 
@@ -12912,6 +12931,7 @@ export class Engine {
     // which is the pattern that works.
     const mirrorView = this.sceneView("mirror")
     const mo = this.device.createRenderBundleEncoder({ label: "mirror opaque phase", ...scene })
+    this.forEachInstance((inst) => this.renderModelOpaqueDepth(mo, inst, mirrorView))
     this.forEachInstance((inst) => this.renderModelOpaquePhase(mo, inst, mirrorView))
     this.mirrorOpaqueBundle = mo.finish({ label: "mirror opaque phase" })
 
@@ -13987,7 +14007,14 @@ export class Engine {
 
       let diffuseTexture = await loadTextureByIndex(mat.diffuseTextureIndex)
       if (!diffuseTexture) {
-        console.warn(`${prefix}material "${mat.name}" has no loadable diffuse texture — using fallback`)
+        // NAMING NO TEXTURE IS NOT A FAILURE. A material can legitimately have
+        // none — an emissive panel whose picture is its emission, a flat colour,
+        // a surface whose whole look comes from its maps — and a stage
+        // converted from glTF is full of them. Warning there said a stage was
+        // broken every time it loaded correctly. What IS worth saying is a
+        // texture that was named and did not arrive, which is a missing file.
+        if (texLogicalPath(mat.diffuseTextureIndex))
+          console.warn(`${prefix}material "${mat.name}" names a diffuse texture that did not load — using fallback`)
         diffuseTexture = this.fallbackMaterialTexture
       }
 
@@ -16865,15 +16892,38 @@ export class Engine {
       : { perFrame: this.perFrameBindGroup, args: "camera", outlines: true }
   }
 
+  /**
+   * Every model's opaque depth, before any model's colour.
+   *
+   * Depth first, colour second — the close-up fix, and the oldest one there is
+   * (see drawOpaqueDepthPrepass). It used to run per model, interleaved with
+   * that model's own colour draws, which meant a model only ever primed
+   * against ITSELF: a stage drawn after the cast still shaded every fragment
+   * standing behind her, because her depth was not there yet when its turn
+   * came. Hoisted here the whole scene's depth is down before anything shades,
+   * and what a character covers stops costing the room behind her.
+   *
+   * PIXELS ARE UNCHANGED. This pass writes no colour, and the only fragments
+   * it newly rejects are opaque ones something opaque provably covers — which
+   * the colour pass was going to overwrite regardless. Within a model the
+   * colour order is untouched, so the eye/hair stencil interplay below runs
+   * exactly as it did.
+   */
+  private renderModelOpaqueDepth(
+    pass: GPURenderPassEncoder | GPURenderBundleEncoder,
+    inst: ModelInstance,
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+  ): void {
+    this.setModelDrawState(pass, inst)
+    this.drawOpaqueDepthPrepass(pass, inst, view)
+  }
+
   private renderModelOpaquePhase(
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
     this.setModelDrawState(pass, inst)
-    // Depth first, colour second — the close-up fix, and the oldest one there
-    // is. See drawOpaqueDepthPrepass.
-    this.drawOpaqueDepthPrepass(pass, inst, view)
     // The opaque author order, in two walks with the hair prime between them.
     //
     // Hair could not join the plain prepass: primed hair depth would depth-
