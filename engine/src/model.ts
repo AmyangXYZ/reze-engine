@@ -1359,9 +1359,42 @@ export class Model {
       Quat.slerpInto(_eyeOwn, _eyeQuat, w, own)
     }
     if (bothRot) bothRot.setIdentity()
-    // Only these need their world matrices again; nothing hangs off an eye.
-    this.eyeSubset ??= new Int32Array(both !== undefined ? [both, left, right] : [left, right])
+    // The eye bones and everything that follows them — the bones under them
+    // and the bones inheriting from them. Rigs often weight the eyeball to one
+    // of those (左目2, a 付与 child), and a motion keying the eyes left it on
+    // the motion's gaze: the full pass had already run.
+    this.eyeSubset ??= this.eyeFollowers(both !== undefined ? [both, left, right] : [left, right])
     this.computeWorldMatrices(this.eyeSubset)
+  }
+
+  /** The seeds, their descendants and their 付与 inheritors, transitively, in
+   *  deform order. */
+  private eyeFollowers(seeds: number[]): Int32Array {
+    const bones = this.skeleton.bones
+    const n = bones.length
+    const affected = new Uint8Array(n)
+    for (const s of seeds) affected[s] = 1
+    let changed = true
+    while (changed) {
+      changed = false
+      for (let k = 0; k < n; k++) {
+        const i = this.deformOrder[k]
+        if (affected[i]) continue
+        const b = bones[i]
+        const ap = b.appendParentIndex
+        const inherits = (b.appendRotate || b.appendMove) && ap !== undefined && ap >= 0 && ap < n && affected[ap]
+        if (inherits || (b.parentIndex >= 0 && affected[b.parentIndex])) {
+          affected[i] = 1
+          changed = true
+        }
+      }
+    }
+    const order: number[] = []
+    for (let k = 0; k < n; k++) {
+      const i = this.deformOrder[k]
+      if (affected[i]) order.push(i)
+    }
+    return Int32Array.from(order)
   }
 
   /** Compose a constant local rotation onto a bone AFTER every pose source (clip,
