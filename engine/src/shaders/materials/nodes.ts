@@ -1014,7 +1014,14 @@ fn eval_principled(
   let spec_direct_raw = bsdf_ggx(N, L, V, NL, NV, p.roughness)
                        * sun_rgb * shadow * ltc_brdf_scale_from_lut(lut);
   let spec_direct = min(spec_direct_raw, vec3f(p.spec_clamp));
-  let spec_indirect = amb_rgb;
+  // Indirect specular reads the world ALONG THE REFLECTION, at a roughness-
+  // picked level — EEVEE's probe_evaluate_world_spec, where the diffuse half
+  // below is probe_evaluate_world_diff along the normal. Taking the diffuse
+  // answer for both gave every surface the same flat wash whatever its
+  // roughness, so a chrome rail mirrored what a matte wall did and a stage's
+  // metal only ever lost its diffuse. A uniform sky gives the same number
+  // either way, so this moves direction, not energy.
+  let spec_indirect = rzWorldSpecular(reflect(-V, N), p.roughness);
   let spec_radiance = (spec_direct + spec_indirect) * reflection_color;
 
   // Sheen add — when p.sheen=0 the whole term collapses, leaving diffuse_color=base.
