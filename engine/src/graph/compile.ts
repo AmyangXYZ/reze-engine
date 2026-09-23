@@ -8,7 +8,7 @@ import type { Diagnostic, ExposedParam, GraphNode, SocketValue, ShaderGraph } fr
 import { NODE_REGISTRY, canConvert, convert, fmtValue, literalFits } from "./registry"
 import type { NodeSpec, SockT } from "./registry"
 import { assembleModule } from "./slots"
-import type { AlphaMode, RenderClass } from "./render-class"
+import type { AlphaMode, RenderClass, StyleBlend } from "./render-class"
 
 export type CompileOptions = {
   /** Fold exposed params to their defaults as consts (no StyleUniforms binding).
@@ -22,6 +22,8 @@ export type CompileOptions = {
   renderClass?: RenderClass
   /** Alpha-handling axis, orthogonal to renderClass. Default "opaque". */
   alphaMode?: AlphaMode
+  /** How the result meets the frame — see StyleGroup.blend. Default "over". */
+  blend?: StyleBlend
 }
 
 /** UBO slot for one exposed param: write `value` at style.p[vec4Index] (+ component). */
@@ -356,6 +358,6 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
   if (opacity) lines.push(`  let final_opacity = saturate(${outputExpr(opacity, "float")}); // @node:${opacity.node}`)
 
   const fsBody = lines.join("\n")
-  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current, !!opacity)
+  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current, !!opacity, opts.blend ?? "over")
   return { ok: true, wgsl, fsBody, slotMap, diagnostics, prunedNodes }
 }

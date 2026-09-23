@@ -90,6 +90,14 @@ type SceneRenderClass =
    *  cast — a reflection that claimed her object id would seed the distance
    *  field twice and put every silhouette effect's border around the glass. */
   | "mirror"
+  /** A material whose light is ADDED rather than laid over what is behind it.
+   *  A game's sky layers are painted this way — a nebula, a starfield, a band of
+   *  colour on a cylinder round the whole scene — and their alpha is 0 across
+   *  the entire image, because additive blending never reads it: the picture is
+   *  wholly in RGB. Drawn alpha-over they are invisible, which is exactly what
+   *  X309's night sky was. Out of WRITES_ID for the mirror's reason — a sheet of
+   *  light is not an object anything should be able to pick or outline. */
+  | "material-additive"
   /** Particles and ribbons in their default, non-additive mode. */
   | "particle"
   /** Particles declaring `#blend additive` — LIGHT rather than matter, so
@@ -172,6 +180,9 @@ const WRITES_ID = new Set<SceneRenderClass>(["material", "ground"])
 /** The blends each class writes its two attachments with. */
 const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState, GPUBlendState]> = {
   material: [ALPHA_OVER, ALPHA_OVER],
+  // The same pair the additive particles use: light into the colour target, and
+  // coverage that still accumulates so bloom and the composite can see it.
+  "material-additive": [ADD_KEEP_ALPHA, ADD_BOTH],
   // PREMULTIPLIED, like the ground and for the same reason: what a mirror
   // writes is a sample of the HDR target, and that target already holds colour
   // premultiplied by its own alpha. Handed to the src-alpha blend it would be

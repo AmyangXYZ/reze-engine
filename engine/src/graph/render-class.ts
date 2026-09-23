@@ -11,6 +11,10 @@ export type RenderClass = "auto" | "eye" | "hair"
  *  hashed alpha test (stockings); "opaque" = the standard near-zero threshold discard. */
 export type AlphaMode = "opaque" | "hashed"
 
+/** How a group's colour meets the frame. "over" is the ordinary alpha blend;
+ *  "additive" adds its light and never reads alpha — see StyleGroup.blend. */
+export type StyleBlend = "over" | "additive"
+
 /** Descriptive manifest for hosts (reze-design) so the render-class picker is data-driven
  *  instead of hardcoding strings. The effect implementations stay engine-side; this only
  *  describes them. `pairsWith` = the effect needs a counterpart class present to show. */

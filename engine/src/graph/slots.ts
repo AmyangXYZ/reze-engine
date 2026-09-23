@@ -10,7 +10,7 @@
 import { NODES_WGSL } from "../shaders/materials/nodes"
 import { COMMON_MATERIAL_PRELUDE_WGSL, DISSOLVE_WGSL, commonFsOutWgsl } from "../shaders/materials/common"
 import { sceneIdWriteWgsl } from "../shaders/passes/scene-contract"
-import type { AlphaMode, RenderClass } from "./render-class"
+import type { AlphaMode, RenderClass, StyleBlend } from "./render-class"
 
 // ── Module-scope declarations ──
 // hair: the over-eyes pipeline-override constant (a second pipeline is compiled with
@@ -80,11 +80,19 @@ function decls(renderClass: RenderClass, alphaMode: AlphaMode): string {
 // fs() header up to and including the graph body's context locals. Composed so the
 // hand-written material shaders' local names (tex_color, n, v, l, sun, amb, shadow) are
 // preserved exactly — the registry's context nodes and emit functions reference them.
-function prelude(renderClass: RenderClass, alphaMode: AlphaMode): string {
+function prelude(renderClass: RenderClass, alphaMode: AlphaMode, blend: StyleBlend): string {
+  // ADDITIVE NEVER GATES ON ALPHA. Its blend adds colour and reads no alpha at
+  // all, so a surface painted this way carries its picture in RGB and leaves
+  // alpha at zero — a game's sky layers do exactly that. Discarding on alpha
+  // throws every one of those fragments away before the blend can add them,
+  // which is what made X309's nebula and starfield invisible while its cloud
+  // dome (opaque) came through.
   const discard =
-    alphaMode === "hashed"
-      ? "  if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"
-      : "  if (alpha < 0.001) { discard; }"
+    blend === "additive"
+      ? ""
+      : alphaMode === "hashed"
+        ? "  if (alpha < hashed_alpha_threshold(input.restPos)) { discard; }"
+        : "  if (alpha < 0.001) { discard; }"
   const gate = renderClass === "eye" ? EYE_REAR_GATE : ""
   // Double-sided shading, winding-independent: a normal pointing away from the
   // camera means we're seeing the surface's other side — flip it. Only genuinely
@@ -143,11 +151,15 @@ ${gate}
 // Tail of fs(): consumes `final_color` + locals, writes FSOut. hashed forces output
 // alpha to 1 (the discard already did the cutout); hair scales alpha for the over-eyes
 // pass when IS_OVER_EYES is compiled true.
-function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: boolean): string {
+function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: boolean, blend: StyleBlend): string {
   // A graph that computes its own opacity wins, including over hashed: hashed
   // writes 1 because its discard already decided the cutout, and a graph asking
-  // for a curve is asking for the opposite of a cutout.
-  const alphaBase = hasOpacity ? "final_opacity" : alphaMode === "hashed" ? "1.0" : "alpha"
+  // for a curve is asking for the opposite of a cutout. Additive writes 1 for a
+  // third reason: its colour blend ignores src alpha entirely, so the only thing
+  // alpha still reaches is the aux target's coverage — and a sky layer that
+  // reported zero coverage would be invisible to bloom and to the composite.
+  const alphaBase =
+    blend === "additive" ? "1.0" : hasOpacity ? "final_opacity" : alphaMode === "hashed" ? "1.0" : "alpha"
   // Empty while ids are off, so the epilogue is exactly what it was. The values
   // ride in the per-draw material uniform (see MaterialUniforms), which is what
   // keeps this working through the indirect-draw path.
@@ -202,6 +214,7 @@ export function assembleModule(
   fsBody: string,
   includeStyleUniforms: boolean,
   hasOpacity = false,
+  blend: StyleBlend = "over",
 ): string {
   return (
     NODES_WGSL +
@@ -212,10 +225,10 @@ export function assembleModule(
     commonFsOutWgsl() +
     (includeStyleUniforms ? STYLE_UNIFORMS_WGSL : "") +
     decls(renderClass, alphaMode) +
-    prelude(renderClass, alphaMode) +
+    prelude(renderClass, alphaMode, blend) +
     fsBody +
     "\n" +
-    epilogue(renderClass, alphaMode, hasOpacity) +
+    epilogue(renderClass, alphaMode, hasOpacity, blend) +
     "}\n"
   )
 }

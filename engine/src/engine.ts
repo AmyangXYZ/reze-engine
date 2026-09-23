@@ -146,7 +146,7 @@ import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
 import type { Diagnostic, ShaderGraph } from "./graph/schema"
-import type { AlphaMode, RenderClass } from "./graph/render-class"
+import type { AlphaMode, RenderClass, StyleBlend } from "./graph/render-class"
 import type {
   ApplyStyleGroupResult,
   ApplyStyleGroupsResult,
@@ -1812,6 +1812,7 @@ export class Engine {
   // Stashed at createPipelines so group pipelines can be compiled later.
   private mainPipelineLayout!: GPUPipelineLayout
   private sceneTargets!: GPUColorTargetState[]
+  private sceneTargetsAdditive!: GPUColorTargetState[]
   /** The scene pass's attachment formats, settled at init once the device has
    *  said which HDR format it will blend. Every scene-pass pipeline asks
    *  scene-contract for its targets against these. */
@@ -7390,6 +7391,9 @@ export class Engine {
     // opaque pixel contributes its whole mask, a translucent one its share.
     const sceneTargets = sceneTargetsFor("material", this.sceneFormats)
     this.sceneTargets = sceneTargets
+    // The same attachments blended as light — for a group that declared
+    // blend: "additive". See scene-contract's material-additive.
+    this.sceneTargetsAdditive = sceneTargetsFor("material-additive", this.sceneFormats)
     this.fullVertexBufferLayouts = fullVertexBuffers
 
     // group 0: per-frame (camera + light + sampler + shadow) — bound once per pass
@@ -16451,6 +16455,7 @@ export class Engine {
       g: group.graph,
       rc: renderClass,
       am: alphaMode,
+      bl: group.blend ?? "over",
       o: opts?.previewNode ?? null,
       im: group.images?.length ?? 0,
       ibm: Object.keys(group.imagesByMaterial ?? {}).sort(),
@@ -16461,7 +16466,7 @@ export class Engine {
       return { ok: true, diagnostics: [], slotMap: existing.slotMap }
     }
 
-    const result = compileGraph(group.graph, { ...opts, renderClass, alphaMode })
+    const result = compileGraph(group.graph, { ...opts, renderClass, alphaMode, blend: group.blend ?? "over" })
     if (!result.ok) return { ok: false, diagnostics: result.diagnostics, slotMap: result.slotMap }
 
     const generation = (inst.styleGroupGen.get(group.id) ?? 0) + 1
@@ -16487,15 +16492,16 @@ export class Engine {
     let overEyesPipeline: GPURenderPipeline | undefined
     let mirrorPipeline: GPURenderPipeline | undefined
     try {
-      pipeline = await this.createRenderClassPipeline(renderClass, module, false)
+      const blend = group.blend ?? "over"
+      pipeline = await this.createRenderClassPipeline(renderClass, module, false, true, false, blend)
       // The depth-write-off twin: stage transparency draws with it (see
       // pipelineForDrawCall), and a future OIT path would too.
-      pipelineNoDepthWrite = await this.createRenderClassPipeline(renderClass, module, false, false)
-      if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true)
+      pipelineNoDepthWrite = await this.createRenderClassPipeline(renderClass, module, false, false, false, blend)
+      if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true, true, false, blend)
       // Only the eye needs one: every other class culls "none", which a flipped
       // winding leaves alone.
       if (renderClass === "eye")
-        mirrorPipeline = await this.createRenderClassPipeline(renderClass, module, false, true, true)
+        mirrorPipeline = await this.createRenderClassPipeline(renderClass, module, false, true, true, blend)
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
       return { ok: false, diagnostics, slotMap: result.slotMap }
@@ -16672,6 +16678,7 @@ export class Engine {
     overEyes: boolean,
     depthWrite = true,
     mirrored = false,
+    blend: StyleBlend = "over",
   ): Promise<GPURenderPipeline> {
     const base = {
       label: `style ${renderClass}${overEyes ? " (over eyes)" : ""}`,
@@ -16733,7 +16740,7 @@ export class Engine {
     }
     return this.device.createRenderPipelineAsync({
       ...base,
-      fragment: { module, constants, targets: this.sceneTargets },
+      fragment: { module, constants, targets: blend === "additive" ? this.sceneTargetsAdditive : this.sceneTargets },
       depthStencil,
     })
   }

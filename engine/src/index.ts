@@ -69,7 +69,7 @@ export type {
   Diagnostic,
 } from "./graph/schema"
 export { NODE_REGISTRY, type NodeSpec, type SockT } from "./graph/registry"
-export { RENDER_CLASSES, type RenderClass, type AlphaMode, type RenderClassInfo } from "./graph/render-class"
+export { RENDER_CLASSES, type RenderClass, type AlphaMode, type StyleBlend, type RenderClassInfo } from "./graph/render-class"
 export type {
   StyleGroup,
   GroupImage,

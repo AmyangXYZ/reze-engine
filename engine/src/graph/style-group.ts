@@ -5,7 +5,7 @@
 // the hand-written preset path. See docs/style-groups-spec.md.
 
 import type { Diagnostic, ShaderGraph } from "./schema"
-import type { AlphaMode, RenderClass } from "./render-class"
+import type { AlphaMode, RenderClass, StyleBlend } from "./render-class"
 import type { StyleSlot } from "./compile"
 
 export type StyleGroup = {
@@ -22,6 +22,16 @@ export type StyleGroup = {
   renderClass?: RenderClass
   /** Alpha-handling axis, orthogonal to renderClass. Default "opaque". */
   alphaMode?: AlphaMode
+  /**
+   * How this group's colour meets what is already there. Default "over".
+   *
+   * "additive" is LIGHT rather than matter: the fragment is added to the frame
+   * and its alpha is never read. A game's sky layers are painted this way — a
+   * nebula and a starfield on cylinders round the scene, their alpha 0 across
+   * the whole image because additive blending does not look at it. Laid over,
+   * they are invisible.
+   */
+  blend?: StyleBlend
   /**
    * Extra image maps for this group's shading, up to four.
    *
