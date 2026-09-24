@@ -190,8 +190,11 @@ export class PmxLoader {
         const j0 = this.getNonVertexIndex(this.boneIndexSize)
         const j1 = this.getNonVertexIndex(this.boneIndexSize)
         const w0f = this.getFloat32()
-        const w0 = Math.max(0, Math.min(255, Math.round(w0f * 255)))
-        const w1 = Math.max(0, Math.min(255, 255 - w0))
+        let w0 = Math.max(0, Math.min(255, Math.round(w0f * 255)))
+        // A side with no bone (-1) takes nothing: it would land on bone 0.
+        if (j1 < 0) w0 = 255
+        else if (j0 < 0) w0 = 0
+        const w1 = 255 - w0
         joints[base] = j0 >= 0 ? j0 : 0
         joints[base + 1] = j1 >= 0 ? j1 : 0
         weights[base] = w0
@@ -203,26 +206,34 @@ export class PmxLoader {
       } else if (type === 2 || type === 4) {
         // BDEF4 or QDEF (treat as LBS4)
         let sum = 0
+        const valid = [false, false, false, false]
         for (let k = 0; k < 4; k++) {
           const j = this.getNonVertexIndex(this.boneIndexSize)
           joints[base + k] = j >= 0 ? j : 0
+          valid[k] = j >= 0
         }
         const wf = [this.getFloat32(), this.getFloat32(), this.getFloat32(), this.getFloat32()]
-        const ws = wf.map((x) => Math.max(0, Math.min(1, x)))
-        const w8 = ws.map((x) => Math.round(x * 255))
-        sum = w8[0] + w8[1] + w8[2] + w8[3]
-        if (sum === 0) {
+        // A slot with no bone (-1) takes nothing: its index lands on bone 0, the
+        // model's root, which a motion never moves with センター.
+        const ws = wf.map((x, k) => (valid[k] ? Math.max(0, Math.min(1, x)) : 0))
+        sum = ws[0] + ws[1] + ws[2] + ws[3]
+        if (sum <= 0) {
           weights[base] = 255
         } else {
-          // Normalize to 255
-          const scale = 255 / sum
+          // Normalize to 255, and the rounding's remainder to the HEAVIEST
+          // slot. It went to the fourth, which is usually empty — bone 0 — and
+          // a vertex one or two 255ths on the root is invisible at the origin
+          // but trails a spike back to it from a figure a motion has carried
+          // 58 m away.
           let accum = 0
-          for (let k = 0; k < 3; k++) {
-            const v = Math.max(0, Math.min(255, Math.round(w8[k] * scale)))
+          let heaviest = 0
+          for (let k = 0; k < 4; k++) {
+            const v = Math.round((ws[k] / sum) * 255)
             weights[base + k] = v
             accum += v
+            if (ws[k] > ws[heaviest]) heaviest = k
           }
-          weights[base + 3] = Math.max(0, Math.min(255, 255 - accum))
+          weights[base + heaviest] = Math.max(0, Math.min(255, weights[base + heaviest] + 255 - accum))
         }
       } else {
         throw new Error(`Invalid bone weight type: ${type}`)
