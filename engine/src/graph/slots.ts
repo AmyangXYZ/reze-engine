@@ -154,7 +154,7 @@ ${gate}
 // Tail of fs(): consumes `final_color` + locals, writes FSOut. hashed forces output
 // alpha to 1 (the discard already did the cutout); hair scales alpha for the over-eyes
 // pass when IS_OVER_EYES is compiled true.
-function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: boolean, blend: StyleBlend): string {
+function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: boolean, blend: StyleBlend, takesLight: boolean): string {
   // A graph that computes its own opacity wins, including over hashed: hashed
   // writes 1 because its discard already decided the cutout, and a graph asking
   // for a curve is asking for the opposite of a cutout. Additive writes 1 for a
@@ -181,7 +181,13 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // so the fix has an address — when graphs gain an optional albedo output
   // (material-track era), it lands here and every light is corrected at once,
   // instead of a hunt through the epilogue's string templates.
-  const LIT = ` + rzLightsDiffuseOnce(input.worldPos, n) * albedo`
+  //
+  // ONLY ON A GRAPH THAT TAKES LIGHT. An emission-only graph — Unlit, a stage's
+  // painted sheet — is Blender's Emission shader, which no lamp reaches; adding
+  // the lamps to it turned X340's floor shadow, a white-RGB picture at a soft
+  // alpha, into a glowing disc under the spot above it.
+  const LIT = takesLight ? ` + rzLightsDiffuseOnce(input.worldPos, n) * albedo` : ""
+
   const ALBEDO = `  let albedo = tex_color;
 `
   // The dissolve's burning edge, ADDED after the graph and after the lights —
@@ -189,19 +195,24 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // on every fragment of every material that is not dissolving, which is what
   // keeps this out of the way of a scene that never uses it.
   const BURN = ` + RZ_BURN_COLOR * rz_burn`
+  // The scene fog, last, as the game lays it over a lit surface; an
+  // emission-only graph takes none (the game's effect shaders have no fog).
+  const FOG = takesLight
+    ? `  out.color = vec4f(mix(mix(out.color.rgb, light.fog[0].rgb, input.fog.x), light.fog[2].rgb, input.fog.y), out.color.a);\n`
+    : ""
   if (renderClass === "hair") {
     return `${ALBEDO}  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
 
   var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
-  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+${FOG}  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `${ALBEDO}  var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
-  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+${FOG}  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${ID_WRITE}  return out;
 `
 }
@@ -218,6 +229,7 @@ export function assembleModule(
   includeStyleUniforms: boolean,
   hasOpacity = false,
   blend: StyleBlend = "over",
+  takesLight = true,
 ): string {
   return (
     NODES_WGSL +
@@ -231,7 +243,7 @@ export function assembleModule(
     prelude(renderClass, alphaMode, blend) +
     fsBody +
     "\n" +
-    epilogue(renderClass, alphaMode, hasOpacity, blend) +
+    epilogue(renderClass, alphaMode, hasOpacity, blend, takesLight) +
     "}\n"
   )
 }

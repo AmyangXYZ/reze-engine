@@ -358,6 +358,9 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
   if (opacity) lines.push(`  let final_opacity = saturate(${outputExpr(opacity, "float")}); // @node:${opacity.node}`)
 
   const fsBody = lines.join("\n")
-  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current, !!opacity, opts.blend ?? "over")
+  // A graph takes light when its body reads any: the four shading nodes all
+  // pass `sun, amb`, and a hand-written node reaching for the lamps names them.
+  const takesLight = /\bsun\b|\bamb\b|rzLight|rzLamp/.test(fsBody)
+  const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current, !!opacity, opts.blend ?? "over", takesLight)
   return { ok: true, wgsl, fsBody, slotMap, diagnostics, prunedNodes }
 }

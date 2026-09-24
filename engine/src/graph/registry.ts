@@ -837,6 +837,14 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       /** Ours, not Blender's: caps firefly speculars from noise-bumped NDF
        *  aliasing, which EEVEE hides behind TAA and we have none. */
       spec_clamp: F(1e30),
+      /** Ours: how roughness picks the reflection's blur. 0 is the engine's
+       *  sqrt ramp; 1 is Unity's probe curve, p·(1.7−0.7p) mip-steps per
+       *  eighth, stopping where a cube's last face texel does — what a stage
+       *  ripped from a Unity game was authored against. See rzWorldSpecularLod. */
+      reflection_lod: F(0),
+      /** Ours: 1 shades the sun's and the lamps' highlights with URP's
+       *  direct-light BRDF, as a stage from a Unity game was lit — see bsdf_urp. */
+      unity_direct: F(0),
     },
     outputs: { color: "color" },
     emit: (a) => {
@@ -848,11 +856,15 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       const bsdf =
         `eval_principled(PrincipledIn(${a.base_color}, ${a.metallic}, ` +
         `${spec}, ${a.roughness}, ` +
-        `${a.spec_clamp}, ${a.sheen_weight}, ${a.sheen_tint}), ${a.normal}, l, v, sun, amb, shadow, input.worldPos)`
+        `${a.spec_clamp}, ${a.sheen_weight}, ${a.sheen_tint}, ${a.reflection_lod}, ${a.unity_direct}), ${a.normal}, l, v, sun, amb, shadow, input.worldPos)`
       // v2 defaults Emission Strength to 0, which is the overwhelming case. Emit
       // the term only when it can do something, so the common shader carries no
       // dead add and the output stays readable.
-      return a.emission_strength === "0.0" ? bsdf : `${bsdf} + ${a.emission_color} * ${a.emission_strength}`
+      const lit = a.emission_strength === "0.0" ? bsdf : `${bsdf} + ${a.emission_color} * ${a.emission_strength}`
+      // Unity mode also ends as SimPipeline's surfaces end: saturate()d, so no
+      // lit or glowing surface passes 1.0 before the post — its bloom works on
+      // what is left under that. A literal, as every stage graph states it.
+      return a.unity_direct === "1.0" ? `min(${lit}, vec3f(1.0))` : lit
     },
   },
 }

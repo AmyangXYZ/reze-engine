@@ -157,7 +157,8 @@ override APPLY_GAMMA: bool = true;
 //            per frame while skybox/effect active.
 // viewU[6] = (time seconds, view transform id, canvas width, canvas height).
 // viewU[7] = (grade offset.rgb, contrast);  viewU[8] = (grade power.rgb, saturation);
-// viewU[9] = (grade slope.rgb, grade on/off) — see grade() below.
+// viewU[9] = (grade slope.rgb, grade flags) — bit 0 the CDL grade(), bit 1 the
+//            scene's own LUT (setStageGrade) — see _rzGradeScene() below.
 // viewU[10] = (camera world position, _) — refreshed with the basis above.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
@@ -178,6 +179,9 @@ override APPLY_GAMMA: bool = true;
 // Blender's AgX, as the 57³ lookup it ships as rather than a reconstruction of
 // it. Sampled in the log-encoded E-Gamut space the cube expects — see agxTransform.
 @group(0) @binding(10) var agxLut: texture_3d<f32>;
+// The scene's own colour grade, as a cube — see _rzStageGrade. sRGB-encoded
+// storage, so what a sample returns is already linear.
+@group(0) @binding(12) var stageGradeLut: texture_3d<f32>;
 // The cast, as data. Read through rzSubject/rzAnchor below — the LAYOUT IS NOT
 // STABLE and never will be, because it depends on what each effect declared.
 // Reading it directly is the one thing that would freeze it forever.
@@ -305,6 +309,33 @@ fn viewTransform(c: vec3f) -> vec3f {
   if (mode > 1.5) { return agxTransform(c); }
   if (mode > 0.5) { return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b)); }
   return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));
+}
+
+fn _rzSrgbDecode(x: f32) -> f32 {
+  let c = max(x, 0.0);
+  return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+}
+
+/** The grade a scene arrived with — a game's, baked to a cube by its converter
+ *  (setStageGrade). Looked up the way that game's final pass looks it up: the
+ *  formed colour, linear, clamped to the cube, with texel centres at the ends,
+ *  and trilinear between. The lookup is the whole grade; it has no dials. */
+fn _rzStageGrade(c: vec3f) -> vec3f {
+  let lin = clamp(vec3f(_rzSrgbDecode(c.r), _rzSrgbDecode(c.g), _rzSrgbDecode(c.b)), vec3f(0.0), vec3f(1.0));
+  let n = f32(textureDimensions(stageGradeLut).x);
+  let graded = textureSampleLevel(stageGradeLut, bloomSamp, lin * ((n - 1.0) / n) + 0.5 / n, 0.0).rgb;
+  return vec3f(srgb_encode(graded.r), srgb_encode(graded.g), srgb_encode(graded.b));
+}
+
+/** Both grades, in order: the scene's own first, as the room was graded, then
+ *  the author's CDL on top of it. Each is behind its own flag bit in viewU[9].w
+ *  so a scene with neither pays one uniform branch. */
+fn _rzGradeScene(c: vec3f) -> vec3f {
+  let flags = u32(viewU[9].w);
+  var x = c;
+  if ((flags & 2u) != 0u) { x = _rzStageGrade(x); }
+  if ((flags & 1u) != 0u) { x = grade(x); }
+  return x;
 }
 `
 
@@ -455,6 +486,7 @@ fn grade(c: vec3f) -> vec3f {
   let luma = dot(x, vec3f(0.2126, 0.7152, 0.0722));
   return max(mix(vec3f(luma), x, viewU[8].w), vec3f(0.0));
 }
+
 `
 
 const COMPOSITE_BODY = /* wgsl */ `
@@ -537,7 +569,7 @@ const COMPOSITE_BODY = /* wgsl */ `
   // load-bearing — leaves green-screen mode's key color unshifted so chroma
   // keying still works. Skipped entirely when the grade is neutral.
   if (viewU[9].w > 0.5) {
-    disp = grade(disp);
+    disp = _rzGradeScene(disp);
   }
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));

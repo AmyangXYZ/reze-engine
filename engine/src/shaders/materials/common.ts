@@ -54,6 +54,13 @@ struct LightUniforms {
   lights: array<Light, 4>,
   /** Irradiance SH of the HDRI world; [0].w is the on-flag. */
   sh: array<vec4f, 9>,
+  /** The scene fog (Engine.setSceneFog): haze (colour, amount), (distance,
+   *  height), then the second layer the same. Amount 0 is none. */
+  fog: array<vec4f, 4>,
+  /** The cast's shadow on a stage (Engine.setStageCastShadow): colour, amount;
+   *  amount 0 is off. Then the view-projection its map was drawn with. */
+  castShadow: vec4f,
+  castVP: mat4x4f,
 };
 
 // Per-material uniforms. Every material binds this layout even if it ignores fields;
@@ -121,7 +128,18 @@ struct VertexOutput {
    * must agree — a pass that disagrees punches holes through her.
    */
   @location(4) @interpolate(flat) faceT: f32,
+  /** The scene fog's two amounts, computed PER VERTEX as the game does — see
+   *  Engine.setSceneFog — and interpolated across the face. */
+  @location(5) fog: vec2f,
 };
+
+/** One fog layer's amount at a vertex of view depth d and world height y. */
+fn _rzFogAmount(d: f32, y: f32, col: vec4f, p: vec4f) -> f32 {
+  if (col.w <= 0.0) { return 0.0; }
+  let f = clamp(d * p.x + p.y, 0.0, 1.0);
+  let h = clamp((p.z - y) / p.w, -1.0, 1.0);
+  return (1.0 - clamp(f - (1.0 - f) * h, 0.0, 1.0)) * col.w;
+}
 
 // One view-projection per shadow cascade, inner to outer — the volumes built
 // by shadow-cascades.ts, in the same order.
@@ -144,6 +162,30 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 // has the 1x1 fallback bound here; rzWorldSpecular checks the SH flag and
 // answers with the flat ambient instead, so nothing samples the placeholder.
 @group(0) @binding(8) var worldEnvTexture: texture_2d<f32>;
+// The cast's own shadow map for a stage's floor — see _rzCastShadow.
+@group(0) @binding(10) var castShadowMap: texture_depth_2d;
+
+/**
+ * How much of the cast stands between this point and the stage's shadow
+ * direction, 0–1 — setStageCastShadow. A 5×5 comparison filter at 1.5 texels:
+ * the game blurs its character shadow before laying it, and a single tap reads
+ * as a stencil.
+ */
+fn _rzCastShadow(wp: vec3f) -> f32 {
+  if (light.castShadow.w <= 0.0) { return 0.0; }
+  let c = light.castVP * vec4f(wp, 1.0);
+  let ndc = c.xyz / c.w;
+  if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0) { return 0.0; }
+  let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let ts = 1.5 / f32(textureDimensions(castShadowMap).x);
+  var lit = 0.0;
+  for (var y = -2; y <= 2; y++) {
+    for (var x = -2; x <= 2; x++) {
+      lit += textureSampleCompareLevel(castShadowMap, shadowSampler, uv + vec2f(f32(x), f32(y)) * ts, ndc.z - 0.001);
+    }
+  }
+  return 1.0 - lit / 25.0;
+}
 // binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 // The light this model takes apart from the scene's — see Engine.setModelFill
@@ -273,6 +315,11 @@ const COMMON_VS_WGSL = /* wgsl */ `
   output.worldPos = skinnedPos.xyz;
   output.restPos = position;
   output.faceT = rz_dissolve_threshold(position);
+  let viewZ = (camera.view * vec4f(skinnedPos.xyz, 1.0)).z;
+  output.fog = vec2f(
+    _rzFogAmount(viewZ, skinnedPos.y, light.fog[0], light.fog[1]),
+    _rzFogAmount(viewZ, skinnedPos.y, light.fog[2], light.fog[3]),
+  );
   return output;
 }
 

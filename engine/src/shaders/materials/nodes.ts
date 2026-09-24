@@ -312,6 +312,21 @@ fn point_world_to_camera(p: vec3f) -> vec3f { return (camera.view * vec4f(p, 1.0
  * texture sees no change at all.
  */
 fn rzWorldSpecular(dir: vec3f, roughness: f32) -> vec3f {
+  return rzWorldSpecularLod(dir, roughness, 0.0);
+}
+
+/**
+ * The same, with the blur curve chosen. unity = 0 is the sqrt ramp above; 1 is
+ * Unity's reflection-probe lookup, mip = p·(1.7 − 0.7p)·8 — the curve a game's
+ * glossy floor was tuned under, about a level sharper than sqrt through the
+ * glossy range (roughness 0.1–0.3) and the same by 0.5.
+ *
+ * Its levels map one to one onto this chain's: a cube of N texels a face and an
+ * equirect 4N wide resolve the same angle per texel, so a cube's last level —
+ * one texel a face — is this chain's log2(width/4), and the curve stops there
+ * rather than averaging the whole sky, as the game's does.
+ */
+fn rzWorldSpecularLod(dir: vec3f, roughness: f32, unity: f32) -> vec3f {
   // A SKY TEXTURE, or the best the scene has. The flag is 2 when an HDRI is
   // installed, 1 when the world is a gradient fitted to the same harmonics,
   // and 0 when it is one flat colour — and in the last two cases the ambient
@@ -327,7 +342,9 @@ fn rzWorldSpecular(dir: vec3f, roughness: f32) -> vec3f {
   // sqrt, not linear: mip n covers roughly twice the angle of n-1, so a linear
   // ramp spends most of its travel in the blurry end and a mirror-to-satin
   // sweep happens entirely in the first tenth of the dial.
-  let lod = clamp(sqrt(clamp(roughness, 0.0, 1.0)) * levels, 0.0, levels);
+  let r = clamp(roughness, 0.0, 1.0);
+  let unityLod = min(r * (1.7 - 0.7 * r) * 8.0, max(levels - 2.0, 0.0));
+  let lod = clamp(mix(sqrt(r) * levels, unityLod, unity), 0.0, levels);
   return textureSampleLevel(worldEnvTexture, diffuseSampler, vec2f(u, v), lod).rgb * light.ambientColor.w;
 }
 
@@ -866,6 +883,28 @@ fn bsdf_ggx(N: vec3f, L: vec3f, V: vec3f, NL_in: f32, NV_in: f32, roughness: f32
   return NL * a2 / (D_opti * G);
 }
 
+// URP's direct-light specular, as a game on URP (or a fork of it) shades its
+// lamps and sun: D·V·F folded into a2 / (d²·max(0.1, LoH²)·(4a + 2)), a the
+// SQUARED roughness. Unity folds π into its light units, and a light that came
+// from one reaches this engine with that π restored (see the app's stage
+// loader), so it comes back out here. Returns BRDF × NL, like bsdf_ggx.
+fn bsdf_urp(N: vec3f, L: vec3f, V: vec3f, NL: f32, roughness: f32) -> f32 {
+  let a = max(roughness * roughness, 6.1035156e-5);
+  let a2 = a * a;
+  let H = normalize(L + V);
+  let NH = max(dot(N, H), 0.0);
+  let LH = max(dot(L, H), 0.0);
+  let d = NH * NH * (a2 - 1.0) + 1.00001;
+  return a2 / (d * d * max(0.1, LH * LH) * (a * 4.0 + 2.0)) * NL / EEVEE_PI;
+}
+
+/** The direct-light lobe a principled closure asked for: 0 the engine's own,
+ *  1 URP's (principled's unity_direct). */
+fn _rzDirectLobe(N: vec3f, L: vec3f, V: vec3f, NL: f32, NV: f32, roughness: f32, unity: f32) -> f32 {
+  if (unity > 0.5) { return bsdf_urp(N, L, V, NL, roughness); }
+  return bsdf_ggx(N, L, V, NL, NV, roughness);
+}
+
 // Split-sum DFG LUT — Karis 2013 curve fit stand-in for the 64×64 baked LUT.
 // Returns (lut.x, lut.y) in Blender convention: tint = f0·lut.x + f90·lut.y.
 fn brdf_lut_approx(NV: f32, roughness: f32) -> vec2f {
@@ -1003,7 +1042,7 @@ fn principled_specular(ior: f32, level: f32) -> f32 {
 // second pass over the grid. See lights.ts.
 struct _RzLampPair { d: vec3f, s: vec3f };
 
-fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> _RzLampPair {
+fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> _RzLampPair {
   var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
   let pr = _rzLightVec(i, 0u);
   let d = pr.xyz - p;
@@ -1021,40 +1060,40 @@ fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) ->
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
   let c = rzLightColor(i);
   if (ndlD > 0.0) { out.d = c * (ndlD * falloff * aim * aim); }
-  if (ndl > 0.0) { out.s = c * (bsdf_ggx(n, toLight, v, ndl, ndv, roughness) * falloff * aim * aim); }
+  if (ndl > 0.0) { out.s = c * (_rzDirectLobe(n, toLight, v, ndl, ndv, roughness, unity) * falloff * aim * aim); }
   return out;
 }
 
-fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> _RzLampPair {
+fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> _RzLampPair {
   var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
   var bits = bits0;
   loop {
     if (bits == 0u) { break; }
     let i = base + firstTrailingBit(bits);
     bits = bits & (bits - 1u);
-    let one = _rzLampOne(i, p, n, v, ndv, roughness);
+    let one = _rzLampOne(i, p, n, v, ndv, roughness, unity);
     acc.d = acc.d + one.d;
     acc.s = acc.s + one.s;
   }
   return acc;
 }
 
-fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32) -> vec3f {
+fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> vec3f {
   var d = vec3f(0.0);
   var s = vec3f(0.0);
   let count = rzLightCount();
   let docs = _rzLightDocCount();
   if (docs > 0u) {
     let m = _rzLightCellMask(p);
-    let wx = _rzLampWord(m.x, 0u, p, n, v, ndv, roughness);
-    let wy = _rzLampWord(m.y, 32u, p, n, v, ndv, roughness);
-    let wz = _rzLampWord(m.z, 64u, p, n, v, ndv, roughness);
-    let ww = _rzLampWord(m.w, 96u, p, n, v, ndv, roughness);
+    let wx = _rzLampWord(m.x, 0u, p, n, v, ndv, roughness, unity);
+    let wy = _rzLampWord(m.y, 32u, p, n, v, ndv, roughness, unity);
+    let wz = _rzLampWord(m.z, 64u, p, n, v, ndv, roughness, unity);
+    let ww = _rzLampWord(m.w, 96u, p, n, v, ndv, roughness, unity);
     d = d + wx.d + wy.d + wz.d + ww.d;
     s = s + wx.s + wy.s + wz.s + ww.s;
   }
   for (var i = docs; i < count; i = i + 1u) {
-    let one = _rzLampOne(i, p, n, v, ndv, roughness);
+    let one = _rzLampOne(i, p, n, v, ndv, roughness, unity);
     d = d + one.d;
     s = s + one.s;
   }
@@ -1075,6 +1114,8 @@ struct PrincipledIn {
   spec_clamp: f32,
   sheen: f32,
   sheen_tint: f32,
+  reflection_lod: f32,
+  unity_direct: f32,
 };
 
 fn eval_principled(
@@ -1101,9 +1142,12 @@ fn eval_principled(
   // split-sum indirect path, matching EEVEE closure_eval_glossy_lib behavior.
   // The sun, and every lamp that reaches this point. One clamp over the pair:
   // a candle a hand's width from a polished floor is a firefly otherwise.
-  let spec_direct_raw = (bsdf_ggx(N, L, V, NL, NV, p.roughness) * sun_rgb * shadow
-                        + rzLampsSpecular(wp, N, V, NV, p.roughness))
-                       * ltc_brdf_scale_from_lut(lut);
+  // URP's lobe carries its own normalisation, so the LTC rescale that matches
+  // EEVEE's direct light to its split-sum indirect does not apply to it.
+  let direct_scale = select(ltc_brdf_scale_from_lut(lut), 1.0, p.unity_direct > 0.5);
+  let spec_direct_raw = (_rzDirectLobe(N, L, V, NL, NV, p.roughness, p.unity_direct) * sun_rgb * shadow
+                        + rzLampsSpecular(wp, N, V, NV, p.roughness, p.unity_direct))
+                       * direct_scale;
   let spec_direct = min(spec_direct_raw, vec3f(p.spec_clamp));
   // Indirect specular reads the world ALONG THE REFLECTION, at a roughness-
   // picked level — EEVEE's probe_evaluate_world_spec, where the diffuse half
@@ -1112,8 +1156,13 @@ fn eval_principled(
   // roughness, so a chrome rail mirrored what a matte wall did and a stage's
   // metal only ever lost its diffuse. A uniform sky gives the same number
   // either way, so this moves direction, not energy.
-  let spec_indirect = rzWorldSpecular(reflect(-V, N), p.roughness);
-  let spec_radiance = (spec_direct + spec_indirect) * reflection_color;
+  let spec_indirect = rzWorldSpecularLod(reflect(-V, N), p.roughness, p.reflection_lod);
+  // URP tints a lamp's highlight by f0 alone — its D·V·F already folds the
+  // Fresnel in — where the split-sum reflectance grows toward grazing; applied
+  // to the direct term it made a far glossy floor several times brighter than
+  // the game draws it. Reflections keep the split sum either way.
+  let direct_tint = select(reflection_color, f0, p.unity_direct > 0.5);
+  let spec_radiance = spec_direct * direct_tint + spec_indirect * reflection_color;
 
   // Sheen add — when p.sheen=0 the whole term collapses, leaving diffuse_color=base.
   let base_tint = tint_from_color(p.base);
@@ -1123,9 +1172,23 @@ fn eval_principled(
   // diffuse_weight = (1-metallic). Indirect diffuse uses amb (L_w) with no π factor
   // (probe_evaluate_world_diff returns SH-projected radiance, not cosine-convolved).
   let diffuse_weight = 1.0 - p.metallic;
-  let diffuse_radiance = diffuse_color * (sun_rgb * NL * shadow / EEVEE_PI + amb_rgb) * diffuse_weight;
+  var diffuse_radiance = diffuse_color * (sun_rgb * NL * shadow / EEVEE_PI + amb_rgb) * diffuse_weight;
+  // The lamps' diffuse, in Unity mode, as URP shades it: THIS surface's albedo
+  // — its tint and its maps, not the raw texture the epilogue would use —
+  // times 0.96·(1 − metal). X340's floor wears a 0.588 tint the epilogue never
+  // saw, and every lamp on it landed 1.7× too bright.
+  if (p.unity_direct > 0.5 && !_rzLampDiffuseTaken) {
+    diffuse_radiance += p.base * (0.96 * (1.0 - p.metallic)) * rzLightsDiffuseOnce(wp, N);
+    _rzLampDiffuseTaken = true;
+  }
 
-  return diffuse_radiance + spec_radiance;
+  // The cast's shadow on a stage (Unity mode): the game lays its character
+  // shadow over the whole lit surface as a multiply toward the shadow colour.
+  var lit = diffuse_radiance + spec_radiance;
+  if (p.unity_direct > 0.5) {
+    lit = lit * mix(vec3f(1.0), light.castShadow.rgb, _rzCastShadow(wp) * light.castShadow.w);
+  }
+  return lit;
 }
 
 `;

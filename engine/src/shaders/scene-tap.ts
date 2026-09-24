@@ -202,7 +202,7 @@ fn rzSceneHit(uv: vec2f) -> bool {
  */
 fn rzSceneDisplay(uv: vec2f) -> vec3f {
   var c = max(viewTransform(rzScene(uv) * exp2(viewU[0].x)), vec3f(0.0));
-  if (viewU[9].w > 0.5) { c = grade(c); }
+  if (viewU[9].w > 0.5) { c = _rzGradeScene(c); }
   return pow(max(c, vec3f(0.0)), vec3f(viewU[0].y));
 }
 

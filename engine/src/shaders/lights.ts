@@ -370,9 +370,13 @@ fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
 var<private> _rzLampN: vec3f;
 var<private> _rzLampDiffuse: vec3f;
 var<private> _rzLampDiffuseSet: bool = false;
+// Set by a closure that shaded the lamps' diffuse itself (a Unity-mode
+// principled, which tints it by its own base) — the epilogue then adds none.
+var<private> _rzLampDiffuseTaken: bool = false;
 
 /** rzLightsDiffuse(p, _rzLampN), taken from a principled walk when one ran. */
 fn rzLightsDiffuseOnce(p: vec3f, n: vec3f) -> vec3f {
+  if (_rzLampDiffuseTaken) { return vec3f(0.0); }
   if (_rzLampDiffuseSet) { return _rzLampDiffuse; }
   return rzLightsDiffuse(p, n);
 }

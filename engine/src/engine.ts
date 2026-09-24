@@ -638,6 +638,35 @@ export const DEFAULT_COLOR_GRADING: ColorGradingOptions = {
   saturation: 1,
 }
 
+/** The cast's shadow on a stage — see Engine.setStageCastShadow. */
+export type StageCastShadow = {
+  /** The way TO the light, this engine's axes. */
+  direction: { x: number; y: number; z: number }
+  /** Linear. */
+  color: { x: number; y: number; z: number }
+  amount: number
+}
+
+/** One layer of scene fog — see Engine.setSceneFog. */
+export type SceneFogLayer = {
+  color: { x: number; y: number; z: number }
+  amount: number
+  /** (slope, offset): f = saturate(depth·slope + offset), 1 = clear. */
+  distance: [number, number]
+  /** (reference, range): h = clamp((reference − y) / range, −1, 1). */
+  height: [number, number]
+}
+export type SceneFog = SceneFogLayer & { dyn?: SceneFogLayer | null }
+
+/** A scene's own grade as a cube — see Engine.setStageGrade. */
+export type StageGradeLut = {
+  /** Texels along each edge. */
+  size: number
+  /** size³ texels, 8-bit sRGB-encoded, red fastest then green then blue;
+   *  RGB (3 bytes a texel) or RGBA (4). */
+  data: Uint8Array
+}
+
 export type GizmoDragKind = "rotate" | "translate"
 
 export interface GizmoDragEvent {
@@ -1792,7 +1821,16 @@ export class Engine {
   private lightUniformBuffer!: GPUBuffer
   // ambient vec4 (4) + 4 lights x 2 vec4 (32) + 9 irradiance-SH vec4s (36),
   // padded to 80. sh[0].w is the IBL flag: 0 = flat world colour, 1 = the sky.
-  private lightData = new Float32Array(80)
+  // …then the scene fog at [72..87] — see setSceneFog — and the cast's
+  // shadow on a stage at [88..107] (colour, amount; its view-projection).
+  private lightData = new Float32Array(112)
+  private castShadow: StageCastShadow | null = null
+  private castShadowTexture!: GPUTexture
+  private castShadowView!: GPUTextureView
+  private castShadowVPBuffer!: GPUBuffer
+  private castShadowBundle: GPURenderBundle | null = null
+  private castShadowCleared = false
+  private readonly castSphereScratch = new Float32Array(4)
   private lightCount = 0
   private resizeObserver: ResizeObserver | null = null
   private resizePending = false
@@ -2457,6 +2495,7 @@ export class Engine {
   private depthOfField: DepthOfFieldOptions = { ...DEFAULT_DEPTH_OF_FIELD_OPTIONS }
   private dofUniformBuffer!: GPUBuffer
   private dofUniformData = new Float32Array(12)
+  private sceneFog: SceneFog | null = null
   private dofFocusScratch = new Vec3(0, 0, 0)
   /** Depth-only view of the scene's MSAA depth buffer, read by the DoF gather. */
   private depthReadView: GPUTextureView | null = null
@@ -2490,6 +2529,9 @@ export class Engine {
   private worldGradientSH: Float32Array | null = null
   /** The installed HDRI's folded irradiance SH (27 floats), or null. */
   private worldSH: Float32Array | null = null
+  /** A diffuse ambient stated outright (setWorldAmbient), outranking the one
+   *  fitted to the picture; the picture still answers reflections. */
+  private worldAmbientSH: Float32Array | null = null
   private fallbackEquirectTexture!: GPUTexture
   private fallbackEquirectView!: GPUTextureView
   // The scene's user WGSL effect (setEffect). ONE per scene, mounted under the
@@ -2569,6 +2611,11 @@ export class Engine {
   private trailDue = 0
   private agxLutTexture: GPUTexture | null = null
   private agxFallbackTexture!: GPUTexture
+  /** The scene's own grade (setStageGrade): the cube as handed over, kept so a
+   *  call before init() still lands, and its texture once uploaded. */
+  private stageGradeCube: StageGradeLut | null = null
+  private stageGradeTexture: GPUTexture | null = null
+  private stageGradeFallback!: GPUTexture
   /** Bound at composite binding 7 when no effect (or a param-less one) is set. */
   private bgParamsDummyBuffer!: GPUBuffer
   private compositePipelineLayout!: GPUPipelineLayout
@@ -2829,6 +2876,57 @@ export class Engine {
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
 
+  /**
+   * The grade a scene arrived with, as a cube — a game's own colour grading,
+   * baked by the converter that brought its stage. Applied to the formed frame
+   * before setColorGrading's, which stays the author's to lay on top. Looked up
+   * as the game looks it up: the view transform's output, linear, trilinear
+   * between texel centres. Null takes it off.
+   *
+   * Bytes are the cube as that game stored it: 8-bit sRGB-encoded, red fastest,
+   * then green, then blue; three bytes a texel or four. A cube whose byte count
+   * does not match its size is refused rather than drawn wrong.
+   */
+  setStageGrade(lut: StageGradeLut | null): void {
+    if (lut) {
+      const stride = lut.data.byteLength / lut.size ** 3
+      if (!Number.isInteger(lut.size) || lut.size < 2 || lut.size > 64 || (stride !== 3 && stride !== 4)) {
+        throw new Error(`setStageGrade: ${lut.data.byteLength} bytes is not a ${lut.size}³ cube`)
+      }
+    }
+    this.stageGradeCube = lut
+    if (this.device && this.stageGradeFallback) this.uploadStageGrade()
+  }
+
+  private uploadStageGrade(): void {
+    const lut = this.stageGradeCube
+    this.stageGradeTexture?.destroy()
+    this.stageGradeTexture = null
+    if (lut) {
+      const n = lut.size
+      const texels = n ** 3
+      const stride = lut.data.byteLength / texels
+      const rgba = new Uint8Array(texels * 4)
+      for (let i = 0; i < texels; i++) {
+        rgba[i * 4] = lut.data[i * stride]
+        rgba[i * 4 + 1] = lut.data[i * stride + 1]
+        rgba[i * 4 + 2] = lut.data[i * stride + 2]
+        rgba[i * 4 + 3] = 255
+      }
+      const tex = this.device.createTexture({
+        label: `stage grade ${n}³`,
+        size: [n, n, n],
+        dimension: "3d",
+        format: "rgba8unorm-srgb",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      this.device.queue.writeTexture({ texture: tex }, rgba, { bytesPerRow: n * 4, rowsPerImage: n }, [n, n, n])
+      this.stageGradeTexture = tex
+    }
+    this.rebuildCompositeBindGroup()
+    if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
   /** Current grade (for serialization into a scene descriptor). */
   getColorGrading(): ColorGradingOptions {
     const g = this.colorGrading
@@ -2969,7 +3067,8 @@ export class Engine {
       u[32] === 1 && u[33] === 1 && u[34] === 1 &&
       u[36] === 1 && u[37] === 1 && u[38] === 1 &&
       g.contrast === 1 && g.saturation === 1
-    u[39] = neutral ? 0 : 1
+    // Bit 0 the CDL above, bit 1 the scene's own cube — see _rzGradeScene.
+    u[39] = (neutral ? 0 : 1) | (this.stageGradeTexture ? 2 : 0)
     this.device.queue.writeBuffer(this.compositeUniformBuffer, 0, u)
   }
 
@@ -3096,9 +3195,10 @@ export class Engine {
     down: [number, number, number]
   } {
     const s = this.world.strength
-    if (this.worldSH) {
+    const fitted = this.worldAmbientSH ?? this.worldSH
+    if (fitted) {
       const at = (n: { x: number; y: number; z: number }) =>
-        evalIrradianceSH(this.worldSH!, n).map((v) => Math.max(v * s, 0)) as [number, number, number]
+        evalIrradianceSH(fitted, n).map((v) => Math.max(v * s, 0)) as [number, number, number]
       return { source: "hdri", strength: s, up: at({ x: 0, y: 1, z: 0 }), down: at({ x: 0, y: -1, z: 0 }) }
     }
     const c = this.world.color
@@ -3828,6 +3928,7 @@ export class Engine {
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
         { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
+        { binding: 12, resource: (this.stageGradeTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.midiBuffer } },
@@ -4266,6 +4367,7 @@ export class Engine {
           { binding: 2, resource: this.bloomSampler },
           { binding: 5, resource: this.filmicLutView },
           { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
+          { binding: 12, resource: (this.stageGradeTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
           { binding: 1, resource: bloom },
           { binding: 4, resource: this.maskResolveView },
         ],
@@ -7251,6 +7353,7 @@ export class Engine {
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
         // And the scene's COVERAGE and bloom, without which the tap cannot
         // reconstruct a pixel: the HDR target is premultiplied, so colour alone
         // reads a half-transparent ground as a dark opaque one.
@@ -7419,7 +7522,8 @@ export class Engine {
       label: "main per-frame bind group layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The vertex stage reads it too: the scene fog is per vertex (setSceneFog).
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" } },
@@ -7433,6 +7537,8 @@ export class Engine {
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
         { binding: 8, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        // The cast's shadow on a stage — setStageCastShadow.
+        { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
       ],
     })
     // group 1: per-instance (skinMats) — bound once per model
@@ -7654,6 +7760,22 @@ export class Engine {
       }),
     )
     this.shadowMapDepthViews = this.shadowMapTextures.map((t) => t.createView())
+    // The cast's shadow on a stage (setStageCastShadow): one map, only the cast
+    // in it, from the stage's own direction. Always allocated so every material
+    // bind group and every instance's shadow bind group stays one shape; drawn
+    // only while a stage asks for it.
+    this.castShadowTexture = this.device.createTexture({
+      label: "stage cast shadow map",
+      size: [1024, 1024],
+      format: Engine.SHADOW_DEPTH_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.castShadowView = this.castShadowTexture.createView()
+    this.castShadowVPBuffer = this.device.createBuffer({
+      label: "stage cast shadow view-projection",
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
 
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
     this.bakeBrdfLut()
@@ -7666,6 +7788,14 @@ export class Engine {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     })
     void this.loadAgxLut()
+    this.stageGradeFallback = this.device.createTexture({
+      label: "stage grade fallback",
+      size: [1, 1, 1],
+      dimension: "3d",
+      format: "rgba8unorm-srgb",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.uploadStageGrade()
     this.bakeFilmicLut()
 
     // BEFORE the bind group below, which binds it. Full size from the start:
@@ -8100,6 +8230,9 @@ export class Engine {
         // AgX's 57³ cube. Decompressed and uploaded off the critical path, so a
         // 1×1×1 stand-in keeps the bind group valid until it arrives.
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
+        // The scene's own grade cube (setStageGrade) — 1×1×1 stand-in while it
+        // has none, which the flag bit keeps from ever being sampled.
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
         // The cast, for rzSubject/rzAnchor. Always bound so the base shader's
         // layout matches; the base shader simply never reads it.
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
@@ -9876,7 +10009,7 @@ export class Engine {
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
       label: "light uniforms",
-      size: 80 * 4, // ambient (4) + 4 lights x 2 vec4 (32) + irradiance SH 9 x vec4 (36), padded to 80
+      size: 112 * 4, // ambient (4) + 4 lights x 2 vec4 (32) + irradiance SH 9 x vec4 (36) + fog 4 x vec4 (16) + cast shadow (4 + 16)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.lightData.fill(0)
@@ -9961,6 +10094,7 @@ export class Engine {
         { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 8, resource: env },
         { binding: 9, resource: this.brdfLutView },
+        { binding: 10, resource: this.castShadowView },
       ],
     })
     this.mirrorPerFrameBindGroup = this.device.createBindGroup({
@@ -9977,6 +10111,7 @@ export class Engine {
         { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 8, resource: env },
         { binding: 9, resource: this.brdfLutView },
+        { binding: 10, resource: this.castShadowView },
       ],
     })
     return true
@@ -10001,7 +10136,7 @@ export class Engine {
     // replaces the colour, strength applies to either).
     // An HDRI outranks a gradient outranks the flat colour, which is the order
     // of how much each one knows about the sky.
-    const sh = this.worldSH ?? this.worldGradientSH
+    const sh = this.worldAmbientSH ?? this.worldSH ?? this.worldGradientSH
     for (let i = 0; i < 9; i++) {
       const b = 36 + i * 4
       if (sh) {
@@ -10044,6 +10179,115 @@ export class Engine {
   }
 
   /** Update the world environment (Blender: World Background). Ambient recomputes immediately. */
+  /**
+   * Distance fog on every lit surface, as a game on SimPipeline lays it: per
+   * layer, t = saturate(f − (1 − f)·h) with f = saturate(depth·distance[0] +
+   * distance[1]) and h = clamp((height[0] − y) / height[1], −1, 1), and the
+   * colour pulled toward the layer's by (1 − t)·amount — the haze first, then
+   * `dyn`, which X340 uses to darken toward black. Depth is along the view
+   * axis and y the world height, both in this engine's units; colours linear.
+   *
+   * PER VERTEX, as the game computes it, and that is load-bearing rather than
+   * a saving: a floor built of long triangles carries the fog of its far
+   * corners into the near half, which is most of what X340's checker floor
+   * shows of its haze. Emission-only graphs take none, as the game's effect
+   * shaders take none. Null clears.
+   */
+  setSceneFog(fog: SceneFog | null): void {
+    this.sceneFog = fog
+    const u = this.lightData
+    const layer = (at: number, l: SceneFogLayer | undefined | null) => {
+      u[at] = l?.color.x ?? 0
+      u[at + 1] = l?.color.y ?? 0
+      u[at + 2] = l?.color.z ?? 0
+      u[at + 3] = l ? Math.max(l.amount, 0) : 0
+      u[at + 4] = l?.distance[0] ?? 0
+      u[at + 5] = l?.distance[1] ?? 1
+      u[at + 6] = l?.height[0] ?? 0
+      u[at + 7] = l?.height[1] ?? 1
+    }
+    layer(72, fog)
+    layer(80, fog?.dyn)
+    this.updateLightBuffer()
+  }
+
+  /**
+   * The cast's shadow on a stage, as a game on SimPipeline lays its ground
+   * shadow: the characters drawn into a map of their own from `direction` (the
+   * way TO the light, this engine's axes), and every Unity-mode stage surface
+   * multiplied toward `color` (linear) by amount × how much of the cast stands
+   * in the way. Independent of the sun — X340's is dim moonlight, which left a
+   * kneeling figure no shadow at all. Only stage materials read it; a scene
+   * without a stage is untouched. Null turns it off.
+   */
+  setStageCastShadow(opts: StageCastShadow | null): void {
+    this.castShadow = opts
+    const u = this.lightData
+    u[88] = opts?.color.x ?? 1
+    u[89] = opts?.color.y ?? 1
+    u[90] = opts?.color.z ?? 1
+    u[91] = 0 // lit per frame by updateCastShadowVP, once there is a cast to fit
+    this.updateLightBuffer()
+  }
+
+  /** Fit the cast map to this frame's cast; false when there is nothing to draw. */
+  private updateCastShadowVP(stage: boolean): boolean {
+    const opts = this.castShadow
+    let on = false
+    if (opts && stage) {
+      let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+      for (const inst of this.modelInstances.values()) {
+        if (inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) continue
+        const s = this.castSphereScratch
+        this.writeCullSphere(inst, s, 0)
+        if (!(s[3] < 1e6)) continue
+        minX = Math.min(minX, s[0] - s[3]); maxX = Math.max(maxX, s[0] + s[3])
+        minY = Math.min(minY, s[1] - s[3]); maxY = Math.max(maxY, s[1] + s[3])
+        minZ = Math.min(minZ, s[2] - s[3]); maxZ = Math.max(maxZ, s[2] + s[3])
+      }
+      if (minX <= maxX) {
+        const c = new Vec3((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
+        const r = Math.max(maxX - minX, maxY - minY, maxZ - minZ) / 2
+        const d = new Vec3(opts.direction.x, opts.direction.y, opts.direction.z).normalize()
+        // Wide enough for the shadow a low light throws, deep enough to reach
+        // the floor under the figure from well above it.
+        const half = r * 2.5
+        const reach = r * 8
+        const eye = new Vec3(c.x + d.x * reach, c.y + d.y * reach, c.z + d.z * reach)
+        const up = Math.abs(d.y) > 0.99 ? new Vec3(0, 0, 1) : new Vec3(0, 1, 0)
+        const vp = Mat4.orthographicLh(-half, half, -half, half, 1, reach * 2).multiply(Mat4.lookAt(eye, c, up)).values
+        this.device.queue.writeBuffer(this.castShadowVPBuffer, 0, new Float32Array(vp))
+        this.lightData.set(vp, 92)
+        on = true
+      }
+    }
+    const amount = on ? Math.max(opts!.amount, 0) : 0
+    if (this.lightData[91] !== amount || on) {
+      this.lightData[91] = amount
+      this.device.queue.writeBuffer(this.lightUniformBuffer, 88 * 4, this.lightData, 88, 20)
+    }
+    return on
+  }
+
+  /**
+   * The world's DIFFUSE light, stated rather than fitted: nine RGB coefficients
+   * (27 floats) in the form rzWorldAmbient evaluates — c0 + c1·y + c2·z + c3·x +
+   * c4·xy + c5·yz + c6·(3z²−1) + c7·xz + c8·(x²−y²), in this engine's axes, the
+   * value a white surface facing n takes. Null goes back to the SH fitted to
+   * the world's picture or gradient.
+   *
+   * A game lights a room's surfaces from an ambient probe that is not its
+   * reflection probe — X340's is a dim blue trilight while its reflections
+   * carry every lamp the probe baked — and one picture cannot be both. With
+   * this set, the picture answers reflections alone. World strength scales it
+   * as it scales the fitted one.
+   */
+  setWorldAmbient(sh: ArrayLike<number> | null): void {
+    if (sh && sh.length !== 27) throw new Error(`setWorldAmbient: ${sh.length} floats, not 27`)
+    this.worldAmbientSH = sh ? Float32Array.from(sh) : null
+    if (this.device && this.lightUniformBuffer) this.writeWorld()
+  }
+
   setWorld(options: WorldOptions): void {
     if (options.color) this.world.color = options.color
     if (options.strength !== undefined) this.world.strength = options.strength
@@ -10334,6 +10578,8 @@ export class Engine {
       this.canvas.removeEventListener("touchend", this.handleCanvasTouch)
     }
 
+    this.stageGradeTexture?.destroy()
+    this.stageGradeTexture = null
     this.overlayDepthTexture?.destroy()
     this.overlayDepthTexture = null
     this.overlayMsaaTexture?.destroy()
@@ -12953,6 +13199,17 @@ export class Engine {
       this.forEachInstance((inst) => this.drawInstanceShadow(shadow, inst, ci))
       return shadow.finish({ label: `shadow pass, cascade ${ci}` })
     })
+    // The cast alone, for the shadow it lays on a stage.
+    const cast = this.device.createRenderBundleEncoder({
+      label: "stage cast shadow pass",
+      colorFormats: [],
+      depthStencilFormat: Engine.SHADOW_DEPTH_FORMAT,
+    })
+    cast.setPipeline(this.shadowDepthPipeline)
+    this.forEachInstance((inst) => {
+      if (!inst.isStage && !inst.isPlane && !inst.isProp) this.drawInstanceShadow(cast, inst, SHADOW_CASCADES.length)
+    })
+    this.castShadowBundle = cast.finish({ label: "stage cast shadow pass" })
     this.bundleRecords++
   }
 
@@ -13421,6 +13678,18 @@ export class Engine {
         layout: this.shadowDepthPipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: this.shadowCascadeVPBuffers[ci] } },
+          { binding: 1, resource: { buffer: skinMatrixBuffer } },
+          { binding: 2, resource: this.materialSampler },
+        ],
+      }),
+    )
+    // …and one more past the cascades, for the cast's shadow on a stage.
+    shadowBindGroups.push(
+      this.device.createBindGroup({
+        label: `${name}: shadow bind, stage cast shadow`,
+        layout: this.shadowDepthPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.castShadowVPBuffer } },
           { binding: 1, resource: { buffer: skinMatrixBuffer } },
           { binding: 2, resource: this.materialSampler },
         ],
@@ -15857,6 +16126,18 @@ export class Engine {
         }
         sp.end()
         this.shadowCascadeCleared[ci] = !wanted
+      }
+      // The cast's shadow on a stage: drawn while a stage asks for it and has a
+      // cast to shade it with; cleared once when it stops, then left alone.
+      const castOn = this.updateCastShadowVP(stage)
+      if (castOn || !this.castShadowCleared) {
+        const cp = encoder.beginRenderPass({
+          colorAttachments: [],
+          depthStencilAttachment: { view: this.castShadowView, depthClearValue: 1.0, depthLoadOp: "clear", depthStoreOp: "store" },
+        })
+        if (castOn && this.castShadowBundle) cp.executeBundles([this.castShadowBundle])
+        cp.end()
+        this.castShadowCleared = !castOn
       }
       this.shadowMapPopulated = hasModels
     }
