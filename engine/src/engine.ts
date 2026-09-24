@@ -640,8 +640,9 @@ export const DEFAULT_COLOR_GRADING: ColorGradingOptions = {
 
 /** The cast's shadow on a stage — see Engine.setStageCastShadow. */
 export type StageCastShadow = {
-  /** The way TO the light, this engine's axes. */
-  direction: { x: number; y: number; z: number }
+  /** The way TO the light, this engine's axes. Omitted, it is the sun's, read
+   *  every frame: the cast's shadow then falls the way the stage's own do. */
+  direction?: { x: number; y: number; z: number } | null
   /** Linear. */
   color: { x: number; y: number; z: number }
   amount: number
@@ -10216,8 +10217,10 @@ export class Engine {
    * shadow: the characters drawn into a map of their own from `direction` (the
    * way TO the light, this engine's axes), and every Unity-mode stage surface
    * multiplied toward `color` (linear) by amount × how much of the cast stands
-   * in the way. Independent of the sun — X340's is dim moonlight, which left a
-   * kneeling figure no shadow at all. Only stage materials read it; a scene
+   * in the way. Its darkness is independent of the sun's — X340's is dim
+   * moonlight, which left a kneeling figure no shadow at all — and without a
+   * `direction` it falls along the sun, so it agrees with every other shadow on
+   * the stage. Only stage materials read it; a scene
    * without a stage is untouched. Null turns it off.
    */
   setStageCastShadow(opts: StageCastShadow | null): void {
@@ -10248,7 +10251,11 @@ export class Engine {
       if (minX <= maxX) {
         const c = new Vec3((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
         const r = Math.max(maxX - minX, maxY - minY, maxZ - minZ) / 2
-        const d = new Vec3(opts.direction.x, opts.direction.y, opts.direction.z).normalize()
+        const sd = this.sun.direction
+        const d = (opts.direction
+          ? new Vec3(opts.direction.x, opts.direction.y, opts.direction.z)
+          : new Vec3(-sd.x, -sd.y, -sd.z)
+        ).normalize()
         // Wide enough for the shadow a low light throws, deep enough to reach
         // the floor under the figure from well above it.
         const half = r * 2.5
@@ -12825,6 +12832,13 @@ export class Engine {
       const o = mi * Engine.CULL_MODEL_FLOATS
       const mf = flags[o + 20]
       if ((mf & Engine.CULL_MODEL_VISIBLE) === 0) continue
+      // A stage's draws only where they cast. Its sky dome is 17500 units out
+      // and casts nothing; in the box it stretched the map's depth across 35000
+      // units, and the compare bias (0.001 of that range) with it — every
+      // shadow on the stage stood off its caster's feet. Anything else stays
+      // whether it casts or not: a floor that only RECEIVES must still be in
+      // range, or the shadow landing on it reads as lit.
+      if (this.cullModels[mi]?.isStage && (this.cullMetaU32[f + 7] & Engine.CULL_DRAW_CASTS_SHADOW) === 0) continue
       if ((mf & Engine.CULL_MODEL_RIGID) !== 0) {
         const cx = (this.cullMetaF32[f] + this.cullMetaF32[f + 4]) * 0.5
         const cy = (this.cullMetaF32[f + 1] + this.cullMetaF32[f + 5]) * 0.5
