@@ -3,6 +3,13 @@ import type { CameraPose } from "./camera-animation"
 
 /** Far cap / zoom limit; large enough for wide shots without clipping distant ground */
 const FAR_CAP = 8000
+/**
+ * The far plane's cap on a float, reversed-Z depth buffer, where precision
+ * holds out to kilometres: a game's sky hangs its moon and its dome a kilometre
+ * and more out (X309's moon 1.1 km, its dome 1.4 km), and at 8000 units they
+ * were loaded and never drawn. The 24-bit buffer keeps FAR_CAP.
+ */
+const FAR_CAP_REVERSED = 80000
 const FAR_MIN = 200
 /**
  * Near-plane floor and cap, in two sets, because what a near plane costs depends
@@ -376,7 +383,7 @@ export class Camera {
     // centre, so the far side of a dome is extent + radius away.
     const fromOrbit = this.radius * 12 + margin
     const fromScene = this.sceneExtent > 0 ? this.sceneExtent + this.radius + margin : 0
-    this.far = Math.min(FAR_CAP, Math.max(FAR_MIN, fromOrbit, fromScene))
+    this.far = Math.min(this.reversedZ ? FAR_CAP_REVERSED : FAR_CAP, Math.max(FAR_MIN, fromOrbit, fromScene))
   }
 
   /**

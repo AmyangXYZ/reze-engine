@@ -61,6 +61,10 @@ type XYZ = { x: number; y: number; z: number }
  * ends, so an empty floor with a dancer on it keeps a short, sharp frustum
  * rather than the camera's far plane.
  */
+/** The deepest a cascade reaches along the view, in world units — the far
+ *  plane's old cap, which is where every stage's shadows were fitted before. */
+const SHADOW_FAR = 8000
+
 export function cascadeSlices(view: ShadowView, bounds: ShadowBounds): [number, number][] {
   let farFit = view.near + 200
   if (bounds) {
@@ -73,7 +77,10 @@ export function cascadeSlices(view: ShadowView, bounds: ShadowBounds): [number, 
     }
     farFit = deepest + 1
   }
-  farFit = Math.min(view.far, Math.max(view.near + 1, farFit))
+  // Never past SHADOW_FAR, whatever the camera's far plane: a stage's sky dome
+  // a kilometre out is in the scene's bounds, and fitting the far cascade to it
+  // would spread the stage's shadow map across the sky.
+  farFit = Math.min(view.far, SHADOW_FAR, Math.max(view.near + 1, farFit))
   const split = Math.min(farFit, Math.max(view.near + 8, view.focus + NEAR_REACH))
   return [
     [view.near, split],
