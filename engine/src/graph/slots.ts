@@ -139,10 +139,18 @@ ${discard}
 ${gate}
   let l = -light.lights[0].direction.xyz;
   let sun = select(light.lights[0].color.xyz * light.lights[0].color.w, modelLight.sun.rgb, modelLight.sun.w > 0.5);
+  let shadow = sampleShadow(input.worldPos, n);
   // The world: flat colour, or the HDRI's irradiance at this normal — which
   // is what makes a loaded sky actually light her instead of only backing her.
-  let amb = rzWorldAmbient(n) + modelLight.fill.rgb;
-  let shadow = sampleShadow(input.worldPos, n);
+  // The model's fill is NOT here: see the epilogue.
+  //
+  // A model given a flat sky (setModelFlatSky - the cast, for an anime look)
+  // takes the sky's AVERAGE instead: its colour and brightness from every
+  // direction alike. The directional sky shaded a face like PBR - soft
+  // realistic gradients the toon ramp never drew - where the game gives its
+  // characters one flat base light. A flat World is its own average, so a
+  // scene without an HDRI renders exactly as before.
+  let amb = select(rzWorldAmbient(n), rzWorldAmbientAvg(), modelLight.opts.x > 0.5);
   let tex_color = tex_s.rgb;
   // The normal the lamps' diffuse layer is lit by, for a principled walk to
   // compute it on the way (rzLightsDiffuseOnce). n is final from here on.
@@ -186,7 +194,13 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // painted sheet — is Blender's Emission shader, which no lamp reaches; adding
   // the lamps to it turned X340's floor shadow, a white-RGB picture at a soft
   // alpha, into a glowing disc under the spot above it.
-  const LIT = takesLight ? ` + rzLightsDiffuseOnce(input.worldPos, n) * albedo` : ""
+  //
+  // The model's fill (Engine.setModelFill) rides here too, as brightness: the
+  // surface colour times the fill, on every pixel of her alike. It used to
+  // enter the graph's ambient, where an NPR ramp read it as LIGHT — sliding it
+  // moved her shadows, and under a hard step flipped whole regions at once.
+  // After the graph it lifts her evenly and leaves every shadow where it is.
+  const LIT = takesLight ? ` + (rzLightsDiffuseOnce(input.worldPos, n) + modelLight.fill.rgb) * albedo` : ""
 
   const ALBEDO = `  let albedo = tex_color;
 `

@@ -28,6 +28,17 @@ export const EYE_GRAPH: ShaderGraph = {
     },
     { id: "emission", type: "emission", inputs: { strength: 1.5 } },
     { id: "add", type: "add_shader" },
+    // The iris glow follows the key round her head: full (1.5) lit from the
+    // front, easing to 0.2 of it lit from behind - a fixed 1.5 left the eyes
+    // bright white in a backlit face. head_basis.forward · L, half-Lambert,
+    // times the sun's shadow at the eye, so an eye in a shadowed face dims too.
+    { id: "eye_hb", type: "head_basis" },
+    { id: "eye_lt", type: "light" },
+    { id: "eye_fl", type: "vector_math/dot" },
+    { id: "eye_half", type: "math/multiply_add", inputs: { b: 0.5, c: 0.5 } },
+    { id: "eye_lvl", type: "map_range", inputs: { from_min: 0.0, from_max: 1.0, to_min: 0.2, to_max: 1.0 } },
+    { id: "eye_sh", type: "math/multiply" },
+    { id: "eye_str", type: "math/multiply", inputs: { b: 1.5 } },
   ],
   links: [
     { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
@@ -36,6 +47,14 @@ export const EYE_GRAPH: ShaderGraph = {
     { from: { node: "tex_base", socket: "color" }, to: { node: "emission", socket: "color" } },
     { from: { node: "principled", socket: "color" }, to: { node: "add", socket: "a" } },
     { from: { node: "emission", socket: "color" }, to: { node: "add", socket: "b" } },
+    { from: { node: "eye_hb", socket: "forward" }, to: { node: "eye_fl", socket: "a" } },
+    { from: { node: "eye_lt", socket: "direction" }, to: { node: "eye_fl", socket: "b" } },
+    { from: { node: "eye_fl", socket: "value" }, to: { node: "eye_half", socket: "a" } },
+    { from: { node: "eye_half", socket: "value" }, to: { node: "eye_sh", socket: "a" } },
+    { from: { node: "eye_lt", socket: "shadow" }, to: { node: "eye_sh", socket: "b" } },
+    { from: { node: "eye_sh", socket: "value" }, to: { node: "eye_lvl", socket: "value" } },
+    { from: { node: "eye_lvl", socket: "value" }, to: { node: "eye_str", socket: "a" } },
+    { from: { node: "eye_str", socket: "value" }, to: { node: "emission", socket: "strength" } },
   ],
   output: { node: "add", socket: "color" },
 }

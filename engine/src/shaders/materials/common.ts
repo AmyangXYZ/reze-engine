@@ -189,11 +189,12 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 // binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 // The light this model takes apart from the scene's — see Engine.setModelFill
-// and Engine.setModelSun. fill is added to its ambient, zero for a model
-// nobody gave one; sun replaces the scene's sun colour while its w is set,
+// and Engine.setModelSun. fill brightens it after its graph (fill ×
+// surface colour, graph/slots.ts), zero for a model nobody gave one; sun replaces the scene's sun colour while its w is set,
 // which is how a stage keeps the daylight its game lit it by while the cast
-// keeps the key the scene set for them.
-struct ModelLight { fill: vec4f, sun: vec4f }
+// keeps the key the scene set for them. opts.x (Engine.setModelFlatSky) gives
+// it the sky's average in place of its shape - see graph/slots.ts.
+struct ModelLight { fill: vec4f, sun: vec4f, opts: vec4f }
 @group(1) @binding(1) var<uniform> modelLight: ModelLight;
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;

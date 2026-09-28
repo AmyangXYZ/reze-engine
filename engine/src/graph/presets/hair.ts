@@ -29,7 +29,7 @@ export const HAIR_GRAPH: ShaderGraph = {
     { id: "hs_002", type: "hue_sat", inputs: { hue: 0.48, saturation: 1.2, value: 0.7, fac: 1.0 } },
     { id: "hs_001", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.5, value: 1.0, fac: 1.0 } },
     { id: "str", type: "shader_to_rgb_diffuse" },
-    { id: "ramp_008", type: "ramp_constant", inputs: { pos0: 0.0, color0: [0, 0, 0, 1], pos1: 0.2966, color1: [1, 1, 1, 1] } },
+    { id: "ramp_008", type: "ramp_cardinal", inputs: { pos0: 0.2466, color0: [0, 0, 0, 1], pos1: 0.3466, color1: [1, 1, 1, 1] } },
     { id: "mix_004", type: "mix/blend" },
     { id: "bc", type: "bright_contrast", inputs: { bright: 0.1, contrast: 0.2 } },
     { id: "sep_n", type: "separate_xyz" },

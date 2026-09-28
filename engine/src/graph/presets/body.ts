@@ -19,7 +19,7 @@ export const BODY_GRAPH: ShaderGraph = {
     { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
     { id: "str", type: "shader_to_rgb_diffuse" },
-    { id: "toon", type: "ramp_constant", inputs: { pos0: 0.0, pos1: 0.2966 } },
+    { id: "toon", type: "ramp_cardinal", inputs: { pos0: 0.2466, pos1: 0.3466 } },
     { id: "shadow_tint", type: "hue_sat", inputs: { hue: 0.5, saturation: 2.0, value: 0.3499999940395355, fac: 1.0 } },
     { id: "lit_tint", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.5, value: 1.0, fac: 1.0 } },
     { id: "toon_color", type: "mix/blend" },

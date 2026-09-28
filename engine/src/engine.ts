@@ -896,8 +896,9 @@ interface ModelInstance {
   shadowDrawCalls: DrawCall[]
   shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
-  /** Its own light — fill and sun — when setModelFill or setModelSun gave it
-   *  one: a 32-byte ModelLight, and the CPU copy it is written from. */
+  /** Its own light — fill, sun and options — when setModelFill, setModelSun or
+   *  setModelFlatSky gave it one: a 48-byte ModelLight, and the CPU copy it is
+   *  written from. */
   lightBuffer: GPUBuffer | null
   modelLight: Float32Array | null
   pickPerInstanceBindGroup: GPUBindGroup
@@ -7433,7 +7434,7 @@ export class Engine {
 
     this.noFillBuffer = this.device.createBuffer({
       label: "model light (none)",
-      size: 32,
+      size: 48,
       usage: GPUBufferUsage.UNIFORM,
     })
 
@@ -11020,8 +11021,12 @@ export class Engine {
   }
 
   /**
-   * Light one model with more than the world gives it: a FILL, linear RGB added
-   * to its ambient everywhere on it. Null takes it away again.
+   * Light one model with more than the world gives it: a FILL, linear RGB times
+   * its surface colour, added after its material graph. Null takes it away again.
+   *
+   * After the graph, not in its ambient: an NPR ramp read an ambient fill as
+   * light, so sliding it moved her shadows and flipped whole regions across a
+   * hard step. Added after, it brightens her evenly and every shadow stays put.
    *
    * A game lights its stage and its characters apart. Aether Gazer's rooms are
    * lit by their lamps and a near-black ambient, while its characters take a
@@ -11048,15 +11053,31 @@ export class Engine {
     return this.writeModelLight(name, 4, sun)
   }
 
-  /** One half of a model's light, at `at` (0 the fill, 4 the sun) in its
-   *  ModelLight; w says whether that half is set. Both null releases the
-   *  buffer and the model takes the shared zero stand-in again. */
-  private writeModelLight(name: string, at: 0 | 4, value: Vec3 | null): boolean {
+  /**
+   * Light one model by the sky's AVERAGE rather than its shape: the world's
+   * colour and brightness from every direction alike. False gives it the
+   * directional sky back.
+   *
+   * For a cast under an anime look. An HDRI's sky is brighter and warmer one
+   * way than another, and taken at each normal it shades a face with soft
+   * realistic gradients that no toon ramp drew — PBR on an anime face. Aether
+   * Gazer gives its characters one flat base light instead. World strength and
+   * colour still reach her; only the shape is gone. A flat World is its own
+   * average, so without an HDRI this changes nothing.
+   */
+  setModelFlatSky(name: string, flat: boolean): boolean {
+    return this.writeModelLight(name, 8, flat ? new Vec3(1, 0, 0) : null)
+  }
+
+  /** One part of a model's light, at `at` (0 the fill, 4 the sun, 8 its
+   *  options) in its ModelLight; w says whether that part is set. All unset
+   *  releases the buffer and the model takes the shared zero stand-in again. */
+  private writeModelLight(name: string, at: 0 | 4 | 8, value: Vec3 | null): boolean {
     const inst = this.modelInstances.get(name)
     if (!inst || !this.device) return false
-    const light = inst.modelLight ?? new Float32Array(8)
+    const light = inst.modelLight ?? new Float32Array(12)
     light.set(value ? [value.x, value.y, value.z, 1] : [0, 0, 0, 0], at)
-    const any = light[3] > 0 || light[7] > 0
+    const any = light[3] > 0 || light[7] > 0 || light[11] > 0
     if (!any) {
       if (!inst.lightBuffer) return true
       const retired = inst.lightBuffer
@@ -11072,7 +11093,7 @@ export class Engine {
     if (!inst.lightBuffer) {
       inst.lightBuffer = this.device.createBuffer({
         label: `${name}: light`,
-        size: 32,
+        size: 48,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       })
       inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, inst.lightBuffer)

@@ -21,7 +21,7 @@ export const METAL_GRAPH: ShaderGraph = {
     { id: "geo", type: "geometry" },
     { id: "tex_tint", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.800000011920929, fac: 1.0 } },
     { id: "str", type: "shader_to_rgb_diffuse" },
-    { id: "ramp_008", type: "ramp_constant_aa", inputs: { edge: 0.2966 } },
+    { id: "ramp_008", type: "ramp_cardinal", inputs: { pos0: 0.2466, pos1: 0.3466 } },
     { id: "mix04_fac", type: "math/multiply", inputs: { b: 0.5 } },
     { id: "dark_tex", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.19999998807907104, fac: 1.0 } },
     { id: "mix_004", type: "mix/blend" },

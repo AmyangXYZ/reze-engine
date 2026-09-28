@@ -37,6 +37,17 @@ fn rzWorldAmbient(n: vec3f) -> vec3f {
     + ${u}.sh[8].xyz * (x * x - y * y);
   return max(c, vec3f(0.0));
 }
+
+/**
+ * The world's light averaged over every direction: its colour and brightness,
+ * with no shape. Every term but sh[0] averages to zero over the sphere (x, xy,
+ * 3z²-1 ... all do), so the average is sh[0] itself; a flat world is its own.
+ * What an anime cast takes from a sky - see ModelLight.opts.
+ */
+fn rzWorldAmbientAvg() -> vec3f {
+  if (${u}.sh[0].w < 0.5) { return ${u}.ambientColor.xyz; }
+  return max(${u}.sh[0].xyz, vec3f(0.0));
+}
 `
 
 /**

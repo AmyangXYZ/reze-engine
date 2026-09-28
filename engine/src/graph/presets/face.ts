@@ -24,7 +24,7 @@ export const FACE_GRAPH: ShaderGraph = {
 
     // ── toon shading ──
     { id: "str", type: "shader_to_rgb_diffuse" },
-    { id: "toon", type: "ramp_constant_aa", inputs: { edge: 0.2966 } },
+    { id: "toon", type: "ramp_cardinal", inputs: { pos0: 0.2466, pos1: 0.3466 } },
     { id: "shadow_tint", type: "hue_sat", inputs: { hue: 0.46000000834465027, saturation: 2.0, value: 0.3499999940395355, fac: 1.0 } },
     { id: "lit_tint", type: "hue_sat", inputs: { hue: 0.46000000834465027, saturation: 1.600000023841858, value: 1.5, fac: 1.0 } },
     { id: "toon_color", type: "mix/blend" },
