@@ -1657,6 +1657,8 @@ interface EffectInstance {
   /** This effect IS a mirror — see the `#mirror` directive. Draws no shader;
    *  the engine reads its dials and folds the scene through the plane. */
   hasMirror: boolean
+  /** `#stepped` — the cast it is aimed at moves on twos. */
+  stepped: boolean
   /** Mounted under the scene. */
   hasBackground: boolean
   /** Mounted over the finished frame — and the reason the scene pass has to
@@ -2659,6 +2661,12 @@ export class Engine {
   private readonly pipelineDescs = new WeakMap<GPURenderPipeline, GPURenderPipelineDescriptor>()
   private readonly singleSided = new WeakMap<GPURenderPipeline, GPURenderPipeline>()
   private readonly singleSidedMirror = new WeakMap<GPURenderPipeline, GPURenderPipeline>()
+  // Stepped motion (#stepped). The models whose pose is being HELD this frame —
+  // their skinning and morph uploads wait for the stepped clock's next tick —
+  // and the tick each was last shown at. Empty while no effect declares it.
+  private readonly steppedHeld = new Set<string>()
+  private readonly steppedTick = new Map<string, number>()
+  private steppedLastClock = -1
   private bloomBlitUniformBuffer!: GPUBuffer
   private bloomUpsampleUniformBuffer!: GPUBuffer
   private readonly bloomBlitUniformData = new Float32Array(4)
@@ -3436,6 +3444,55 @@ export class Engine {
    * Gated on `weight`, so a scheduled mirror appears and leaves with its strip
    * and a faded-out one costs no reflection pass at all.
    */
+  /** The dials a stepped effect is read by, by name — MIRROR_DIALS' pattern. */
+  private static readonly STEPPED_DIALS = {
+    /** Poses per second of scene time: 12 is 24fps animation on twos, 6 on fours. */
+    fps: "FPS",
+  } as const
+
+  /**
+   * Decide which models hold their pose this frame.
+   *
+   * Nothing underneath is slowed: animation and physics run every frame as they
+   * always do, so the pose that lands on each tick is the true one for that
+   * moment and a hold never drifts behind the music. What steps is only when it
+   * reaches the GPU — the skinning upload and the morph dispatch wait for the
+   * next tick of a clock running at FPS on the scene clock, which is what an
+   * export steps.
+   *
+   * FIRST match wins, and only the models it is aimed at hold: a stage, a prop
+   * and every effect keep moving on ones, which is what makes the cast read as
+   * animated rather than the playback as broken.
+   */
+  private syncSteppedFromEffects(): void {
+    this.steppedHeld.clear()
+    let fx: EffectInstance | null = null
+    for (const e of this.effects) {
+      if (e.stepped && e.weight > 0) {
+        fx = e
+        break
+      }
+    }
+    if (!fx) {
+      this.steppedTick.clear()
+      return
+    }
+    // Paused, nothing holds: time is not moving, so there is nothing to step,
+    // and a pose edited on a stopped timeline has to show as it is edited.
+    const paused = this.sceneClock === this.steppedLastClock
+    this.steppedLastClock = this.sceneClock
+    if (paused) return
+    const D = Engine.STEPPED_DIALS
+    const fps = Math.max(this.effectDial(fx, D.fps, 6), 1)
+    const tick = Math.floor(this.sceneClock * fps + 1e-6)
+    this.forEachInstance((inst) => {
+      const slot = this.castSlotOf.get(inst.name)
+      if (slot === undefined || !(fx!.subjectMask & (1 << slot))) return
+      if (this.steppedTick.get(inst.name) === tick) this.steppedHeld.add(inst.name)
+      else this.steppedTick.set(inst.name, tick)
+    })
+  }
+
   private syncMirrorFromEffects(): void {
     let fx: EffectInstance | null = null
     for (const e of this.effects) {
@@ -4787,14 +4844,15 @@ export class Engine {
     // #mirror is a mount on the same footing, and for the same reason: a
     // reflection re-renders the scene from a folded camera, which is a pass and
     // not a shader, so the effect declares it and draws nothing itself.
-    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails && !hasLightEmit(wgsl) && !d.mirror) {
+    // #stepped too: it decides when a pose reaches the screen, not what is drawn.
+    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails && !hasLightEmit(wgsl) && !d.mirror && !d.stepped) {
       return { ok: false, diagnostics: [
           "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f, " +
             "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f, " +
             "the particle trio (particleInit/particleStep/particleShade), " +
             "the ribbon pair (trailWidth/trailShade), " +
             "fn lightEmit(i: u32) -> RzLight with #lights <n>, " +
-            "or #mirror",
+            "#mirror, or #stepped",
         ], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
     const mounts = { background: hasBackground, foreground: hasForeground }
@@ -5106,6 +5164,7 @@ export class Engine {
         paramsBuffer,
         paramsData,
         hasMirror: d.mirror,
+        stepped: d.stepped,
         hasBackground,
         hasForeground,
         // The author's OWN source, not the assembled module: the assembled one
@@ -12709,6 +12768,8 @@ export class Engine {
     for (const inst of this.modelInstances.values()) {
       const gm = inst.gpuMorph
       if (!gm || !gm.dispatchNeeded) continue
+      // The face holds with the body (see syncSteppedFromEffects).
+      if (this.steppedHeld.has(inst.name)) continue
       if (!pass) {
         pass = encoder.beginComputePass({ label: "morph compute", timestampWrites: this.stamps("morph") })
         pass.setPipeline(this.morphComputePipeline)
@@ -16127,6 +16188,7 @@ export class Engine {
     }
 
     const hasModels = this.modelInstances.size > 0
+    this.syncSteppedFromEffects()
     if (hasModels) {
       this.updateInstances(deltaTime)
       this.updateSkinMatrices()
@@ -18113,6 +18175,9 @@ export class Engine {
       // re-uploading bones×64 bytes for scenery that never moves is the one
       // per-frame cost a stage would otherwise still pay in full.
       if (!inst.skinMatricesDirty) return
+      // Held on a stepped effect's tick: stays dirty, so the pose that is current
+      // when the next tick comes is the one uploaded.
+      if (this.steppedHeld.has(inst.name)) return
       const skinMatrices = inst.model.getSkinMatrices()
       this.device.queue.writeBuffer(
         inst.skinMatrixBuffer,

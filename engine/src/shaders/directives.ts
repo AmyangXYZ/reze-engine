@@ -88,6 +88,15 @@ export type EffectDirectives = {
    */
   mirror: boolean
   /**
+   * `#stepped`: the cast this effect is aimed at moves ON TWOS — its pose, and
+   * its face, held for a few frames and then snapped to where it is now, the way
+   * limited animation and stop-motion move. A mount with no shader, on
+   * #mirror's footing: it changes WHEN a pose reaches the screen, which no
+   * shader can. The rate comes from the effect's own FPS dial by name — see
+   * the engine's STEPPED_DIALS.
+   */
+  stepped: boolean
+  /**
    * How long ONE firing of this effect lasts, in seconds. 0 = undeclared.
    *
    * An effect is one of two things, and only its author knows which. A HIT has
@@ -118,6 +127,7 @@ const SPEC = {
   bloom: 0,
   dissolve: 0,
   mirror: 0,
+  stepped: 0,
   duration: 1,
   ground: "rest",
 } as const
@@ -177,6 +187,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     dissolve: false,
     ground: null,
     mirror: false,
+    stepped: false,
     duration: 0,
   }
   const errors: string[] = []
@@ -295,6 +306,9 @@ export function parseDirectives(wgsl: string): DirectiveResult {
         return
       case "mirror":
         d.mirror = true
+        return
+      case "stepped":
+        d.stepped = true
         return
       case "duration": {
         // SECONDS, like every other time a directive states (see #dissolve).
