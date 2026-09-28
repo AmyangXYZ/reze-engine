@@ -724,6 +724,17 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputs: { value: "float" },
     emit: () => `shader_to_rgb_diffuse(n, l, sun, amb, shadow)`,
   },
+  /**
+   * Hands this surface to the screen-space scattering pass: the colour passes
+   * through, and the pixel is blurred afterwards the way ray-mmd blurs skin —
+   * red furthest, never across a depth step. Strength scales the width; 1 is
+   * ray-mmd's skin, up to 4. It has to lie on the path to the output to take effect.
+   */
+  subsurface: {
+    inputs: { color: C([1, 1, 1], true), strength: F(1) },
+    outputs: { color: "color" },
+    emit: (a) => `rz_subsurface(${a.strength}, ${a.color})`,
+  },
 
   /**
    * The same closure as a COLOUR, which is what Blender's Shader to RGB

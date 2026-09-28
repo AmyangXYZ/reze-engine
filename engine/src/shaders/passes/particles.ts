@@ -391,13 +391,13 @@ struct FSOut {
   // writes it; a blended one writes all four, which is what not declaring it
   // would have meant.
   @builtin(sample_mask) samples: u32,
-  // The scene's aux target: (bloom mask, coverage). Materials write it, so a
-  // particle that skipped it would punch a hole in the mask of whatever it drew
-  // over.
+  // The scene's aux target: (bloom mask, coverage, subsurface). Materials write
+  // it, so a particle that skipped it would punch a hole in the mask of whatever
+  // it drew over. A particle is never skin, so its .b is 0.
   //
-  // vec4f even though the target is rg8unorm and only .rg land: that target's
-  // blend factors reference SrcAlpha, and a fragment with no alpha channel is
-  // rejected outright — "reading alpha but it is missing from fragment output".
+  // vec4f because that target's blend factors reference SrcAlpha, and a fragment
+  // with no alpha channel is rejected outright — "reading alpha but it is
+  // missing from fragment output".
   // The material shaders declare vec4f here for the same reason.
   @location(1) mask: vec4f,
   // Declared whenever the pass carries the attachment, and padded rather than

@@ -330,17 +330,17 @@ const COMMON_VS_WGSL = /* wgsl */ `
 // Location 0: final radiance+alpha (blended into rg11b10ufloat; the HDR target
 // has no alpha channel, but the blend equation still uses the .a you write here
 // as the src-alpha factor that premultiplies rgb into the HDR target).
-// Location 1: auxiliary rg8unorm carrying
+// Location 1: auxiliary rgba8unorm carrying
 //   .r = bloom mask (1 = contributes to bloom, 0 = skip — e.g. ground).
 //   .g = accumulated canvas alpha — the channel that used to live in hdr.a
 //        before the switch to rg11b10ufloat. Sampled by composite to
 //        un-premultiply color for tonemap and to set the final drawable alpha
 //        (needed for the `premultiplied` canvas alphaMode that blends the
 //        WebGPU surface over the page background).
-// FS output at location 1 must be vec4f — the blend state references src.a, and
-// WebGPU requires the fragment output to provide an alpha component even though
-// the rg8unorm target only stores .r and .g (extra components are discarded).
-// Materials write mask = vec4f(1.0, 1.0, 0.0, color.a); ground writes
+//   .b = subsurface strength ÷ 4 — what a graph's `subsurface` node set, 0 for
+//        everything else. Read by the scattering pass (passes/subsurface.ts).
+// FS output at location 1 must be vec4f — the blend state references src.a.
+// Materials write mask = vec4f(1.0, 1.0, _rzSubsurface, color.a); ground writes
 // vec4f(0.0, 1.0, 0.0, edgeFade). With src.a coming from the 4th component and
 // src-alpha blending enabled:
 //   out.r = mask_r · src.a + dst.r · (1-src.a)   (bloom mask, weighted by alpha)

@@ -112,6 +112,7 @@ import {
   EFFECT_TRAIL_BASE,
   EFFECT_TRAIL_SAMPLES,
 } from "./shaders/passes/composite"
+import { SUBSURFACE_WGSL, SSS_SPIKE } from "./shaders/passes/subsurface"
 import {
   buildParticleComputeShader,
   buildParticleRenderShader,
@@ -761,6 +762,12 @@ interface DrawCall {
   /** Material draws only: false = excluded from the shadow map (PMX cast-shadow
    *  flag off). Sheer texels are cut per fragment by the shadow pass's alpha test. */
   castsShadow?: boolean
+  /** The PMX author's double-sided flag (bit 0x01). Off means MMD draws the
+   *  material's front faces only — an inner lining authored as a flipped copy
+   *  of the outer layer is invisible from outside, which is what the author
+   *  built it around. Media planes stay double-sided: they build their own
+   *  index list and say so there. */
+  doubleSided: boolean
   /** Edge-flagged materials: interleaved inverted-hull outline drawn right after
    *  this material with the outline pipeline. Shares this call's index range;
    *  own bind group (edge uniforms + diffuse texture for the alpha test). */
@@ -2082,15 +2089,18 @@ export class Engine {
   /** Stencil value stamped by eye draws so hair can stencil-test against it and
    *  alpha-blend a second pass over eye silhouette pixels (see-through-hair effect). */
   private static readonly STENCIL_EYE_VALUE = 1
-  /** Aux MRT alongside HDR color. Two channels:
+  /** Aux MRT alongside HDR color. Three channels:
    *   .r — bloom mask (1 = model geometry, 0 = ground; sampled by bloom blit to gate prefilter).
    *   .g — accumulated alpha (the channel that used to live in hdr.a before the HDR format
    *        switched to rg11b10ufloat, which has no alpha). Sampled by composite/bloom to
    *        un-premultiply color for tonemap and to produce the canvas-drawable alpha used by
    *        the premultiplied alphaMode compositor (so the page background still shows through
    *        cleared / edge-faded regions like before).
-   *  rg8unorm at 4× MSAA is 8 bytes/texel — still fits Apple TBDR tile memory comfortably. */
-  private static readonly BLOOM_MASK_FORMAT: GPUTextureFormat = "rg8unorm"
+   *   .b — subsurface strength, set by a graph's `subsurface` node and 0 everywhere
+   *        else; the scattering pass reads it to find skin (passes/subsurface.ts).
+   *  rgba8unorm at 4× MSAA is 16 bytes/texel; it never leaves tile memory (storeOp
+   *  discard), only its single-sample resolve does. */
+  private static readonly BLOOM_MASK_FORMAT: GPUTextureFormat = "rgba8unorm"
   /**
    * The master switch for the id attachment. OFF — and off having been proven
    * to work, not off because it was never finished.
@@ -2633,6 +2643,22 @@ export class Engine {
   //   composite adds bloomUp mip 0 × (color × intensity) to HDR before Filmic.
   // Matches EEVEE energy: tint/intensity applied at composite, not prefilter.
   private bloomSampler!: GPUSampler
+  // Screen-space subsurface scattering (passes/subsurface.ts). The scratch target
+  // is the X pass's output and lives with the canvas size; the bind groups name
+  // it and the HDR resolve, so a resize drops them and the next frame rebuilds.
+  private sssPipelineX: GPURenderPipeline | null = null
+  private sssPipelineY: GPURenderPipeline | null = null
+  private sssScratch: GPUTexture | null = null
+  private sssBindGroupX: GPUBindGroup | null = null
+  private sssBindGroupY: GPUBindGroup | null = null
+  private sssUniformX: GPUBuffer | null = null
+  private sssUniformY: GPUBuffer | null = null
+  private readonly sssUniformData = new Float32Array(8)
+  // Model pipelines' descriptors, and the single-sided twins built from them —
+  // one per pipeline per view (see sidedPipeline).
+  private readonly pipelineDescs = new WeakMap<GPURenderPipeline, GPURenderPipelineDescriptor>()
+  private readonly singleSided = new WeakMap<GPURenderPipeline, GPURenderPipeline>()
+  private readonly singleSidedMirror = new WeakMap<GPURenderPipeline, GPURenderPipeline>()
   private bloomBlitUniformBuffer!: GPUBuffer
   private bloomUpsampleUniformBuffer!: GPUBuffer
   private readonly bloomBlitUniformData = new Float32Array(4)
@@ -6143,6 +6169,134 @@ export class Engine {
   /** The user's field mounts, drawn at half resolution for the composite to
    *  upsample. Runs the whole quad — uniform control flow, so effects may use
    *  derivatives freely, which the old inline path had to forbid. */
+  /** Whether any installed style group routes through a `subsurface` node —
+   *  the scattering pass, and the depth it reads, cost nothing otherwise. */
+  private subsurfaceInUse(): boolean {
+    for (const inst of this.modelInstances.values()) {
+      for (const g of inst.styleGroups.values()) {
+        if (g.group.materials.length && g.group.graph.nodes.some((n) => n.type === "subsurface")) return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * ray-mmd's skin scattering: a horizontal then a vertical depth-aware blur of
+   * the pixels the scene pass marked as skin (aux .b), the second written back
+   * into the HDR resolve through a blend that keeps ray-mmd's per-channel share
+   * of the unblurred picture. See passes/subsurface.ts.
+   */
+  private renderSubsurface(encoder: GPUCommandEncoder): void {
+    if (!this.device || !this.subsurfaceInUse()) return
+    if (!this.hdrResolveTexture || !this.maskResolveView || !this.depthReadView || !this.dofUniformBuffer) return
+    const w = this.hdrResolveTexture.width
+    const h = this.hdrResolveTexture.height
+
+    if (!this.sssPipelineX || !this.sssPipelineY) {
+      const module = this.device.createShaderModule({ label: "subsurface scattering", code: SUBSURFACE_WGSL })
+      this.sssPipelineX = this.device.createRenderPipeline({
+        label: "subsurface blur x",
+        layout: "auto",
+        vertex: { module, entryPoint: "vs" },
+        fragment: { module, entryPoint: "fsX", targets: [{ format: this.hdrFormat }] },
+        primitive: { topology: "triangle-list" },
+      })
+      // result = blurred·(1 − spike) + original·spike, per channel: the
+      // destination is the original, and the blend constant holds the spike.
+      this.sssPipelineY = this.device.createRenderPipeline({
+        label: "subsurface blur y",
+        layout: "auto",
+        vertex: { module, entryPoint: "vs" },
+        fragment: {
+          module,
+          entryPoint: "fsY",
+          targets: [
+            {
+              format: this.hdrFormat,
+              blend: {
+                color: { srcFactor: "one-minus-constant", dstFactor: "constant", operation: "add" },
+                alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "triangle-list" },
+      })
+      this.sssBindGroupX = null
+      this.sssBindGroupY = null
+    }
+    if (!this.sssUniformX || !this.sssUniformY) {
+      const make = (label: string) =>
+        this.device.createBuffer({ label, size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+      this.sssUniformX = make("subsurface uniforms x")
+      this.sssUniformY = make("subsurface uniforms y")
+    }
+    if (!this.sssScratch || this.sssScratch.width !== w || this.sssScratch.height !== h) {
+      this.sssScratch?.destroy()
+      this.sssScratch = this.device.createTexture({
+        label: "subsurface scratch",
+        size: [w, h],
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.sssBindGroupX = null
+      this.sssBindGroupY = null
+    }
+    if (!this.sssBindGroupX || !this.sssBindGroupY) {
+      const mask = this.maskResolveView
+      const depth = this.depthReadView
+      const dof = this.dofUniformBuffer
+      const group = (pipeline: GPURenderPipeline, src: GPUTexture, uniforms: GPUBuffer, label: string) =>
+        this.device.createBindGroup({
+          label,
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: src.createView() },
+            { binding: 1, resource: mask },
+            { binding: 2, resource: depth },
+            { binding: 3, resource: { buffer: dof } },
+            { binding: 4, resource: { buffer: uniforms } },
+          ],
+        })
+      this.sssBindGroupX = group(this.sssPipelineX, this.hdrResolveTexture, this.sssUniformX, "subsurface x")
+      this.sssBindGroupY = group(this.sssPipelineY, this.sssScratch, this.sssUniformY, "subsurface y")
+    }
+
+    const tanY = Math.tan(this.camera.fov * 0.5)
+    const u = this.sssUniformData
+    u[2] = 0
+    u[3] = 0
+    u[4] = tanY * this.camera.aspect
+    u[5] = tanY
+    u[6] = w
+    u[7] = h
+    u[0] = 1
+    u[1] = 0
+    this.device.queue.writeBuffer(this.sssUniformX, 0, u)
+    u[0] = 0
+    u[1] = 1
+    this.device.queue.writeBuffer(this.sssUniformY, 0, u)
+
+    const px = encoder.beginRenderPass({
+      label: "subsurface blur x",
+      colorAttachments: [{ view: this.sssScratch.createView(), loadOp: "clear", clearValue: [0, 0, 0, 0], storeOp: "store" }],
+    })
+    px.setPipeline(this.sssPipelineX)
+    px.setBindGroup(0, this.sssBindGroupX)
+    px.draw(3)
+    px.end()
+
+    const py = encoder.beginRenderPass({
+      label: "subsurface blur y",
+      colorAttachments: [{ view: this.hdrResolveTexture.createView(), loadOp: "load", storeOp: "store" }],
+    })
+    py.setPipeline(this.sssPipelineY)
+    py.setBindGroup(0, this.sssBindGroupY)
+    py.setBlendConstant({ r: SSS_SPIKE[0], g: SSS_SPIKE[1], b: SSS_SPIKE[2], a: 0 })
+    py.draw(3)
+    py.end()
+  }
+
   private renderFieldPass(encoder: GPUCommandEncoder): void {
     // TWO PREDICATES, deliberately, and they are not interchangeable.
     //
@@ -7210,7 +7364,7 @@ export class Engine {
     multisample?: GPUMultisampleState
   }): GPURenderPipeline {
     const targets = config.fragmentTargets ?? (config.fragmentTarget ? [config.fragmentTarget] : undefined)
-    return this.device.createRenderPipeline({
+    return this.createModelPipeline({
       label: config.label,
       layout: config.layout,
       vertex: {
@@ -7653,7 +7807,7 @@ export class Engine {
         depthCompare: this.depthAhead,
       },
     }
-    this.depthPrepassPipeline = this.device.createRenderPipeline({
+    this.depthPrepassPipeline = this.createModelPipeline({
       label: "opaque depth prepass",
       ...prepassDesc,
       fragment: {
@@ -7665,7 +7819,7 @@ export class Engine {
     // The SOLID prime: same module, cutoff forced to exactly 1.0. Only texels
     // whose blend ignores the destination may pre-claim depth in the
     // transparent phase — see the override's note in depth-prepass.ts.
-    this.solidPrepassPipeline = this.device.createRenderPipeline({
+    this.solidPrepassPipeline = this.createModelPipeline({
       label: "transparent solid prepass",
       ...prepassDesc,
       fragment: {
@@ -7681,7 +7835,7 @@ export class Engine {
     // hair depth from ever claiming the pixels the see-through-hair pass needs
     // the eye to survive on. (Bundle draws use the PASS's stencil reference;
     // only pipeline/bind/vertex state resets across executeBundles.)
-    this.hairPrimePipeline = this.device.createRenderPipeline({
+    this.hairPrimePipeline = this.createModelPipeline({
       label: "hair depth prime",
       ...prepassDesc,
       depthStencil: {
@@ -8553,6 +8707,10 @@ export class Engine {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       })
       this.maskResolveView = this.maskResolveTexture.createView()
+      this.sssScratch?.destroy()
+      this.sssScratch = null
+      this.sssBindGroupX = null
+      this.sssBindGroupY = null
 
       // The floor mirror's targets — FULL resolution, the same attachment
       // contract and sample count as the scene pass, which is what lets the
@@ -10403,6 +10561,8 @@ export class Engine {
       bindGroup: this.groundShadowBindGroup!,
       materialName: "Ground",
       groupId: null,
+      // The ground's own pipeline decides its culling.
+      doubleSided: true,
       // The ground belongs to no model instance, so it is not in the cull list —
       // cullIndex -1 leaves renderGround unconditional. Its box is filled in
       // anyway rather than left a lie for whoever reads this next.
@@ -14479,6 +14639,7 @@ export class Engine {
         groupId: null,
         baseBindGroupEntries,
         castsShadow,
+        doubleSided: inst.isPlane || (mat.edgeFlag & 0x01) !== 0,
         outline,
         bounds,
         cullIndex: -1,
@@ -16063,7 +16224,10 @@ export class Engine {
     // The two real readers are both in the composite and both have their own
     // flag above: linearDepth() feeds the DoF gather and the depth handed to a
     // foreground mount. Nothing else binds depthTex at all.
-    const depthRead = dofOn || this.effects.some((e) => e.hasForeground)
+    // The scattering pass is the third reader: it rejects taps across a depth
+    // step and scales its width by distance, so a scene wearing a subsurface
+    // look stores depth for as long as it does.
+    const depthRead = dofOn || this.effects.some((e) => e.hasForeground) || this.subsurfaceInUse()
     this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
     if (depthRead) this.writeDepthOfFieldUniforms()
 
@@ -16261,6 +16425,9 @@ export class Engine {
     // kept ribbons out of bloom.
     this.drawTrails(pass, "camera")
     pass.end()
+    // Skin scattering, on the resolved scene and before anything reads it:
+    // bloom should bleed the scattered skin, not the raw one.
+    this.renderSubsurface(encoder)
     // The field mounts, likewise: after the scene so foregrounds can read its
     // depth, before the composite that samples both layers.
     this.renderFieldPass(encoder)
@@ -17081,11 +17248,53 @@ export class Engine {
         stencilWriteMask: 0xff,
       }
     }
-    return this.device.createRenderPipelineAsync({
+    const desc: GPURenderPipelineDescriptor = {
       ...base,
       fragment: { module, constants, targets: blend === "additive" ? this.sceneTargetsAdditive : this.sceneTargets },
       depthStencil,
+    }
+    return this.device.createRenderPipelineAsync(desc).then((pipeline) => {
+      this.pipelineDescs.set(pipeline, desc)
+      return pipeline
     })
+  }
+
+  /** A pipeline whose descriptor is kept, so a single-sided twin can be built
+   *  from it on demand (see sidedPipeline). */
+  private createModelPipeline(desc: GPURenderPipelineDescriptor): GPURenderPipeline {
+    const pipeline = this.device.createRenderPipeline(desc)
+    this.pipelineDescs.set(pipeline, desc)
+    return pipeline
+  }
+
+  /**
+   * The pipeline a draw should use once its double-sided flag is honoured.
+   *
+   * A single-sided material culls its back faces, as MMD does. PMX winds a front
+   * face clockwise, which this engine sees as a BACK face — the eye's front cull
+   * and the outline hull's back cull are the same fact — so the cull is "front"
+   * for the camera and "back" in the mirror, whose reflection flips winding.
+   *
+   * Every pipeline that draws a material's surface goes through here, depth
+   * primes included: a prime that kept a culled face would write depth for a
+   * surface nobody sees and hide what is behind it. A pipeline that already
+   * culls (the eye) is returned as it is.
+   */
+  private sidedPipeline(pipeline: GPURenderPipeline, draw: DrawCall, mirrored: boolean): GPURenderPipeline {
+    if (draw.doubleSided) return pipeline
+    const desc = this.pipelineDescs.get(pipeline)
+    if (!desc || (desc.primitive?.cullMode ?? "none") !== "none") return pipeline
+    const cache = mirrored ? this.singleSidedMirror : this.singleSided
+    let twin = cache.get(pipeline)
+    if (!twin) {
+      twin = this.device.createRenderPipeline({
+        ...desc,
+        label: `${desc.label ?? "pipeline"} (single-sided${mirrored ? ", mirror" : ""})`,
+        primitive: { ...desc.primitive, cullMode: mirrored ? "back" : "front" },
+      })
+      cache.set(pipeline, twin)
+    }
+    return twin
   }
 
   // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
@@ -17145,7 +17354,8 @@ export class Engine {
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
         bound = true
       }
-      const pipeline = this.pipelineForDrawCall(inst, draw, view.args === "mirror")
+      const mirrored = view.args === "mirror"
+      const pipeline = this.sidedPipeline(this.pipelineForDrawCall(inst, draw, mirrored), draw, mirrored)
       if (pipeline !== currentPipeline) {
         pass.setPipeline(pipeline)
         currentPipeline = pipeline
@@ -17268,14 +17478,17 @@ export class Engine {
     inst: ModelInstance,
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
-    let bound = false
+    let bound: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
       if (draw.type !== "opaque" || !this.isHairDraw(inst, draw)) continue
-      if (!bound) {
-        pass.setPipeline(this.hairPrimePipeline)
-        pass.setBindGroup(0, view.perFrame)
-        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
-        bound = true
+      const pipeline = this.sidedPipeline(this.hairPrimePipeline, draw, view.args === "mirror")
+      if (bound !== pipeline) {
+        pass.setPipeline(pipeline)
+        if (!bound) {
+          pass.setBindGroup(0, view.perFrame)
+          pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        }
+        bound = pipeline
       }
       pass.setBindGroup(2, draw.bindGroup)
       this.issueDraw(pass, draw, view.args)
@@ -17338,6 +17551,7 @@ export class Engine {
         if (install?.alphaMode === "hashed") pipeline = this.solidPrepassPipeline
         else if (install && install.alphaMode !== "opaque") continue
       }
+      pipeline = this.sidedPipeline(pipeline, draw, view.args === "mirror")
       if (bound !== pipeline) {
         pass.setPipeline(pipeline)
         // One layout for both prepass pipelines, so groups 0 and 1 carry over.
@@ -17375,14 +17589,17 @@ export class Engine {
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
     if (inst.isStage) return
-    let bound = false
+    let bound: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
       if (draw.type !== "transparent") continue
-      if (!bound) {
-        pass.setPipeline(this.solidPrepassPipeline)
-        pass.setBindGroup(0, view.perFrame)
-        pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
-        bound = true
+      const pipeline = this.sidedPipeline(this.solidPrepassPipeline, draw, view.args === "mirror")
+      if (bound !== pipeline) {
+        pass.setPipeline(pipeline)
+        if (!bound) {
+          pass.setBindGroup(0, view.perFrame)
+          pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
+        }
+        bound = pipeline
       }
       pass.setBindGroup(2, draw.bindGroup)
       this.issueDraw(pass, draw, view.args)
@@ -17442,8 +17659,9 @@ export class Engine {
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
       if (draw.type !== "opaque") continue
-      const overEyes = this.overEyesPipelineFor(inst, draw)
-      if (!overEyes) continue
+      const hairOverEyes = this.overEyesPipelineFor(inst, draw)
+      if (!hairOverEyes) continue
+      const overEyes = this.sidedPipeline(hairOverEyes, draw, view.args === "mirror")
       if (!bound) {
         pass.setBindGroup(0, view.perFrame)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)

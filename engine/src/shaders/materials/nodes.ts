@@ -654,6 +654,18 @@ fn shader_to_rgb_diffuse(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f,
   return luminance_rec709_linear(shader_to_rgb_lit(n, l, sun_rgb, ambient_rgb, shadow));
 }
 
+// ─── SUBSURFACE node ────────────────────────────────────────────────
+// Marks this fragment for the screen-space scattering pass (passes/subsurface.ts)
+// and passes its colour through. The strength lands in the aux target's .b via
+// the epilogue, stored as a quarter so an 8-bit channel carries 0–4: 1 is
+// ray-mmd's skin width, 0 leaves the pixel out of the pass.
+var<private> _rzSubsurface: f32 = 0.0;
+
+fn rz_subsurface(strength: f32, color: vec3f) -> vec3f {
+  _rzSubsurface = clamp(strength, 0.0, 4.0) * 0.25;
+  return color;
+}
+
 // ─── BUMP node ──────────────────────────────────────────────────────
 // Screen-space bump from a scalar height field. Needs dFdx/dFdy which
 // WGSL provides as dpdx/dpdy.

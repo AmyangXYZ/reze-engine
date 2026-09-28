@@ -220,13 +220,13 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
 
   var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
-${FOG}  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `${ALBEDO}  var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
-${FOG}  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
 }

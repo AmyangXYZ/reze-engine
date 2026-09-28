@@ -127,7 +127,7 @@ const ADD_KEEP_ALPHA: GPUBlendState = {
   alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
 }
 
-/** Both channels sum. rg8unorm clamps at 1, which is the saturation alpha-over
+/** Both channels sum. rgba8unorm clamps at 1, which is the saturation alpha-over
  *  would have reached anyway. */
 const ADD_BOTH: GPUBlendState = {
   color: { srcFactor: "one", dstFactor: "one", operation: "add" },
