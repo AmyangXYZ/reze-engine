@@ -60,6 +60,16 @@ export type EffectDirectives = {
   /** `#points <prefix>`: every bone on every model whose name starts with it,
    *  as rzPoint(i) in the particle stages. Null when the file declares none. */
   points: string | null
+  /**
+   * `#textures N` (1-4): the particle shading reads N pictures the HOST hands
+   * over with the install (setEffects' `textures`), as rzTexture(i, uv) — uv
+   * (0,0) at the image's top-left, repeating. A game's own splash or spray is a
+   * picture on a card, and drawn procedurally it can only ever be a guess at
+   * it; this is how a converted stage's particles carry the real one. The
+   * other modules an effect is spliced into get the names as stubs returning
+   * zero. 0 when undeclared.
+   */
+  textures: number
   bloom: boolean
   /** This effect takes the cast apart — the host reads the timing. */
   dissolve: boolean
@@ -124,6 +134,7 @@ const SPEC = {
   lights: 1,
   grid: 1,
   points: 1,
+  textures: 1,
   bloom: 0,
   dissolve: 0,
   mirror: 0,
@@ -183,6 +194,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     lights: 0,
     grid: 0,
     points: null,
+    textures: 0,
     bloom: false,
     dissolve: false,
     ground: null,
@@ -304,6 +316,15 @@ export function parseDirectives(wgsl: string): DirectiveResult {
       case "points":
         d.points = args[0]
         return
+      case "textures": {
+        const n = num(args[0])
+        if (n === null || !Number.isInteger(n) || n < 1 || n > 4) {
+          errors.push(`${at}: #textures takes a count from 1 to 4`)
+          return
+        }
+        d.textures = n
+        return
+      }
       case "mirror":
         d.mirror = true
         return

@@ -12,6 +12,7 @@ import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 import { idApi } from "../id-api"
 import { sceneLightApi } from "../scene-light-api"
 import { pointsApi } from "../points-api"
+import { textureApi } from "../texture-api"
 // Ribbons along a bone's recorded path, drawn as geometry.
 //
 // This is the effect the whole geometry path was built for. As a fullscreen
@@ -303,7 +304,7 @@ fn rzTurnRadius(a: vec3f, b: vec3f, c: vec3f) -> f32 {
     gridReadApi(0, 8, 9, src.gridSize) +
     // Stubbed: this module cannot read an attachment the scene pass writes — see
     // id-api.ts. The author's whole file compiles here, so the names must exist.
-    idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) + pointsApi(false) +
+    idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) + pointsApi(false) + textureApi(0) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `

@@ -12,6 +12,7 @@ import { sceneIdFieldWgsl, sceneIdPadWgsl } from "./scene-contract"
 import { idApi } from "../id-api"
 import { sceneLightApi } from "../scene-light-api"
 import { pointsApi } from "../points-api"
+import { textureApi } from "../texture-api"
 // GPU particles for user effects: a compute step and an instanced quad draw.
 //
 // Its own shader MODULE rather than more source spliced into composite.ts, for
@@ -115,6 +116,9 @@ type ParticleSource = {
    *  bending where a foot pressed is the whole case: the bend has to persist and
    *  recover, which is memory, and memory is what the grid is for. */
   gridSize: number
+  /** `#textures N`: pictures the shading samples (rzTexture), bound only when
+   *  N > 0 — see texture-api.ts. Omitted = 0. */
+  textures?: number
 }
 
 /** Where the shading stage's five scene-light bindings start — see scene-light-api.ts. */
@@ -126,6 +130,10 @@ export const PARTICLE_POINTS_BINDING = 15
  *  (6, count, 0, 0), so the draw reads at byte 16. */
 export const PARTICLE_INDIRECT_BINDING = 16
 export const PARTICLE_INDIRECT_BYTES = 32
+/** `#textures`: the pictures at 17..20 and their one sampler at 21, render
+ *  stage only — see texture-api.ts. */
+export const PARTICLE_TEXTURE_BINDING = 17
+export const PARTICLE_TEXTURE_SAMPLER_BINDING = 21
 export const PARTICLE_INDIRECT_DRAW_OFFSET = 16
 
 /** Bytes per particle. Explicitly padded — see the struct below. */
@@ -234,6 +242,9 @@ ${src.paramsDecl}
     idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) +
     // The named points, for real: particleInit is where a flame is put on a wick.
     pointsApi(true, 0, PARTICLE_POINTS_BINDING) +
+    // Stubs: textureSample is fragment-only, and a spawn rule has no use for a
+    // picture. The names resolve so the file compiles here.
+    textureApi(0) +
     (src.live
       ? `@group(0) @binding(${PARTICLE_INDIRECT_BINDING}) var<storage, read_write> _rzIndirect: array<u32, 8>;\n`
       : "") +
@@ -333,6 +344,8 @@ ${src.paramsDecl}
     // run by the time this draws, inside the scene pass. See scene-light-api.ts.
     sceneLightApi(true, 0, PARTICLE_LIGHT_BINDING) +
     pointsApi(true, 0, PARTICLE_POINTS_BINDING) +
+    // The host's pictures, for real — see texture-api.ts.
+    textureApi(src.textures ?? 0, 0, PARTICLE_TEXTURE_BINDING, PARTICLE_TEXTURE_SAMPLER_BINDING) +
     "\n// ── user effect ──\n" +
     src.wgsl +
     /* wgsl */ `

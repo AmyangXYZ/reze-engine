@@ -138,7 +138,7 @@ const ADD_BOTH: GPUBlendState = {
  * OVER for something that arrives ALREADY premultiplied: take the source whole
  * and let it displace the destination by its own coverage.
  *
- * The ground needs this and nothing else does. Every other class writes a
+ * The ground, the mirror and particles need it. The other classes write a
  * straight colour and an alpha, and the src-alpha factor premultiplies it once
  * on the way in. The ground cannot: its coverage is the SUM of a lit surface
  * and a colourless shadow-catcher layer, so it has to weight its own colour by
@@ -194,7 +194,11 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
   // everything else, and coverage is what the blend applies.
   ground: [PREMULTIPLIED_OVER, ALPHA_OVER],
   outline: [ALPHA_OVER, ALPHA_OVER],
-  particle: [ALPHA_OVER, ALPHA_OVER],
+  // PREMULTIPLIED colour: the particle fragment weights its colour by its own
+  // alpha before it writes (passes/particles.ts), so the src-alpha blend would
+  // weight it a second time — a splash at alpha 0.1 arrived at a hundredth of
+  // its colour instead of a tenth. The aux mask is written straight, as ever.
+  particle: [PREMULTIPLIED_OVER, ALPHA_OVER],
   "particle-additive": [ADD_KEEP_ALPHA, ADD_BOTH],
   trail: [ADD_PREMULTIPLIED, ALPHA_OVER],
 }

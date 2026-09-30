@@ -42,6 +42,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const read = (p) => readFileSync(join(here, p), "utf8")
 const engine = read("../src/engine.ts")
 const groundSrc = read("../src/shaders/passes/ground.ts")
+const particlesSrc = read("../src/shaders/passes/particles.ts")
 
 /** The formats the engine settles on at init. rgba16float is the fallback; the
  *  rg11b10ufloat path differs only in the colour format, and every assertion
@@ -466,7 +467,7 @@ test("the subject id and the pick id are the same number", () => {
   assert.match(fieldWith(true), new RegExp(`return u32\\(_rzCast\\[g \\* ${EFFECT_SUBJECT_VEC4S} \\+ 1\\]\\.w\\)`), "rzSubjectId must read that same slot")
 })
 
-test("only the ground blends premultiplied, and only because it premultiplies", () => {
+test("the ground and particles blend premultiplied, and only because they premultiply", () => {
   // The ground writes `finalColor * surfA` — it weights its own colour by the
   // SURFACE's share, because its coverage also includes a colourless
   // shadow-catcher layer. Handed to the src-alpha blend every other class uses,
@@ -482,10 +483,17 @@ test("only the ground blends premultiplied, and only because it premultiplies", 
   assert.match(groundSrc, /out\.color = vec4f\(pm, outA\)/, "…which is only correct while it still premultiplies")
   assert.match(groundSrc, /pm = baseColor \* surfA \+ pm \* \(1\.0 - surfA\)/)
 
+  // Particles weight their colour by their alpha in the fragment, so they take
+  // the ground's blend: under src-alpha a splash at alpha 0.1 came out at a
+  // hundredth of its colour.
+  const [particleColor] = sceneTargets("particle", FORMATS)
+  assert.equal(particleColor.blend.color.srcFactor, "one", "a particle's colour arrives premultiplied")
+  assert.match(particlesSrc, /out\.color = vec4f\(c\.rgb \* c\.a, c\.a\)/, "…which is only correct while it still premultiplies")
+
   // Everyone else writes a straight colour, so src-alpha premultiplying it once
   // is exactly right. If one of these ever pre-scales its rgb, it needs the
   // ground's blend too — and this is where that gets noticed.
-  for (const cls of ["material", "outline", "particle"]) {
+  for (const cls of ["material", "outline"]) {
     const [c] = sceneTargets(cls, FORMATS)
     assert.equal(c.blend.color.srcFactor, "src-alpha", `${cls} writes straight colour and must be premultiplied by the blend`)
   }

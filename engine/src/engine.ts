@@ -118,6 +118,8 @@ import {
   buildParticleRenderShader,
   PARTICLE_LIGHT_BINDING,
   PARTICLE_POINTS_BINDING,
+  PARTICLE_TEXTURE_BINDING,
+  PARTICLE_TEXTURE_SAMPLER_BINDING,
   particleEntryPoints,
   PARTICLE_INDIRECT_BINDING,
   PARTICLE_INDIRECT_BYTES,
@@ -488,6 +490,17 @@ export type EffectParamValue = number | { x: number; y: number; z: number }
 /** A vector by shape rather than by class — Vec3 satisfies it, and so does a
  *  JSON object out of a scene document or a literal typed into a console. */
 export type XYZ = { x: number; y: number; z: number }
+/**
+ * One picture an effect's `#textures` reads, as the host holds it — slot i of
+ * the install's `textures` is rzTexture(i, uv). `srgb` for a colour picture
+ * (decoded to linear on sample), false for data. Null, or a slot past the end,
+ * reads white. The engine never fetches: images arrive decoded, as models do.
+ */
+export type EffectTextureInput = {
+  source: ImageBitmap | HTMLImageElement | HTMLCanvasElement | OffscreenCanvas | ImageData
+  srgb: boolean
+} | null
+
 export type EffectResult = {
   ok: boolean
   /** Compile/validation errors, line:col relative to the USER's WGSL. Also
@@ -1513,6 +1526,9 @@ interface EffectParticles {
    *  indirect arguments it writes them to. Null when the effect declared none —
    *  the whole pool is then stepped and drawn. */
   live: { pipeline: GPUComputePipeline; indirect: GPUBuffer; binds: [GPUBindGroup, GPUBindGroup] } | null
+  /** `#textures`: the pictures the host handed over, uploaded for this effect
+   *  alone and destroyed with it. Empty when it declared none. */
+  textures: GPUTexture[]
 }
 
 /**
@@ -4780,6 +4796,8 @@ export class Engine {
     anchors: { bone: string; trail: boolean }[],
     /** Its row of that table: local slot → scene slot. */
     alias: number[],
+    /** The pictures for `#textures`, as the host passed them. */
+    textures?: EffectTextureInput[],
   ): Promise<{ ok: true; instance: EffectInstance; warnings: string[] } | EffectResult> {
     const noMounts = { background: false, foreground: false }
     if (!this.device) return { ok: false, diagnostics: ["setEffect requires init() to have run"], mounts: noMounts, params: [], duration: 0, readsCast: false }
@@ -5100,6 +5118,7 @@ export class Engine {
       particles?.uniform.destroy()
       particles?.points?.buffer.destroy()
       particles?.live?.indirect.destroy()
+      for (const t of particles?.textures ?? []) t.destroy()
       grid?.textures[0].destroy()
       grid?.textures[1].destroy()
       grid?.uniform.destroy()
@@ -5115,7 +5134,7 @@ export class Engine {
       grid = built.state
     }
     if (wantsParticles) {
-      const built = await this.buildParticles(wgsl, d, anchors, alias, paramsFor, grid)
+      const built = await this.buildParticles(wgsl, d, anchors, alias, paramsFor, grid, textures)
       if (!built.ok) return abandon(built.diagnostics)
       particles = built.state
     }
@@ -5276,6 +5295,9 @@ export class Engine {
            *  aimed at one dancer should not spend its first frame on all four,
            *  which on a ribbon or a sigil reads as a flash. */
           subjects?: readonly string[] | null
+          /** `#textures`: slot i is the effect's rzTexture(i, uv). See
+           *  EffectTextureInput. Ignored by an effect that declares none. */
+          textures?: EffectTextureInput[]
         }[]
       | null,
   ): Promise<EffectResult[]> {
@@ -5329,6 +5351,7 @@ export class Engine {
         requested[i].params,
         perEffectAnchors[i],
         table.alias[i],
+        requested[i].textures,
       )
       if (!("instance" in built)) {
         // Contained: this one is out, the others carry on.
@@ -5444,13 +5467,13 @@ export class Engine {
    * Install ONE effect — the singleton API, kept because most scenes are one
    * effect and every existing caller uses it. A one-element setEffects.
    */
-  async setEffect(wgsl: string | null, params?: Record<string, EffectParamValue>): Promise<EffectResult> {
+  async setEffect(wgsl: string | null, params?: Record<string, EffectParamValue>, textures?: EffectTextureInput[]): Promise<EffectResult> {
     const noMounts = { background: false, foreground: false }
     if (wgsl === null) {
       await this.setEffects(null)
       return { ok: true, diagnostics: [], mounts: noMounts, params: [], duration: 0, readsCast: false }
     }
-    const [result] = await this.setEffects([{ wgsl, params }])
+    const [result] = await this.setEffects([{ wgsl, params, textures }])
     return result ?? { ok: false, diagnostics: ["effect failed to install"], mounts: noMounts, params: [], duration: 0, readsCast: false }
   }
 
@@ -5471,6 +5494,8 @@ export class Engine {
     /** This effect's own grid, already built, or null when it declared none.
      *  Read-only here: the pool samples it, the grid pass owns it. */
     grid: EffectGrid | null,
+    /** `#textures`: the host's pictures, slot for slot. */
+    textureInputs?: EffectTextureInput[],
   ): Promise<{ ok: true; state: EffectParticles } | { ok: false; diagnostics: string[] }> {
     // No pragma means "some": an author who wrote the trio clearly wants
     // particles, and failing over a missing comment would be pedantry.
@@ -5484,8 +5509,15 @@ export class Engine {
       gridSize: grid?.size ?? 0,
       cover: particleEntryPoints(wgsl).cover,
       live: particleEntryPoints(wgsl).count,
+      textures: d.textures,
     }
     const prepass = src.blend === "cutout" && src.cover
+    // `#textures`: uploaded now, each with its mips, for this effect alone. A
+    // slot the host left empty is null here and binds the white fallback.
+    const textures = this.uploadEffectTextures(textureInputs, d.textures)
+    const dropTextures = () => {
+      for (const t of textures) t?.destroy()
+    }
     const points = d.points
       ? {
           prefix: d.points,
@@ -5525,11 +5557,13 @@ export class Engine {
     const computeModule = await compile(buildParticleComputeShader(src, cast), "particle compute")
     if (Array.isArray(computeModule)) {
       points?.buffer.destroy()
+      dropTextures()
       return { ok: false, diagnostics: computeModule }
     }
     const renderModule = await compile(buildParticleRenderShader(src, cast), "particle render")
     if (Array.isArray(renderModule)) {
       points?.buffer.destroy()
+      dropTextures()
       return { ok: false, diagnostics: renderModule }
     }
 
@@ -5609,6 +5643,18 @@ export class Engine {
           ...(withIndirect
             ? [{ binding: PARTICLE_INDIRECT_BINDING, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" as const } }]
             : []),
+          // `#textures`, the shading stage only and only when declared — an
+          // effect without them keeps exactly the layout it always had.
+          ...(shadow && textures.length
+            ? [
+                ...textures.map((_, k) => ({
+                  binding: PARTICLE_TEXTURE_BINDING + k,
+                  visibility: GPUShaderStage.FRAGMENT,
+                  texture: { sampleType: "float" as const },
+                })),
+                { binding: PARTICLE_TEXTURE_SAMPLER_BINDING, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" as const } },
+              ]
+            : []),
         ],
       })
     /** One per GRID PARITY, for the reason rebuildFieldBindGroup gives: the grid
@@ -5641,6 +5687,15 @@ export class Engine {
                 ]
               : []),
             ...(withIndirect && indirect ? [{ binding: PARTICLE_INDIRECT_BINDING, resource: { buffer: indirect } }] : []),
+            ...(shadow && textures.length
+              ? [
+                  ...textures.map((t, k) => ({
+                    binding: PARTICLE_TEXTURE_BINDING + k,
+                    resource: (t ?? this.fallbackMaterialTexture).createView(),
+                  })),
+                  { binding: PARTICLE_TEXTURE_SAMPLER_BINDING, resource: this.effectTextureSampler() },
+                ]
+              : []),
           ],
         }),
       ) as [GPUBindGroup, GPUBindGroup]
@@ -5723,6 +5778,7 @@ export class Engine {
         uniform.destroy()
         points?.buffer.destroy()
         indirect?.destroy()
+        dropTextures()
         return { ok: false, diagnostics: [scoped.message] }
       }
       return {
@@ -5752,6 +5808,7 @@ export class Engine {
           }),
           points,
           live,
+          textures: textures.filter((t): t is GPUTexture => t !== null),
         },
       }
     } catch (e) {
@@ -5760,6 +5817,7 @@ export class Engine {
       uniform.destroy()
       points?.buffer.destroy()
       indirect?.destroy()
+      dropTextures()
       return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)] }
     }
   }
@@ -6528,6 +6586,7 @@ export class Engine {
       e.particles?.uniform.destroy()
       e.particles?.points?.buffer.destroy()
       e.particles?.live?.indirect.destroy()
+      for (const t of e.particles?.textures ?? []) t.destroy()
       e.particles = null
     }
   }
@@ -12394,6 +12453,54 @@ export class Engine {
     install.uniformBuffer.destroy()
     for (const tex of install.images ?? []) tex?.destroy()
     for (const set of Object.values(install.imagesByMaterial ?? {})) for (const tex of set) tex?.destroy()
+  }
+
+  /**
+   * An effect's `#textures`, uploaded: `count` slots, each with a full mip chain
+   * (a splash card seen from across a stage is a few pixels, and unmipped it
+   * sparkles). Slot k is null where the host gave nothing — the bind group then
+   * reads the white fallback.
+   */
+  private uploadEffectTextures(inputs: EffectTextureInput[] | undefined, count: number): (GPUTexture | null)[] {
+    const out: (GPUTexture | null)[] = []
+    for (let k = 0; k < count; k++) {
+      const entry = inputs?.[k]
+      if (!entry) {
+        out.push(null)
+        continue
+      }
+      const src = entry.source
+      const width = Math.max(1, "naturalWidth" in src ? src.naturalWidth : src.width)
+      const height = Math.max(1, "naturalHeight" in src ? src.naturalHeight : src.height)
+      const mipLevelCount = Math.floor(Math.log2(Math.max(width, height))) + 1
+      const tex = this.device.createTexture({
+        label: `effect texture ${k}`,
+        size: [width, height],
+        mipLevelCount,
+        format: entry.srgb ? "rgba8unorm-srgb" : "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.device.queue.copyExternalImageToTexture({ source: src }, { texture: tex }, [width, height])
+      if (mipLevelCount > 1) this.generateMipmaps(tex, mipLevelCount)
+      out.push(tex)
+    }
+    return out
+  }
+
+  private effectTextureSamplerCache: GPUSampler | null = null
+  /** Linear, mipmapped, repeating — one for every effect's pictures. */
+  private effectTextureSampler(): GPUSampler {
+    if (!this.effectTextureSamplerCache) {
+      this.effectTextureSamplerCache = this.device.createSampler({
+        label: "effect texture sampler",
+        magFilter: "linear",
+        minFilter: "linear",
+        mipmapFilter: "linear",
+        addressModeU: "repeat",
+        addressModeV: "repeat",
+      })
+    }
+    return this.effectTextureSamplerCache
   }
 
   /** Upload a group's image maps. Sources are decoded images the host already

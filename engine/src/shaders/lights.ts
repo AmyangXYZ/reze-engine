@@ -49,6 +49,7 @@ import { clockApi, trailSlotsApi, viewportApi } from "./passes/hosted-api"
 import { idApi } from "./id-api"
 import { sceneLightApi, worldAmbientWgsl } from "./scene-light-api"
 import { pointsApi } from "./points-api"
+import { textureApi } from "./texture-api"
 
 /** Words before the first record: the counts, the grid's placement and the
  *  outside mask, four vec4s — see the layout above. */
@@ -179,7 +180,7 @@ ${viewportApi("viewU[6].w")}
 ${trailSlotsApi(cast.trailCount)}
 // The id accessors, stubbed: this module cannot read an attachment the
 // scene pass writes. See id-api.ts — the author's whole file compiles here.
-${idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) + pointsApi(false)}
+${idApi(false, 0, 0) + castDistanceStub() + sceneLightApi(false, 0, 0) + pointsApi(false) + textureApi(0)}
 // The dials the author declared, if any. A lamp is exactly the thing someone
 // retunes — its colour and its reach — so an emitter reads params like every
 // other mount rather than being the one place a #param resolves to nothing.
