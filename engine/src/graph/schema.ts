@@ -74,5 +74,7 @@ export type Diagnostic = {
   message: string
 }
 
-export const MAX_NODES = 64
+// A sanity bound, not a GPU one: a graph compiles to one fragment function and
+// a longer one is only more WGSL. The game ports (X348's sea and water) run 60+.
+export const MAX_NODES = 128
 export const MAX_PARAMS = 16
