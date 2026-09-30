@@ -183,10 +183,17 @@ export type MaterialPresetMap = Partial<Record<MaterialPreset, string[]>>
 
 // Substring hints mapping common PMX material names (JP/CN/EN) to a style category,
 // tried when a material isn't in the caller's explicit override map. Ordered: more
-// specific families first (靴下 must hit stockings before 靴 hits cloth). A material
+// specific families first (靴下 must hit socks before 靴 hits cloth). A material
 // matching nothing resolves to null — it stays ungrouped (neutral default).
+//
+// SOCKS ARE CLOTH, STOCKINGS ARE SHEER. The game draws a white sock as opaque
+// fabric on the ordinary cloth ramp; only a sheer stocking gets the stockings
+// look, whose see-through blend made white socks glow flat or wash out. So the
+// sock words go to rough cloth ahead of the stocking words — 袜子 before the
+// bare 袜 that 丝袜 (silk stockings) still reaches.
 const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
-  ["stockings", ["靴下", "ソックス", "タイツ", "ニーソ", "袜", "stocking", "socks", "tights"]],
+  ["cloth_rough", ["靴下", "ソックス", "ニーソ", "袜子", "短袜", "棉袜", "socks", "sock"]],
+  ["stockings", ["タイツ", "ストッキング", "袜", "stocking", "tights", "pantyhose"]],
   [
     "eye",
     ["白目", "目影", "二重", "睫", "まつげ", "まゆ", "眉", "目", "瞳", "眼", "eye", "iris", "pupil", "lash", "brow"],

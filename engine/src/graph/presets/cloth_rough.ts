@@ -1,6 +1,8 @@
 // M_Rough_Cloth as a ShaderGraph — port of shaders/materials/cloth_rough.ts.
 // NPR graph identical to M_Smooth_Cloth, but the noise bump subtree IS live on
-// Principled.Normal (weave bump in rest space) and Roughness is raised to 0.8187.
+// Principled.Normal (weave bump in rest space), and it is MATTE where smooth cloth
+// shines: roughness 1, specular 0.25, and a wider toon band (0.20-0.45) so the
+// light rolls off cotton instead of cutting. Smooth keeps 0.5 / 0.8 / 0.25-0.35.
 // The tex_noise node hits the detail=2 peephole → tex_noise_d2.
 
 import type { ShaderGraph } from "../schema"
@@ -19,7 +21,7 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
     { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
     { id: "str", type: "shader_to_rgb_diffuse" },
-    { id: "ramp_008", type: "ramp_cardinal", inputs: { pos0: 0.2466, pos1: 0.3466 } },
+    { id: "ramp_008", type: "ramp_cardinal", inputs: { pos0: 0.2, pos1: 0.45 } },
     { id: "mix04_fac", type: "math/multiply", inputs: { b: 0.5 } },
     { id: "dark_tex", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.19999998807907104, fac: 1.0 } },
     { id: "mix_004", type: "mix/blend" },
@@ -36,7 +38,7 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
     {
       id: "principled",
       type: "principled",
-      inputs: { metallic: 0.0, specular_ior_level: 0.8, roughness: 0.8187, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
+      inputs: { metallic: 0.0, specular_ior_level: 0.25, roughness: 1.0, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
     },
     { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.8999999761581421 } },
   ],
