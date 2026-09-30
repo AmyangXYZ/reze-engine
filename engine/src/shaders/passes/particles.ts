@@ -102,6 +102,15 @@ type ParticleSource = {
    *  where every stacked fragment is otherwise shaded in full; the prepass is
    *  the shape of that rejection, done by hand and cheaply. */
   cover: boolean
+  /** The effect defines `particleOrient(p: Particle, id: u32) -> mat3x3f`: the
+   *  quad lies along its first two columns (right, up) instead of facing the
+   *  camera. A card that belongs to a surface — a raindrop's glow on a window,
+   *  a sheet of water standing in its fall — is flat on that surface and turns
+   *  with it, not with the eye: Unity's Local and World render alignments. The
+   *  particle's rotation still turns the corners within that plane, and a
+   *  stretched particle stretches along its velocity projected into it. `id`
+   *  is the particle's slot, so the axes can come from its emitter. */
+  orient?: boolean
   /** The effect defines `particleCount() -> u32`: how many of the pool are
    *  live this frame, as a function of its dials. The step is dispatched and
    *  the quads drawn for that many slots and no more, through indirect
@@ -196,8 +205,9 @@ fn rzCamPos() -> vec3f { return cam.camPos; }
 /** Does the source define the particle contract? All three are required
  *  together; `cover` is optional and only means anything to a cutout, and
  *  `count` is optional and bounds the frame's work — see particleCount. */
-export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean; cover: boolean; count: boolean } {
+export function particleEntryPoints(wgsl: string): { init: boolean; step: boolean; shade: boolean; cover: boolean; count: boolean; orient: boolean } {
   return {
+    orient: /\bfn\s+particleOrient\s*\(/.test(wgsl),
     init: /\bfn\s+particleInit\s*\(/.test(wgsl),
     step: /\bfn\s+particleStep\s*\(/.test(wgsl),
     shade: /\bfn\s+particleShade\s*\(/.test(wgsl),
@@ -372,9 +382,13 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
     out.clip = vec4f(0.0, 0.0, -2.0, 1.0);
     return out;
   }
-  let right = vec3f(cam.view[0][0], cam.view[1][0], cam.view[2][0]);
-  let up = vec3f(cam.view[0][1], cam.view[1][1], cam.view[2][1]);
-  let s = sin(p.rot);
+  var right = vec3f(cam.view[0][0], cam.view[1][0], cam.view[2][0]);
+  var up = vec3f(cam.view[0][1], cam.view[1][1], cam.view[2][1]);
+${src.orient ? `  // the author's own plane (particleOrient): a card on a surface, not facing the eye
+  let o = particleOrient(p, ii);
+  right = o[0];
+  up = o[1];
+` : ""}  let s = sin(p.rot);
   let k = cos(p.rot);
   var r = vec2f(c.x * k - c.y * s, c.x * s + c.y * k);
   // Stretched along the direction of travel ON SCREEN — which is not the world

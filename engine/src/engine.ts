@@ -5508,6 +5508,7 @@ export class Engine {
       paramsDecl: params.wgsl(EFFECT_PARAMS_BINDING),
       gridSize: grid?.size ?? 0,
       cover: particleEntryPoints(wgsl).cover,
+      orient: particleEntryPoints(wgsl).orient,
       live: particleEntryPoints(wgsl).count,
       textures: d.textures,
     }
