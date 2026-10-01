@@ -191,7 +191,13 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // painted sheet — is Blender's Emission shader, which no lamp reaches; adding
   // the lamps to it turned X340's floor shadow, a white-RGB picture at a soft
   // alpha, into a glowing disc under the spot above it.
-  const LIT = takesLight ? ` + rzLightsDiffuseOnce(input.worldPos, n) * albedo` : ""
+  //
+  // The model's fill (Engine.setModelFill) rides here too, as brightness: the
+  // surface colour times the fill, on every pixel of her alike. In the graph's
+  // ambient an NPR ramp would read it as LIGHT — sliding it would move her
+  // shadows, and under a hard step flip whole regions at once. After the graph
+  // it lifts her evenly and leaves every shadow where it is.
+  const LIT = takesLight ? ` + (rzLightsDiffuseOnce(input.worldPos, n) + objectLight.fill.rgb) * albedo` : ""
 
   const ALBEDO = `  let albedo = tex_color;
 `

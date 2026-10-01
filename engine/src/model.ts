@@ -3,6 +3,7 @@ import { Engine } from "./engine"
 import { joinAssetPath, type AssetReader } from "./asset-reader"
 import { Rigidbody, Joint } from "./physics"
 import { IKSolverSystem } from "./ik-solver"
+import { buildOutlineVertices } from "./outline-normals"
 import { VMDLoader, type VMDKeyFrame } from "./vmd-loader"
 import { VMDWriter, type VmdTrackSelection } from "./vmd-writer"
 import {
@@ -564,8 +565,10 @@ export class Model {
     morphing: Morphing,
     rigidbodies: Rigidbody[] = [],
     joints: Joint[] = [],
-    loadWarnings: string[] = []
+    loadWarnings: string[] = [],
+    edgeScales: Float32Array | null = null
   ) {
+    this.edgeScales = edgeScales
     // Store base vertex data (original positions before morphing)
     this.baseVertexData = new Float32Array(vertexData)
     this.vertexData = vertexData
@@ -999,6 +1002,20 @@ export class Model {
 
   getVertices(): Float32Array<ArrayBuffer> {
     return this.vertexData
+  }
+
+  /** PMX per-vertex edge scale, when the source had one. */
+  private edgeScales: Float32Array | null = null
+  private outlineVertices: Float32Array<ArrayBuffer> | null = null
+
+  /**
+   * The outline hull's own vertex stream: per vertex, the smoothed rest-pose
+   * normal (xyz) and the PMX edge scale (w). See outline-normals.ts. Built on
+   * first ask — only models with an edge-flagged material ever ask.
+   */
+  getOutlineVertices(): Float32Array<ArrayBuffer> {
+    this.outlineVertices ??= buildOutlineVertices(this.baseVertexData, VERTEX_STRIDE, this.indexData, this.edgeScales ?? undefined)
+    return this.outlineVertices
   }
 
   getTextures(): Texture[] {

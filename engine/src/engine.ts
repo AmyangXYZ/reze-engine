@@ -52,7 +52,13 @@ import { outlineMaxOffsetMultiplier, towardMatrix } from "./unity/character"
 import type { NativeValue } from "./unity/host"
 import { SHADOW_ATLAS_SIZE, SHADOW_CASCADES, buildShadowCascades, cascadeSpheres, type ShadowBounds, type ShadowView } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
-import { MIRROR_MASK_DOWNSAMPLE_WGSL, MIRROR_MAT_BYTES, mirrorShaderWgsl, mirrorShadowWgsl } from "./shaders/passes/mirror"
+import {
+  MIRROR_DOWNSAMPLE_WGSL,
+  MIRROR_MASK_DOWNSAMPLE_WGSL,
+  MIRROR_MAT_BYTES,
+  mirrorShaderWgsl,
+  mirrorShadowWgsl,
+} from "./shaders/passes/mirror"
 import { packHalf, type HdrImage } from "./hdr"
 import { evalIrradianceSH, projectIrradianceSH, gradientIrradianceSH } from "./ibl"
 import { LYRIC_ATLAS_MAX_H, LYRIC_ATLAS_MAX_W, LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
@@ -104,11 +110,11 @@ import {
   type RigidbodyOverlayOptions,
 } from "./overlay"
 import {
-  BLOOM_BLIT_SHADER_WGSL,
-  BLOOM_DOWNSAMPLE_SHADER_WGSL,
+  BLOOM_BLUR_H_SHADER_WGSL,
+  BLOOM_BLUR_V_SHADER_WGSL,
+  BLOOM_PREFILTER_SHADER_WGSL,
   BLOOM_UPSAMPLE_SHADER_WGSL,
 } from "./shaders/passes/bloom"
-import { AGX_LUT_GZ, AGX_LUT_SIZE } from "./shaders/agx-lut"
 import {
   buildCompositeShader,
   EFFECT_SCENE_API,
@@ -556,25 +562,29 @@ type CameraOptions = {
   fov?: number
 }
 
-/** EEVEE Bloom panel (3D Viewport > Render > Bloom). Fields map 1:1 to Blender's UI. */
+/** Bloom — Aether Gazer's own (shaders/passes/bloom.ts): a soft-knee prefilter,
+ *  a Gaussian chain down to a few pixels, and a scatter blend back up, added to
+ *  the scene before the view transform. The defaults ARE the game. */
 export type BloomOptions = {
   enabled: boolean
+  /** Brightest-channel level where the glow starts (the game's per-scene
+   *  threshold). The soft knee is always half of it. */
   threshold: number
-  knee: number
-  radius: number
+  /** 0..1: how far each level leans toward the wider one on the way up — low is
+   *  a tight halo, high a wide haze. The game: 0.77. */
+  scatter: number
+  /** Tint on the glow; white is the game. */
   color: Vec3
+  /** Multiplier on the glow added in the composite; 1 is the game. */
   intensity: number
-  clamp: number
 }
 
 export const DEFAULT_BLOOM_OPTIONS: BloomOptions = {
   enabled: true,
-  threshold: 0.5,
-  knee: 0.5,
-  radius: 4.0,
-  color: new Vec3(1.0, 0.7247558832168579, 0.6487361788749695),
-  intensity: 0.05,
-  clamp: 0.0,
+  threshold: 0.7,
+  scatter: 0.77,
+  color: new Vec3(1, 1, 1),
+  intensity: 1,
 }
 
 /** Camera depth of field — a bokeh gather in the composite pass. Costs nothing
@@ -613,34 +623,33 @@ export const DEFAULT_DEPTH_OF_FIELD_OPTIONS: DepthOfFieldOptions = {
   quality: "balanced",
 }
 
-/** Blender Color Management / View (rendering.txt: Filmic, exposure, gamma). `look` is reserved for future curve tweaks. */
+/** How the scene-linear frame becomes a display image: exposure, then a tone
+ *  transform, then display gamma. */
 export type ViewTransformOptions = {
-  /** Stops applied before Filmic: `linear *= 2^exposure`. */
+  /** Stops applied before the transform: `linear *= 2^exposure`. */
   exposure: number
-  /** After Filmic, display gamma (`pow(rgb, 1/gamma)`). */
+  /** After the transform, display gamma (`pow(rgb, 1/gamma)`). */
   gamma: number
   /**
-   * Which display transform the frame is formed with.
+   * Which display transform the frame is formed with (composite.ts, viewTransform).
    *
-   * "standard" is Blender's Standard: the sRGB encoding and nothing else, which
-   * is what NPR and anime work uses — the colours the graph computes are the
-   * colours that land, with no film curve reinterpreting them. Both of the
-   * reference Wuthering Waves projects render this way.
+   * "soft" — Aether Gazer's own final curve, (1 - e^(-2.5x))^1.4. The default.
+   * "neutral" — Unity URP's Neutral, the Khronos PBR Neutral operator: colour
+   *   passes through until the top fifth, which rolls off.
+   * "aces" — Unity URP's ACES (RRT + ODT approximation from the Core RP).
+   * "none" — the sRGB encoding and nothing else.
    *
-   * "filmic" is Blender 3.6's Filmic, Medium High Contrast, baked as a LUT.
-   *
-   * "aether-gazer" is that game's own final curve, (1 - e^(-2.5x))^1.4 — what
-   * its scenes are graded through (composite.ts, agTransform).
+   * All four end in the sRGB encoding.
    */
-  transform: "agx" | "filmic" | "standard" | "aether-gazer"
+  transform: ViewTransformName
 }
 
-// Matches the reference Blender project: Filmic view, Medium High Contrast look,
-// exposure 0.3, gamma 1.0, sRGB display, no curves.
+export type ViewTransformName = "soft" | "neutral" | "aces" | "none"
+
 export const DEFAULT_VIEW_TRANSFORM: ViewTransformOptions = {
-  exposure: 0.6,
+  exposure: 0,
   gamma: 1.0,
-  transform: "filmic",
+  transform: "soft",
 }
 
 /** Color grading applied to the tonemapped scene (ASC CDL — see grade() in
@@ -735,9 +744,9 @@ export type EngineOptions = {
   /** Canvas background (display-space sRGB 0–1), composited under the scene after
    *  tonemapping. Omit/null = transparent canvas (see setBackgroundColor). */
   background?: Vec3 | null
-  /** Initial EEVEE-style bloom; tune at runtime with `setBloomOptions`. */
+  /** Initial bloom; tune at runtime with `setBloomOptions`. */
   bloom?: Partial<BloomOptions>
-  /** View transform (exposure/gamma) applied in composite before/after Filmic. */
+  /** View transform (exposure, tone transform, gamma) applied in the composite. */
   view?: Partial<ViewTransformOptions>
   onRaycast?: RaycastCallback
   /** See {@link GizmoDragCallback}. */
@@ -930,12 +939,16 @@ interface ModelInstance {
   indexBuffer: GPUBuffer
   jointsBuffer: GPUBuffer
   weightsBuffer: GPUBuffer
+  /** The outline hull's own stream — smoothed normal + PMX edge scale per
+   *  vertex (outline-normals.ts). Made with the first edge-flagged material,
+   *  so a model with no outline never pays for it. */
+  outlineVertexBuffer?: GPUBuffer
   skinMatrixBuffer: GPUBuffer
   drawCalls: DrawCall[]
   shadowDrawCalls: DrawCall[]
   shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
-  /** Its ObjectLight — rendering layers, its own ambient — and the CPU copy it
+  /** Its ObjectLight — rendering layers, its own ambient, its fill — and the CPU copy it
    *  is written from. Every model has one: its layers decide its lights. */
   lightBuffer: GPUBuffer
   objectLight: Float32Array<ArrayBuffer>
@@ -2505,6 +2518,7 @@ export class Engine {
    *  premultiplied quantity and a blur has to move them together. */
   private mirrorMaskMipViews: GPUTextureView[] = []
   private mirrorMaskBlurBindGroups: GPUBindGroup[] | null = null
+  private mirrorDownsamplePipeline: GPURenderPipeline | null = null
   private mirrorMaskDownsamplePipeline: GPURenderPipeline | null = null
   /** Two blocks the ground reads its clip from: the camera's is inert, the
    *  mirror's carries the live plane. Which one a draw sees is decided by which
@@ -2699,8 +2713,6 @@ export class Engine {
   /** Trail samples owed this frame, computed once so every trail on every
    *  character samples in lockstep and their paths stay comparable. */
   private trailDue = 0
-  private agxLutTexture: GPUTexture | null = null
-  private agxFallbackTexture!: GPUTexture
   /** The scene's own grade (setStageGrade): the cube as handed over, kept so a
    *  call before init() still lands, and its texture once uploaded. */
   private stageGradeCube: StageGradeLut | null = null
@@ -2714,12 +2726,8 @@ export class Engine {
    *  `time` is measured from here — see where it is written. */
   private compositeBloomView: GPUTextureView | null = null
 
-  // EEVEE-style bloom pyramid (mirrors Blender 3.6 effect_bloom_frag.glsl):
-  //   blit (HDR → half-res, 4-tap Karis + soft threshold/knee)
-  //   N-1 downsamples (13-tap Jimenez/COD box filter, 5 group averages)
-  //   N-1 upsamples (9-tap tent, additively combined with corresponding downsample mip)
-  //   composite adds bloomUp mip 0 × (color × intensity) to HDR before Filmic.
-  // Matches EEVEE energy: tint/intensity applied at composite, not prefilter.
+  // Linear clamp sampler for the bloom chain (also the mirror blur and the
+  // composite's bloom read).
   private bloomSampler!: GPUSampler
   // Screen-space subsurface scattering (passes/subsurface.ts). The scratch target
   // is the X pass's output and lives with the canvas size; the bind groups name
@@ -2737,33 +2745,56 @@ export class Engine {
   private readonly pipelineDescs = new WeakMap<GPURenderPipeline, GPURenderPipelineDescriptor>()
   private readonly singleSided = new WeakMap<GPURenderPipeline, GPURenderPipeline>()
   private readonly singleSidedMirror = new WeakMap<GPURenderPipeline, GPURenderPipeline>()
+  /** Twins whose async build is in flight, so a draw asks for each once. */
+  private readonly sidedPending = new WeakSet<GPURenderPipeline>()
+  private readonly sidedPendingMirror = new WeakSet<GPURenderPipeline>()
+  // The engine-wide shader cache (see cachedRenderPipeline). Modules by WGSL
+  // source, pipelines by module + descriptor state: one compile per source,
+  // whoever asks — a graph on two models, an effect reinstalled, the composite.
+  private readonly shaderModuleCache = new Map<string, GPUShaderModule>()
+  private readonly pipelineCache = new Map<string, Promise<GPURenderPipeline | GPUComputePipeline>>()
+  private readonly bindGroupLayoutCache = new Map<string, GPUBindGroupLayout>()
+  private readonly pipelineLayoutCache = new Map<string, GPUPipelineLayout>()
+  private readonly gpuObjectIds = new WeakMap<object, number>()
+  private gpuObjectNext = 1
+  /** Init's pipelines, built async and in parallel; init awaits them. Null
+   *  outside init, where a pipeline job builds the way it always did. */
+  private initPipelineJobs: Promise<unknown>[] | null = null
   // Stepped motion (#stepped). The models whose pose is being HELD this frame —
   // their skinning and morph uploads wait for the stepped clock's next tick —
   // and the tick each was last shown at. Empty while no effect declares it.
   private readonly steppedHeld = new Set<string>()
   private readonly steppedTick = new Map<string, number>()
   private steppedLastClock = -1
-  private bloomBlitUniformBuffer!: GPUBuffer
-  private bloomUpsampleUniformBuffer!: GPUBuffer
-  private readonly bloomBlitUniformData = new Float32Array(4)
-  private readonly bloomUpsampleUniformData = new Float32Array(4)
-  private bloomBlitPipeline!: GPURenderPipeline
-  private bloomDownsamplePipeline!: GPURenderPipeline
-  private bloomUpsamplePipeline!: GPURenderPipeline
-  private bloomBlitBindGroupLayout!: GPUBindGroupLayout
-  private bloomDownsampleBindGroupLayout!: GPUBindGroupLayout
-  private bloomUpsampleBindGroupLayout!: GPUBindGroupLayout
-  private bloomDownTexture!: GPUTexture
-  private bloomUpTexture!: GPUTexture
-  private bloomMipCount = 0
-  private bloomDownMipViews: GPUTextureView[] = []
-  private bloomUpMipViews: GPUTextureView[] = []
-  private bloomBlitBindGroup!: GPUBindGroup
-  private bloomDownsampleBindGroups: GPUBindGroup[] = []
-  private bloomUpsampleBindGroups: GPUBindGroup[] = []
+
+  // Bloom (shaders/passes/bloom.ts), Aether Gazer's chain. One level per halving
+  // down to a few pixels (the game's count, up to 16), each a down/up pair;
+  // up[i] holds the horizontal blur on the way down and the scatter blend on the
+  // way up. The composite adds up[0] × (color × intensity) before the view transform.
+  private bloomPrefilterBindGroupLayout!: GPUBindGroupLayout
+  private bloomBlurBindGroupLayout!: GPUBindGroupLayout
   /** Single-attachment pass; colorAttachments[0].view set per bloom step. */
   private bloomPassDescriptor!: GPURenderPassDescriptor
-  private static readonly BLOOM_MAX_LEVELS = 5
+  private bloomPrefilterPipeline: GPURenderPipeline | null = null
+  private bloomBlurHPipeline: GPURenderPipeline | null = null
+  private bloomBlurVPipeline: GPURenderPipeline | null = null
+  private bloomUpsamplePipeline: GPURenderPipeline | null = null
+  private bloomUpsampleBindGroupLayout: GPUBindGroupLayout | null = null
+  private bloomUniformBuffer: GPUBuffer | null = null
+  private readonly bloomUniformData = new Float32Array(4)
+  private bloomDownTexture: GPUTexture | null = null
+  private bloomUpTexture: GPUTexture | null = null
+  private bloomLevels = 0
+  private bloomDownViews: GPUTextureView[] = []
+  private bloomUpViews: GPUTextureView[] = []
+  private bloomPrefilterBindGroup: GPUBindGroup | null = null
+  private bloomBlurHBindGroups: GPUBindGroup[] = []
+  private bloomBlurVBindGroups: GPUBindGroup[] = []
+  private bloomUpsampleBindGroups: GPUBindGroup[] = []
+  /** The game's prefilter clamps at 6550.4 — a tenth of the half-float ceiling
+   *  (its BloomPass _Params.y of 100 never reaches the shader). */
+  private static readonly BLOOM_CLAMP = 6550.4
+  private static readonly BLOOM_MAX_LEVELS = 16
 
   // Ground properties (shadow only)
   private groundVertexBuffer?: GPUBuffer
@@ -2777,10 +2808,6 @@ export class Engine {
   private shadowAtlasView!: GPUTextureView
   private brdfLutTexture!: GPUTexture
   private brdfLutView!: GPUTextureView
-  private filmicLutTexture!: GPUTexture
-  private filmicLutView!: GPUTextureView
-  // Width of the baked Filmic tone LUT (composite.ts FILMIC_LUT_W must match).
-  private static readonly FILMIC_LUT_WIDTH = 256
   private shadowDepthPipeline!: GPURenderPipeline
   private shadowLightVPBuffer!: GPUBuffer
   // The shadow PASS reads one cascade's matrix per pass, and a uniform binding
@@ -2922,18 +2949,16 @@ export class Engine {
     this.backgroundColor = bg ? new Vec3(bg.x, bg.y, bg.z) : null
   }
 
-  /** Merge partial bloom with EEVEE defaults (same as constructor). */
+  /** Merge partial bloom with the defaults (same as constructor). */
   static mergeBloomDefaults(partial?: Partial<BloomOptions>): BloomOptions {
     const d = DEFAULT_BLOOM_OPTIONS
     const c = partial?.color
     return {
       enabled: partial?.enabled ?? d.enabled,
       threshold: partial?.threshold ?? d.threshold,
-      knee: partial?.knee ?? d.knee,
-      radius: partial?.radius ?? d.radius,
+      scatter: partial?.scatter ?? d.scatter,
       color: c ? new Vec3(c.x, c.y, c.z) : new Vec3(d.color.x, d.color.y, d.color.z),
       intensity: partial?.intensity ?? d.intensity,
-      clamp: partial?.clamp ?? d.clamp,
     }
   }
 
@@ -2946,17 +2971,15 @@ export class Engine {
     }
   }
 
-  /** Current bloom settings (Blender names; tint is a copied `Vec3`). */
+  /** Current bloom settings (tint is a copied `Vec3`). */
   getBloomOptions(): BloomOptions {
     const b = this.bloomSettings
     return {
       enabled: b.enabled,
       threshold: b.threshold,
-      knee: b.knee,
-      radius: b.radius,
+      scatter: b.scatter,
       color: new Vec3(b.color.x, b.color.y, b.color.z),
       intensity: b.intensity,
-      clamp: b.clamp,
     }
   }
 
@@ -3110,6 +3133,14 @@ export class Engine {
     return b.enabled && b.intensity > 0
   }
 
+  /** viewU[6].y per transform — see viewTransform in composite.ts. */
+  private static readonly VIEW_TRANSFORM_ID: Record<string, number> = {
+    soft: 0,
+    none: 1,
+    neutral: 2,
+    aces: 3,
+  }
+
   private writeCompositeViewUniforms(): void {
     const v = this.viewTransform
     const b = this.bloomSettings
@@ -3152,7 +3183,7 @@ export class Engine {
     // rebuilt per effect, so the compiled variant IS the flag.
     u[11] = this.backdropEquirectView ? 2 : showingWorld ? 3 : bg ? 1 : 0
     // Which display transform forms the frame (see viewTransform in composite.ts).
-    u[25] = v.transform === "aether-gazer" ? 3 : v.transform === "agx" ? 2 : v.transform === "standard" ? 1 : 0
+    u[25] = Engine.VIEW_TRANSFORM_ID[v.transform] ?? 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
@@ -3882,7 +3913,7 @@ export class Engine {
   }
 
   /**
-   * Fill the mirror's mip levels — the bloom pyramid's own 13-tap downsample,
+   * Fill the mirror's mip levels — a 13-tap downsample (MIRROR_DOWNSAMPLE_WGSL),
    * one pass per level. Only when the blur dial is up: at zero the ground
    * samples level 0 exactly and the chain would be work nobody reads.
    */
@@ -3892,8 +3923,19 @@ export class Engine {
     // memory, which read as the model going black the moment the slider moved.
     const blur = Math.max(this.groundMirrorBlur, this.mirrorSurface?.blur ?? 0)
     if (blur <= 0 || this.mirrorMipCount < 2) return
+    if (!this.mirrorDownsamplePipeline) {
+      const module = this.device.createShaderModule({ label: "mirror downsample", code: MIRROR_DOWNSAMPLE_WGSL })
+      this.mirrorDownsamplePipeline = this.device.createRenderPipeline({
+        label: "mirror downsample pipeline",
+        layout: "auto",
+        vertex: { module, entryPoint: "vs" },
+        fragment: { module, entryPoint: "fs", targets: [{ format: this.hdrFormat }] },
+        primitive: { topology: "triangle-list" },
+      })
+    }
+    const downsample = this.mirrorDownsamplePipeline
     if (!this.mirrorBlurBindGroups) {
-      const layout = this.bloomDownsamplePipeline.getBindGroupLayout(0)
+      const layout = downsample.getBindGroupLayout(0)
       this.mirrorBlurBindGroups = []
       for (let i = 1; i < this.mirrorMipCount; i++) {
         this.mirrorBlurBindGroups.push(
@@ -3913,7 +3955,7 @@ export class Engine {
         label: `mirror blur ${i}`,
         colorAttachments: [{ view: this.mirrorMipViews[i], loadOp: "clear", storeOp: "store" }],
       })
-      p.setPipeline(this.bloomDownsamplePipeline)
+      p.setPipeline(downsample)
       p.setBindGroup(0, this.mirrorBlurBindGroups[i - 1])
       p.draw(3)
       p.end()
@@ -4081,7 +4123,6 @@ export class Engine {
         { binding: 2, resource: this.bloomSampler },
         { binding: 3, resource: { buffer: this.compositeUniformBuffer } },
         { binding: 4, resource: this.maskResolveView },
-        { binding: 5, resource: this.filmicLutView },
         // Whichever equirect is SHOWING — the backdrop if there is one, the
         // world otherwise. The world's light does not come through here; it
         // rides worldSH into the material shells.
@@ -4089,7 +4130,6 @@ export class Engine {
         { binding: 7, resource: { buffer: this.effect?.paramsBuffer ?? this.bgParamsDummyBuffer } },
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
-        { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
         { binding: 12, resource: (this.stageGradeTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
@@ -4527,8 +4567,6 @@ export class Engine {
           { binding: 31, resource: layers[2] },
           { binding: 32, resource: layers[3] },
           { binding: 2, resource: this.bloomSampler },
-          { binding: 5, resource: this.filmicLutView },
-          { binding: 10, resource: (this.agxLutTexture ?? this.agxFallbackTexture).createView({ dimension: "3d" }) },
           { binding: 12, resource: (this.stageGradeTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
           { binding: 1, resource: bloom },
           { binding: 4, resource: this.maskResolveView },
@@ -4790,20 +4828,37 @@ export class Engine {
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
 
-  private makeCompositePipeline(module: GPUShaderModule, applyGamma: boolean, label: string): GPURenderPipeline {
-    return this.device.createRenderPipeline({
-      label,
-      layout: this.compositePipelineLayout,
-      vertex: { module, entryPoint: "vs" },
-      fragment: {
-        module,
-        entryPoint: "fs",
-        constants: { APPLY_GAMMA: applyGamma ? 1 : 0 },
-        targets: [{ format: this.presentationFormat }],
-      },
-      primitive: { topology: "triangle-list" },
-    })
+  /**
+   * The scene composite's pair (gamma = 1, gamma ≠ 1), async and from the
+   * shader cache. Its source depends only on which field mounts the scene
+   * samples, so there are four at most, and an effect install that keeps the
+   * mounts it had gets the pair already built.
+   */
+  private compositePipelines(hasBackground: boolean, hasForeground: boolean): Promise<[GPURenderPipeline, GPURenderPipeline]> {
+    const code = buildCompositeShader(
+      hasBackground || hasForeground
+        ? // No wgsl and so no trails: the composite hosts no effect source at
+          // all, it only decides whether to sample the layer the field pass drew.
+          { wgsl: "", paramsDecl: "", hasBackground, hasForeground, gridSize: 0, trailCount: 0 }
+        : null,
+    )
+    const module = this.cachedShaderModule(code, "composite shader")
+    const make = (applyGamma: boolean, label: string) =>
+      this.cachedRenderPipeline({
+        label,
+        layout: this.compositePipelineLayout,
+        vertex: { module, entryPoint: "vs" },
+        fragment: {
+          module,
+          entryPoint: "fs",
+          constants: { APPLY_GAMMA: applyGamma ? 1 : 0 },
+          targets: [{ format: this.presentationFormat }],
+        },
+        primitive: { topology: "triangle-list" },
+      })
+    return Promise.all([make(false, "composite pipeline (gamma=1)"), make(true, "composite pipeline (gamma!=1)")])
   }
+
 
   /**
    * Install the scene's WGSL effect (shadertoy-style), rendered per-pixel in the
@@ -5042,11 +5097,11 @@ export class Engine {
       hasBackground || hasForeground
         ? { wgsl, paramsDecl, hasBackground, hasForeground, gridSize, alias, trailCount: anchors.filter((a) => a.trail).length, filter, additiveLayer: d.additiveLayer }
         : null
-    const source = buildCompositeShader(fieldEffect)
-    this.device.pushErrorScope("validation")
-    const module = this.device.createShaderModule({ label: "composite shader (effect)", code: source })
-    const scopeErr = await this.device.popErrorScope()
-    if (scopeErr) return { ok: false, diagnostics: [scopeErr.message], mounts, params: d.params, duration: d.duration, readsCast: false }
+    // No composite is built here. One used to be — a module and two pipelines
+    // per effect, then dropped: the composite is static (no user code reaches
+    // it) and setEffects builds the scene's one after the list is in. Those
+    // two compiles were most of a second each and validated nothing an author
+    // wrote.
 
     // Declared like every other mount property: by what the source says, not by
     // a setting somewhere else that an author cannot see from the file.
@@ -5058,16 +5113,11 @@ export class Engine {
       const fieldSource = buildFieldShader({ ...fieldEffect, ids: mrtIdsEnabled() })
       const userLineOffset = fieldSource.slice(0, fieldSource.indexOf(wgsl)).split("\n").length - 1
       this.device.pushErrorScope("validation")
-      const fieldModule = this.device.createShaderModule({ label: "field shader (effect)", code: fieldSource })
-      const info = await fieldModule.getCompilationInfo()
-      const fieldScopeErr = await this.device.popErrorScope()
-      const diagnostics = info.messages
-        .filter((m) => m.type === "error")
-        .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
-      if (diagnostics.length === 0 && fieldScopeErr) diagnostics.push(fieldScopeErr.message)
-      if (diagnostics.length > 0) return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration, readsCast: false }
-      try {
-        fieldPipeline = await this.device.createRenderPipelineAsync({
+      const fieldModule = this.cachedShaderModule(fieldSource, "field shader (effect)")
+      const fieldScope = this.device.popErrorScope()
+      // Started before the diagnostics are read, which only decide whether it
+      // is kept: the compile and the check overlap.
+      const fieldBuild = this.cachedRenderPipeline({
           label: "field layer pipeline",
           layout: this.fieldPipelineLayout,
           vertex: { module: fieldModule, entryPoint: "fieldVs" },
@@ -5095,32 +5145,21 @@ export class Engine {
           primitive: { topology: "triangle-list" },
           multisample: { count: 1 },
         })
+      fieldBuild.catch(() => {})
+      const [info, fieldScopeErr] = await Promise.all([fieldModule.getCompilationInfo(), fieldScope])
+      const diagnostics = info.messages
+        .filter((m) => m.type === "error")
+        .map((m) => `${Math.max(0, m.lineNum - userLineOffset)}:${m.linePos} ${m.message}`)
+      if (diagnostics.length === 0 && fieldScopeErr) diagnostics.push(fieldScopeErr.message)
+      if (diagnostics.length > 0) {
+        this.forgetShaderModule(fieldSource)
+        return { ok: false, diagnostics, mounts, params: d.params, duration: d.duration, readsCast: false }
+      }
+      try {
+        fieldPipeline = await fieldBuild
       } catch (e) {
         return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration, readsCast: false }
       }
-    }
-    let identity: GPURenderPipeline
-    let gamma: GPURenderPipeline
-    try {
-      const make = (applyGamma: boolean, label: string) =>
-        this.device.createRenderPipelineAsync({
-          label,
-          layout: this.compositePipelineLayout,
-          vertex: { module, entryPoint: "vs" },
-          fragment: {
-            module,
-            entryPoint: "fs",
-            constants: { APPLY_GAMMA: applyGamma ? 1 : 0 },
-            targets: [{ format: this.presentationFormat }],
-          },
-          primitive: { topology: "triangle-list" },
-        })
-      ;[identity, gamma] = await Promise.all([
-        make(false, "composite pipeline (effect, gamma=1)"),
-        make(true, "composite pipeline (effect, gamma!=1)"),
-      ])
-    } catch (e) {
-      return { ok: false, diagnostics: [e instanceof Error ? e.message : String(e)], mounts, params: d.params, duration: d.duration, readsCast: false }
     }
 
     // Built BEFORE the swap: a particle stage that fails to compile has to leave
@@ -5365,6 +5404,9 @@ export class Engine {
 
     const requested = list ?? []
     if (requested.length === 0) {
+      // Built (or found) before anything is torn down, so no frame draws
+      // between the old effects and the composite that no longer samples them.
+      const [identity, gamma] = await this.compositePipelines(false, false)
       for (const e of this.effects) {
       e.paramsBuffer?.destroy()
       e.lights?.uniform.destroy()
@@ -5377,9 +5419,8 @@ export class Engine {
       this.allocateLightSlots()
       this.anchorTable = EMPTY_ANCHOR_TABLE
       this.clearTrailHistory()
-      const module = this.device.createShaderModule({ label: "composite shader", code: buildCompositeShader(null) })
-      this.compositePipelineIdentity = this.makeCompositePipeline(module, false, "composite pipeline (gamma=1)")
-      this.compositePipelineGamma = this.makeCompositePipeline(module, true, "composite pipeline (gamma!=1)")
+      this.compositePipelineIdentity = identity
+      this.compositePipelineGamma = gamma
       this.rebuildCompositeBindGroup()
       this.writeCompositeViewUniforms()
       return []
@@ -5435,6 +5476,14 @@ export class Engine {
       if (r) r.diagnostics.push(`anchor "${d.bone}" dropped: the scene is already using all ${MAX_EFFECT_ANCHORS} slots`)
     }
 
+    // The composite for the new list, built before the swap below so the swap
+    // stays one synchronous step. From the shader cache: it was rebuilt, and
+    // synchronously, on every install.
+    const [compositeIdentity, compositeGamma] = await this.compositePipelines(
+      instances.some((e) => e.hasBackground),
+      instances.some((e) => e.hasForeground),
+    )
+
     // ── Swap. Everything above either succeeded or was excluded, so the scene
     // that was running is only torn down now.
     for (const e of this.effects) {
@@ -5486,20 +5535,8 @@ export class Engine {
     // Scene-level, from the union: the composite decides only whether to SAMPLE
     // the field layers, so one effect with a background is enough to turn that
     // on for the frame.
-    const hasBackground = instances.some((e) => e.hasBackground)
-    const hasForeground = instances.some((e) => e.hasForeground)
-    const compositeModule = this.device.createShaderModule({
-      label: "composite shader (effects)",
-      code: buildCompositeShader(
-        hasBackground || hasForeground
-          ? // No wgsl and so no trails: the composite hosts no effect source at
-            // all, it only decides whether to sample the layer the field pass drew.
-            { wgsl: "", paramsDecl: "", hasBackground, hasForeground, gridSize: 0, trailCount: 0 }
-          : null,
-      ),
-    })
-    this.compositePipelineIdentity = this.makeCompositePipeline(compositeModule, false, "composite pipeline (gamma=1)")
-    this.compositePipelineGamma = this.makeCompositePipeline(compositeModule, true, "composite pipeline (gamma!=1)")
+    this.compositePipelineIdentity = compositeIdentity
+    this.compositePipelineGamma = compositeGamma
 
     // Nothing to promote any more: `#fullres` is per effect, read into
     // fieldLayer when the instance is built, and both target pairs exist for
@@ -5596,26 +5633,32 @@ export class Engine {
       alias,
     }
 
+    // The scope is popped before the first await: compiles run side by side
+    // (both modules here, other effects, style groups), and a scope held open
+    // across an await would catch whichever of them errored first.
     const compile = async (code: string, label: string): Promise<GPUShaderModule | string[]> => {
       const offset = code.slice(0, code.indexOf(wgsl)).split("\n").length - 1
       this.device.pushErrorScope("validation")
-      const module = this.device.createShaderModule({ label, code })
-      const info = await module.getCompilationInfo()
-      const scopeErr = await this.device.popErrorScope()
+      const module = this.cachedShaderModule(code, label)
+      const scope = this.device.popErrorScope()
+      const [info, scopeErr] = await Promise.all([module.getCompilationInfo(), scope])
       const diagnostics = info.messages
         .filter((m) => m.type === "error")
         .map((m) => `${Math.max(0, m.lineNum - offset)}:${m.linePos} ${m.message}`)
       if (diagnostics.length === 0 && scopeErr) diagnostics.push(scopeErr.message)
+      if (diagnostics.length) this.forgetShaderModule(code)
       return diagnostics.length ? diagnostics : module
     }
 
-    const computeModule = await compile(buildParticleComputeShader(src, cast), "particle compute")
+    const [computeModule, renderModule] = await Promise.all([
+      compile(buildParticleComputeShader(src, cast), "particle compute"),
+      compile(buildParticleRenderShader(src, cast), "particle render"),
+    ])
     if (Array.isArray(computeModule)) {
       points?.buffer.destroy()
       dropTextures()
       return { ok: false, diagnostics: computeModule }
     }
-    const renderModule = await compile(buildParticleRenderShader(src, cast), "particle render")
     if (Array.isArray(renderModule)) {
       points?.buffer.destroy()
       dropTextures()
@@ -5656,7 +5699,7 @@ export class Engine {
     // layout invalid, and the error surfaces later and unhelpfully as "invalid
     // due to a previous error".
     const layoutFor = (storage: GPUBufferBindingType, visibility: number, shadow: boolean, withIndirect: boolean) =>
-      this.device.createBindGroupLayout({
+      this.cachedBindGroupLayout({
         entries: [
           { binding: 0, visibility, buffer: { type: storage } },
           { binding: 1, visibility, buffer: { type: "uniform" } },
@@ -5768,32 +5811,29 @@ export class Engine {
     const targets = sceneTargetsFor(src.blend === "additive" ? "particle-additive" : "particle", this.sceneFormats)
     const cutout = src.blend === "cutout"
 
+    // ALL STAGES AT ONCE: compute, count, prepass and shading compile side by
+    // side rather than in turn. The scope closes before the first await, for
+    // the reason compile() gives.
     this.device.pushErrorScope("validation")
-    try {
-      const computePipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [computeLayout] })
-      const compute = await this.device.createComputePipelineAsync({
+    const renderLayoutObj = this.cachedPipelineLayout([renderLayout])
+    const builds = Promise.all([
+      this.cachedComputePipeline({
         label: "particle compute pipeline",
-        layout: computePipelineLayout,
+        layout: this.cachedPipelineLayout([computeLayout]),
         compute: { module: computeModule, entryPoint: "main" },
-      })
-      const live =
-        indirect && countLayout
-          ? {
-              pipeline: await this.device.createComputePipelineAsync({
-                label: "particle count pipeline",
-                layout: this.device.createPipelineLayout({ bindGroupLayouts: [countLayout] }),
-                compute: { module: computeModule, entryPoint: "rzCount" },
-              }),
-              indirect,
-              binds: bindFor(countLayout, this.cameraUniformBuffer, false, true),
-            }
-          : null
-      const renderLayoutObj = this.device.createPipelineLayout({ bindGroupLayouts: [renderLayout] })
+      }),
+      indirect && countLayout
+        ? this.cachedComputePipeline({
+            label: "particle count pipeline",
+            layout: this.cachedPipelineLayout([countLayout]),
+            compute: { module: computeModule, entryPoint: "rzCount" },
+          })
+        : null,
       // The prepass, when the effect gave the cutout a cheap shape: coverage to
       // depth, colour targets at writeMask 0 (the depth-prepass class), and
       // the shading pass below then tests EQUAL and writes no depth.
-      const depth = prepass
-        ? await this.device.createRenderPipelineAsync({
+      prepass
+        ? this.cachedRenderPipeline({
             label: "particle depth prepass pipeline",
             layout: renderLayoutObj,
             vertex: { module: renderModule, entryPoint: "vs" },
@@ -5802,8 +5842,8 @@ export class Engine {
             depthStencil: { format: this.depthFormat, depthWriteEnabled: true, depthCompare: this.depthAhead },
             multisample: { count: Engine.MULTISAMPLE_COUNT },
           })
-        : null
-      const render = await this.device.createRenderPipelineAsync({
+        : null,
+      this.cachedRenderPipeline({
         label: "particle render pipeline",
         layout: renderLayoutObj,
         vertex: { module: renderModule, entryPoint: "vs" },
@@ -5824,8 +5864,20 @@ export class Engine {
           ? { format: this.depthFormat, depthWriteEnabled: false, depthCompare: "equal" }
           : { format: this.depthFormat, depthWriteEnabled: cutout, depthCompare: this.depthAhead },
         multisample: { count: Engine.MULTISAMPLE_COUNT },
-      })
-      const scoped = await this.device.popErrorScope()
+      }),
+    ])
+    const scope = this.device.popErrorScope()
+    try {
+      const [compute, countPipeline, depth, render] = await builds
+      const live =
+        indirect && countLayout && countPipeline
+          ? {
+              pipeline: countPipeline,
+              indirect,
+              binds: bindFor(countLayout, this.cameraUniformBuffer, false, true),
+            }
+          : null
+      const scoped = await scope
       if (scoped) {
         buffer.destroy()
         uniform.destroy()
@@ -5865,7 +5917,7 @@ export class Engine {
         },
       }
     } catch (e) {
-      await this.device.popErrorScope()
+      await scope
       buffer.destroy()
       uniform.destroy()
       points?.buffer.destroy()
@@ -7120,41 +7172,170 @@ export class Engine {
     const b = this.bloomSettings
     if (patch.enabled !== undefined) b.enabled = patch.enabled
     if (patch.threshold !== undefined) b.threshold = patch.threshold
-    if (patch.knee !== undefined) b.knee = patch.knee
-    if (patch.radius !== undefined) b.radius = patch.radius
+    if (patch.scatter !== undefined) b.scatter = patch.scatter
     if (patch.color !== undefined) {
       b.color.x = patch.color.x
       b.color.y = patch.color.y
       b.color.z = patch.color.z
     }
     if (patch.intensity !== undefined) b.intensity = patch.intensity
-    if (patch.clamp !== undefined) b.clamp = patch.clamp
-    if (this.device && this.bloomBlitUniformBuffer) {
+    if (this.device && this.compositeUniformBuffer) {
       this.writeBloomUniforms()
       this.writeCompositeViewUniforms()
     }
   }
 
-  // EEVEE prefilter uniforms (blit stage) + upsample sample scale. Intensity/tint live in composite.
+  private ensureBloomPipelines(): void {
+    // The buffer, not a pipeline, says "already built": at init the pipelines
+    // land async (initRenderPipeline) and are absent for a moment.
+    if (this.bloomUniformBuffer) return
+    const device = this.device
+    this.bloomUniformBuffer = device.createBuffer({
+      label: "bloomuniforms",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.bloomUpsampleBindGroupLayout = device.createBindGroupLayout({
+      label: "bloomupsample layout",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+      ],
+    })
+    const pipeline = (label: string, code: string, layout: GPUBindGroupLayout, assign: (p: GPURenderPipeline) => void) => {
+      const module = device.createShaderModule({ label, code })
+      this.initRenderPipeline(
+        {
+          label,
+          layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+          vertex: { module, entryPoint: "vs" },
+          fragment: { module, entryPoint: "fs", targets: [{ format: this.hdrFormat }] },
+          primitive: { topology: "triangle-list" },
+        },
+        assign,
+      )
+    }
+    pipeline("bloomprefilter", BLOOM_PREFILTER_SHADER_WGSL, this.bloomPrefilterBindGroupLayout, (p) => (this.bloomPrefilterPipeline = p))
+    pipeline("bloomblur H", BLOOM_BLUR_H_SHADER_WGSL, this.bloomBlurBindGroupLayout, (p) => (this.bloomBlurHPipeline = p))
+    pipeline("bloomblur V", BLOOM_BLUR_V_SHADER_WGSL, this.bloomBlurBindGroupLayout, (p) => (this.bloomBlurVPipeline = p))
+    pipeline("bloomupsample", BLOOM_UPSAMPLE_SHADER_WGSL, this.bloomUpsampleBindGroupLayout, (p) => (this.bloomUpsamplePipeline = p))
+  }
+
+  /** The game's chain at the current canvas size (AGSimPostFX.Bloom): half
+   *  size, then floor(log2(longest side)) - 1 levels, each half the last. */
+  private buildBloomTargets(): void {
+    if (!this.device || !this.hdrResolveTexture || !this.maskResolveView || !this.bloomPrefilterBindGroupLayout) return
+    this.ensureBloomPipelines()
+    const w0 = Math.max(1, Math.floor(this.hdrResolveTexture.width / 2))
+    const h0 = Math.max(1, Math.floor(this.hdrResolveTexture.height / 2))
+    const levels = Math.min(Engine.BLOOM_MAX_LEVELS, Math.max(1, Math.floor(Math.log2(Math.max(w0, h0)) - 1)))
+    // Mip chains, whose sizes are floor-halved exactly as the game's targets are.
+    const make = (label: string) =>
+      this.device.createTexture({
+        label,
+        size: [w0, h0],
+        mipLevelCount: levels,
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+    this.bloomDownTexture?.destroy()
+    this.bloomUpTexture?.destroy()
+    this.bloomDownTexture = make("bloomdown")
+    this.bloomUpTexture = make("bloomup")
+    this.bloomLevels = levels
+    const views = (t: GPUTexture) =>
+      Array.from({ length: levels }, (_, i) => t.createView({ baseMipLevel: i, mipLevelCount: 1 }))
+    this.bloomDownViews = views(this.bloomDownTexture)
+    this.bloomUpViews = views(this.bloomUpTexture)
+    this.writeBloomUniforms()
+    const uniform = { buffer: this.bloomUniformBuffer! }
+    this.bloomPrefilterBindGroup = this.device.createBindGroup({
+      label: "bloomprefilter",
+      layout: this.bloomPrefilterBindGroupLayout,
+      entries: [
+        { binding: 0, resource: this.hdrResolveTexture.createView() },
+        { binding: 1, resource: uniform },
+        { binding: 2, resource: this.maskResolveView },
+      ],
+    })
+    const blur = (label: string, src: GPUTextureView) =>
+      this.device.createBindGroup({
+        label,
+        layout: this.bloomBlurBindGroupLayout,
+        entries: [
+          { binding: 0, resource: src },
+          { binding: 1, resource: this.bloomSampler },
+        ],
+      })
+    // [i - 1] is level i: blurH reads down[i-1] into up[i], blurV up[i] into down[i].
+    this.bloomBlurHBindGroups = []
+    this.bloomBlurVBindGroups = []
+    for (let i = 1; i < levels; i++) {
+      this.bloomBlurHBindGroups.push(blur(`bloomblur H ${i}`, this.bloomDownViews[i - 1]))
+      this.bloomBlurVBindGroups.push(blur(`bloomblur V ${i}`, this.bloomUpViews[i]))
+    }
+    // [k] writes up[levels - 2 - k], coarsest first.
+    this.bloomUpsampleBindGroups = []
+    for (let i = levels - 2; i >= 0; i--) {
+      const low = i === levels - 2 ? this.bloomDownViews[i + 1] : this.bloomUpViews[i + 1]
+      this.bloomUpsampleBindGroups.push(
+        this.device.createBindGroup({
+          label: `bloomupsample ${i}`,
+          layout: this.bloomUpsampleBindGroupLayout!,
+          entries: [
+            { binding: 0, resource: this.bloomDownViews[i] },
+            { binding: 1, resource: low },
+            { binding: 2, resource: this.bloomSampler },
+            { binding: 3, resource: uniform },
+          ],
+        }),
+      )
+    }
+  }
+
   private writeBloomUniforms(): void {
+    if (!this.bloomUniformBuffer) return
     const b = this.bloomSettings
-    const bu = this.bloomBlitUniformData
-    // EEVEE prefilter: threshold, knee_half, clamp (0 → disabled), _unused
-    // Blender halves the knee before passing to the shader (eevee_bloom.c: knee * 0.5f).
-    // The blit shader's quadratic soft-knee curve uses knee_half as the offset from threshold,
-    // so the soft ramp spans [threshold - knee/2 .. threshold + knee/2] — NOT [threshold - knee .. threshold + knee].
-    bu[0] = b.threshold
-    bu[1] = b.knee * 0.5
-    bu[2] = b.clamp
-    bu[3] = 0.0
-    this.device.queue.writeBuffer(this.bloomBlitUniformBuffer, 0, bu)
-    const us = this.bloomUpsampleUniformData
-    // Blender: bloom.radius directly controls the tent-filter sample scale in texel units.
-    us[0] = Math.max(0.5, b.radius)
-    us[1] = 0
-    us[2] = 0
-    us[3] = 0
-    this.device.queue.writeBuffer(this.bloomUpsampleUniformBuffer, 0, us)
+    const u = this.bloomUniformData
+    // Threshold, its soft knee (half of it, as the game derives it), the clamp,
+    // and scatter. Tint and intensity live in the composite.
+    u[0] = Math.max(0, b.threshold)
+    u[1] = Math.max(0, b.threshold) * 0.5
+    u[2] = Engine.BLOOM_CLAMP
+    u[3] = Math.min(1, Math.max(0, b.scatter))
+    this.device.queue.writeBuffer(this.bloomUniformBuffer, 0, u)
+  }
+
+  /** The game's chain, pass for pass (AGSimPostFX.Bloom). */
+  private renderBloom(encoder: GPUCommandEncoder): void {
+    const levels = this.bloomLevels
+    const att = (this.bloomPassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
+    const total = 1 + 3 * (levels - 1)
+    let n = 0
+    const draw = (target: GPUTextureView, pipeline: GPURenderPipeline, group: GPUBindGroup) => {
+      att.view = target
+      // One timing span for the whole chain, as for the pyramid.
+      const open = n === 0 ? this.stampOpen("bloom") : undefined
+      const close = n === total - 1 ? this.stampClose("bloom") : undefined
+      this.bloomPassDescriptor.timestampWrites = open && close ? { ...open, ...close } : (open ?? close)
+      n++
+      const p = encoder.beginRenderPass(this.bloomPassDescriptor)
+      p.setPipeline(pipeline)
+      p.setBindGroup(0, group)
+      p.draw(3)
+      p.end()
+    }
+    draw(this.bloomDownViews[0], this.bloomPrefilterPipeline!, this.bloomPrefilterBindGroup!)
+    for (let i = 1; i < levels; i++) {
+      draw(this.bloomUpViews[i], this.bloomBlurHPipeline!, this.bloomBlurHBindGroups[i - 1])
+      draw(this.bloomDownViews[i], this.bloomBlurVPipeline!, this.bloomBlurVBindGroups[i - 1])
+    }
+    for (let k = 0; k < levels - 1; k++) {
+      draw(this.bloomUpViews[levels - 2 - k], this.bloomUpsamplePipeline!, this.bloomUpsampleBindGroups[k])
+    }
+    this.bloomPassDescriptor.timestampWrites = undefined
   }
 
   // Step 1: Get WebGPU device and context
@@ -7282,7 +7463,16 @@ export class Engine {
     this.setupCamera()
     this.setupLighting()
     const tPipelines = performance.now()
+    // Built async and side by side (see initRenderPipeline): a synchronous
+    // build holds the GPU process for the whole compile, one after another,
+    // which was a 2–3 s frozen frame on a cold open.
+    this.initPipelineJobs = []
     this.createPipelines()
+    try {
+      await Promise.all(this.initPipelineJobs)
+    } finally {
+      this.initPipelineJobs = null
+    }
     this.setupResize()
     const ms = (a: number, b: number) => Math.round(b - a)
     console.info(
@@ -7413,123 +7603,11 @@ export class Engine {
     ltcTemp.destroy()
   }
 
-  // Bake the Blender 3.6 Filmic MHC tone curve into a WIDTH×1 r16float LUT sampled by the
-  // composite pass. The 14 anchors are the same as the old inline array; we fit a monotone
-  // cubic (Fritsch–Carlson) through them so the curve is C1-continuous (no Mach banding in
-  // smooth gradients) while still passing through every anchor (look preserved) and staying
-  // monotone (no tonemap overshoot/ringing). Domain is uniform in log2 space: anchor k sits
-  // at t=k, k=0..13 (t = log2(linear)+10). See composite.ts::filmic for the sampling map.
-  /**
-   * Decompress and upload Blender's AgX cube.
-   *
-   * Deliberately off the critical path: it is 723 KB once inflated, and a frame
-   * rendered before it lands should show the scene under whatever transform is
-   * already there rather than wait. Until then binding 10 holds a 1×1×1 stand-in,
-   * which is only ever sampled if someone selects AgX in that window.
-   */
-  private async loadAgxLut(): Promise<void> {
-    try {
-      const packed = Uint8Array.from(atob(AGX_LUT_GZ), (ch) => ch.charCodeAt(0))
-      const stream = new Blob([packed]).stream().pipeThrough(new DecompressionStream("gzip"))
-      const bytes = new Uint8Array(await new Response(stream).arrayBuffer())
-      const n = AGX_LUT_SIZE
-      if (bytes.byteLength !== n * n * n * 4) throw new Error(`AgX LUT is ${bytes.byteLength} bytes, expected ${n ** 3 * 4}`)
-      const tex = this.device.createTexture({
-        label: "AgX 57³ LUT",
-        size: [n, n, n],
-        dimension: "3d",
-        format: "rgb10a2unorm",
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-      })
-      // .cube order is red fastest, which is exactly a 3D texture's own layout.
-      this.device.queue.writeTexture({ texture: tex }, bytes, { bytesPerRow: n * 4, rowsPerImage: n }, [n, n, n])
-      this.agxLutTexture = tex
-      this.rebuildCompositeBindGroup()
-    } catch {
-      // A missing LUT costs AgX, not the renderer — the other transforms stand.
-    }
+  private createRenderPipeline(config: Parameters<Engine["renderPipelineDesc"]>[0]): GPURenderPipeline {
+    return this.createModelPipeline(this.renderPipelineDesc(config))
   }
 
-  private bakeFilmicLut() {
-    const anchors = [
-      0.0028, 0.0068, 0.0151, 0.0313, 0.061, 0.112, 0.192, 0.306, 0.459, 0.631, 0.82, 0.907, 0.962, 0.989,
-    ]
-    const n = anchors.length
-    // Secant slopes (unit spacing, so d_k = y_{k+1} - y_k).
-    const d = new Array<number>(n - 1)
-    for (let k = 0; k < n - 1; k++) d[k] = anchors[k + 1] - anchors[k]
-    // Endpoint + interior tangents.
-    const m = new Array<number>(n)
-    m[0] = d[0]
-    m[n - 1] = d[n - 2]
-    for (let k = 1; k < n - 1; k++) m[k] = (d[k - 1] + d[k]) * 0.5
-    // Fritsch–Carlson monotonicity clamp.
-    for (let k = 0; k < n - 1; k++) {
-      if (d[k] === 0) {
-        m[k] = 0
-        m[k + 1] = 0
-        continue
-      }
-      const a = m[k] / d[k]
-      const b = m[k + 1] / d[k]
-      const s = a * a + b * b
-      if (s > 9) {
-        const tau = 3 / Math.sqrt(s)
-        m[k] = tau * a * d[k]
-        m[k + 1] = tau * b * d[k]
-      }
-    }
-    const W = Engine.FILMIC_LUT_WIDTH
-    const values = new Float32Array(W)
-    for (let j = 0; j < W; j++) {
-      const t = ((n - 1) * j) / (W - 1) // t ∈ [0, n-1]
-      const k = Math.min(Math.floor(t), n - 2)
-      const s = t - k // local param in [0,1], unit-spaced segment
-      const s2 = s * s
-      const s3 = s2 * s
-      // Hermite basis (h=1).
-      const h00 = 2 * s3 - 3 * s2 + 1
-      const h10 = s3 - 2 * s2 + s
-      const h01 = -2 * s3 + 3 * s2
-      const h11 = s3 - s2
-      values[j] = h00 * anchors[k] + h10 * m[k] + h01 * anchors[k + 1] + h11 * m[k + 1]
-    }
-
-    // f32 → f16 bits (same conversion as bakeBrdfLut).
-    const half = new Uint16Array(W)
-    const f32 = new Float32Array(1)
-    const u32 = new Uint32Array(f32.buffer)
-    for (let j = 0; j < W; j++) {
-      f32[0] = values[j]
-      const x = u32[0]
-      const sign = (x >>> 16) & 0x8000
-      const exp = ((x >>> 23) & 0xff) - 127 + 15
-      const mant = x & 0x7fffff
-      if (exp <= 0) {
-        half[j] = sign
-      } else if (exp >= 31) {
-        half[j] = sign | 0x7c00
-      } else {
-        half[j] = sign | (exp << 10) | (mant >>> 13)
-      }
-    }
-
-    this.filmicLutTexture = this.device.createTexture({
-      label: "Filmic tone LUT",
-      size: [W, 1],
-      format: "r16float",
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.filmicLutView = this.filmicLutTexture.createView()
-    this.device.queue.writeTexture(
-      { texture: this.filmicLutTexture },
-      half,
-      { bytesPerRow: W * 2, rowsPerImage: 1 },
-      { width: W, height: 1, depthOrArrayLayers: 1 },
-    )
-  }
-
-  private createRenderPipeline(config: {
+  private renderPipelineDesc(config: {
     label: string
     layout: GPUPipelineLayout
     shaderModule: GPUShaderModule
@@ -7540,9 +7618,9 @@ export class Engine {
     cullMode?: GPUCullMode
     depthStencil?: GPUDepthStencilState
     multisample?: GPUMultisampleState
-  }): GPURenderPipeline {
+  }): GPURenderPipelineDescriptor {
     const targets = config.fragmentTargets ?? (config.fragmentTarget ? [config.fragmentTarget] : undefined)
-    return this.createModelPipeline({
+    return {
       label: config.label,
       layout: config.layout,
       vertex: {
@@ -7559,7 +7637,7 @@ export class Engine {
       primitive: { cullMode: config.cullMode ?? "none" },
       depthStencil: config.depthStencil,
       multisample: config.multisample ?? { count: Engine.MULTISAMPLE_COUNT },
-    })
+    }
   }
 
   private createPipelines() {
@@ -7685,8 +7763,6 @@ export class Engine {
         // creation with "binding doesn't exist", naming a binding no effect
         // author ever wrote. Sharing the code meant sharing these.
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
-        { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
         { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
         // And the scene's COVERAGE and bloom, without which the tap cannot
         // reconstruct a pixel: the HDR target is premultiplied, so colour alone
@@ -7708,31 +7784,40 @@ export class Engine {
       const seedModule = this.device.createShaderModule({ label: "cast distance seed", code: buildCastSeedShader(Engine.MULTISAMPLE_COUNT) })
       const stepModule = this.device.createShaderModule({ label: "cast distance step", code: buildCastStepShader() })
       const resolveModule = this.device.createShaderModule({ label: "cast distance resolve", code: buildCastResolveShader() })
-      this.castSeedPipeline = this.device.createRenderPipeline({
-        label: "cast distance seed",
-        layout: "auto",
-        vertex: { module: seedModule, entryPoint: "vs" },
-        fragment: {
-          module: seedModule,
-          entryPoint: "fs",
-          targets: [{ format: CAST_SEED_FORMAT }, { format: CAST_COVERAGE_FORMAT }],
+      this.initRenderPipeline(
+        {
+          label: "cast distance seed",
+          layout: "auto",
+          vertex: { module: seedModule, entryPoint: "vs" },
+          fragment: {
+            module: seedModule,
+            entryPoint: "fs",
+            targets: [{ format: CAST_SEED_FORMAT }, { format: CAST_COVERAGE_FORMAT }],
+          },
+          primitive: { topology: "triangle-list" },
         },
-        primitive: { topology: "triangle-list" },
-      })
-      this.castStepPipeline = this.device.createRenderPipeline({
-        label: "cast distance step",
-        layout: "auto",
-        vertex: { module: stepModule, entryPoint: "vs" },
-        fragment: { module: stepModule, entryPoint: "fs", targets: [{ format: CAST_SEED_FORMAT }] },
-        primitive: { topology: "triangle-list" },
-      })
-      this.castResolvePipeline = this.device.createRenderPipeline({
-        label: "cast distance resolve",
-        layout: "auto",
-        vertex: { module: resolveModule, entryPoint: "vs" },
-        fragment: { module: resolveModule, entryPoint: "fs", targets: [{ format: CAST_DIST_FORMAT }] },
-        primitive: { topology: "triangle-list" },
-      })
+        (p) => (this.castSeedPipeline = p),
+      )
+      this.initRenderPipeline(
+        {
+          label: "cast distance step",
+          layout: "auto",
+          vertex: { module: stepModule, entryPoint: "vs" },
+          fragment: { module: stepModule, entryPoint: "fs", targets: [{ format: CAST_SEED_FORMAT }] },
+          primitive: { topology: "triangle-list" },
+        },
+        (p) => (this.castStepPipeline = p),
+      )
+      this.initRenderPipeline(
+        {
+          label: "cast distance resolve",
+          layout: "auto",
+          vertex: { module: resolveModule, entryPoint: "vs" },
+          fragment: { module: resolveModule, entryPoint: "fs", targets: [{ format: CAST_DIST_FORMAT }] },
+          primitive: { topology: "triangle-list" },
+        },
+        (p) => (this.castResolvePipeline = p),
+      )
       // 65504 is the largest half float. Bound wherever the field is not
       // running, so rzCastDistance answers "unreachably far" and an effect keyed
       // on it draws nothing at all.
@@ -7933,34 +8018,42 @@ export class Engine {
     // hand shaders are retired in favor of graphs.
     const neutral = compileGraph(DEFAULT_GRAPH, { renderClass: "auto", alphaMode: "opaque" })
     if (!neutral.ok) throw new Error("failed to compile the neutral default graph")
-    const neutralModule = this.device.createShaderModule({ label: "neutral base (default graph)", code: neutral.wgsl })
-    this.neutralPipeline = this.createRenderPipeline({
-      label: "neutral base pipeline",
-      layout: mainPipelineLayout,
-      shaderModule: neutralModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: this.depthFormat,
-        depthWriteEnabled: true,
-        depthCompare: this.depthAhead,
-      },
-    })
+    const neutralModule = this.cachedShaderModule(neutral.wgsl, "neutral base (default graph)")
+    this.initRenderPipeline(
+      this.renderPipelineDesc({
+        label: "neutral base pipeline",
+        layout: mainPipelineLayout,
+        shaderModule: neutralModule,
+        vertexBuffers: fullVertexBuffers,
+        fragmentTargets: sceneTargets,
+        cullMode: "none",
+        depthStencil: {
+          format: this.depthFormat,
+          depthWriteEnabled: true,
+          depthCompare: this.depthAhead,
+        },
+      }),
+      (p) => (this.neutralPipeline = p),
+      true,
+    )
     // Depth-write-off twin for transparent-bucket draws (see pipelineForDrawCall).
-    this.neutralPipelineNoDepthWrite = this.createRenderPipeline({
-      label: "neutral base pipeline (no depth write)",
-      layout: mainPipelineLayout,
-      shaderModule: neutralModule,
-      vertexBuffers: fullVertexBuffers,
-      fragmentTargets: sceneTargets,
-      cullMode: "none",
-      depthStencil: {
-        format: this.depthFormat,
-        depthWriteEnabled: false,
-        depthCompare: this.depthAhead,
-      },
-    })
+    this.initRenderPipeline(
+      this.renderPipelineDesc({
+        label: "neutral base pipeline (no depth write)",
+        layout: mainPipelineLayout,
+        shaderModule: neutralModule,
+        vertexBuffers: fullVertexBuffers,
+        fragmentTargets: sceneTargets,
+        cullMode: "none",
+        depthStencil: {
+          format: this.depthFormat,
+          depthWriteEnabled: false,
+          depthCompare: this.depthAhead,
+        },
+      }),
+      (p) => (this.neutralPipelineNoDepthWrite = p),
+      true,
+    )
     // Depth-only prepass for transparent draws (see depth-prepass.ts): writes the
     // fabric's depth AFTER its color blended, so outlines drawn later are
     // occluded behind it. Color targets kept for pass compatibility, writeMask 0.
@@ -7979,51 +8072,63 @@ export class Engine {
         depthCompare: this.depthAhead,
       },
     }
-    this.depthPrepassPipeline = this.createModelPipeline({
-      label: "opaque depth prepass",
-      ...prepassDesc,
-      fragment: {
-        module: prepassModule,
-        entryPoint: "fs",
-        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+    this.initRenderPipeline(
+      {
+        label: "opaque depth prepass",
+        ...prepassDesc,
+        fragment: {
+          module: prepassModule,
+          entryPoint: "fs",
+          targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+        },
       },
-    })
+      (p) => (this.depthPrepassPipeline = p),
+      true,
+    )
     // The SOLID prime: same module, cutoff forced to exactly 1.0. Only texels
     // whose blend ignores the destination may pre-claim depth in the
     // transparent phase — see the override's note in depth-prepass.ts.
-    this.solidPrepassPipeline = this.createModelPipeline({
-      label: "transparent solid prepass",
-      ...prepassDesc,
-      fragment: {
-        module: prepassModule,
-        entryPoint: "fs",
-        constants: { CUTOFF: 1.0 },
-        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+    this.initRenderPipeline(
+      {
+        label: "transparent solid prepass",
+        ...prepassDesc,
+        fragment: {
+          module: prepassModule,
+          entryPoint: "fs",
+          constants: { CUTOFF: 1.0 },
+          targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+        },
       },
-    })
+      (p) => (this.solidPrepassPipeline = p),
+      true,
+    )
     // The HAIR prime: solid texels only, and stencil-fenced off the eye
     // silhouette. It records after the non-hair opaque draws, so the eye has
     // already written its stencil — not-equal here is what keeps the primed
     // hair depth from ever claiming the pixels the see-through-hair pass needs
     // the eye to survive on. (Bundle draws use the PASS's stencil reference;
     // only pipeline/bind/vertex state resets across executeBundles.)
-    this.hairPrimePipeline = this.createModelPipeline({
-      label: "hair depth prime",
-      ...prepassDesc,
-      depthStencil: {
-        ...prepassDesc.depthStencil,
-        stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
-        stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
-        stencilReadMask: 0xff,
-        stencilWriteMask: 0,
+    this.initRenderPipeline(
+      {
+        label: "hair depth prime",
+        ...prepassDesc,
+        depthStencil: {
+          ...prepassDesc.depthStencil,
+          stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+          stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+          stencilReadMask: 0xff,
+          stencilWriteMask: 0,
+        },
+        fragment: {
+          module: prepassModule,
+          entryPoint: "fs",
+          constants: { CUTOFF: 1.0 },
+          targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
+        },
       },
-      fragment: {
-        module: prepassModule,
-        entryPoint: "fs",
-        constants: { CUTOFF: 1.0 },
-        targets: sceneTargetsFor("depth-prepass", this.sceneFormats),
-      },
-    })
+      (p) => (this.hairPrimePipeline = p),
+      true,
+    )
 
     // The matrices, then one vec4: the caster sphere, which effects' rzShadow
     // tests before any tap. The materials and the ground bind the matrices only.
@@ -8050,28 +8155,31 @@ export class Engine {
       label: "shadow depth",
       code: SHADOW_DEPTH_SHADER_WGSL,
     })
-    this.shadowDepthPipeline = this.device.createRenderPipeline({
-      label: "shadow depth pipeline",
-      // Group 1 is the main pass's per-material layout so each shadow draw can
-      // rebind the draw call's existing material bind group for the alpha test.
-      layout: this.device.createPipelineLayout({
-        bindGroupLayouts: [shadowBindGroupLayout, this.mainPerMaterialBindGroupLayout],
-      }),
-      vertex: { module: shadowShader, entryPoint: "vs", buffers: fullVertexBuffers as GPUVertexBufferLayout[] },
-      fragment: { module: shadowShader, entryPoint: "fs", targets: [] },
-      primitive: { cullMode: "none" },
-      depthStencil: {
-        format: Engine.SHADOW_DEPTH_FORMAT,
-        depthWriteEnabled: true,
-        depthCompare: "less-equal",
-        // The shadow map keeps the NON-reversed convention (orthographicLh maps
-        // [0,1] with far = 1, and this pass never flipped) — so this bias must
-        // NOT follow reversedZ. It is the camera-pass biases that flip.
-        depthBias: 2,
-        depthBiasSlopeScale: 1.5,
-        depthBiasClamp: 0,
+    this.initRenderPipeline(
+      {
+        label: "shadow depth pipeline",
+        // Group 1 is the main pass's per-material layout so each shadow draw can
+        // rebind the draw call's existing material bind group for the alpha test.
+        layout: this.device.createPipelineLayout({
+          bindGroupLayouts: [shadowBindGroupLayout, this.mainPerMaterialBindGroupLayout],
+        }),
+        vertex: { module: shadowShader, entryPoint: "vs", buffers: fullVertexBuffers as GPUVertexBufferLayout[] },
+        fragment: { module: shadowShader, entryPoint: "fs", targets: [] },
+        primitive: { cullMode: "none" },
+        depthStencil: {
+          format: Engine.SHADOW_DEPTH_FORMAT,
+          depthWriteEnabled: true,
+          depthCompare: "less-equal",
+          // The shadow map keeps the NON-reversed convention (orthographicLh maps
+          // [0,1] with far = 1, and this pass never flipped) — so this bias must
+          // NOT follow reversedZ. It is the camera-pass biases that flip.
+          depthBias: 2,
+          depthBiasSlopeScale: 1.5,
+          depthBiasClamp: 0,
+        },
       },
-    })
+      (p) => (this.shadowDepthPipeline = p),
+    )
     this.shadowComparisonSampler = this.device.createSampler({
       compare: "less",
       magFilter: "linear",
@@ -8106,14 +8214,23 @@ export class Engine {
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
     this.bakeBrdfLut()
     this.bakeGroundNoise()
-    this.agxFallbackTexture = this.device.createTexture({
-      label: "AgX LUT fallback",
-      size: [1, 1, 1],
-      dimension: "3d",
-      format: "rgb10a2unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    })
-    void this.loadAgxLut()
+    // The mipmap blit for the formats model textures arrive in, built here so
+    // the first texture of the first model does not compile it synchronously
+    // in the middle of a load (generateMipmaps builds any other on demand).
+    {
+      const mipModule = this.device.createShaderModule({ label: "mipmap blit", code: MIPMAP_BLIT_SHADER_WGSL })
+      for (const format of ["rgba8unorm", "rgba8unorm-srgb"] as const)
+        this.initRenderPipeline(
+          {
+            label: `mipmap blit pipeline (${format})`,
+            layout: "auto",
+            vertex: { module: mipModule, entryPoint: "vs" },
+            fragment: { module: mipModule, entryPoint: "fs", targets: [{ format }] },
+            primitive: { topology: "triangle-list" },
+          },
+          (p) => this.mipBlitPipelines.set(format, p),
+        )
+    }
     this.stageGradeFallback = this.device.createTexture({
       label: "stage grade fallback",
       size: [1, 1, 1],
@@ -8122,7 +8239,6 @@ export class Engine {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     })
     this.uploadStageGrade()
-    this.bakeFilmicLut()
 
     // BEFORE the bind group below, which binds it. Full size from the start:
     // every material pipeline binds this, so sizing it to the light count would
@@ -8213,7 +8329,10 @@ export class Engine {
       cullMode: "back",
       depthStencil: { format: this.depthFormat, depthWriteEnabled: true, depthCompare: this.depthAhead },
     }
-    this.groundShadowPipeline = this.buildGroundPipeline(false)
+    this.initRenderPipeline(
+      this.renderPipelineDesc(this.groundPipelineConfig(false)),
+      (p) => (this.groundShadowPipeline = p),
+    )
 
     // Outline: group 0 = per-frame (camera), group 1 = per-instance (skinMats), group 2 = per-material (edge uniforms)
     this.outlinePerFrameBindGroupLayout = this.device.createBindGroupLayout({
@@ -8282,7 +8401,12 @@ export class Engine {
       label: "outline pipeline",
       layout: outlinePipelineLayout,
       shaderModule: outlineShaderModule,
-      vertexBuffers: outlineVertexBuffers,
+      // The selection mask's streams plus the hull's own: smoothed normal and
+      // PMX edge scale (ModelInstance.outlineVertexBuffer).
+      vertexBuffers: [
+        ...outlineVertexBuffers,
+        { arrayStride: 4 * 4, attributes: [{ shaderLocation: 5, offset: 0, format: "float32x4" }] },
+      ],
       fragmentTargets: sceneTargetsFor("outline", this.sceneFormats),
       cullMode: "back",
       depthStencil: {
@@ -8316,12 +8440,16 @@ export class Engine {
         stencilWriteMask: 0,
       },
     }
-    this.outlinePipeline = this.createRenderPipeline(outlineDesc)
-    this.outlineMirrorPipeline = this.createRenderPipeline({
-      ...outlineDesc,
-      label: "outline pipeline (mirror)",
-      cullMode: "front",
-    })
+    this.initRenderPipeline(this.renderPipelineDesc(outlineDesc), (p) => (this.outlinePipeline = p), true)
+    this.initRenderPipeline(
+      this.renderPipelineDesc({
+        ...outlineDesc,
+        label: "outline pipeline (mirror)",
+        cullMode: "front",
+      }),
+      (p) => (this.outlineMirrorPipeline = p),
+      true,
+    )
 
     // ─── Selection overlay (screen-space edge-detect on a per-material mask) ───
     // Reuses outline camera + main skinMats bind group layouts. No group 2 (no per-mat uniform).
@@ -8333,19 +8461,22 @@ export class Engine {
       label: "selection mask shader",
       code: SELECTION_MASK_SHADER_WGSL,
     })
-    this.selectionMaskPipeline = this.device.createRenderPipeline({
-      label: "selection mask pipeline",
-      layout: selectionMaskPipelineLayout,
-      vertex: { module: selectionMaskShaderModule, entryPoint: "vs", buffers: outlineVertexBuffers },
-      fragment: {
-        module: selectionMaskShaderModule,
-        entryPoint: "fs",
-        targets: [{ format: "r8unorm" }],
+    this.initRenderPipeline(
+      {
+        label: "selection mask pipeline",
+        layout: selectionMaskPipelineLayout,
+        vertex: { module: selectionMaskShaderModule, entryPoint: "vs", buffers: outlineVertexBuffers },
+        fragment: {
+          module: selectionMaskShaderModule,
+          entryPoint: "fs",
+          targets: [{ format: "r8unorm" }],
+        },
+        primitive: { cullMode: "none" },
+        // Single-sample, no depth (depth-always via not attaching a depth buffer at all).
+        multisample: { count: 1 },
       },
-      primitive: { cullMode: "none" },
-      // Single-sample, no depth (depth-always via not attaching a depth buffer at all).
-      multisample: { count: 1 },
-    })
+      (p) => (this.selectionMaskPipeline = p),
+    )
 
     this.selectionEdgeBindGroupLayout = this.device.createBindGroupLayout({
       label: "selection edge bind group layout",
@@ -8363,26 +8494,29 @@ export class Engine {
       label: "selection edge shader",
       code: SELECTION_EDGE_SHADER_WGSL,
     })
-    this.selectionEdgePipeline = this.device.createRenderPipeline({
-      label: "selection edge pipeline",
-      layout: selectionEdgePipelineLayout,
-      vertex: { module: selectionEdgeShaderModule, entryPoint: "vs" },
-      fragment: {
-        module: selectionEdgeShaderModule,
-        entryPoint: "fs",
-        targets: [
-          {
-            format: this.presentationFormat,
-            blend: {
-              color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+    this.initRenderPipeline(
+      {
+        label: "selection edge pipeline",
+        layout: selectionEdgePipelineLayout,
+        vertex: { module: selectionEdgeShaderModule, entryPoint: "vs" },
+        fragment: {
+          module: selectionEdgeShaderModule,
+          entryPoint: "fs",
+          targets: [
+            {
+              format: this.presentationFormat,
+              blend: {
+                color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
             },
-          },
-        ],
+          ],
+        },
+        primitive: { topology: "triangle-list" },
+        multisample: { count: 1 },
       },
-      primitive: { topology: "triangle-list" },
-      multisample: { count: 1 },
-    })
+      (p) => (this.selectionEdgePipeline = p),
+    )
     this.selectionSampler = this.device.createSampler({
       label: "selection sampler",
       magFilter: "linear",
@@ -8402,10 +8536,7 @@ export class Engine {
     // ─── Editor overlays (instanced wireframe primitives) ────────────
     this.setupOverlay()
 
-    // ─── Bloom (EEVEE 3.6 pyramid): blit(Karis prefilter) → 13-tap downsamples → 9-tap tent upsamples ───
-    // Mirrors source/blender/draw/engines/eevee/shaders/effect_bloom_frag.glsl.
-    // Firefly suppression lives in the blit (Karis luminance-weighted 4-tap average). A single-pass
-    // Gaussian cannot reproduce this — hot pixels dominate and produce the sparkle halo.
+    // ─── Bloom: Aether Gazer's chain (prefilter → Gaussian down chain → scatter up chain) ───
     this.bloomSampler = this.device.createSampler({
       label: "bloom sampler",
       magFilter: "linear",
@@ -8413,88 +8544,26 @@ export class Engine {
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge",
     })
-    this.bloomBlitUniformBuffer = this.device.createBuffer({
-      label: "bloom blit uniforms",
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
-    this.bloomUpsampleUniformBuffer = this.device.createBuffer({
-      label: "bloom upsample uniforms",
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
-
-    this.bloomBlitBindGroupLayout = this.device.createBindGroupLayout({
-      label: "bloom blit layout",
+    this.bloomPrefilterBindGroupLayout = this.device.createBindGroupLayout({
+      label: "bloom prefilter layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
       ],
     })
-    this.bloomDownsampleBindGroupLayout = this.device.createBindGroupLayout({
-      label: "bloom downsample layout",
+    this.bloomBlurBindGroupLayout = this.device.createBindGroupLayout({
+      label: "bloom blur layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
       ],
     })
-    this.bloomUpsampleBindGroupLayout = this.device.createBindGroupLayout({
-      label: "bloom upsample layout",
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} }, // coarser-mip accumulator
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} }, // matching downsample mip (base add)
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-      ],
-    })
+    this.ensureBloomPipelines()
 
-    const bloomBlitShader = this.device.createShaderModule({
-      label: "bloom blit (Karis prefilter)",
-      code: BLOOM_BLIT_SHADER_WGSL,
-    })
-
-    const bloomDownsampleShader = this.device.createShaderModule({
-      label: "bloom downsample 13-tap",
-      code: BLOOM_DOWNSAMPLE_SHADER_WGSL,
-    })
-
-    const bloomUpsampleShader = this.device.createShaderModule({
-      label: "bloom upsample 9-tap tent",
-      code: BLOOM_UPSAMPLE_SHADER_WGSL,
-    })
-
-    const bloomBlitLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.bloomBlitBindGroupLayout] })
-    const bloomDownLayout = this.device.createPipelineLayout({
-      bindGroupLayouts: [this.bloomDownsampleBindGroupLayout],
-    })
-    const bloomUpLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.bloomUpsampleBindGroupLayout] })
-
-    this.bloomBlitPipeline = this.device.createRenderPipeline({
-      label: "bloom blit pipeline",
-      layout: bloomBlitLayout,
-      vertex: { module: bloomBlitShader, entryPoint: "vs" },
-      fragment: { module: bloomBlitShader, entryPoint: "fs", targets: [{ format: this.hdrFormat }] },
-      primitive: { topology: "triangle-list" },
-    })
-    this.bloomDownsamplePipeline = this.device.createRenderPipeline({
-      label: "bloom downsample pipeline",
-      layout: bloomDownLayout,
-      vertex: { module: bloomDownsampleShader, entryPoint: "vs" },
-      fragment: { module: bloomDownsampleShader, entryPoint: "fs", targets: [{ format: this.hdrFormat }] },
-      primitive: { topology: "triangle-list" },
-    })
-    this.bloomUpsamplePipeline = this.device.createRenderPipeline({
-      label: "bloom upsample pipeline",
-      layout: bloomUpLayout,
-      vertex: { module: bloomUpsampleShader, entryPoint: "vs" },
-      fragment: { module: bloomUpsampleShader, entryPoint: "fs", targets: [{ format: this.hdrFormat }] },
-      primitive: { topology: "triangle-list" },
-    })
-
-    // ─── Composite: HDR + bloom → Filmic → swapchain (premultiplied) ───
-    // Bloom color/intensity applied HERE (pyramid is pure energy; tint belongs to the combine step,
-    // mirroring EEVEE where bloom color/intensity are combine-stage params, not prefilter).
+    // ─── Composite: HDR + bloom → view transform → swapchain (premultiplied) ───
+    // Bloom color/intensity applied HERE: the chain is pure energy, tint and
+    // strength belong to the combine step.
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
       // 15 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
@@ -8536,8 +8605,6 @@ export class Engine {
         // Aux mask/alpha texture — composite reads .g to reconstruct the alpha that
         // used to live in the HDR target before the rg11b10ufloat switch.
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        // Filmic tone LUT (r16float, filterable) — sampled with the binding-2 sampler.
-        { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         // 360 backdrop equirect (PhotoDome-style skybox) — 1×1 fallback when unset.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         // User background-effect params — dummy buffer when no effect is set. The
@@ -8552,9 +8619,6 @@ export class Engine {
           texture: { sampleType: "depth", viewDimension: "2d", multisampled: true },
         },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        // AgX's 57³ cube. Decompressed and uploaded off the critical path, so a
-        // 1×1×1 stand-in keeps the bind group valid until it arrives.
-        { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
         // The scene's own grade cube (setStageGrade) — 1×1×1 stand-in while it
         // has none, which the flag bit keeps from ever being sampled.
         { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
@@ -8580,12 +8644,14 @@ export class Engine {
     this.compositePipelineLayout = this.device.createPipelineLayout({
       bindGroupLayouts: [this.compositeBindGroupLayout],
     })
-    const compositeShader = this.device.createShaderModule({
-      label: "composite shader",
-      code: buildCompositeShader(null),
-    })
-    this.compositePipelineIdentity = this.makeCompositePipeline(compositeShader, false, "composite pipeline (gamma=1)")
-    this.compositePipelineGamma = this.makeCompositePipeline(compositeShader, true, "composite pipeline (gamma!=1)")
+    // The same pair setEffects asks for with no field mounts, so an install
+    // that adds none finds it built.
+    this.initPipelineJobs?.push(
+      this.compositePipelines(false, false).then(([identity, gamma]) => {
+        this.compositePipelineIdentity = identity
+        this.compositePipelineGamma = gamma
+      }),
+    )
 
     // GPU vertex-morph compute pipeline (shared by all models; per-model bind groups).
     // Bindings: 0-4 read-only storage (base pos, CSR rowStart/colMorph/colOffset, weights),
@@ -8603,14 +8669,17 @@ export class Engine {
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
       ],
     })
-    this.morphComputePipeline = this.device.createComputePipeline({
-      label: "morph compute pipeline",
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.morphComputeBindGroupLayout] }),
-      compute: {
-        module: this.device.createShaderModule({ label: "morph compute shader", code: MORPH_COMPUTE_WGSL }),
-        entryPoint: "cs",
+    this.initComputePipeline(
+      {
+        label: "morph compute pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.morphComputeBindGroupLayout] }),
+        compute: {
+          module: this.device.createShaderModule({ label: "morph compute shader", code: MORPH_COMPUTE_WGSL }),
+          entryPoint: "cs",
+        },
       },
-    })
+      (p) => (this.morphComputePipeline = p),
+    )
 
     // GPU frustum cull. One pipeline for the whole scene; the bind group is rebuilt
     // with the buffers whenever the draw list changes. See shaders/passes/cull.ts.
@@ -8631,20 +8700,26 @@ export class Engine {
     // encoder it is set on, so a WGSL slip here would take the whole frame down —
     // every pass, every model, an unrelated-looking cascade of style-group and
     // effect failures. Catching it turns that into "culling is off".
-    this.device.pushErrorScope("validation")
-    this.cullPipeline = this.device.createComputePipeline({
-      label: "cull pipeline",
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.cullBindGroupLayout] }),
-      compute: {
-        module: this.device.createShaderModule({ label: "cull compute shader", code: CULL_COMPUTE_WGSL }),
-        entryPoint: "cs",
-      },
-    })
-    void this.device.popErrorScope().then((err) => {
-      if (!err) return
-      console.error(`[cull] pipeline failed to compile — frustum culling disabled:\n${err.message}`)
-      this.cullPipeline = null
-    })
+    // Async, so a failure arrives as the rejection rather than a scoped error.
+    const cullBuild = this.device
+      .createComputePipelineAsync({
+        label: "cull pipeline",
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.cullBindGroupLayout] }),
+        compute: {
+          module: this.device.createShaderModule({ label: "cull compute shader", code: CULL_COMPUTE_WGSL }),
+          entryPoint: "cs",
+        },
+      })
+      .then(
+        (p) => {
+          this.cullPipeline = p
+        },
+        (err) => {
+          console.error(`[cull] pipeline failed to compile — frustum culling disabled:\n${(err as Error).message}`)
+          this.cullPipeline = null
+        },
+      )
+    this.initPipelineJobs?.push(cullBuild)
 
     this.bloomPassDescriptor = {
       label: "bloom pass",
@@ -8691,21 +8766,24 @@ export class Engine {
       entries: [{ binding: 0, resource: { buffer: this.cameraUniformBuffer } }],
     })
 
-    this.pickPipeline = this.device.createRenderPipeline({
-      label: "pick pipeline",
-      layout: pickPipelineLayout,
-      vertex: { module: pickShaderModule, buffers: fullVertexBuffers },
-      fragment: {
-        module: pickShaderModule,
-        targets: [{ format: "rgba8unorm" }],
+    this.initRenderPipeline(
+      {
+        label: "pick pipeline",
+        layout: pickPipelineLayout,
+        vertex: { module: pickShaderModule, buffers: fullVertexBuffers },
+        fragment: {
+          module: pickShaderModule,
+          targets: [{ format: "rgba8unorm" }],
+        },
+        primitive: { cullMode: "none" },
+        depthStencil: {
+          format: "depth24plus",
+          depthWriteEnabled: true,
+          depthCompare: this.depthAhead,
+        },
       },
-      primitive: { cullMode: "none" },
-      depthStencil: {
-        format: "depth24plus",
-        depthWriteEnabled: true,
-        depthCompare: this.depthAhead,
-      },
-    })
+      (p) => (this.pickPipeline = p),
+    )
 
     this.pickReadbackBuffer = this.device.createBuffer({
       label: "pick readback",
@@ -8782,6 +8860,9 @@ export class Engine {
     // handleResize — so the size asked for before the device existed is applied
     // in full the moment there is something to apply it to.
     if (!this.device) return
+    // Nor while init's pipelines are still compiling: init ends with its own
+    // handleResize, which applies whatever was asked for meanwhile.
+    if (this.initPipelineJobs) return
     // Fixed override (offline/video rendering) wins; otherwise track CSS size × dpr.
     const dpr = window.devicePixelRatio || 1
     const width = this.fixedRenderSize ? this.fixedRenderSize.width : Math.floor(this.canvas.clientWidth * dpr)
@@ -9006,38 +9087,6 @@ export class Engine {
       this.buildGroundBindGroup()
       this.buildMirrorSurfaceBindGroup()
 
-      // Bloom pyramid: mip 0 is half-res, each subsequent mip halves again.
-      // Mip count chosen so the coarsest mip is ≥4 px on the short side, capped at BLOOM_MAX_LEVELS.
-      const bw = Math.max(1, Math.floor(width / 2))
-      const bh = Math.max(1, Math.floor(height / 2))
-      const shortSide = Math.max(1, Math.min(bw, bh))
-      this.bloomMipCount = Math.max(1, Math.min(Engine.BLOOM_MAX_LEVELS, Math.floor(Math.log2(shortSide)) - 1))
-      this.bloomDownTexture?.destroy()
-      this.bloomDownTexture = this.device.createTexture({
-        label: "bloom down pyramid",
-        size: [bw, bh],
-        mipLevelCount: this.bloomMipCount,
-        format: this.hdrFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      })
-      this.bloomUpTexture?.destroy()
-      this.bloomUpTexture = this.device.createTexture({
-        label: "bloom up pyramid",
-        size: [bw, bh],
-        mipLevelCount: Math.max(1, this.bloomMipCount - 1),
-        format: this.hdrFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      })
-      this.bloomDownMipViews = []
-      for (let i = 0; i < this.bloomMipCount; i++) {
-        this.bloomDownMipViews.push(this.bloomDownTexture.createView({ baseMipLevel: i, mipLevelCount: 1 }))
-      }
-      this.bloomUpMipViews = []
-      const upLevels = Math.max(1, this.bloomMipCount - 1)
-      for (let i = 0; i < upLevels; i++) {
-        this.bloomUpMipViews.push(this.bloomUpTexture.createView({ baseMipLevel: i, mipLevelCount: 1 }))
-      }
-
       this.depthTexture?.destroy()
       this.depthTexture = this.device.createTexture({
         label: "depth texture",
@@ -9157,54 +9206,10 @@ export class Engine {
         ],
       }
 
-      this.writeBloomUniforms()
-
-      if (this.compositeBindGroupLayout && this.bloomBlitBindGroupLayout) {
-        // Blit: reads HDR resolve texture (full-res), writes bloomDown mip 0.
-        this.bloomBlitBindGroup = this.device.createBindGroup({
-          label: "bloom blit bind group",
-          layout: this.bloomBlitBindGroupLayout,
-          entries: [
-            { binding: 0, resource: this.hdrResolveTexture.createView() },
-            { binding: 1, resource: { buffer: this.bloomBlitUniformBuffer } },
-            { binding: 2, resource: this.maskResolveView },
-          ],
-        })
-        // Downsample[i] reads bloomDown mip (i-1), writes bloomDown mip i. i ∈ [1..N-1].
-        this.bloomDownsampleBindGroups = []
-        for (let i = 1; i < this.bloomMipCount; i++) {
-          this.bloomDownsampleBindGroups.push(
-            this.device.createBindGroup({
-              label: `bloom downsample ${i}`,
-              layout: this.bloomDownsampleBindGroupLayout,
-              entries: [
-                { binding: 0, resource: this.bloomDownMipViews[i - 1] },
-                { binding: 1, resource: this.bloomSampler },
-              ],
-            }),
-          )
-        }
-        // Upsample[i] writes bloomUp mip i. Coarsest step reads bloomDown[N-1] (no prior up yet);
-        // subsequent steps read bloomUp[i+1]. Both read bloomDown[i] as the base (additive combine).
-        this.bloomUpsampleBindGroups = []
-        const topIdx = this.bloomMipCount - 2
-        for (let i = topIdx; i >= 0; i--) {
-          const srcView = i === topIdx ? this.bloomDownMipViews[this.bloomMipCount - 1] : this.bloomUpMipViews[i + 1]
-          this.bloomUpsampleBindGroups.push(
-            this.device.createBindGroup({
-              label: `bloom upsample ${i}`,
-              layout: this.bloomUpsampleBindGroupLayout,
-              entries: [
-                { binding: 0, resource: srcView },
-                { binding: 1, resource: this.bloomDownMipViews[i] },
-                { binding: 2, resource: this.bloomSampler },
-                { binding: 3, resource: { buffer: this.bloomUpsampleUniformBuffer } },
-              ],
-            }),
-          )
-        }
-        // Composite reads bloomUp mip 0 (full pyramid collapsed); fallback to bloomDown mip 0 if no upsample level.
-        this.compositeBloomView = this.bloomMipCount > 1 ? this.bloomUpMipViews[0] : this.bloomDownMipViews[0]
+      if (this.compositeBindGroupLayout && this.bloomPrefilterBindGroupLayout) {
+        this.buildBloomTargets()
+        // The composite reads the finished chain: up[0], or down[0] when there is one level.
+        this.compositeBloomView = this.bloomLevels > 1 ? this.bloomUpViews[0] : this.bloomDownViews[0]
         this.rebuildCompositeBindGroup()
       }
 
@@ -9479,17 +9484,20 @@ export class Engine {
       },
       multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
     } satisfies GPURenderPipelineDescriptor
-    this.overlayPipeline = this.device.createRenderPipeline(overlayPipelineDescriptor)
+    this.initRenderPipeline(overlayPipelineDescriptor, (p) => (this.overlayPipeline = p))
 
     // The solid volumes: the same shader and layout, with no depth write and no
     // culling. A translucent body must not hide the rig behind it, and you have
     // to see its far wall for it to read as a volume rather than a silhouette.
-    this.overlaySolidPipeline = this.device.createRenderPipeline({
-      ...overlayPipelineDescriptor,
-      label: "overlay solid pipeline",
-      primitive: { topology: "triangle-list", cullMode: "none" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "always" },
-    })
+    this.initRenderPipeline(
+      {
+        ...overlayPipelineDescriptor,
+        label: "overlay solid pipeline",
+        primitive: { topology: "triangle-list", cullMode: "none" },
+        depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "always" },
+      },
+      (p) => (this.overlaySolidPipeline = p),
+    )
 
     const compositeShader = this.device.createShaderModule({
       label: "overlay composite shader",
@@ -9580,34 +9588,37 @@ export class Engine {
       ],
     })
     const wireShader = this.device.createShaderModule({ label: "wireframe shader", code: WIREFRAME_SHADER_WGSL })
-    this.wireframePipeline = this.device.createRenderPipeline({
-      label: "wireframe pipeline",
-      layout: this.device.createPipelineLayout({
-        label: "wireframe pipeline layout",
-        bindGroupLayouts: [wireBg0, this.wireframeSkinLayout],
-      }),
-      // No vertex stream: an edge quad's corners come from two different model
-      // vertices, so the mesh is read through storage instead.
-      vertex: { module: wireShader, entryPoint: "vs" },
-      fragment: {
-        module: wireShader,
-        entryPoint: "fs",
-        targets: [
-          {
-            format: this.presentationFormat,
-            blend: {
-              color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+    this.initRenderPipeline(
+      {
+        label: "wireframe pipeline",
+        layout: this.device.createPipelineLayout({
+          label: "wireframe pipeline layout",
+          bindGroupLayouts: [wireBg0, this.wireframeSkinLayout],
+        }),
+        // No vertex stream: an edge quad's corners come from two different model
+        // vertices, so the mesh is read through storage instead.
+        vertex: { module: wireShader, entryPoint: "vs" },
+        fragment: {
+          module: wireShader,
+          entryPoint: "fs",
+          targets: [
+            {
+              format: this.presentationFormat,
+              blend: {
+                color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
             },
-          },
-        ],
+          ],
+        },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+        // Depth-TESTED but not written: the mesh is a haze the rig reads against,
+        // so a bone behind a triangle must not be punched out by it.
+        depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: this.depthAhead },
+        multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
       },
-      primitive: { topology: "triangle-list", cullMode: "none" },
-      // Depth-TESTED but not written: the mesh is a haze the rig reads against,
-      // so a bone behind a triangle must not be punched out by it.
-      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: this.depthAhead },
-      multisample: { count: Engine.OVERLAY_SAMPLE_COUNT },
-    })
+      (p) => (this.wireframePipeline = p),
+    )
     // The mesh's own depth, so the wireframe can be occluded by the body it
     // belongs to. Occluded is the default everywhere — Blender's edit mode, Maya,
     // three's and Babylon's wireframe materials all depth-test, and X-ray is a
@@ -11383,6 +11394,29 @@ export class Engine {
     return true
   }
 
+  /**
+   * Light one model with more than the world gives it: a FILL, linear RGB times
+   * its surface colour, added after its material graph. Null takes it away again.
+   *
+   * After the graph, not in its ambient: an NPR ramp reads an ambient fill as
+   * light, so sliding it moved her shadows and flipped whole regions across a
+   * hard step. Added after, it brightens her evenly and every shadow stays put.
+   *
+   * A game lights its stage and its characters apart. Aether Gazer's rooms are
+   * lit by their lamps and a near-black ambient, while its characters take a
+   * flat base light of their own — so a stage whose World is right for the room
+   * leaves a face turned from the lamps in the dark. This is that second light,
+   * for the models the host counts as cast. A model drawn by the game's own
+   * shaders (src/unity) lights itself and takes none of it.
+   */
+  setModelFill(name: string, fill: { x: number; y: number; z: number } | null): boolean {
+    const inst = this.modelInstances.get(name)
+    if (!inst || !this.device) return false
+    inst.objectLight.set(fill ? [fill.x, fill.y, fill.z, 0] : [0, 0, 0, 0], 44)
+    this.device.queue.writeBuffer(inst.lightBuffer, 0, inst.objectLight)
+    return true
+  }
+
   /** The per-model group: its skinning matrices and its ObjectLight. */
   private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, light: GPUBuffer): GPUBindGroup {
     return this.device.createBindGroup({
@@ -11401,6 +11435,9 @@ export class Engine {
     // Before the texture cache below frees it: a stale entry here would hand a
     // destroyed texture to the next setPlaneFrame.
     this.planeTextures.delete(name)
+    // Its native look too: it skins from this model's buffers, which are
+    // destroyed below, and would otherwise go on drawing from them.
+    this.nativeLooks?.remove(name)
     inst.model.stop()
     for (const path of inst.textureCacheKeys) {
       const tex = this.textureCache.get(path)
@@ -14071,8 +14108,9 @@ export class Engine {
 
     // Its ObjectLight: the world's ambient, and the layers its kind draws on —
     // the cast on the character layer as well as the default one. Words:
-    // layers [0..3], ambient flag [4..7], SH [8..43] — see materials/common.ts.
-    const objectLight = new Float32Array(44)
+    // layers [0..3], ambient flag [4..7], SH [8..43], fill [44..47] — see
+    // materials/common.ts.
+    const objectLight = new Float32Array(48)
     new Uint32Array(objectLight.buffer)[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0
     const lightBuffer = this.device.createBuffer({
@@ -14309,7 +14347,11 @@ export class Engine {
   private groundShadowPipelineDesc!: Omit<Parameters<Engine["createRenderPipeline"]>[0], "shaderModule">
 
   private buildGroundPipeline(soft: boolean, mirrored = false): GPURenderPipeline {
-    return this.createRenderPipeline({
+    return this.createRenderPipeline(this.groundPipelineConfig(soft, mirrored))
+  }
+
+  private groundPipelineConfig(soft: boolean, mirrored = false): Parameters<Engine["renderPipelineDesc"]>[0] {
+    return {
       ...this.groundShadowPipelineDesc,
       // A REFLECTION FLIPS WINDING — determinant -1, see reflection.ts. The
       // ground culls back faces, so drawn into the mirror pass with the ordinary
@@ -14319,11 +14361,8 @@ export class Engine {
       // the mirror, and the same answer the scene-pass pipelines already use.
       cullMode: mirrored ? "none" : this.groundShadowPipelineDesc.cullMode,
       label: `ground shadow pipeline${soft ? " (soft)" : ""}${mirrored ? " (mirror)" : ""}`,
-      shaderModule: this.device.createShaderModule({
-        label: soft ? "ground shadow (soft)" : "ground shadow",
-        code: groundShaderWgsl(soft),
-      }),
-    })
+      shaderModule: this.cachedShaderModule(groundShaderWgsl(soft), soft ? "ground shadow (soft)" : "ground shadow"),
+    }
   }
 
   private groundMirrorPipeline: GPURenderPipeline | null = null
@@ -14773,6 +14812,17 @@ export class Engine {
           ],
         })
         outline = { bindGroup: outlineBindGroup }
+        if (!inst.outlineVertexBuffer) {
+          const data = inst.model.getOutlineVertices()
+          const buf = this.device.createBuffer({
+            label: `${prefix}outline normals`,
+            size: data.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+          })
+          this.device.queue.writeBuffer(buf, 0, data)
+          inst.gpuBuffers.push(buf)
+          inst.outlineVertexBuffer = buf
+        }
       }
 
       // Model-space AABB for the cull compute, grown by the three things that can
@@ -16625,58 +16675,17 @@ export class Engine {
     // depth, before the composite that samples both layers.
     this.renderFieldPass(encoder)
 
-    // Bloom pyramid (EEVEE 3.6):
-    //   1. Blit: HDR → bloomDown[0] (Karis prefilter, half-res)
-    //   2. Downsample: bloomDown[0] → bloomDown[1] → … → bloomDown[N-1] (13-tap)
-    //   3. Upsample (top-down): bloomUp[N-2] = tent(bloomDown[N-1]) + bloomDown[N-2],
-    //      then bloomUp[i] = tent(bloomUp[i+1]) + bloomDown[i] until i=0 (9-tap tent)
-    //   Composite reads bloomUp[0] and adds tint * intensity * bloom before Filmic.
-    // bloomContributes() gates the whole pyramid, not just its intensity. The
-    // composite still SAMPLES bloomUp[0] unconditionally, which is safe and
-    // deliberate: it scales what it reads by the same effective intensity, so a
-    // stale or never-written pyramid is multiplied by zero. Skipping the build
-    // is therefore invisible in the frame and nine render passes cheaper.
-    if (this.bloomContributes() && this.bloomBlitBindGroup && this.compositeBindGroup && this.bloomMipCount > 0) {
-      const bloomAtt = this.bloomPassDescriptor.colorAttachments as GPURenderPassColorAttachment[]
+    // Bloom (renderBloom): prefilter, the Gaussian chain down, the scatter
+    // blend back up; the composite adds up[0] × tint × intensity before the view
+    // transform. bloomContributes() gates the whole chain, not just its
+    // intensity. The composite still SAMPLES up[0] unconditionally, which is safe
+    // and deliberate: it scales what it reads by the same effective intensity, so
+    // a stale or never-written chain is multiplied by zero. Skipping the build is
+    // therefore invisible in the frame and a couple of dozen render passes cheaper.
+    if (this.bloomContributes() && this.bloomPrefilterBindGroup && this.compositeBindGroup && this.bloomLevels > 0)
+      this.renderBloom(encoder)
 
-      // 1. Blit — opens the pyramid's timing span. See stampOpen: the nine
-      // passes below read as ONE component, which is the only useful grain.
-      bloomAtt[0].view = this.bloomDownMipViews[0]
-      this.bloomPassDescriptor.timestampWrites = this.stampOpen("bloom")
-      const pBlit = encoder.beginRenderPass(this.bloomPassDescriptor)
-      pBlit.setPipeline(this.bloomBlitPipeline)
-      pBlit.setBindGroup(0, this.bloomBlitBindGroup)
-      pBlit.draw(3)
-      pBlit.end()
-
-      // 2. Downsample chain
-      this.bloomPassDescriptor.timestampWrites = undefined
-      for (let i = 1; i < this.bloomMipCount; i++) {
-        bloomAtt[0].view = this.bloomDownMipViews[i]
-        const p = encoder.beginRenderPass(this.bloomPassDescriptor)
-        p.setPipeline(this.bloomDownsamplePipeline)
-        p.setBindGroup(0, this.bloomDownsampleBindGroups[i - 1])
-        p.draw(3)
-        p.end()
-      }
-
-      // 3. Upsample chain (coarsest to finest; bindGroups[0] is the coarsest step)
-      const upSteps = this.bloomUpsampleBindGroups.length
-      const topIdx = this.bloomMipCount - 2
-      for (let k = 0; k < upSteps; k++) {
-        const levelIdx = topIdx - k // writes bloomUp[levelIdx]
-        bloomAtt[0].view = this.bloomUpMipViews[levelIdx]
-        // The LAST upsample closes the span opened on the blit.
-        this.bloomPassDescriptor.timestampWrites = k === upSteps - 1 ? this.stampClose("bloom") : undefined
-        const p = encoder.beginRenderPass(this.bloomPassDescriptor)
-        p.setPipeline(this.bloomUpsamplePipeline)
-        p.setBindGroup(0, this.bloomUpsampleBindGroups[k])
-        p.draw(3)
-        p.end()
-      }
-    }
-
-    // Composite: HDR + bloom → Filmic tonemap → swapchain.
+    // Composite: HDR + bloom → view transform → swapchain.
     const swapchainView = this.context.getCurrentTexture().createView()
     const compositeAttachment = (this.compositePassDescriptor.colorAttachments as GPURenderPassColorAttachment[])[0]
     compositeAttachment.view = swapchainView
@@ -16827,11 +16836,14 @@ export class Engine {
       }
     }
 
-    const groupResults: GroupDiagnostic[] = []
-    for (const g of groups) {
-      const r = await this.compileAndInstallGroup(inst, g)
-      groupResults.push({ groupId: g.id, diagnostics: r.diagnostics, ok: r.ok })
-    }
+    // ALL GROUPS AT ONCE. Each install touches only its own id — its entry in
+    // styleGroups, its uniform buffer, the draw calls already bound to it — so
+    // the order they land in changes nothing, and each keeps its own staleness
+    // guard (styleGroupGen). Awaiting them in turn made a model's styling the
+    // sum of its compiles; the GPU process runs them side by side.
+    const groupResults: GroupDiagnostic[] = (
+      await Promise.all(groups.map((g) => this.compileAndInstallGroup(inst, g)))
+    ).map((r, i) => ({ groupId: groups[i].id, diagnostics: r.diagnostics, ok: r.ok }))
 
     // Repoints every draw call away from the outgoing installs (among
     // everything else) — only past this line is destroying them safe.
@@ -16846,6 +16858,38 @@ export class Engine {
       unknownMaterials: [...unknownMaterials],
       conflicts: [...conflicts],
     }
+  }
+
+  /**
+   * Compile style groups' pipelines before any model needs them — a scene's
+   * groups while its bundle is still downloading. Installs nothing: the
+   * pipelines land in the shader cache, and applyStyleGroups later finds them
+   * there (or still in flight). A group that does not compile is skipped
+   * silently; its real install reports it.
+   */
+  async prewarmStyleGroups(groups: readonly StyleGroup[]): Promise<void> {
+    if (!this.device) return
+    await Promise.all(
+      groups.map(async (g) => {
+        const renderClass = g.renderClass ?? "auto"
+        const alphaMode = g.alphaMode ?? "opaque"
+        const blend = g.blend ?? "over"
+        let result: ReturnType<typeof compileGraph>
+        try {
+          result = compileGraph(g.graph, { renderClass, alphaMode, blend })
+        } catch {
+          return
+        }
+        if (!result.ok) return
+        const module = this.cachedShaderModule(result.wgsl, `style group: ${g.id} (${renderClass})`)
+        await Promise.all([
+          this.createRenderClassPipeline(renderClass, module, false, true, false, blend),
+          this.createRenderClassPipeline(renderClass, module, false, false, false, blend),
+          renderClass === "hair" ? this.createRenderClassPipeline(renderClass, module, true, true, false, blend) : null,
+          renderClass === "eye" ? this.createRenderClassPipeline(renderClass, module, false, true, true, blend) : null,
+        ]).catch(() => {})
+      }),
+    )
   }
 
   /** Add or replace a single style group by id. `opts` may carry a `previewNode` for the
@@ -17209,9 +17253,35 @@ export class Engine {
     inst.styleGroupGen.set(group.id, generation)
 
     this.device.pushErrorScope("validation")
-    const module = this.device.createShaderModule({ label: `style group: ${group.id} (${renderClass})`, code: result.wgsl })
-    const info = await module.getCompilationInfo()
-    const scopeError = await this.device.popErrorScope()
+    const module = this.cachedShaderModule(result.wgsl, `style group: ${group.id} (${renderClass})`)
+    const scopePromise = this.device.popErrorScope()
+    // EVERY VARIANT AT ONCE, and the module's diagnostics read beside them
+    // rather than first: the compiles run in parallel in the GPU process, and
+    // awaiting each in turn (and the diagnostics before any) made a group cost
+    // the sum of its pipelines instead of the longest.
+    const blend = group.blend ?? "over"
+    // The single-sided twins a draw of this group will ask for (sidedPipeline),
+    // built with their pipelines rather than synchronously at the first draw.
+    const singleSided = inst.drawCalls.some((dc) => !dc.doubleSided && group.materials.includes(dc.materialName))
+    const variant = (overEyes: boolean, depthWrite: boolean, mirrored: boolean) =>
+      this.createRenderClassPipeline(renderClass, module, overEyes, depthWrite, mirrored, blend).then(async (p) => {
+        if (singleSided && !mirrored) await this.buildSidedTwin(p, false)
+        return p
+      })
+    const variants = Promise.all([
+      variant(false, true, false),
+      // The depth-write-off twin: stage transparency draws with it (see
+      // pipelineForDrawCall), and a future OIT path would too.
+      variant(false, false, false),
+      renderClass === "hair" ? variant(true, true, false) : undefined,
+      // Only the eye needs one: every other class culls "none", which a flipped
+      // winding leaves alone.
+      renderClass === "eye" ? variant(false, true, true) : undefined,
+    ])
+    // Handled below either way; this keeps a rejection off the console while
+    // the diagnostics are read.
+    variants.catch(() => {})
+    const [info, scopeError] = await Promise.all([module.getCompilationInfo(), scopePromise])
     const diagnostics = [...result.diagnostics]
     for (const msg of info.messages) {
       if (msg.type !== "error") continue
@@ -17220,6 +17290,7 @@ export class Engine {
     if (diagnostics.some((d) => d.severity === "error") || scopeError) {
       if (scopeError && !diagnostics.some((d) => d.severity === "error"))
         diagnostics.push({ severity: "error", message: `WGSL: ${scopeError.message}` })
+      this.forgetShaderModule(result.wgsl)
       return { ok: false, diagnostics, slotMap: result.slotMap }
     }
 
@@ -17228,16 +17299,7 @@ export class Engine {
     let overEyesPipeline: GPURenderPipeline | undefined
     let mirrorPipeline: GPURenderPipeline | undefined
     try {
-      const blend = group.blend ?? "over"
-      pipeline = await this.createRenderClassPipeline(renderClass, module, false, true, false, blend)
-      // The depth-write-off twin: stage transparency draws with it (see
-      // pipelineForDrawCall), and a future OIT path would too.
-      pipelineNoDepthWrite = await this.createRenderClassPipeline(renderClass, module, false, false, false, blend)
-      if (renderClass === "hair") overEyesPipeline = await this.createRenderClassPipeline(renderClass, module, true, true, false, blend)
-      // Only the eye needs one: every other class culls "none", which a flipped
-      // winding leaves alone.
-      if (renderClass === "eye")
-        mirrorPipeline = await this.createRenderClassPipeline(renderClass, module, false, true, true, blend)
+      ;[pipeline, pipelineNoDepthWrite, overEyesPipeline, mirrorPipeline] = await variants
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
       return { ok: false, diagnostics, slotMap: result.slotMap }
@@ -17479,8 +17541,8 @@ export class Engine {
       fragment: { module, constants, targets: blend === "additive" ? this.sceneTargetsAdditive : this.sceneTargets },
       depthStencil,
     }
-    return this.device.createRenderPipelineAsync(desc).then((pipeline) => {
-      this.pipelineDescs.set(pipeline, desc)
+    return this.cachedRenderPipeline(desc).then((pipeline) => {
+      if (!this.pipelineDescs.has(pipeline)) this.pipelineDescs.set(pipeline, desc)
       return pipeline
     })
   }
@@ -17491,6 +17553,181 @@ export class Engine {
     const pipeline = this.device.createRenderPipeline(desc)
     this.pipelineDescs.set(pipeline, desc)
     return pipeline
+  }
+
+  // ─── The shader cache ─────────────────────────────────────────────
+  //
+  // A compile is most of a second per distinct fragment shader on a cold
+  // browser cache, and the same source used to be compiled once per CALLER: a
+  // graph per model that carried it, the composite per effect install. These
+  // key a module by its WGSL and a pipeline by its module and every descriptor
+  // field but the label, so a second request for the same thing — in flight or
+  // done — is the first one's promise. Bounded, oldest first, because an editor
+  // session compiles a new source per keystroke.
+
+  private static readonly SHADER_CACHE_MAX = 256
+  private static readonly PIPELINE_CACHE_MAX = 512
+
+  private static trimCache<K, V>(cache: Map<K, V>, max: number): void {
+    while (cache.size > max) cache.delete(cache.keys().next().value as K)
+  }
+
+  /** A small stable id per GPU object, for cache keys. */
+  private gpuObjectId(o: object): number {
+    let id = this.gpuObjectIds.get(o)
+    if (id === undefined) {
+      id = this.gpuObjectNext++
+      this.gpuObjectIds.set(o, id)
+    }
+    return id
+  }
+
+  /** One module per WGSL source. */
+  private cachedShaderModule(code: string, label: string): GPUShaderModule {
+    let module = this.shaderModuleCache.get(code)
+    if (module) {
+      this.shaderModuleCache.delete(code)
+    } else {
+      module = this.device.createShaderModule({ label, code })
+    }
+    this.shaderModuleCache.set(code, module)
+    Engine.trimCache(this.shaderModuleCache, Engine.SHADER_CACHE_MAX)
+    return module
+  }
+
+  /** Drop a source whose module did not validate, so a retry reports afresh. */
+  private forgetShaderModule(code: string): void {
+    this.shaderModuleCache.delete(code)
+  }
+
+  /** One bind group layout per entry list. */
+  private cachedBindGroupLayout(desc: GPUBindGroupLayoutDescriptor): GPUBindGroupLayout {
+    const key = JSON.stringify(desc.entries)
+    let layout = this.bindGroupLayoutCache.get(key)
+    if (!layout) {
+      layout = this.device.createBindGroupLayout(desc)
+      this.bindGroupLayoutCache.set(key, layout)
+    }
+    return layout
+  }
+
+  /** One pipeline layout per bind group layout list. */
+  private cachedPipelineLayout(bindGroupLayouts: GPUBindGroupLayout[]): GPUPipelineLayout {
+    const key = bindGroupLayouts.map((l) => this.gpuObjectId(l)).join(",")
+    let layout = this.pipelineLayoutCache.get(key)
+    if (!layout) {
+      layout = this.device.createPipelineLayout({ bindGroupLayouts })
+      this.pipelineLayoutCache.set(key, layout)
+    }
+    return layout
+  }
+
+  private pipelineKey(kind: string, desc: GPURenderPipelineDescriptor | GPUComputePipelineDescriptor): string {
+    return (
+      kind +
+      JSON.stringify(desc, (k, v) =>
+        k === "label" ? undefined : (k === "module" || k === "layout") && v && typeof v === "object" ? `#${this.gpuObjectId(v)}` : v,
+      )
+    )
+  }
+
+  private cachedPipeline<T extends GPURenderPipeline | GPUComputePipeline>(key: string, build: () => Promise<T>): Promise<T> {
+    let p = this.pipelineCache.get(key) as Promise<T> | undefined
+    if (p) {
+      this.pipelineCache.delete(key)
+    } else {
+      p = build().catch((e) => {
+        this.pipelineCache.delete(key)
+        throw e
+      })
+    }
+    this.pipelineCache.set(key, p)
+    Engine.trimCache(this.pipelineCache, Engine.PIPELINE_CACHE_MAX)
+    return p
+  }
+
+  /** createRenderPipelineAsync, once per module + state. */
+  private cachedRenderPipeline(desc: GPURenderPipelineDescriptor): Promise<GPURenderPipeline> {
+    return this.cachedPipeline(this.pipelineKey("render", desc), () => this.device.createRenderPipelineAsync(desc))
+  }
+
+  /** createComputePipelineAsync, once per module + state. */
+  private cachedComputePipeline(desc: GPUComputePipelineDescriptor): Promise<GPUComputePipeline> {
+    return this.cachedPipeline(this.pipelineKey("compute", desc), () => this.device.createComputePipelineAsync(desc))
+  }
+
+  /**
+   * A pipeline init builds: async, in parallel with the rest, and in place by
+   * the time init returns (it awaits every job). Outside init — a pass built
+   * on first use — it is the synchronous build it always was.
+   */
+  private initRenderPipeline(desc: GPURenderPipelineDescriptor, assign: (p: GPURenderPipeline) => void, twins = false): void {
+    if (!this.initPipelineJobs) {
+      const pipeline = this.device.createRenderPipeline(desc)
+      if (twins) this.pipelineDescs.set(pipeline, desc)
+      assign(pipeline)
+      return
+    }
+    this.initPipelineJobs.push(
+      this.cachedRenderPipeline(desc)
+        // A rejected build is rebuilt the old way, which hands back the invalid
+        // pipeline and reports through uncapturederror — a bad init pipeline
+        // was never fatal to init, and is not now.
+        .catch(() => this.device.createRenderPipeline(desc))
+        .then((pipeline) => {
+        assign(pipeline)
+        if (!twins) return
+        this.pipelineDescs.set(pipeline, desc)
+        // The mirror's twin too, but not waited for: only a scene with a
+        // mirror draws it, and it is a cache hit on the module just built.
+        void this.buildSidedTwin(pipeline, true)
+        return this.buildSidedTwin(pipeline, false)
+      }),
+    )
+  }
+
+  /** The compute twin of initRenderPipeline. */
+  private initComputePipeline(desc: GPUComputePipelineDescriptor, assign: (p: GPUComputePipeline) => void): void {
+    if (!this.initPipelineJobs) {
+      assign(this.device.createComputePipeline(desc))
+      return
+    }
+    this.initPipelineJobs.push(
+      this.cachedComputePipeline(desc)
+        .catch(() => this.device.createComputePipeline(desc))
+        .then(assign),
+    )
+  }
+
+  /**
+   * Build a model pipeline's single-sided twin off the draw path (see
+   * sidedPipeline). Resolves once it is in place; never rejects — a twin that
+   * fails leaves the draw on its double-sided pipeline, as before it existed.
+   */
+  private buildSidedTwin(pipeline: GPURenderPipeline, mirrored: boolean): Promise<void> {
+    const desc = this.pipelineDescs.get(pipeline)
+    if (!desc || (desc.primitive?.cullMode ?? "none") !== "none") return Promise.resolve()
+    const cache = mirrored ? this.singleSidedMirror : this.singleSided
+    const pending = mirrored ? this.sidedPendingMirror : this.sidedPending
+    if (cache.has(pipeline) || pending.has(pipeline)) return Promise.resolve()
+    pending.add(pipeline)
+    return this.cachedRenderPipeline({
+      ...desc,
+      label: `${desc.label ?? "pipeline"} (single-sided${mirrored ? ", mirror" : ""})`,
+      primitive: { ...desc.primitive, cullMode: mirrored ? "back" : "front" },
+    }).then(
+      (twin) => {
+        cache.set(pipeline, twin)
+        pending.delete(pipeline)
+        // A bundle recorded meanwhile holds the double-sided stand-in.
+        this.bundlesDirty = true
+      },
+      () => {
+        // Remembered as itself, so the draw stops asking.
+        cache.set(pipeline, pipeline)
+        pending.delete(pipeline)
+      },
+    )
   }
 
   /**
@@ -17510,17 +17747,14 @@ export class Engine {
     if (draw.doubleSided) return pipeline
     const desc = this.pipelineDescs.get(pipeline)
     if (!desc || (desc.primitive?.cullMode ?? "none") !== "none") return pipeline
-    const cache = mirrored ? this.singleSidedMirror : this.singleSided
-    let twin = cache.get(pipeline)
-    if (!twin) {
-      twin = this.device.createRenderPipeline({
-        ...desc,
-        label: `${desc.label ?? "pipeline"} (single-sided${mirrored ? ", mirror" : ""})`,
-        primitive: { ...desc.primitive, cullMode: mirrored ? "back" : "front" },
-      })
-      cache.set(pipeline, twin)
-    }
-    return twin
+    const twin = (mirrored ? this.singleSidedMirror : this.singleSided).get(pipeline)
+    if (twin) return twin
+    // NEVER BUILT HERE SYNCHRONOUSLY: a sync build stalls the GPU process for
+    // the whole compile, mid-frame. The camera's twins are built beside their
+    // pipelines; one asked for first here (a mirror's) is started now and the
+    // draw keeps its double-sided pipeline until it lands.
+    void this.buildSidedTwin(pipeline, mirrored)
+    return pipeline
   }
 
   // Pipeline for a material draw call: its group's compiled pipeline when grouped, else
@@ -17596,6 +17830,9 @@ export class Engine {
         pass.setPipeline(mirrored ? this.outlineMirrorPipeline : this.outlinePipeline)
         pass.setBindGroup(0, mirrored ? this.outlineMirrorPerFrameBindGroup : this.outlinePerFrameBindGroup)
         pass.setBindGroup(2, draw.outline.bindGroup)
+        // Slot 3: the hull's smoothed normals + edge scale. Only the outline
+        // pipeline reads it; the others leave the slot alone.
+        if (inst.outlineVertexBuffer) pass.setVertexBuffer(3, inst.outlineVertexBuffer)
         this.issueDraw(pass, draw, view.args)
         pass.setBindGroup(0, view.perFrame)
         currentPipeline = null
@@ -18390,6 +18627,13 @@ export class Engine {
     )
     this.writeCullHidden(true)
     return true
+  }
+
+  /** Resolves once a model's native look can draw: every pass's pipeline is
+   *  compiled (async, at setModelNativeLook). Until then its dressed materials
+   *  sit out — a host reveals the model after this to avoid that gap. */
+  nativeLookReady(name: string): Promise<void> {
+    return this.nativeLooks?.ready(name) ?? Promise.resolve()
   }
 
   /** The hosts for the game's shaders: the scene pass's and the shadow atlas's,

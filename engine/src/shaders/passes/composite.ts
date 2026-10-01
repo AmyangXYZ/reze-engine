@@ -13,7 +13,7 @@ import { castDistanceApi, CAST_FIELD_DIV } from "./cast-distance"
 import { lyricsApi, lyricsTextApi } from "../lyrics-api"
 import { midiApi } from "../midi-api"
 import { gridReadApi } from "./grid"
-// Composite: HDR scene + bloom pyramid → Filmic tone map → gamma → swapchain.
+// Composite: HDR scene + bloom → view transform (soft / neutral / aces / none) → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
 //
 // The shader is a TEMPLATE: buildCompositeShader() emits either the base pass or
@@ -138,14 +138,6 @@ override APPLY_GAMMA: bool = true;
 // re-premultiply the tonemapped color for output so the premultiplied canvas
 // alphaMode composites the WebGPU surface over the page background correctly.
 @group(0) @binding(4) var maskTex: texture_2d<f32>;
-// Filmic tone curve baked to a WIDTH×1 r16float LUT (bakeFilmicLut on the CPU side).
-// Domain: log2(linear) mapped to [0,13]. Replaces the old array<f32,14> that was indexed
-// by a runtime u32 (a Metal-backend smell — dynamic local-array indexing lowers to a
-// per-invocation copy/switch) and interpolated piecewise-linearly (C0, so segment slope
-// discontinuities showed as Mach bands in smooth skin/shadow gradients). The LUT is a
-// monotone-cubic (Fritsch–Carlson) fit through the same 14 anchors — same values, C1
-// continuity kills the banding — sampled with hardware linear filtering.
-@group(0) @binding(5) var filmicLut: texture_2d<f32>;
 // viewU[0] = (exposure, invGamma, grain amount, grain seed);  viewU[1] = (tint.rgb, intensity)
 // viewU[2] = (background.rgb, mode) — display-space sRGB, composited UNDER the
 //            scene post-tonemap. BASE-layer mode: 0 transparent (DOM shows),
@@ -177,9 +169,6 @@ override APPLY_GAMMA: bool = true;
 //           track the camera radius. Cleared depth (1.0) inverts to the far
 //           plane, so empty sky reads as maximally defocused background.
 @group(0) @binding(9) var<uniform> dofU: array<vec4<f32>, 3>;
-// Blender's AgX, as the 57³ lookup it ships as rather than a reconstruction of
-// it. Sampled in the log-encoded E-Gamut space the cube expects — see agxTransform.
-@group(0) @binding(10) var agxLut: texture_3d<f32>;
 // The scene's own colour grade, as a cube — see _rzStageGrade. sRGB-encoded
 // storage, so what a sample returns is already linear.
 @group(0) @binding(12) var stageGradeLut: texture_3d<f32>;
@@ -215,8 +204,6 @@ override APPLY_GAMMA: bool = true;
 fn rzFieldMerge(top: vec4f, bot: vec4f) -> vec4f {
   return vec4f(top.rgb + bot.rgb * (1.0 - top.a), top.a + bot.a * (1.0 - top.a));
 }
-// Must match FILMIC_LUT_WIDTH in engine.ts (bakeFilmicLut).
-const FILMIC_LUT_W: f32 = 256.0;
 
 fn linearDepth(coord: vec2<i32>) -> f32 {
   let z = textureLoad(depthTex, coord, 0);
@@ -249,79 +236,138 @@ fn sceneSample(coord: vec2<i32>, fullSzI: vec2<i32>, fullSz: vec2f) -> vec4f {
   return vec4f((sHdr + sBloom) * sAlpha, sAlpha);
 }
 
-fn filmic(x: f32) -> f32 {
-  // Reference checkpoints (Blender 3.6 Filmic MHC, sobotka/filmic-blender
-  // look_medium-high-contrast.spi1d): linear 0.18 → ~0.395, linear 1.0 → ~0.83.
-  // NOTE: version-pinned to Blender 3.6 — 4.x defaults to AgX, not Filmic.
-  let t = clamp(log2(max(x, 1e-10)) + 10.0, 0.0, 13.0);
-  // Map t∈[0,13] to the texel-center of baked sample j = t·(W-1)/13.
-  let u = (t * (FILMIC_LUT_W - 1.0) / 13.0 + 0.5) / FILMIC_LUT_W;
-  // textureSampleLevel (explicit LOD, no derivatives) is legal in non-uniform flow.
-  return textureSampleLevel(filmicLut, bloomSamp, vec2f(u, 0.5), 0.0).r;
-}
-
-/** The sRGB display encoding — Blender's "Standard" view transform, which is what
- *  NPR work uses: no film curve at all, so the colours a graph computes are the
- *  colours that land. Not a 2.2 power law; sRGB has a linear toe. */
+/** The sRGB display encoding — "none": no tone curve at all, so the colours a
+ *  graph computes are the colours that land. Not a 2.2 power law; sRGB has a
+ *  linear toe. Every transform below ends in it. */
 fn srgb_encode(x: f32) -> f32 {
   let c = max(x, 0.0);
   return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);
 }
 
 /**
- * AgX, the chain config.ocio states for "AgX Base Rec.1886" on an sRGB display:
- *
- *   scene-linear Rec.709 → 3x3 into FilmLight E-Gamut
- *   → log2 across 25 stops, [-12.47393, +12.5261] → 0..1
- *   → the 57³ cube
- *   → Rec.1886 (pure γ2.4) decoded, then re-encoded as sRGB for the swapchain
- *
- * The last step is not pedantry: Rec.1886 is a pure power law and sRGB has a
- * linear toe, so skipping it lifts the darkest few code values.
- *
- * Blender interpolates the cube tetrahedrally and a GPU sampler is trilinear.
- * The difference is small and confined to saturated gradients; if it ever shows,
- * tetrahedral is a dozen lines here.
+ * "soft" — Aether Gazer's own curve, from its final pass
+ * (Hidden/SimPipeline/Final, decompiled): (1 - e^(-exposure x))^contrast, at the
+ * 2.5 and 1.4 its scenes set, into a linear target the swapchain then encodes.
+ * The game's ACES branch is off in every scene measured.
  */
-fn agxTransform(c: vec3f) -> vec3f {
-  let m = mat3x3<f32>(
-    vec3f(0.55937113, 0.07622071, 0.06552670),
-    vec3f(0.30478326, 0.78797183, 0.16454675),
-    vec3f(0.13584556, 0.13580748, 0.76992653),
-  );
-  let e = m * max(c, vec3f(0.0));
-  // The cube's domain: an unlit pixel would take log2 to -inf, so floor it at
-  // the bottom stop rather than sampling outside the LUT.
-  let t = clamp((log2(max(e, vec3f(1e-10))) + vec3f(12.47393)) / 25.0, vec3f(0.0), vec3f(1.0));
-  // Half-texel inset, so the end stops are the cube's own values and not a blend
-  // with the clamp-to-edge border.
-  let n = 57.0;
-  let uvw = t * ((n - 1.0) / n) + (0.5 / n);
-  let formed = textureSampleLevel(agxLut, bloomSamp, uvw, 0.0).rgb;
-  let linear = pow(max(formed, vec3f(0.0)), vec3f(2.4));
-  return vec3f(srgb_encode(linear.r), srgb_encode(linear.g), srgb_encode(linear.b));
-}
-
-/**
- * Aether Gazer's own curve, from its final pass (Hidden/SimPipeline/Final,
- * decompiled): (1 - e^(-exposure x))^contrast, at the 2.5 and 1.4 its scenes
- * set, into a linear target the swapchain then encodes. The game's ACES branch
- * is off in every scene measured.
- */
-fn agTransform(c: vec3f) -> vec3f {
+fn softTransform(c: vec3f) -> vec3f {
   let t = pow(max(vec3f(1.0) - exp(-2.5 * max(c, vec3f(0.0))), vec3f(0.0)), vec3f(1.4));
   return vec3f(srgb_encode(t.r), srgb_encode(t.g), srgb_encode(t.b));
 }
 
-/** Which display transform, chosen per frame at viewU[6].y (0 filmic, 1 standard, 2 agx, 3 aether-gazer).
- *  A uniform branch rather than a pipeline variant: switching is rare, and both
- *  arms are cheap enough that specialising the pipeline would buy nothing. */
+fn _rzSrgbEncode3(c: vec3f) -> vec3f {
+  return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b));
+}
+
+/**
+ * "neutral" — Unity URP's Neutral tonemapper as the Khronos PBR Neutral
+ * operator, to the published formula: below the start of compression colour
+ * passes through (less a small toe offset); above it the peak rolls off toward
+ * 1 and desaturates in proportion to how much it lost.
+ */
+fn neutralTransform(color: vec3f) -> vec3f {
+  let startCompression = 0.8 - 0.04;
+  let desaturation = 0.15;
+  var c = max(color, vec3f(0.0));
+  let x = min(c.r, min(c.g, c.b));
+  let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+  c = c - vec3f(offset);
+  let peak = max(c.r, max(c.g, c.b));
+  if (peak >= startCompression) {
+    let d = 1.0 - startCompression;
+    let newPeak = 1.0 - d * d / (peak + d - startCompression);
+    c = c * (newPeak / peak);
+    let g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    c = mix(c, vec3f(newPeak), g);
+  }
+  return _rzSrgbEncode3(clamp(c, vec3f(0.0), vec3f(1.0)));
+}
+
+// "aces" — Unity URP's ACES: unity_to_ACES then AcesTonemap, both from the Core
+// RP's Color.hlsl (the branch URP compiles, not full ACES): the RRT's glow and
+// red modifier and global desaturation, the luminance fit of RRT +
+// ODT.Academy.RGBmonitor_100nits_dim, the dim-surround gamma, the ODT
+// desaturation, then AP1 → XYZ → D60→D65 → Rec.709, saturated as URP's
+// ApplyTonemap does. HLSL's row-major matrices are written as rows here.
+fn _rzRows(r0: vec3f, r1: vec3f, r2: vec3f, v: vec3f) -> vec3f {
+  return vec3f(dot(r0, v), dot(r1, v), dot(r2, v));
+}
+fn _rzAp1ToXyz(v: vec3f) -> vec3f {
+  return _rzRows(vec3f(0.6624541811, 0.1340042065, 0.1561876870),
+                 vec3f(0.2722287168, 0.6740817658, 0.0536895174),
+                 vec3f(-0.0055746495, 0.0040607335, 1.0103391003), v);
+}
+fn _rzAp1Luma(v: vec3f) -> f32 {
+  return dot(v, vec3f(0.272229, 0.674082, 0.0536895));
+}
+fn acesTransform(color: vec3f) -> vec3f {
+  // unity_to_ACES: linear sRGB → AP0.
+  var aces = _rzRows(vec3f(0.4397010, 0.3829780, 0.1773350),
+                     vec3f(0.0897923, 0.8134230, 0.0967616),
+                     vec3f(0.0175440, 0.1115440, 0.8707040), max(color, vec3f(0.0)));
+  // Glow module.
+  let mi = min(aces.r, min(aces.g, aces.b));
+  let ma = max(aces.r, max(aces.g, aces.b));
+  let saturation = (max(ma, 1e-4) - max(mi, 1e-4)) / max(ma, 1e-2);
+  let k = max(aces.b * (aces.b - aces.g) + aces.g * (aces.g - aces.r) + aces.r * (aces.r - aces.b), 0.0);
+  let ycIn = (aces.b + aces.g + aces.r + 1.75 * sqrt(k)) / 3.0;
+  let sx = (saturation - 0.4) / 0.2;
+  let st = max(1.0 - abs(sx / 2.0), 0.0);
+  let s = (1.0 + select(-1.0, 1.0, sx >= 0.0) * (1.0 - st * st)) / 2.0;
+  let glowGain = 0.05 * s;
+  let glowMid = 0.08;
+  var glow = glowGain * (glowMid / max(ycIn, 1e-6) - 0.5);
+  if (ycIn <= 2.0 / 3.0 * glowMid) { glow = glowGain; }
+  if (ycIn >= 2.0 * glowMid) { glow = 0.0; }
+  aces = aces * (1.0 + glow);
+  // Red modifier.
+  var hue = 0.0;
+  if (!(aces.r == aces.g && aces.g == aces.b)) {
+    hue = degrees(atan2(sqrt(3.0) * (aces.g - aces.b), 2.0 * aces.r - aces.g - aces.b));
+  }
+  if (hue < 0.0) { hue = hue + 360.0; }
+  var centered = hue;
+  if (centered < -180.0) { centered = centered + 360.0; } else if (centered > 180.0) { centered = centered - 360.0; }
+  var hueWeight = smoothstep(0.0, 1.0, 1.0 - abs(2.0 * centered / 135.0));
+  hueWeight = hueWeight * hueWeight;
+  aces.r = aces.r + hueWeight * saturation * (0.03 - aces.r) * (1.0 - 0.82);
+  // AP0 → AP1 (ACEScg), then the RRT's global desaturation.
+  var cg = max(_rzRows(vec3f(1.4514393161, -0.2365107469, -0.2149285693),
+                       vec3f(-0.0765537734, 1.1762296998, -0.0996759264),
+                       vec3f(0.0083161484, -0.0060324498, 0.9977163014), aces), vec3f(0.0));
+  cg = mix(vec3f(_rzAp1Luma(cg)), cg, vec3f(0.96));
+  // The luminance fit of RRT + ODT.Academy.RGBmonitor_100nits_dim.
+  let post = (cg * (2.785085 * cg + 0.107772)) / (cg * (2.936045 * cg + 0.887122) + 0.806889);
+  // Dark → dim surround: Y^0.9811, in xyY.
+  var xyz = _rzAp1ToXyz(post);
+  let div = max(xyz.x + xyz.y + xyz.z, 1e-4);
+  let xyY = vec3f(xyz.x / div, xyz.y / div, pow(clamp(xyz.y, 0.0, 65504.0), 0.9811));
+  let m = xyY.z / max(xyY.y, 1e-4);
+  xyz = vec3f(xyY.x * m, xyY.z, (1.0 - xyY.x - xyY.y) * m);
+  var lin = _rzRows(vec3f(1.6410233797, -0.3248032942, -0.2364246952),
+                    vec3f(-0.6636628587, 1.6153315917, 0.0167563477),
+                    vec3f(0.0117218943, -0.0082844420, 0.9883948585), xyz);
+  // The ODT's desaturation, then to the display's primaries.
+  lin = mix(vec3f(_rzAp1Luma(lin)), lin, vec3f(0.93));
+  xyz = _rzRows(vec3f(0.98722400, -0.00611327, 0.0159533),
+                vec3f(-0.00759836, 1.00186000, 0.0053302),
+                vec3f(0.00307257, -0.00509595, 1.0816800), _rzAp1ToXyz(lin));
+  let rec709 = _rzRows(vec3f(3.2409699419, -1.5373831776, -0.4986107603),
+                       vec3f(-0.9692436363, 1.8759675015, 0.0415550574),
+                       vec3f(0.0556300797, -0.2039769589, 1.0569715142), xyz);
+  return _rzSrgbEncode3(clamp(rec709, vec3f(0.0), vec3f(1.0)));
+}
+
+/** Which display transform, chosen per frame at viewU[6].y (0 soft, 1 none,
+ *  2 neutral, 3 aces). A uniform branch rather than a pipeline variant: switching
+ *  is rare, and every arm is cheap enough that specialising the pipeline would
+ *  buy nothing. */
 fn viewTransform(c: vec3f) -> vec3f {
   let mode = viewU[6].y;
-  if (mode > 2.5) { return agTransform(c); }
-  if (mode > 1.5) { return agxTransform(c); }
-  if (mode > 0.5) { return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b)); }
-  return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));
+  if (mode > 2.5) { return acesTransform(c); }
+  if (mode > 1.5) { return neutralTransform(c); }
+  if (mode > 0.5) { return _rzSrgbEncode3(c); }
+  return softTransform(c);
 }
 
 fn _rzSrgbDecode(x: f32) -> f32 {

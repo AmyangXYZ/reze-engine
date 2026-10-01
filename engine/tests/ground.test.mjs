@@ -45,7 +45,10 @@ function objectAt(src, from) {
 test("the ground pipeline writes depth", () => {
   const at = engine.indexOf('label: "ground shadow pipeline"')
   assert.ok(at > 0, "ground shadow pipeline not found — it was renamed, and this test went blind with it")
-  const desc = objectAt(engine, engine.lastIndexOf("createRenderPipeline", at))
+  // The descriptor that carries the label. This used to search back for the
+  // nearest createRenderPipeline call, which was the SHADOW pipeline's — it
+  // passed on that one's depthWriteEnabled until the shadow build moved.
+  const desc = objectAt(engine, engine.lastIndexOf("{", at))
   assert.match(
     desc,
     /depthWriteEnabled:\s*true/,

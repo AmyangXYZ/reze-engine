@@ -97,6 +97,8 @@ const OVERRIDE_MODES = ["OVERRIDE1", "OVERRIDE2", "OVERRIDE3"]
 export class NativeLooks {
   readonly host: NativeHost
   private installs = new Map<string, Install>()
+  /** Per model: its passes' pipelines compiling (see install). */
+  private warming = new Map<string, Promise<void>>()
   private skinPipeline: GPUComputePipeline
   private zero: GPUBuffer
   private white: GPUBuffer
@@ -141,6 +143,12 @@ export class NativeLooks {
 
   has(model: string): boolean {
     return this.installs.has(model)
+  }
+
+  /** Resolves once every pass of the model's look has its pipeline — until
+   *  then those draws sit out (NativeHost never compiles at a draw). */
+  ready(model: string): Promise<void> {
+    return this.warming.get(model) ?? Promise.resolve()
   }
 
   /** Is this model's material drawn by its native look? */
@@ -205,7 +213,7 @@ export class NativeLooks {
       const spec = look.materials.find((m) => m.materials.includes(draw.materialName))
       if (spec) dressed.push({ draw, spec })
     }
-    this.installs.set(model.name, {
+    const install: Install = {
       model,
       look,
       views,
@@ -218,7 +226,18 @@ export class NativeLooks {
       skinBind,
       dressed,
       block: {},
-    })
+    }
+    this.installs.set(model.name, install)
+    // Every pass this look will draw, compiled now and side by side — the
+    // shader, its state and the streams are all known here.
+    const drawn = [...OPAQUE_MODES, ...CHARACTER_MODES, ...OVERRIDE_MODES]
+    const jobs: Promise<void>[] = []
+    for (const d of dressed)
+      for (const p of d.spec.passes) if (drawn.includes(p.lightMode)) jobs.push(this.host.warm(p.shader, p.state, this.streams(install, p.shader)))
+    this.warming.set(
+      model.name,
+      Promise.all(jobs).then(() => {}),
+    )
   }
 
   remove(name: string): void {

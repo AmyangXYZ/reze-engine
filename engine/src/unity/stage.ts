@@ -242,6 +242,10 @@ export class NativeStage {
       }),
     )
 
+    // Loaded means drawable: every pass's pipeline is compiled before this
+    // resolves, rather than one at a time in the frames after it.
+    const warming = st.warm(hosts, meshes)
+
     const textures = new Map<string, Tex>()
     await Promise.all(
       pkg.textures.map(async (t) => {
@@ -255,6 +259,7 @@ export class NativeStage {
     )
 
     st.build(meshes, textures, tools.fallback)
+    await warming
     return st
   }
 
@@ -429,8 +434,10 @@ export class NativeStage {
         const samplers: Record<string, GPUSampler | undefined> = {
           ...globalSamplers,
         }
-        // an empty slot reads what the shader declared it defaults to
-        for (const [slot, def] of Object.entries(mat.defaults ?? {})) views[slot] = fallback[def] ?? fallback.white
+        // an empty slot reads what the shader declared it defaults to. A default
+        // with no name ("") is no picture at all — a cube's, usually — and is
+        // left to the host, which stands in by the binding's own kind.
+        for (const [slot, def] of Object.entries(mat.defaults ?? {})) if (def && fallback[def]) views[slot] = fallback[def]
         for (const [slot, id] of [...Object.entries(mat.textures), ...Object.entries(r.textures)]) {
           const t = textures.get(id)
           if (!t) continue
@@ -457,6 +464,35 @@ export class NativeStage {
           }
         }
       })
+  }
+
+  /**
+   * Every pass's pipeline, compiled before the stage reports loaded (see
+   * NativeHost.warm) — side by side, and never at the first draw. Needs only
+   * the meshes' stream layouts, so it runs while the pictures decode. The
+   * passes are the ones build() keeps: casters that cast, and the main modes.
+   */
+  private warm(
+    hosts: { scene: NativeHost; shadow: NativeHost },
+    meshes: Map<string, { info: NativeStageMesh; buffer: GPUBuffer }>,
+  ): Promise<void> {
+    const jobs: Promise<void>[] = []
+    const mats = new Map(this.pkg.materials.map((m) => [m.id, m]))
+    for (const r of this.pkg.renderers) {
+      const mesh = meshes.get(r.mesh)
+      if (!mesh) continue
+      r.materials.forEach((mid, sub) => {
+        const mat = mid ? mats.get(mid) : undefined
+        if (!mat || sub >= mesh.info.submeshes.length) return
+        for (const pass of mat.passes) {
+          const caster = pass.lightMode === "SHADOWCASTER"
+          if (caster ? !r.castShadows : !MAIN_MODES.includes(pass.lightMode)) continue
+          const host = caster ? hosts.shadow : hosts.scene
+          jobs.push(host.warm(pass.shader, pass.state, this.streams(host, { mesh, pass } as Item)))
+        }
+      })
+    }
+    return Promise.all(jobs).then(() => {})
   }
 
   private streams(host: NativeHost, it: Item): NativeStream[] {

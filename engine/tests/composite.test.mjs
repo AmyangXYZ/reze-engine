@@ -42,7 +42,6 @@ const PLACEHOLDER = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g
 // The cast's shape, declared by CAST_API in every module that hosts an effect.
 const ALLOWED = new Set([
   "APPLY_GAMMA",
-  "FILMIC_LUT_W",
   "RZ_MAX_ANCHORS",
   "RZ_TRAIL_SAMPLES",
   "RZ_GRID_SIZE",

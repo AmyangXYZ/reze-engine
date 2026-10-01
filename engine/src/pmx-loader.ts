@@ -36,6 +36,9 @@ export class PmxLoader {
   private inverseBindMatrices: Float32Array | null = null
   private joints0: Uint16Array | null = null
   private weights0: Uint8Array | null = null
+  /** PMX per-vertex edge scale — the outline's width multiplier, as the
+   *  game's outline takes vertex colour alpha. */
+  private edgeScales: Float32Array | null = null
   private morphs: Morph[] = []
   private vertexCount: number = 0
   private rigidbodies: Rigidbody[] = []
@@ -150,6 +153,7 @@ export class PmxLoader {
     // Prepare skinning arrays (4 influences per vertex)
     const joints = new Uint16Array(count * 4)
     const weights = new Uint8Array(count * 4) // UNORM8, will be normalized to 255
+    const edgeScales = new Float32Array(count)
 
     for (let i = 0; i < count; i++) {
       const px = this.getFloat32()
@@ -238,11 +242,12 @@ export class PmxLoader {
       } else {
         throw new Error(`Invalid bone weight type: ${type}`)
       }
-      this.offset += 4 // edge scale
+      edgeScales[i] = this.getFloat32()
     }
 
     this.joints0 = joints
     this.weights0 = weights
+    this.edgeScales = edgeScales
     return { positions, normals, uvs }
   }
 
@@ -1136,7 +1141,8 @@ export class PmxLoader {
       morphing,
       this.rigidbodies,
       this.joints,
-      this.warnings
+      this.warnings,
+      this.edgeScales
     )
   }
 

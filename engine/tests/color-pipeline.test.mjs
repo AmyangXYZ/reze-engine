@@ -160,82 +160,39 @@ test("zero lights is exactly zero, so the layer costs nothing until asked for", 
   assert.equal(lit + 0, lit, "adding zero is exact in floating point")
 })
 
-// ── The REAL transform, measured off the engine's own cube ───────────────────
+// ── The REAL transforms, read off the composite's own source ─────────────────
 //
-// The approximation above is fine for order-of-magnitude checks. This is not an
-// approximation: it decodes the shipped AgX LUT and runs the same chain the
-// shader does, so any constant mapping authored values onto the screen can be
-// DERIVED rather than borrowed. Borrowing is what put a field exposure at 3.0
-// on the strength of "Snow uses 3.0" — a particle intensity under a different
-// curve — and flattened every falloff in the frame.
+// The approximation above is fine for order-of-magnitude checks. These are not
+// approximations: the default transform's constants are read from composite.ts,
+// so a constant mapping authored values onto the screen can be DERIVED rather
+// than borrowed.
 
-import { gunzipSync } from "node:zlib"
-import { AGX_LUT_GZ, AGX_LUT_SIZE, AGX_INSET, AGX_MIN_EV } from "../dist/shaders/agx-lut.js"
-
-const lut = gunzipSync(Buffer.from(AGX_LUT_GZ, "base64"))
-const N = AGX_LUT_SIZE
-const agxTexel = (x, y, z) => {
-  const v = lut.readUInt32LE(((z * N + y) * N + x) * 4)
-  return [(v & 1023) / 1023, ((v >> 10) & 1023) / 1023, ((v >> 20) & 1023) / 1023]
-}
-function agxSample(uvw) {
-  const c = uvw.map((u) => Math.min(Math.max(u * N - 0.5, 0), N - 1))
-  const i0 = c.map(Math.floor)
-  const f = c.map((x, k) => x - i0[k])
-  const i1 = i0.map((x) => Math.min(x + 1, N - 1))
-  let out = [0, 0, 0]
-  for (let dz = 0; dz < 2; dz++)
-    for (let dy = 0; dy < 2; dy++)
-      for (let dx = 0; dx < 2; dx++) {
-        const w = (dx ? f[0] : 1 - f[0]) * (dy ? f[1] : 1 - f[1]) * (dz ? f[2] : 1 - f[2])
-        const t = agxTexel(dx ? i1[0] : i0[0], dy ? i1[1] : i0[1], dz ? i1[2] : i0[2])
-        out = out.map((v, k) => v + t[k] * w)
-      }
-  return out
-}
+const compositeSrc = readFileSync(new URL("../src/shaders/passes/composite.ts", import.meta.url), "utf8")
 const srgbEncode = (x) => (x <= 0.0031308 ? Math.max(x, 0) * 12.92 : 1.055 * Math.pow(Math.max(x, 0), 1 / 2.4) - 0.055)
-function agx(rgb) {
-  const m = AGX_INSET
-  const e = [
-    m[0] * rgb[0] + m[1] * rgb[1] + m[2] * rgb[2],
-    m[3] * rgb[0] + m[4] * rgb[1] + m[5] * rgb[2],
-    m[6] * rgb[0] + m[7] * rgb[1] + m[8] * rgb[2],
-  ].map((v) => Math.max(v, 0))
-  const t = e.map((v) => Math.min(Math.max((Math.log2(Math.max(v, 1e-10)) - AGX_MIN_EV) / 25.0, 0), 1))
-  return agxSample(t.map((v) => v * ((N - 1) / N) + 0.5 / N)).map((v) => srgbEncode(Math.pow(Math.max(v, 0), 2.4)))
-}
-const saturation = (c) => {
-  const mx = Math.max(...c)
-  return mx <= 0 ? 0 : (mx - Math.min(...c)) / mx
-}
 
-test("the shipped AgX lifts midtones — it does NOT land 1.0 at mid grey", () => {
-  // The belief that steered a reverted attempt was that an authored 1.0 arrives
-  // as grey and needs a large boost. Measured, it arrives at 0.77 — light, not
-  // grey — so the boost solved a problem of the wrong size.
-  const at = (x) => agx([x, x, x])[0]
-  assert.ok(Math.abs(at(0.5) - 0.66) < 0.02, `linear 0.5 -> ${at(0.5).toFixed(3)}`)
-  assert.ok(Math.abs(at(1.0) - 0.77) < 0.02, `linear 1.0 -> ${at(1.0).toFixed(3)}`)
-  assert.ok(at(0.5) > 0.5, "midtones are LIFTED, not crushed")
-  assert.ok(at(1.0) < 1.0, "and the top is compressed, so nothing reaches pure white")
+test("the view transforms are soft, neutral, aces and none — soft first, the default", () => {
+  const dispatch = compositeSrc.slice(compositeSrc.indexOf("fn viewTransform("))
+  for (const fn of ["acesTransform", "neutralTransform", "softTransform"]) assert.ok(dispatch.includes(`return ${fn}(c)`), fn)
+  const engine = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
+  assert.match(engine, /export type ViewTransformName = "soft" \| "neutral" \| "aces" \| "none"/)
+  assert.match(engine, /transform: "soft",\n\}/, "soft is the default")
+  assert.doesNotMatch(compositeSrc, /filmicLut|agxLut/, "no Blender LUTs left")
 })
 
-test("AgX desaturates saturated colour — why field effects stay in display space", () => {
-  // THE measurement behind that decision. Note Fall's blue, at magnitude 1 with
-  // no clipping anywhere: authored it is vivid, through the transform it is
-  // washed. A filmic curve does this at EVERY magnitude, so an effect authored
-  // as a display colour cannot keep its hue by being made dimmer or brighter.
-  //
-  // Field effects therefore composite in display space and land exactly as
-  // authored. To be LIGHT in the scene an effect declares lights (lightEmit),
-  // which illuminates the cast rather than merely glowing — a better answer
-  // than bloom, and one that costs the author no new flag.
-  const glow = [0.14, 0.42, 1.0]
-  assert.ok(saturation(glow) > 0.8, "authored: a vivid blue")
-  assert.ok(saturation(agx(glow)) < 0.45, `through AgX: washed (${saturation(agx(glow)).toFixed(2)})`)
-  // And dimming does not rescue it — the hue loss is the transform's, not a
-  // matter of exposure.
-  assert.ok(saturation(agx(glow.map((c) => c * 0.5))) < 0.6, "still washed at half the magnitude")
+test("soft is the game's curve: (1 - e^(-2.5x))^1.4, then sRGB", () => {
+  const body = compositeSrc.slice(compositeSrc.indexOf("fn softTransform("))
+  assert.match(body, /exp\(-2\.5 \* max\(c, vec3f\(0\.0\)\)\)/)
+  assert.match(body, /vec3f\(1\.4\)/)
+  const soft = (x) => srgbEncode(Math.pow(1 - Math.exp(-2.5 * x), 1.4))
+  // Mid grey lands light, white lands just short of the top: the game's look.
+  assert.ok(Math.abs(soft(0.18) - 0.529) < 0.005, `linear 0.18 -> ${soft(0.18).toFixed(3)}`)
+  assert.ok(soft(1.0) > 0.94 && soft(1.0) < 0.96, `linear 1.0 -> ${soft(1.0).toFixed(3)}`)
+})
+
+test("neutral passes colour through below its knee — Khronos PBR Neutral's start 0.76", () => {
+  const body = compositeSrc.slice(compositeSrc.indexOf("fn neutralTransform("))
+  assert.match(body, /startCompression = 0\.8 - 0\.04/)
+  assert.match(body, /desaturation = 0\.15/)
 })
 
 test("the world and the backdrop are separate seats", () => {

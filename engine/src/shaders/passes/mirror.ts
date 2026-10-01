@@ -218,20 +218,52 @@ ${sceneIdPadWgsl("out")}
 }
 
 /**
- * The mirror in the SHADOW pass — the frame throwing shade on the floor.
- *
- * Its own shader because the mirror has no vertex buffer and no skeleton: the
- * quad is six generated vertices and the model matrix is the whole of it, while
- * the ordinary shadow shader is built for skinned geometry with an alpha test.
- *
- * Depth only, no fragment stage. The pane is opaque across its whole rectangle
- * — glass included, because this glass is not see-through — so there is nothing
- * to alpha-test and nothing to colour.
- *
- * The cascade index arrives in its own tiny uniform rather than as a dynamic
- * offset: the cascade matrices sit 64 bytes apart in one array, and a dynamic
- * uniform offset has to be 256-aligned.
+ * Downsample for the reflection's COLOUR chain, one pass per mip level: the
+ * Jimenez/COD 13-tap dual box — five weighted 2x2 averages, which rejects the
+ * nyquist ringing a plain box would leave in a blurred reflection.
  */
+export const MIRROR_DOWNSAMPLE_WGSL = /* wgsl */ `
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let x = f32((vi & 1u) << 2u) - 1.0;
+  let y = f32((vi & 2u) << 1u) - 1.0;
+  return vec4f(x, y, 0.0, 1.0);
+}
+
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSamp: sampler;
+
+fn samp(uv: vec2f, off: vec2f) -> vec3f {
+  return textureSampleLevel(srcTex, srcSamp, uv + off, 0.0).rgb;
+}
+
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let srcDims = vec2f(textureDimensions(srcTex));
+  let t = 1.0 / srcDims;
+  // fragCoord.xy reports pixel centers (e.g. 0.5,0.5 for first pixel) — divide by dst dims directly.
+  let dstDims = srcDims * 0.5;
+  let uv = p.xy / max(dstDims, vec2f(1.0));
+  let A = samp(uv, t * vec2f(-2.0, -2.0));
+  let B = samp(uv, t * vec2f( 0.0, -2.0));
+  let C = samp(uv, t * vec2f( 2.0, -2.0));
+  let D = samp(uv, t * vec2f(-1.0, -1.0));
+  let E = samp(uv, t * vec2f( 1.0, -1.0));
+  let F = samp(uv, t * vec2f(-2.0,  0.0));
+  let G = samp(uv, t * vec2f( 0.0,  0.0));
+  let H = samp(uv, t * vec2f( 2.0,  0.0));
+  let I = samp(uv, t * vec2f(-1.0,  1.0));
+  let J = samp(uv, t * vec2f( 1.0,  1.0));
+  let K = samp(uv, t * vec2f(-2.0,  2.0));
+  let L = samp(uv, t * vec2f( 0.0,  2.0));
+  let M = samp(uv, t * vec2f( 2.0,  2.0));
+  var o = (D + E + I + J) * (0.5 / 4.0);
+  o = o + (A + B + G + F) * (0.125 / 4.0);
+  o = o + (B + C + H + G) * (0.125 / 4.0);
+  o = o + (F + G + L + K) * (0.125 / 4.0);
+  o = o + (G + H + M + L) * (0.125 / 4.0);
+  return vec4f(o, 1.0);
+}
+`
+
 /**
  * Downsample for the reflection's COVERAGE chain.
  *
@@ -263,6 +295,21 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, };
 }
 `
 
+/**
+ * The mirror in the SHADOW pass — the frame throwing shade on the floor.
+ *
+ * Its own shader because the mirror has no vertex buffer and no skeleton: the
+ * quad is six generated vertices and the model matrix is the whole of it, while
+ * the ordinary shadow shader is built for skinned geometry with an alpha test.
+ *
+ * Depth only, no fragment stage. The pane is opaque across its whole rectangle
+ * — glass included, because this glass is not see-through — so there is nothing
+ * to alpha-test and nothing to colour.
+ *
+ * The cascade index arrives in its own tiny uniform rather than as a dynamic
+ * offset: the cascade matrices sit 64 bytes apart in one array, and a dynamic
+ * uniform offset has to be 256-aligned.
+ */
 export function mirrorShadowWgsl(cascades: number): string {
   return /* wgsl */ `
 struct LightVP { viewProj: array<mat4x4f, ${cascades}>, };

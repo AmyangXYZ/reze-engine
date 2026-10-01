@@ -173,6 +173,8 @@ export type NativeDraw = {
 export class NativeHost {
   private prepared = new Map<string, Prepared>()
   private pipelines = new Map<string, { pipeline: GPURenderPipeline; stencilRef: number } | null>()
+  /** Pipelines being compiled (see warm). */
+  private pending = new Map<string, Promise<void>>()
   private draws = new Map<string, DrawCache>()
   private shared = new Map<string, Block>()
   private frame = 0
@@ -281,9 +283,58 @@ export class NativeHost {
       : []
   }
 
+  private pipelineKey(p: Prepared, state: PassState, streams: NativeStream[]): string {
+    return `${p.shader.name}|${JSON.stringify(state)}|${streams.map((s) => `${s.format}/${s.stride}`).join(",")}`
+  }
+
+  /**
+   * Compile a draw's pipeline ahead of the draw — what a stage or a look calls
+   * for every pass it will draw, the moment it knows the shader, the state and
+   * the streams. Async: a synchronous build holds the GPU process for the
+   * whole compile, which was a one-to-two-second frozen frame at the first
+   * draw of each new shader. Resolves when the pipeline is ready or has
+   * failed (into `errors`); never rejects.
+   */
+  warm(shader: string, state: PassState, streams: NativeStream[]): Promise<void> {
+    const p = this.prepared.get(shader)
+    if (!p) return Promise.resolve()
+    const key = this.pipelineKey(p, state, streams)
+    if (this.pipelines.has(key)) return Promise.resolve()
+    let job = this.pending.get(key)
+    if (job) return job
+    let built: { desc: GPURenderPipelineDescriptor; stencilRef: number }
+    try {
+      built = this.describe(p, state, streams)
+    } catch (e) {
+      this.errors.push(`pipeline ${p.shader.name}: ${(e as Error).message}`)
+      this.pipelines.set(key, null)
+      return Promise.resolve()
+    }
+    job = this.device.createRenderPipelineAsync(built.desc).then(
+      (pipeline) => {
+        this.pipelines.set(key, { pipeline, stencilRef: built.stencilRef })
+        this.pending.delete(key)
+      },
+      (e) => {
+        this.errors.push(`pipeline ${p.shader.name}: ${(e as Error).message}`)
+        this.pipelines.set(key, null)
+        this.pending.delete(key)
+      },
+    )
+    this.pending.set(key, job)
+    return job
+  }
+
+  /** The draw's pipeline if it is ready. Never built here: one that is not
+   *  ready is started and the draw sits this frame out. */
   private pipeline(p: Prepared, state: PassState, streams: NativeStream[]) {
-    const key = `${p.shader.name}|${JSON.stringify(state)}|${streams.map((s) => s.format).join(",")}`
-    if (this.pipelines.has(key)) return this.pipelines.get(key)!
+    const ready = this.pipelines.get(this.pipelineKey(p, state, streams))
+    if (ready !== undefined) return ready
+    void this.warm(p.shader.name, state, streams)
+    return null
+  }
+
+  private describe(p: Prepared, state: PassState, streams: NativeStream[]): { desc: GPURenderPipelineDescriptor; stencilRef: number } {
     const t = this.targets
     const stencil = stencilState(state)
     const blend = blendState(state)
@@ -317,10 +368,8 @@ export class NativeHost {
         ]
     if (t.colorFormats[2]) targets.push({ format: t.colorFormats[2], writeMask: 0 })
     const offset = state.Offset
-    let result: { pipeline: GPURenderPipeline; stencilRef: number } | null
-    try {
-      result = {
-        pipeline: this.device.createRenderPipeline({
+    return {
+      desc: {
           label: `${p.shader.name} pipeline`,
           layout: p.layout,
           vertex: {
@@ -367,15 +416,9 @@ export class NativeHost {
               : {}),
           },
           multisample: { count: t.sampleCount },
-        }),
-        stencilRef: stencil?.ref ?? 0,
-      }
-    } catch (e) {
-      this.errors.push(`pipeline ${p.shader.name}: ${(e as Error).message}`)
-      result = null
+      },
+      stencilRef: stencil?.ref ?? 0,
     }
-    this.pipelines.set(key, result)
-    return result
   }
 
   private lookup(name: string, sources: ValueSource[]): NativeValue | undefined {

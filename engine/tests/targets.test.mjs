@@ -548,8 +548,6 @@ test("every render target handleResize replaces is released first", () => {
     "hdrResolveTexture",
     "multisampleMaskTexture",
     "maskResolveTexture",
-    "bloomDownTexture",
-    "bloomUpTexture",
     "depthTexture",
   ]) {
     const assign = body.indexOf(`this.${name} = this.device.createTexture(`)
@@ -559,5 +557,14 @@ test("every render target handleResize replaces is released first", () => {
       new RegExp(`this\\.${name}\\?\\.destroy\\(\\)`),
       `${name} is replaced without releasing the one it replaces`,
     )
+  }
+  // The bloom chain is rebuilt by buildBloomTargets, which handleResize calls;
+  // it releases both chains before making new ones.
+  assert.match(body, /this\.buildBloomTargets\(\)/, "handleResize rebuilds the bloom chain")
+  const build = engine.slice(engine.indexOf("private buildBloomTargets()"))
+  for (const name of ["bloomDownTexture", "bloomUpTexture"]) {
+    const assign = build.indexOf(`this.${name} = make(`)
+    assert.ok(assign > 0, `${name} is not allocated in buildBloomTargets`)
+    assert.match(build.slice(0, assign), new RegExp(`this\\.${name}\\?\\.destroy\\(\\)`), `${name} is replaced without releasing the one it replaces`)
   }
 })

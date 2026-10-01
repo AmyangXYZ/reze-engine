@@ -73,14 +73,39 @@ struct VertexOutput {
   /** The triangle's own threshold, flat — see the material VertexOutput. The
    *  hull traces the body's faces, so it has to lose the same ones. */
   @location(2) @interpolate(flat) faceT: f32,
+  /** How much of a pixel-wide line this one really is (1 = all of it): a line
+   *  held at the minimum width fades by what it was short. */
+  @location(3) coverage: f32,
 };
+
+/**
+ * Half the frame height (engine units, at the subject) below which a line keeps
+ * its constant screen width; wider than that it thins as a world-size line.
+ * 12.5 = a frame 25 units tall — a full figure (an MMD model is ~20) with
+ * room around her.
+ *
+ * Not the game's own break (w = 1 game unit = 8 engine units). The game's
+ * near width is ~3× MMD's 2·edgeSize px; its world-size line comes down to
+ * MMD's width only at a full-figure framing, so that is where the break goes:
+ * close-ups and full figures keep today's width, and past that the game's rule
+ * holds — NDC offset ∝ 1/w, scaled by the zoom as its projection._m11 scales
+ * it. At the game's 8 the demo's own camera (33 units) drew a quarter of
+ * today's width, which put every line on the faded minimum.
+ */
+const RZ_OUTLINE_FULL_FIGURE = 12.5;
+/** The thinnest a line is drawn, in pixels at 1080p (and never under this many
+ *  device pixels). A line due to be thinner is drawn this wide and faded by
+ *  the shortfall, so far lines thin out without aliasing into dashes. */
+const RZ_OUTLINE_MIN_PX = 1.5;
 
 @vertex fn vs(
   @location(0) position: vec3f,
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
   @location(3) joints0: vec4<u32>,
-  @location(4) weights0: vec4<f32>
+  @location(4) weights0: vec4<f32>,
+  /** xyz: the smoothed rest normal (outline-normals.ts), w: PMX edge scale. */
+  @location(5) outlineNormal: vec4f
 ) -> VertexOutput {
   var output: VertexOutput;
   let pos4 = vec4f(position, 1.0);
@@ -97,30 +122,58 @@ struct VertexOutput {
     let m = skinMats[j];
     skinnedPos += (m * pos4) * w;
     let r3 = mat3x3f(m[0].xyz, m[1].xyz, m[2].xyz);
-    skinnedNrm += (r3 * normal) * w;
+    skinnedNrm += (r3 * outlineNormal.xyz) * w;
   }
   let worldPos = skinnedPos.xyz;
   let worldNormal = normalize(skinnedNrm);
 
   let clipPos = camera.projection * camera.view * vec4f(worldPos, 1.0);
 
-  // babylon-mmd: screenNormal = normalize((view * worldNormal).xy)
+  // The push direction is the view-space normal's XY, NOT renormalized — the
+  // game's: full length at the silhouette, where the normal lies across the
+  // view, and shrinking on surfaces turned toward the camera, so creases
+  // facing her draw finer than the rim. Skinned exactly as the colour pass
+  // skins the normal, from the smoothed rest normal, so every vertex sharing a
+  // position pushes the same way and the hull stays closed over hard edges
+  // and UV seams.
   let viewNormal = (camera.view * vec4f(worldNormal, 0.0)).xyz;
-  let snLen = length(viewNormal.xy);
-  let screenNormal = select(vec2f(0.0, 0.0), viewNormal.xy / snLen, snLen > 1e-5);
 
   // Reference-height normalization (babylon-mmd ships this variant commented
-  // out as \`renderHeight = 1080\`): thickness is a constant FRACTION of the
-  // frame — 2·edgeSize px at 1080p — so retina DPR and 4K export don't thin
-  // the rims to sub-pixel. Width follows the projection aspect.
+  // out as \`renderHeight = 1080\`): the near width is a constant FRACTION of
+  // the frame — 2·edgeSize px at 1080p — so retina DPR and 4K export don't
+  // thin the rims to sub-pixel. Width follows the projection aspect.
   // projection[1][1]/projection[0][0] = width/height for a symmetric frustum.
   let aspect = camera.projection[1][1] / camera.projection[0][0];
-  let viewport = vec2f(1080.0 * aspect, 1080.0);
+  let refViewport = vec2f(1080.0 * aspect, 1080.0);
+  let deviceViewport = vec2f(camera.viewportHeight * aspect, camera.viewportHeight);
 
-  // NDC offset = edgeSize · 4/viewport, ×w so the perspective divide cancels:
-  // constant screen thickness at any distance (babylon-mmd parity).
-  let offset = screenNormal * (material.edgeSize * 4.0 / viewport) * clipPos.w;
-  output.position = vec4f(clipPos.xy + offset, clipPos.z, clipPos.w);
+  // The game's width (Character/Debug.shader, pass "Outline"): the clip offset
+  // is the near offset × min(w, break depth). Up close the ×w cancels the
+  // perspective divide — constant screen width; past the break it stops
+  // growing, so the NDC offset falls as 1/w like a line of fixed world width.
+  // The break is the depth at which the frame is a full figure tall, so a
+  // zoomed lens moves it out (see RZ_OUTLINE_FULL_FIGURE). Under an
+  // orthographic camera w is 1 and the same min() makes the line world-size
+  // once the frame is taller than a figure. The PMX per-vertex edge scale
+  // multiplies it all, as vertex colour alpha does in the game.
+  let w = max(clipPos.w, 1e-4);
+  let breakDepth = RZ_OUTLINE_FULL_FIGURE * camera.projection[1][1];
+  let nearNdc = viewNormal.xy * (material.edgeSize * outlineNormal.w * 4.0 / refViewport);
+  var ndc = nearNdc * (min(w, breakDepth) / w);
+
+  // Antialiased minimum (the game's _OutlineAntialias): held at the minimum
+  // width and faded by the shortfall, never thinner. The game fades by
+  // sqrt(coverage.x · coverage.y), per axis; for one width that is the ratio
+  // itself.
+  let px = length(ndc * deviceViewport * 0.5);
+  let minPx = RZ_OUTLINE_MIN_PX * max(1.0, camera.viewportHeight / 1080.0);
+  var coverage = 1.0;
+  if (px < minPx) {
+    coverage = px / minPx;
+    ndc = select(vec2f(0.0), ndc * (minPx / px), px > 1e-6);
+  }
+  output.coverage = coverage;
+  output.position = vec4f(clipPos.xy + ndc * w, clipPos.z, clipPos.w);
   output.uv = uv;
   output.restPos = position;
   output.faceT = rz_dissolve_threshold(position);
@@ -155,7 +208,11 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
     discard;
   }
   var out: FSOut;
-  out.color = vec4f(material.edgeColor.rgb, material.edgeColor.a * texA);
+  // Blended, not alpha-to-coverage: this pass already blends (the texture
+  // alpha above), it is drawn right after the surface it traces so what lies
+  // under a faded line is already there, and 4× MSAA would quantize a fade to
+  // four steps.
+  out.color = vec4f(material.edgeColor.rgb, material.edgeColor.a * texA * input.coverage);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${sceneIdPadWgsl("out")}  return out;
 }

@@ -14,6 +14,7 @@ export {
   type BloomOptions,
   type DepthOfFieldOptions,
   type ViewTransformOptions,
+  type ViewTransformName,
   type LoadModelFromFilesOptions,
   type MaterialPreset,
   type MaterialPresetMap,

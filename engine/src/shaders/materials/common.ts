@@ -195,8 +195,10 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 //             layers, as the game lights them;
 //   ambient.x 1 while it has an ambient of its own (Engine.setModelAmbient),
 //             0 for the world's;
-//   sh        that ambient's irradiance, folded as the world's (ibl.ts).
-struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9> }
+//   sh        that ambient's irradiance, folded as the world's (ibl.ts);
+//   fill.rgb  its fill (Engine.setModelFill), added after its graph times its
+//             surface colour — zero for a model that has none.
+struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f }
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
 
 /** The light arriving at a surface of this object facing n: its own ambient

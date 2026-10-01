@@ -78,10 +78,13 @@ export function tangentsFor(verts: Float32Array, indices: Uint32Array | Uint16Ar
     const p = (v: number, k: number) => verts[v * 8 + k]
     const e1 = [p(b, 0) - p(a, 0), p(b, 1) - p(a, 1), p(b, 2) - p(a, 2)]
     const e2 = [p(c, 0) - p(a, 0), p(c, 1) - p(a, 1), p(c, 2) - p(a, 2)]
+    // v measured upward, as Unity builds tangent space: a PMX uv runs v down,
+    // and taken as it is the bitangent — the handedness in w — comes out
+    // reversed, which a game normal map reads as its green channel inverted.
     const du1 = p(b, 6) - p(a, 6),
-      dv1 = p(b, 7) - p(a, 7)
+      dv1 = p(a, 7) - p(b, 7)
     const du2 = p(c, 6) - p(a, 6),
-      dv2 = p(c, 7) - p(a, 7)
+      dv2 = p(a, 7) - p(c, 7)
     const det = du1 * dv2 - du2 * dv1
     if (Math.abs(det) < 1e-12) continue
     const r = 1 / det
