@@ -348,6 +348,215 @@ fn rzWorldSpecularLod(dir: vec3f, roughness: f32, unity: f32) -> vec3f {
   return textureSampleLevel(worldEnvTexture, diffuseSampler, vec2f(u, v), lod).rgb * light.ambientColor.w;
 }
 
+// ── Aether Gazer's character shading, step by step ──
+// From the decompiled ForwardBase pass of SimPipeline/Character/Debug. Its
+// spaces are the game's: a view space looking down -Z (Unity's camera space),
+// which the engine's +Z-forward view is turned into by negating z.
+
+/** CharacterEffect's key light, in sim_TowardMatrix's frame: the camera's
+ *  backward direction flattened to the ground (d), up, and up × d. The
+ *  direction points toward the light. */
+fn ag_key_light(inclination: f32, azimuth: f32) -> vec3f {
+  let f = vec3f(camera.view[0].z, camera.view[1].z, camera.view[2].z);
+  let flat = vec3f(-f.x, 0.0, -f.z);
+  let len = length(flat);
+  let d = select(vec3f(0.0, 0.0, 1.0), flat / max(len, 1e-5), len > 1e-5);
+  let incl = radians(inclination);
+  let az = radians(-azimuth);
+  let c = cos(incl);
+  let k = vec3f(sin(az) * -c, sin(incl), cos(az) * c);
+  return normalize(vec3f(d.z, 0.0, -d.x) * k.x + vec3f(0.0, 1.0, 0.0) * k.y + d * k.z);
+}
+
+/** u on the shadow ramp: N·L, darkened by the mask's occlusion
+ *  (1 - min((1 - ao) * scale, 1)), and min'd with the sun's cast shadow. */
+fn ag_shade_term(n: vec3f, l: vec3f, ao: f32, aoScale: f32, receive: f32, wp: vec3f) -> f32 {
+  let ndl = max(dot(n, l), 0.0);
+  var t = (1.0 - min((1.0 - ao) * aoScale, 1.0)) * ndl;
+  if (receive > 0.5) { t = min(t, rzSunOcclusion(wp, n)); }
+  return t;
+}
+
+/** A ramp image's uv, kept off the image's edge texels so a repeating sampler
+ *  does not blend the far end in. The row is Unity's v, which runs up from the
+ *  image's bottom row; the image is uploaded top row first. */
+fn ag_ramp_uv(value: f32, row: f32) -> vec3f {
+  return vec3f(clamp(value, 0.002, 0.998), clamp(1.0 - row, 0.002, 0.998), 0.0);
+}
+
+/** The view-space reflection, as the game builds it: the view ray mirrored on
+ *  the normal, into camera space, halved and pushed half a unit toward the
+ *  eye, normalised. xy*0.5+0.5 is the sphere image's uv (xyz here, z unused),
+ *  and z how much it faces the eye (w). */
+fn ag_view_reflection(n: vec3f, v: vec3f) -> vec4f {
+  let r = reflect(-v, n);
+  let rv = vec3f(
+    camera.view[0].x * r.x + camera.view[1].x * r.y + camera.view[2].x * r.z,
+    camera.view[0].y * r.x + camera.view[1].y * r.y + camera.view[2].y * r.z,
+    -(camera.view[0].z * r.x + camera.view[1].z * r.y + camera.view[2].z * r.z),
+  );
+  let m = normalize(rv * 0.5 + vec3f(0.0, 0.0, 0.5));
+  // A sphere image is addressed as Unity reads it, v up: flipped for the
+  // top-row-first upload.
+  return vec4f(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5, 0.0, m.z);
+}
+
+/** The matcap's lift: max(mask * (matcap * strength - 1) + 1, 1). */
+fn ag_matcap(color: vec3f, matcap: vec3f, strength: f32, mask: f32) -> vec3f {
+  return color * max(mask * (matcap * strength - vec3f(1.0)) + vec3f(1.0), vec3f(1.0));
+}
+
+/** The rim: smoothstep'd to the silhouette by facing, limited to the two rim
+ *  directions (CharacterEffect: (cos a·s, sin a·s, z), a = azimuth·π,
+ *  s = sqrt(1 - z²)), laid on as a colour dodge: min(max(c, 2), c / (1 - 2·rim)). */
+fn ag_rim(color: vec3f, facing: f32, uvw: vec3f, rimColor: vec3f, threshold: f32, fade: f32, range: f32,
+          inclination: f32, azimuth1: f32, azimuth2: f32, mask: f32) -> vec3f {
+  let m = vec3f(uvw.x * 2.0 - 1.0, 1.0 - uvw.y * 2.0, facing);
+  let t = saturate((facing - (threshold + fade)) / (threshold - (threshold + fade)));
+  let edge = t * t * (3.0 - 2.0 * t);
+  let s = sqrt(max(1.0 - inclination * inclination, 0.0));
+  let a1 = azimuth1 * 3.1415927;
+  let a2 = azimuth2 * 3.1415927;
+  let d1 = vec3f(cos(a1) * s, sin(a1) * s, inclination);
+  let d2 = vec3f(cos(a2) * s, sin(a2) * s, inclination);
+  let along = saturate(max(dot(m, d1), dot(m, d2)) + range);
+  let rim = min(edge, along) * rimColor;
+  let f = min(rim * mask * 2.0, vec3f(0.99));
+  return min(max(color, vec3f(2.0)), color / (vec3f(1.0) - f));
+}
+
+/** The fill: inner to outer by pow(1 - facing², softness + 2), laid over by
+ *  its amount. */
+fn ag_fill(color: vec3f, facing: f32, inner: vec3f, outer: vec3f, amount: f32, softness: f32) -> vec3f {
+  let k = pow(max(1.0 - facing * facing, 0.0), softness + 2.0);
+  return mix(color, mix(inner, outer, k), amount);
+}
+
+// ── Aether Gazer's PBR character shading (SimPipeline/Character/PBR/Uber) ──
+// The ForwardBase pass of the game's current character shader, decompiled and
+// written back out step by step. Its ramp image carries the whole tone of the
+// look in rows: the diffuse ramp in the row the material picks, the specular
+// ramp at 0.95, the environment's floor at 0.85.
+
+/** A ramp image on a group slot, read at a computed coordinate — mip 0 only,
+ *  as the game reads it, and so legal wherever the shading branches. */
+fn _ag_ramp(slot: u32, uv: vec2f) -> vec4f {
+  // Unity's v runs up from the bottom row; the image is uploaded top row first.
+  let c = clamp(vec2f(uv.x, 1.0 - uv.y), vec2f(0.002), vec2f(0.998));
+  switch slot {
+    case 1u: { return textureSampleLevel(groupTexture1, diffuseSampler, c, 0.0); }
+    case 2u: { return textureSampleLevel(groupTexture2, diffuseSampler, c, 0.0); }
+    case 3u: { return textureSampleLevel(groupTexture3, diffuseSampler, c, 0.0); }
+    default: { return textureSampleLevel(groupTexture0, diffuseSampler, c, 0.0); }
+  }
+}
+
+/**
+ * The whole lighting of one Uber material under the character's key light:
+ *   diffuse = base·(1−metal) · ramp(min(shadow, occlusion·N·L), row)
+ *   specular = GGX through the ramp's 0.95 row, × F0, plus the rim, × the
+ *              shade term
+ *   ambient = the object's SH at n × diffuse
+ *   reflection = the scene's environment along the reflected view, at a
+ *              roughness mip, × the mobile environment-BRDF fit
+ *              (F0·A + ramp(N·L·B, 0.85))
+ * Lamps and fog are the engine's, laid on after.
+ */
+fn ag_uber(slot: u32, base: vec3f, metallic: f32, roughness: f32, occlusion: f32, n: vec3f, l: vec3f,
+           row: f32, receive: f32, rimMask: f32, rimMid: f32, rimWidth: f32, rimTint: vec3f,
+           rimIntensity: f32, rimAlbedo: f32, rimInLight: f32, emissive: vec3f, reflection: f32,
+           shade: f32, face: f32, wp: vec3f, v: vec3f) -> vec3f {
+  let diffuse = base * (1.0 - metallic);
+  let f0 = mix(vec3f(0.04), base, metallic);
+  let pr = clamp(roughness, 0.0, 1.0);
+  let r = max(pr * pr, 0.0078125);
+  let a2 = r * r;
+  let h = normalize(v + l);
+  let ndl = saturate(dot(n, l));
+  let ndv = saturate(dot(v, n));
+  let ndh = saturate(dot(n, h));
+  let vdh = saturate(dot(v, h));
+  let ldh = saturate(dot(l, h));
+
+  // where on the ramp: N·L under occlusion, and the sun's cast shadow
+  var shadow = 1.0;
+  if (receive > 0.5) { shadow = rzSunOcclusion(wp, n); }
+  // A face replaces N·L with its SDF shade; anything else reads N·L.
+  let u = min(shadow, occlusion * select(ndl, shade, shade >= 0.0));
+  let ramp = _ag_ramp(slot, vec2f(u, row)).rgb;
+
+  // GGX, as the pass writes it, then through the ramp's specular row
+  let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+  let D = select(a2 / (dd * dd), 1.0, dd * dd == a2);
+  let vis = min(0.5 / (ndl * (ndv * (1.0 - r) + r) + ndv * (ndl * (1.0 - r) + r)), 1.0);
+  let vis2 = min(0.5 / (ldh * (vdh * (1.0 - r) + r) + vdh * (ldh * (1.0 - r) + r)), 1.0);
+  let x = saturate(D * vis * a2 / vis2);
+  let specRamp = _ag_ramp(slot, vec2f(x, 0.95)).rgb;
+  let spec = clamp(vis * specRamp * min(1.0 / a2, 2048.0), vec3f(0.0), vec3f(10.0));
+
+  // the rim: toward the silhouette on the lit side, tinted toward the albedo
+  let lit = select(0.0, 1.0, u > 0.001);
+  let t = saturate(((ndl * 0.25 + 0.75) * (1.0 - ndv) * lit - (rimMid - rimWidth)) / max(2.0 * rimWidth, 1e-4));
+  let edge = t * t * (3.0 - 2.0 * t);
+  let tint = min(rimTint * rimIntensity * mix(vec3f(1.0), base, rimAlbedo) * 2.0 * rimMask, vec3f(0.99));
+  let rim = tint * edge * (1.0 + rimInLight * (u - 1.0));
+
+  // A face (FACE_MODE) takes no GGX: its light is the ramp, the rim and its
+  // optional SDF highlight (off unless _FaceSpecular).
+  let isFace = face > 0.5;
+  let direct = (select(spec * f0, vec3f(0.0), isFace) + rim) * u + diffuse * ramp;
+
+  // the environment, with the game's fit of the split-sum
+  let a004 = min((1.0 - pr) * (1.0 - pr), exp2(-9.28 * ndv)) * (1.0 - pr) + (0.0425 - 0.0275 * pr);
+  let A = -a004 * 1.04 + (1.04 - 0.572 * pr);
+  let ns = saturate(dot(n, mix(reflect(-l, n), h, 0.8)));
+  let B = _ag_ramp(slot, vec2f(ns * (a004 * 1.04 + (0.022 * pr - 0.04)), 0.85)).r;
+  let env = rzWorldSpecularLod(reflect(-v, n), pr, 1.0) * reflection;
+
+  // ... and the environment at a flat 0.0157 rather than through the BRDF fit.
+  let envTerm = select((f0 * A + B) * env, env * 0.0157, isFace);
+  return emissive + rzObjectAmbient(n) * diffuse + envTerm + direct;
+}
+
+
+/**
+ * The face's shade from its SDF image (Uber FACE_MODE, _SDFType 0), in place of
+ * N·L: the key light taken into the face's frame and flattened, the field read
+ * at the uv and at its mirror, the side the light is on choosing which, both
+ * compared against the light's front-to-back angle with _BlendSmoothness, then
+ * softened by how level the light is and a half-Lambert. The face frame is the
+ * head bone's, turned to the game's convention (x to the face's right, z out of
+ * it). An SDF is painted in the face's uvs, so it belongs to models that share
+ * the game's face layout; a white slot reads as a face lit evenly until the
+ * light goes behind it.
+ */
+fn ag_face_sdf(slot: u32, uv: vec2f, l: vec3f, n: vec3f, smoothness: f32, invert: f32) -> f32 {
+  let hb = skinMats[u32(max(material.headBoneIndex, 0.0))];
+  let fx = -normalize(hb[0].xyz);
+  let fy = normalize(hb[1].xyz);
+  let fz = -normalize(hb[2].xyz);
+  let lf = normalize(vec3f(dot(l, fx), dot(l, fy), dot(l, fz)));
+  let fl = lf.xz * inverseSqrt(max(dot(lf.xz, lf.xz), 1.1754944e-38));
+  let u0 = mix(uv.x, 1.0 - uv.x, invert);
+  let s1 = _ag_ramp(slot, vec2f(u0, 1.0 - uv.y));
+  let s2 = _ag_ramp(slot, vec2f(1.0 - u0, 1.0 - uv.y));
+  let left = fl.x < 0.0;
+  let a = select(s2.x, s1.x, left);
+  let b = select(s1.x, s2.x, left);
+  let flag = select(0.0, 1.0, s1.w > 0.5);
+  let k = max(smoothness, 0.001);
+  let th = fl.y * -0.5 + 0.5;
+  let w = 1.0 - th;
+  var m1 = max(saturate((a - th) / k + 0.5), saturate((b - w - 1.0) / k + 0.5));
+  m1 = min(m1, min(saturate((2.0 - a - w) / k + 0.5), saturate((2.0 - b - w) / k + 0.5)));
+  var m2 = max(saturate((b - th - 1.0) / k + 0.5), saturate((a - w) / k + 0.5));
+  m2 = min(m2, min(saturate((a + w) / k + 0.5), saturate((b + w) / k + 0.5)));
+  var r = flag * (m1 - m2) + m2;
+  r *= (1.0 - abs(lf.z)) * 0.5 + 0.5;
+  r *= saturate(dot(n, l)) * 0.5 + 0.5;
+  return r;
+}
+
 fn group_tex0(uv: vec2f) -> vec4f { return textureSample(groupTexture0, diffuseSampler, uv); }
 fn group_tex1(uv: vec2f) -> vec4f { return textureSample(groupTexture1, diffuseSampler, uv); }
 fn group_tex2(uv: vec2f) -> vec4f { return textureSample(groupTexture2, diffuseSampler, uv); }
@@ -1056,6 +1265,7 @@ struct _RzLampPair { d: vec3f, s: vec3f };
 
 fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> _RzLampPair {
   var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  if (!_rzLightReaches(i)) { return out; }
   let pr = _rzLightVec(i, 0u);
   let d = pr.xyz - p;
   let dist = length(d);

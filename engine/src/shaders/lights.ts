@@ -28,7 +28,8 @@ import { subjectMaskApi } from "./cast-api"
 //   [0..2] position, world space               [3] radius
 //   [4..6] colour PREMULTIPLIED by intensity   [7] type
 //   [8..10] aim, unit, pointing away from the light   [11] cos of the outer angle
-//   [12] cos of the inner angle                [13..15] spare
+//   [12] cos of the inner angle
+//   [13] the rendering layers it does NOT reach (u32 bits)   [14..15] spare
 //
 // then the grid: LIGHT_MASK_WORDS words of lamp bits per cell.
 //
@@ -40,6 +41,12 @@ import { subjectMaskApi } from "./cast-api"
 // branchless: it stores aim (0,0,0) and both cosines at -1, which makes the
 // cone term below saturate to exactly 1. `type` says which a light is for
 // anyone reading the buffer; the shading never asks.
+//
+// LAYERS, as the game's pipeline (URP's rendering layers) gates its lights: a
+// draw carries layer bits, and a light reaches it only where its own mask
+// shares one. Stored INVERTED — the layers a light does not reach — so the
+// zero every writer that predates layers leaves in [13] reaches everything,
+// which is what an effect's lamp and a plain document light mean.
 
 import { castDistanceStub } from "./passes/cast-distance"
 import { audioApi } from "./audio-api"
@@ -243,8 +250,9 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
 `
 }
 
-/** The rz*Light accessors, with the buffer declared at the given binding. */
-export function lightsApi(group: number, binding: number): string {
+/** The rz*Light accessors, with the buffer declared at the given binding.
+ *  `layers` is the WGSL expression for the drawing's rendering-layer bits. */
+export function lightsApi(group: number, binding: number, layers: string): string {
   const R = LIGHT_HEADER / 4
   const S = LIGHT_STRIDE / 4
   return /* wgsl */ `
@@ -286,6 +294,10 @@ fn rzLightAim(i: u32) -> vec3f { return _rzLightVec(i, 2u).xyz; }
  *  light stores (-1, -1), which saturates the cone term to 1. */
 fn rzLightCone(i: u32) -> vec2f { return vec2f(_rzLightVec(i, 2u).w, _rzLightVec(i, 3u).x); }
 
+/** Does light i reach this drawing's rendering layers? Read as bits, never as
+ *  a float — see the layout. */
+fn _rzLightReaches(i: u32) -> bool { return ((${layers}) & ~_rzLights[${R}u + i * ${S}u + 3u].y) != 0u; }
+
 /** The document lamps that can reach p: its grid cell's bits, or the outside
  *  mask beyond the grid. Written so a NaN position fails the inside test. */
 fn _rzLightCellMask(p: vec3f) -> vec4u {
@@ -312,6 +324,7 @@ fn _rzLightCellMask(p: vec3f) -> vec4u {
  * writes in candela over 683.
  */
 fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
+  if (!_rzLightReaches(i)) { return vec3f(0.0); }
   let pr = _rzLightVec(i, 0u);
   let d = pr.xyz - p;
   let dist = length(d);

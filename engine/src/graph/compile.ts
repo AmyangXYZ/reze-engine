@@ -344,9 +344,11 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
   }
 
   const lines: string[] = []
+  let nodeTakesLight = false
   for (const id of order) {
     const node = nodes.get(id)!
     const s = spec(node)
+    if (s.takesLight) nodeTakesLight = true
     if (s.contextOutputs) continue
     const args: Record<string, Resolved> = {}
     for (const [socket, input] of Object.entries(s.inputs)) args[socket] = resolveInput(node, socket, input.type)
@@ -360,7 +362,7 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
   const fsBody = lines.join("\n")
   // A graph takes light when its body reads any: the four shading nodes all
   // pass `sun, amb`, and a hand-written node reaching for the lamps names them.
-  const takesLight = /\bsun\b|\bamb\b|rzLight|rzLamp/.test(fsBody)
+  const takesLight = nodeTakesLight || /\bsun\b|\bamb\b|rzLight|rzLamp/.test(fsBody)
   const wgsl = assembleModule(opts.renderClass ?? "auto", opts.alphaMode ?? "opaque", fsBody, usesStyle.current, !!opacity, opts.blend ?? "over", takesLight)
   return { ok: true, wgsl, fsBody, slotMap, diagnostics, prunedNodes }
 }

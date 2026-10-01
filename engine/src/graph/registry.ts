@@ -26,6 +26,9 @@ export type NodeSpec = {
   contextOutputs?: Record<string, string>
   /** Swizzle applied to the node's variable per output socket (default: none). */
   outputSelect?: Record<string, string>
+  /** The node shades by the scene's light without naming it: its graph takes
+   *  the lamps and the fog as the four shading nodes' graphs do. */
+  takesLight?: boolean
 }
 
 // ─── Literal formatting ───────────────────────────────────────────────
@@ -124,6 +127,54 @@ function foldSpecular(ior: string, level: string): string {
   // and only makes the emitted shader harder to read.
   return fmtFloat(Number(((r * r * 2 * Math.max(l, 0)) / 0.08).toPrecision(9)))
 }
+
+const uberNode = (slot: number): NodeSpec => ({
+  inputs: {
+    base: C([1, 1, 1], true),
+    metallic: F(0),
+    roughness: F(0.6),
+    occlusion: F(1),
+    normal: { type: "vector", contextDefault: "n" },
+    direction: { type: "vector", requiresLink: true },
+    // Unity's v into the ramp: the property map's alpha, which picks a
+    // surface's band (skin 0.702, hair and pale cloth 0.506).
+    row: F(0.702),
+    receive_shadow: F(1),
+    rim_mask: F(1),
+    rim_mid: F(0.448),
+    rim_width: F(0.11),
+    rim_tint: C([0.9623, 0.9214, 0.9214]),
+    rim_intensity: F(1),
+    rim_albedo: F(0.9),
+    rim_in_light: F(1),
+    emission: C([0, 0, 0]),
+    reflection: F(1),
+    // A face's SDF shade (ag_face_sdf); left at -1, the material reads N·L.
+    shade: F(-1),
+    // 1: the game's FACE_MODE — no GGX, the environment at a flat 0.0157.
+    face: F(0),
+  },
+  outputs: { color: "color" },
+  emit: (a) =>
+    `ag_uber(${slot}u, ${a.base}, ${a.metallic}, ${a.roughness}, ${a.occlusion}, ${a.normal}, ${a.direction}, ${a.row}, ${a.receive_shadow}, ` +
+    `${a.rim_mask}, ${a.rim_mid}, ${a.rim_width}, ${a.rim_tint}, ${a.rim_intensity}, ${a.rim_albedo}, ${a.rim_in_light}, ${a.emission}, ${a.reflection}, ${a.shade}, ${a.face}, input.worldPos, v)`,
+  takesLight: true,
+})
+const UBER_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_uber/${s}`, uberNode(s)]))
+// The face's SDF shade, the image on the slot the type names — 104903's face
+// template (SDF_04_shaonv) by default in the AG pack.
+const faceSdfNode = (slot: number): NodeSpec => ({
+  inputs: {
+    uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" },
+    direction: { type: "vector", requiresLink: true },
+    normal: { type: "vector", contextDefault: "n" },
+    smoothness: F(0.1),
+    invert: F(0),
+  },
+  outputs: { value: "float" },
+  emit: (a) => `ag_face_sdf(${slot}u, ${a.uv}.xy, ${a.direction}, ${a.normal}, ${a.smoothness}, ${a.invert})`,
+})
+const FACE_SDF_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_face_sdf/${s}`, faceSdfNode(s)]))
 
 export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // ── Context inputs (template locals; no emission) ──
@@ -453,6 +504,97 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputSelect: { color: ".rgb", alpha: ".a" },
     emit: (a) => `group_tex3(${a.uv}.xy)`,
   },
+
+  // ── Aether Gazer's character shading ──
+  // The game's character shader (SimPipeline/Character/Debug, which most of its
+  // characters wear), taken apart into the steps it runs — see ag_* in
+  // nodes.ts for each step's derivation from the decompiled pass. A graph
+  // composes them as the game did: a ramp lookup driven by the key light, a
+  // matcap, a reflection, the rim and the fill, with the ramp and matcap
+  // images on the style group's slots.
+
+  // The key light: CharacterEffect's direction, held in a frame that turns
+  // with the camera about the vertical (sim_TowardMatrix) — the game lights a
+  // character from where the viewer is, not from the scene's sun.
+  ag_key_light: {
+    inputs: { inclination: F(24), azimuth: F(-28) },
+    outputs: { direction: "vector" },
+    emit: (a) => `ag_key_light(${a.inclination}, ${a.azimuth})`,
+  },
+  // Where on the shadow ramp this point falls: N·L under the mask's occlusion,
+  // and the sun's cast shadow on top when the character receives it.
+  ag_shade_term: {
+    inputs: {
+      normal: { type: "vector", contextDefault: "n" },
+      direction: { type: "vector", requiresLink: true },
+      occlusion: F(1),
+      occlusion_scale: F(1),
+      receive_shadow: F(1),
+    },
+    outputs: { value: "float" },
+    emit: (a) => `ag_shade_term(${a.normal}, ${a.direction}, ${a.occlusion}, ${a.occlusion_scale}, ${a.receive_shadow}, input.worldPos)`,
+    takesLight: true,
+  },
+  // A ramp image's coordinate: u from the shade term, v the ramp's row (the
+  // game's property map picks it per texel; a PMX carries one per material).
+  ag_ramp_uv: {
+    inputs: { value: F(0), row: F(0.5) },
+    outputs: { uv: "vector" },
+    emit: (a) => `ag_ramp_uv(${a.value}, ${a.row})`,
+  },
+  // The view-space reflection the matcap, the reflection map, the rim and the
+  // fill all read: its uv into a sphere image, and how much it faces the eye.
+  ag_view_reflection: {
+    inputs: { normal: { type: "vector", contextDefault: "n" } },
+    outputs: { uv: "vector", facing: "float" },
+    outputSelect: { uv: ".xyz", facing: ".w" },
+    emit: (a) => `ag_view_reflection(${a.normal}, v)`,
+  },
+  // The matcap's lift: a metal's shine, at least 1, where the mask says.
+  ag_matcap: {
+    inputs: { color: C([1, 1, 1], true), matcap: C([1, 1, 1]), strength: F(1), mask: F(1) },
+    outputs: { color: "color" },
+    emit: (a) => `ag_matcap(${a.color}, ${a.matcap}, ${a.strength}, ${a.mask})`,
+  },
+  // The rim: the two fixed screen-side directions CharacterEffect sets, cut to
+  // the silhouette, laid on as a colour dodge where the mask allows.
+  ag_rim: {
+    inputs: {
+      color: C([1, 1, 1], true),
+      facing: F(1),
+      uv: { type: "vector", requiresLink: true },
+      rim_color: C([0.8584906, 0.8584906, 0.8584906]),
+      threshold: F(0.1),
+      fade: F(0.113),
+      range: F(0.444),
+      inclination: F(0),
+      azimuth1: F(0.8499963),
+      azimuth2: F(1),
+      mask: F(1),
+    },
+    outputs: { color: "color" },
+    emit: (a) =>
+      `ag_rim(${a.color}, ${a.facing}, ${a.uv}, ${a.rim_color}, ${a.threshold}, ${a.fade}, ${a.range}, ${a.inclination}, ${a.azimuth1}, ${a.azimuth2}, ${a.mask})`,
+  },
+  // The fill: a colour laid toward the silhouette, inner to outer.
+  ag_fill: {
+    inputs: {
+      color: C([1, 1, 1], true),
+      facing: F(1),
+      inner: C([0, 0, 0]),
+      outer: C([0, 0, 0]),
+      amount: F(0),
+      softness: F(0),
+    },
+    outputs: { color: "color" },
+    emit: (a) => `ag_fill(${a.color}, ${a.facing}, ${a.inner}, ${a.outer}, ${a.amount}, ${a.softness})`,
+  },
+
+  // Aether Gazer's current character shading (PBR/Uber) as one closure, the way
+  // Principled is one: the ramp image on the group slot named by the type.
+  // Defaults are 104903's skin.
+  ...UBER_NODES,
+  ...FACE_SDF_NODES,
 
   // ── Blender 5.2 colour utilities ──
   separate_color: {

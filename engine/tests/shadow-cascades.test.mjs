@@ -50,7 +50,7 @@ test("every corner of a slice lands inside its cascade", () => {
     for (const sun of SUNS) {
       const v = view()
       const slices = cascadeSlices(v, bounds)
-      const out = buildShadowCascades(v, sun, bounds, new Float32Array(32))
+      const out = buildShadowCascades(v, sun, bounds, new Float32Array(16 * SHADOW_CASCADES.length))
       for (let i = 0; i < SHADOW_CASCADES.length; i++) {
         const vp = out.subarray(i * 16, i * 16 + 16)
         for (const c of sliceCorners(v, slices[i][0], slices[i][1])) {
@@ -67,8 +67,9 @@ test("the outer cascade contains the inner — the cull and the sampler both lea
     for (const sun of SUNS) {
       const v = view()
       const slices = cascadeSlices(v, bounds)
-      const out = buildShadowCascades(v, sun, bounds, new Float32Array(32))
-      const outer = out.subarray(16, 32)
+      const n = SHADOW_CASCADES.length
+      const out = buildShadowCascades(v, sun, bounds, new Float32Array(16 * n))
+      const outer = out.subarray(16 * (n - 1), 16 * n)
       for (const c of sliceCorners(v, slices[0][0], slices[0][1])) {
         assert.ok(inside(project(outer, c)), `inner corner ${JSON.stringify(c)} outside the outer cascade`)
       }
@@ -79,7 +80,7 @@ test("the outer cascade contains the inner — the cull and the sampler both lea
 test("the scene's whole depth is inside every cascade's range along the light", () => {
   for (const sun of SUNS) {
     const v = view()
-    const out = buildShadowCascades(v, sun, ROOM, new Float32Array(32))
+    const out = buildShadowCascades(v, sun, ROOM, new Float32Array(16 * SHADOW_CASCADES.length))
     for (let i = 0; i < SHADOW_CASCADES.length; i++) {
       const vp = out.subarray(i * 16, i * 16 + 16)
       // The room's corners that fall inside the box laterally must fall inside
@@ -95,11 +96,13 @@ test("the scene's whole depth is inside every cascade's range along the light", 
 
 test("the near slice reaches past the point of interest and the far slice ends at the scene", () => {
   const v = view()
-  const [near, far] = cascadeSlices(v, ROOM)
+  const slices = cascadeSlices(v, ROOM)
+  const near = slices[0]
+  const far = slices[slices.length - 1]
   assert.equal(near[0], v.near)
   assert.ok(Math.abs(near[1] - (v.focus + NEAR_REACH)) < 1e-9)
   assert.ok(far[1] > 300 && far[1] < 320, `the far slice ends where the room does: ${far[1]}`)
-  const [, alone] = cascadeSlices(v, DANCER)
+  const alone = cascadeSlices(v, DANCER).at(-1)
   assert.ok(alone[1] < 70, `a dancer alone keeps a short frustum: ${alone[1]}`)
 })
 

@@ -118,7 +118,7 @@ test("rzShadow and rzWorldAmbient resolve wherever an effect's file compiles, an
     const code = code_only(src)
     assert.match(code, /fn rzShadow\(p: vec3f\) -> f32/, `${name} is missing rzShadow — a lawn's particleShade compiles here too`)
     assert.match(code, /fn rzWorldAmbient\(n: vec3f\) -> vec3f/, `${name} is missing rzWorldAmbient`)
-    const real = /_rzShadowNear/.test(code) && /_rzLight\.sh\[0\]/.test(code)
+    const real = /_rzShadowAtlas/.test(code) && /_rzLight\.sh\[0\]/.test(code)
     assert.equal(real, name === "particle render", `${name} ${real ? "binds" : "stubs"} the scene's light`)
   }
 })

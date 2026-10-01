@@ -130,7 +130,7 @@ type ParticleSource = {
   textures?: number
 }
 
-/** Where the shading stage's five scene-light bindings start — see scene-light-api.ts. */
+/** Where the shading stage's four scene-light bindings start — see scene-light-api.ts. */
 export const PARTICLE_LIGHT_BINDING = 10
 /** The effect's named points (`#points`), in both stages — see points-api.ts. */
 export const PARTICLE_POINTS_BINDING = 15

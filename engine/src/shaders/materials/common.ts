@@ -1,7 +1,7 @@
 import { sceneFsOutWgsl } from "../passes/scene-contract"
 import { lightsApi } from "../lights"
 import { SHADOW_CASCADES } from "../../shadow-cascades"
-import { pcf9 } from "../scene-light-api"
+import { sunShadowWgsl } from "../scene-light-api"
 import { WORLD_AMBIENT_WGSL } from "../lights"
 
 // Shared WGSL blocks concatenated by every material shader.
@@ -61,6 +61,9 @@ struct LightUniforms {
    *  amount 0 is off. Then the view-projection its map was drawn with. */
   castShadow: vec4f,
   castVP: mat4x4f,
+  /** The rendering layers each directional light reaches, slot by slot — a
+   *  draw is lit by the first whose bits it shares (rzMainLight). */
+  dirLayers: vec4u,
 };
 
 // Per-material uniforms. Every material binds this layout even if it ignores fields;
@@ -148,13 +151,10 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> light: LightUniforms;
 @group(0) @binding(2) var diffuseSampler: sampler;
-@group(0) @binding(3) var shadowMap: texture_depth_2d;
+// The sun's shadow atlas: every cascade in its own tile — see shadow-cascades.ts.
+@group(0) @binding(3) var shadowAtlas: texture_depth_2d;
 @group(0) @binding(4) var shadowSampler: sampler_comparison;
 @group(0) @binding(5) var<uniform> lightVP: LightVP;
-// The far cascade's map — coarser texels over a much wider box, so the stage
-// keeps its shadows when the crisp near volume ends. Binding 7: 6 is the
-// positional lights, 9 the BRDF LUT.
-@group(0) @binding(7) var shadowMapFar: texture_depth_2d;
 // The world's own sky, for a surface that REFLECTS it rather than merely being
 // lit by it. Equirect, in the same layout and the same linear radiance the
 // composite draws the dome from, and mipped — a rough surface reads a coarser
@@ -188,14 +188,37 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 }
 // binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
-// The light this model takes apart from the scene's — see Engine.setModelFill
-// and Engine.setModelSun. fill brightens it after its graph (fill ×
-// surface colour, graph/slots.ts), zero for a model nobody gave one; sun replaces the scene's sun colour while its w is set,
-// which is how a stage keeps the daylight its game lit it by while the cast
-// keeps the key the scene set for them. opts.x (Engine.setModelFlatSky) gives
-// it the sky's average in place of its shape - see graph/slots.ts.
-struct ModelLight { fill: vec4f, sun: vec4f, opts: vec4f }
-@group(1) @binding(1) var<uniform> modelLight: ModelLight;
+// What this object's lighting is, apart from the scene's, as the game's
+// pipeline gives each renderer its own:
+//   layers.x  its rendering-layer bits, which decide the lights that reach it —
+//             a stage's daylight and the cast's key are two lights on two
+//             layers, as the game lights them;
+//   ambient.x 1 while it has an ambient of its own (Engine.setModelAmbient),
+//             0 for the world's;
+//   sh        that ambient's irradiance, folded as the world's (ibl.ts).
+struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9> }
+@group(1) @binding(1) var<uniform> objectLight: ObjectLight;
+
+/** The light arriving at a surface of this object facing n: its own ambient
+ *  where loaded data gave it one (a stage's probes, a character's), else the
+ *  world's. The same polynomial rzWorldAmbient evaluates. */
+fn rzObjectAmbient(n: vec3f) -> vec3f {
+  if (objectLight.ambient.x < 0.5) { return rzWorldAmbient(n); }
+  let s = objectLight.sh;
+  let c = s[0].xyz + s[1].xyz * n.y + s[2].xyz * n.z + s[3].xyz * n.x
+    + s[4].xyz * (n.x * n.y) + s[5].xyz * (n.y * n.z) + s[6].xyz * (3.0 * n.z * n.z - 1.0)
+    + s[7].xyz * (n.x * n.z) + s[8].xyz * (n.x * n.x - n.y * n.y);
+  return max(c, vec3f(0.0));
+}
+
+/** The directional light slot that lights this draw: the first whose layers
+ *  it shares, else the sun's. */
+fn rzMainLight() -> u32 {
+  for (var k = 0u; k < 4u; k++) {
+    if ((light.dirLayers[k] & objectLight.layers.x) != 0u) { return k; }
+  }
+  return 0u;
+}
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
 // Reserved for future sphere/toon graph nodes; graphs that don't read them get the
@@ -226,58 +249,41 @@ fn safe_normal(nIn: vec3f) -> vec3f {
 `;
 
 // ─── Shadow sampler (3×3 PCF, cascade-selected) ─────────────────────
-// Normal-bias 0.08, depth-bias 0.001 NDC; the kernel is pcf9 in scene-light-api.ts,
-// shared with effects. Texel sizes are interpolated
-// from SHADOW_CASCADES so they cannot go stale the way the hardcoded 1/2048
-// once did (PCF taps landed TWO texels apart after the map grew to 4096,
-// quantizing self-shadow edges into crawling gray squares).
+// Normal-bias 0.08, depth-bias 0.001 NDC; the lookup is sunShadowWgsl in
+// scene-light-api.ts, shared with the ground and effects.
 //
-// Selection: the crisp near cascade wherever its box covers the point — with a
-// margin that keeps the whole PCF kernel inside the map, so selection never
-// mixes maps mid-kernel — else the far cascade, else LIT. Lit is a fix, not
-// merely a default: the old single-volume path clamped, and past the light's
-// far plane the comparison failed against every stored depth, silently
-// shadowing any stage deeper than the box.
-
+// Selection: the first cascade whose box covers the point — with a margin that
+// keeps the whole PCF kernel inside its tile — else LIT. Lit is a fix, not
+// merely a default: past every cascade there is no occlusion information, and
+// comparing against unrelated depths would silently shadow any stage deeper
+// than the boxes.
 
 const SAMPLE_SHADOW_WGSL = /* wgsl */ `
+${sunShadowWgsl("_rzSun", "shadowAtlas", "shadowSampler", "lightVP.viewProj")}
 
-fn sampleShadowNear(ndc: vec3f) -> f32 {
-${pcf9("shadowMap", `1.0 / ${SHADOW_CASCADES[0].mapSize}.0`)}
-}
-
-fn sampleShadowFar(ndc: vec3f) -> f32 {
-${pcf9("shadowMapFar", `1.0 / ${SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize}.0`)}
+/** The sun's cast shadow alone, without sampleShadow's facing test: what a
+ *  character's ramp is min'd with (its own N·L carries the terminator). */
+fn rzSunOcclusion(worldPos: vec3f, n: vec3f) -> f32 {
+  let castAmt = light.lights[0].direction.w;
+  if (castAmt <= 0.0) { return 1.0; }
+  let a = _rzSunLocate(worldPos + n * 0.08);
+  if (a.w < 0.0) { return 1.0; }
+  return mix(1.0, _rzSunTaps(a), castAmt);
 }
 
 fn sampleShadow(worldPos: vec3f, n: vec3f) -> f32 {
   // THE SCENE'S ONE SHADOW SWITCH, and it lives on the sun because the sun is
-  // the only thing that casts. Positional lamps are diffuse-only — rzLightsDiffuse
-  // has no shadow term at all — so turning this off turns off every shadow there
-  // is, on the ground and on the cast alike. Gated here rather than by not
-  // rendering the map: the map is also what the ground catcher reads, and a host
-  // that wants a figure lit with no shadow still wants everything else about the
-  // frame unchanged.
-  //
-  // Lit is the answer when it is off. Returning 0 would be "fully shadowed",
-  // which is the opposite of what a disabled shadow means.
+  // the only thing that casts. Lit is the answer when it is off: returning 0
+  // would be "fully shadowed", the opposite of what a disabled shadow means.
   let castAmt = light.lights[0].direction.w;
   if (castAmt <= 0.0) { return 1.0; }
-  if (dot(n, -light.lights[0].direction.xyz) <= 0.0) { return 0.0; }
-  let biasedPos = worldPos + n * 0.08;
-  let c0 = lightVP.viewProj[0] * vec4f(biasedPos, 1.0);
-  let n0 = c0.xyz / max(c0.w, 1e-6);
-  if (all(abs(n0.xy) < vec2f(0.98)) && n0.z > 0.0 && n0.z < 1.0) {
-    return mix(1.0, sampleShadowNear(n0), castAmt);
-  }
-  let c1 = lightVP.viewProj[1] * vec4f(biasedPos, 1.0);
-  let n1 = c1.xyz / max(c1.w, 1e-6);
-  if (all(abs(n1.xy) < vec2f(0.98)) && n1.z > 0.0 && n1.z < 1.0) {
-    return mix(1.0, sampleShadowFar(n1), castAmt);
-  }
-  // Outside every cascade there is no occlusion information; lit is the only
-  // honest answer.
-  return 1.0;
+  // A surface turned from the sun is in its own shade — when the sun is what
+  // keys it. Under a key of its own layer the atlas is only the occluders'
+  // shadow, and the key's N·L decides its terminator.
+  if (rzMainLight() == 0u && dot(n, -light.lights[0].direction.xyz) <= 0.0) { return 0.0; }
+  let a = _rzSunLocate(worldPos + n * 0.08);
+  if (a.w < 0.0) { return 1.0; }
+  return mix(1.0, _rzSunTaps(a), castAmt);
 }
 
 `;
@@ -499,4 +505,4 @@ fn rz_dissolve_threshold(restPos: vec3f) -> f32 {
 // The FSOut struct is NOT in here any more — see commonFsOutWgsl above. Every
 // consumer of this constant appends it immediately, which is where it was.
 export const COMMON_MATERIAL_PRELUDE_WGSL =
-  COMMON_BINDINGS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL
+  COMMON_BINDINGS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6, "objectLight.layers.x") + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL

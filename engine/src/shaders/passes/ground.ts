@@ -1,6 +1,7 @@
 import { sceneFsOutWgsl, sceneIdWriteWgsl } from "./scene-contract"
 import { lightsApi } from "../lights"
-import { SHADOW_CASCADES } from "../../shadow-cascades"
+import { SHADOW_ATLAS_SIZE, SHADOW_CASCADES } from "../../shadow-cascades"
+import { SHADOW_MARGIN } from "../scene-light-api"
 import { WORLD_AMBIENT_WGSL } from "../lights"
 
 // Ground shadow-catcher: receives directional shadow, grid lines, frosted noise,
@@ -36,6 +37,9 @@ const SOFT_MAX_SPREAD = 14
  * normalised, so there is no `/ 9.0` left at the call site.
  */
 function pcfWgsl(map: string, uv: string, texel: string, z: string, acc: string, pad: string, soft: boolean): string {
+  // Every tap stays inside the cascade's own tile (tileLo..tileHi, in scope at
+  // the call): the soft disk reaches further than the selection margin, and a
+  // tap in the neighbouring tile compares against another cascade's depths.
   const golden = 2.39996323
   // ONE BRANCH IS COMPILED, NOT BOTH.
   //
@@ -58,7 +62,7 @@ function pcfWgsl(map: string, uv: string, texel: string, z: string, acc: string,
     `  for (var x = -1; x <= 1; x++) {`,
     // ...Level, not the implicit-derivative form: identical on a single-mip
     // shadow map, and legal inside a branch.
-    `    ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(f32(x), f32(y)) * st, ${z});`,
+    `    ${acc} += textureSampleCompareLevel(${map}, shadowSampler, clamp(${uv} + vec2f(f32(x), f32(y)) * st, tileLo, tileHi), ${z});`,
     `  }`,
     `}`,
     `${acc} *= ${1 / 9};`,
@@ -71,7 +75,7 @@ function pcfWgsl(map: string, uv: string, texel: string, z: string, acc: string,
     // keeps successive taps from lining up into spokes.
     `  let r = sqrt((fs + 0.5) * ${1 / SOFT_TAPS});`,
     `  let a = fs * ${golden} + rot;`,
-    `  ${acc} += textureSampleCompareLevel(${map}, shadowSampler, ${uv} + vec2f(cos(a), sin(a)) * (r * radius), ${z});`,
+    `  ${acc} += textureSampleCompareLevel(${map}, shadowSampler, clamp(${uv} + vec2f(cos(a), sin(a)) * (r * radius), tileLo, tileHi), ${z});`,
     `}`,
     `${acc} *= ${1 / SOFT_TAPS};`,
   ]
@@ -89,12 +93,10 @@ struct Light { direction: vec4f, color: vec4f, };
 struct LightUniforms { ambientColor: vec4f, lights: array<Light, 4>, sh: array<vec4f, 9>, };
 struct GroundShadowMat {
   diffuseColor: vec3f, fadeStart: f32,
-  fadeEnd: f32, shadowStrength: f32, pcfTexel: f32, gridSpacing: f32,
+  fadeEnd: f32, shadowStrength: f32, _pad6: f32, gridSpacing: f32,
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, mirror: f32,
-  // farCascade: 1 while a stage is loaded, 0 otherwise. See the branch below —
-  // with no stage the far map is never drawn into, so its taps are known.
-  mirrorBlur: f32, farCascade: f32, shadowSoftness: f32, groundY: f32,
+  mirrorBlur: f32, _pad17: f32, shadowSoftness: f32, groundY: f32,
   // Every shadow caster in one sphere, refreshed per frame. w = radius; 0 means
   // nothing casts, negative means "do not use this" (a rigid caster has no
   // sphere, so a scene with a stage keeps the taps). See rzShadowPossible.
@@ -105,12 +107,11 @@ struct GroundShadowMat {
 struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> light: LightUniforms;
-@group(0) @binding(2) var shadowMap: texture_depth_2d;
+// The sun's shadow atlas — see shadow-cascades.ts.
+@group(0) @binding(2) var shadowAtlas: texture_depth_2d;
 @group(0) @binding(3) var shadowSampler: sampler_comparison;
 @group(0) @binding(4) var<uniform> material: GroundShadowMat;
 @group(0) @binding(5) var<uniform> lightVP: LightVP;
-// The far cascade's map, binding 7 as in the materials' layout.
-@group(0) @binding(7) var shadowMapFar: texture_depth_2d;
 // The floor mirror (step 7D): the reflection target, the camera that rendered
 // it, and an ordinary sampler — the two shadow bindings above are comparison.
 // params = (projA, projB, _, _) — the depth-linearisation pair of the SHARED
@@ -144,7 +145,7 @@ struct MirrorVP { viewProj: mat4x4f, params: vec4f, };
 struct MirrorClip { plane: vec4f, on: f32, _p0: f32, _p1: f32, _p2: f32, };
 @group(0) @binding(14) var<uniform> clip: MirrorClip;
 ${WORLD_AMBIENT_WGSL}
-${lightsApi(0, 6)}
+${lightsApi(0, 6, "1u")}
 
 struct VO { @builtin(position) position: vec4f, @location(0) worldPos: vec3f, @location(1) normal: vec3f, };
 @vertex fn vs(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f) -> VO {
@@ -178,21 +179,6 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
     return out;
   }
 
-  // Outside a cascade's frustum there IS no shadow information — the clamped
-  // border samples compare against unrelated depths and read "shadowed",
-  // darkening the whole far plane with a visible band at the frustum edge
-  // (masked by the opaque surface normally, glaring in green-screen mode where
-  // only the shadow-catcher term renders). So each cascade fades out near its
-  // border — the near one INTO the far one's answer, the far one into lit.
-  let l0 = lightVP.viewProj[0] * vec4f(i.worldPos, 1.0);
-  let ndc = l0.xyz / max(l0.w, 1e-6);
-  let inZ = select(0.0, 1.0, ndc.z > 0.0 && ndc.z < 1.0);
-  let frustum = (1.0 - smoothstep(0.88, 0.96, abs(ndc.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc.y))) * inZ;
-  let l1 = lightVP.viewProj[1] * vec4f(i.worldPos, 1.0);
-  let ndc1 = l1.xyz / max(l1.w, 1e-6);
-  let inZ1 = select(0.0, 1.0, ndc1.z > 0.0 && ndc1.z < 1.0);
-  let frustum1 = (1.0 - smoothstep(0.88, 0.96, abs(ndc1.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc1.y))) * inZ1;
-
   // THE cost of this shader, measured: a full-screen ground ran 25 shadow
   // comparisons per pixel, and each one is hardware-bilinear, so ~100 depth
   // samples per pixel. Gutting the rest of the shader changed nothing; cutting
@@ -201,11 +187,9 @@ ${sceneFsOutWgsl()}@fragment fn fs(i: VO) -> FSOut {
   // 3x3 at two-texel spacing covers the same +/-2 texel penumbra the 5x5 at
   // one-texel spacing did — that kernel was oversampled, its taps overlapping
   // almost entirely once the comparison sampler's own 2x2 filter is counted.
-  // Nine taps instead of twenty-five for the same blur radius.
+  // Nine taps instead of twenty-five for the same blur radius, and one
+  // cascade's worth per pixel: the first that holds it.
   //
-  // The far cascade's taps run ONLY where the near one is fading or absent
-  // (frustum < 1), so a pixel in the near core costs exactly what it did with
-  // one cascade — and that core is where the camera usually looks.
   // Can anything cast a shadow ONTO this point at all?
   //
   // The ground is vastly larger than what stands on it, and the answer for most
@@ -261,33 +245,26 @@ ${
   let rot = ign * 6.28318530718;`
       : ""
   }
-  // The far cascade's taps, skipped entirely when nothing ever drew into it.
-  //
-  // This branch is the expensive one on a wide floor: it runs wherever the NEAR
-  // cascade does not reach, and the near cascade is a 64-unit box around the
-  // camera target, so a floor receding to the horizon takes it almost
-  // everywhere. Nine comparison taps, per pixel, on the largest draw in the
-  // frame — against a map that is cleared unless a stage is in the scene.
-  //
-  // Cleared depth compares as "no occluder", so the skipped path leaves vis at
-  // 1.0, which is exactly what the taps returned. Free, not cheaper.
-  if (material.farCascade > 0.0 && frustum < 1.0 && frustum1 > 0.0) {
-    let suv1 = vec2f(ndc1.x * 0.5 + 0.5, 0.5 - ndc1.y * 0.5);
-    let suv1_c = clamp(suv1, vec2f(0.02), vec2f(0.98));
-    let compareZ1 = ndc1.z - 0.0035;
-    var acc1 = 0.0;
-${pcfWgsl("shadowMapFar", "suv1_c", `${1 / SHADOW_CASCADES[SHADOW_CASCADES.length - 1].mapSize}`, "compareZ1", "acc1", "    ", soft)}
-    vis = mix(1.0, acc1, frustum1);
-  }
-  if (frustum > 0.0) {
-    let suv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    let suv_c = clamp(suv, vec2f(0.02), vec2f(0.98));
+  // The first cascade whose box holds the point, as the materials pick it.
+  // Outside a cascade's box there IS no shadow information — the clamped
+  // border samples compare against unrelated depths and read "shadowed",
+  // darkening the far floor with a band at the edge — so the outermost one
+  // fades into lit near its border. Inner cascades hand over to the next.
+  let n = ${SHADOW_CASCADES.length}u;
+  for (var ci = 0u; ci < n; ci++) {
+    let lc = lightVP.viewProj[ci] * vec4f(i.worldPos, 1.0);
+    let ndc = lc.xyz / max(lc.w, 1e-6);
+    if (!(all(abs(ndc.xy) < vec2f(${SHADOW_MARGIN})) && ndc.z > 0.0 && ndc.z < 1.0)) { continue; }
+    let frustum = select(1.0, (1.0 - smoothstep(0.88, 0.96, abs(ndc.x))) * (1.0 - smoothstep(0.88, 0.96, abs(ndc.y))), ci == n - 1u);
+    let tile = vec2f(f32(ci % 2u), f32(ci / 2u)) * ${SHADOW_CASCADES[0].mapSize / SHADOW_ATLAS_SIZE};
+    let tileLo = tile + vec2f(${0.5 / SHADOW_ATLAS_SIZE});
+    let tileHi = tile + vec2f(${(SHADOW_CASCADES[0].mapSize - 0.5) / SHADOW_ATLAS_SIZE});
+    let suv = tile + vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * ${SHADOW_CASCADES[0].mapSize / SHADOW_ATLAS_SIZE};
     let compareZ = ndc.z - 0.0035;
     var acc = 0.0;
-${pcfWgsl("shadowMap", "suv_c", "material.pcfTexel", "compareZ", "acc", "    ", soft)}
-    // The base is whatever the far cascade decided, so the near border blends
-    // cascade to cascade rather than snapping to lit mid-floor.
-    vis = mix(vis, acc, frustum);
+${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "    ", soft)}
+    vis = mix(1.0, acc, frustum);
+    break;
   }
   }
 

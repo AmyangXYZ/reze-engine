@@ -3,36 +3,54 @@ import { Mat4, Vec3 } from "./math"
 /**
  * THE SUN'S SHADOW FOLLOWS THE CAMERA, the way Blender's does.
  *
- * Each cascade is fitted every frame to a slice of the view frustum: the near
- * one to the stretch around what the camera is looking at, the far one to the
- * whole of what it sees. Whatever is in view is in a cascade, and whatever
- * could throw a shadow onto it is in the cascade's depth range, which is fitted
- * to the scene's bounds along the light. A room forty metres across with its
- * window frames behind the camera shadows its floor as the game does; a lone
- * dancer on an empty floor keeps a crisp near map.
+ * Each cascade is fitted every frame to a slice of the view frustum: the
+ * innermost to the stretch around what the camera is looking at, the
+ * outermost to the whole of what it sees, two more between. Whatever is in
+ * view is in a cascade, and whatever could throw a shadow onto it is in the
+ * cascade's depth range, which is fitted to the scene's bounds along the
+ * light. A room forty metres across with its window frames behind the camera
+ * shadows its floor as the game does; a lone dancer on an empty floor keeps a
+ * crisp inner tile.
  *
- * The earlier shape was two fixed boxes around the camera target, 64 and 256
- * units across, and a stage reached past them: the floor near the windows lay
- * outside every box and was drawn lit, the shadows stopping at the box's edge
- * in a straight line.
+ * The earlier shapes were two fixed boxes around the camera target, then two
+ * fitted maps; the game's pipeline draws four cascades into one atlas, and so
+ * does this.
  *
- * INVARIANT the sampler and the cull both lean on: the outer cascade CONTAINS
- * the inner one. The sampler falls from cascade 0 to 1 at the box edge, which
- * is only seamless if 1 covers where 0 ends, and the cull tests the OUTERMOST
- * frustum alone. Both hold because the outer slice is the whole frustum, of
- * which the inner slice is a part, and both take the same depth range.
+ * INVARIANT the sampler and the cull both lean on: each cascade CONTAINS the
+ * ones inside it. The sampler takes the first box that holds a point, which
+ * is only seamless if the next covers where one ends, and the cull tests the
+ * OUTERMOST frustum alone. Both hold because every slice starts at the near
+ * plane and the outermost is the whole frustum, and all take the same depth
+ * range.
  * tests/shadow-cascades.test.mjs pins it.
  */
 export type ShadowCascade = {
-  /** Texels per side of this cascade's map — sets the snap quantum. */
+  /** Texels per side of this cascade's tile — sets the snap quantum. */
   mapSize: number
+  /** Where the tile sits in the atlas, in texels from its top-left corner. */
+  origin: readonly [number, number]
 }
 
-export const SHADOW_CASCADES: readonly ShadowCascade[] = [{ mapSize: 4096 }, { mapSize: 2048 }]
+/**
+ * ONE ATLAS, FOUR TILES, as the game's pipeline (and URP) lays its sun shadow
+ * out: one depth texture, cascade i in tile (i mod 2, i div 2). One texture
+ * means one binding for every reader — materials, ground, effects, particles —
+ * and room in the same scheme for the local lights' shadows later.
+ */
+export const SHADOW_ATLAS_SIZE = 4096
 
-/** How far past the camera's point of interest the near cascade reaches, in
- *  world units: the dancer and the floor around her, at the near map's texel. */
-export const NEAR_REACH = 40
+const TILE = SHADOW_ATLAS_SIZE / 2
+
+export const SHADOW_CASCADES: readonly ShadowCascade[] = [0, 1, 2, 3].map((i) => ({
+  mapSize: TILE,
+  origin: [(i % 2) * TILE, Math.floor(i / 2) * TILE] as const,
+}))
+
+/** How far past the camera's point of interest the inner cascade reaches, in
+ *  world units: the dancer and the floor around her. Half the old two-map
+ *  reach, which keeps her texel where it was at half the tile; the three
+ *  outer cascades carry the rest of the room. */
+export const NEAR_REACH = 20
 
 /** The view the cascades are fitted to: the camera's eye and basis (world
  *  space, left-handed, +Z forward as the projection is), its vertical field of
@@ -55,16 +73,18 @@ export type ShadowBounds = { min: [number, number, number]; max: [number, number
 
 type XYZ = { x: number; y: number; z: number }
 
-/**
- * Where each cascade's slice of the view starts and ends, as distances along
- * the view: [near, split] and [near, farFit]. The far end is where the scene
- * ends, so an empty floor with a dancer on it keeps a short, sharp frustum
- * rather than the camera's far plane.
- */
 /** The deepest a cascade reaches along the view, in world units — the far
  *  plane's old cap, which is where every stage's shadows were fitted before. */
 const SHADOW_FAR = 8000
 
+/**
+ * Where each cascade's slice of the view starts and ends, as distances along
+ * the view, inner to outer: every slice starts at the near plane and they
+ * nest, the innermost ending just past the point of interest and the
+ * outermost where the scene ends, the two between spaced evenly in ratio.
+ * Nested rather than abutting so the invariant above holds: the outermost
+ * box contains all of them, and the sampler takes the first that holds a point.
+ */
 export function cascadeSlices(view: ShadowView, bounds: ShadowBounds): [number, number][] {
   let farFit = view.near + 200
   if (bounds) {
@@ -81,11 +101,14 @@ export function cascadeSlices(view: ShadowView, bounds: ShadowBounds): [number, 
   // a kilometre out is in the scene's bounds, and fitting the far cascade to it
   // would spread the stage's shadow map across the sky.
   farFit = Math.min(view.far, SHADOW_FAR, Math.max(view.near + 1, farFit))
-  const split = Math.min(farFit, Math.max(view.near + 8, view.focus + NEAR_REACH))
-  return [
-    [view.near, split],
-    [view.near, farFit],
-  ]
+  const first = Math.min(farFit, Math.max(view.near + 8, view.focus + NEAR_REACH))
+  const n = SHADOW_CASCADES.length
+  const out: [number, number][] = []
+  for (let i = 0; i < n; i++) {
+    const end = i === n - 1 ? farFit : first * Math.pow(farFit / first, i / (n - 1))
+    out.push([view.near, end])
+  }
+  return out
 }
 
 /** The bounding sphere of a frustum slice: on the view axis, at the depth that
@@ -186,6 +209,12 @@ export function fitShadowVP(
   const proj = Mat4.orthographicLh(-half, half, -half, half, 1, far + 1)
   out.set(proj.multiply(viewM).values, offset)
   return out
+}
+
+/** Every cascade's bounding sphere (centre, radius), inner to outer — the
+ *  split spheres a game shader picks its cascade by (_CascadeShadowSplitSpheres). */
+export function cascadeSpheres(view: ShadowView, bounds: ShadowBounds): { center: Vec3; radius: number }[] {
+  return cascadeSlices(view, bounds).map(([n, f]) => sliceSphere(view, n, f))
 }
 
 /** Every cascade's view-projection in a row, inner to outer. */

@@ -44,7 +44,13 @@ import {
   type SimClock,
 } from "./effect-schedule"
 import { parentKeySpan, type ModelParentKey } from "./parent-keys"
-import { SHADOW_CASCADES, buildShadowCascades, type ShadowBounds, type ShadowView } from "./shadow-cascades"
+import { NativeHost } from "./unity/host"
+import { NativeLooks, type NativeLook } from "./unity/looks"
+import { NativeStage, type NativeStagePackage, type NativeStageReader } from "./unity/stage"
+import { gameDir, unityFrameGlobals } from "./unity/globals"
+import { outlineMaxOffsetMultiplier, towardMatrix } from "./unity/character"
+import type { NativeValue } from "./unity/host"
+import { SHADOW_ATLAS_SIZE, SHADOW_CASCADES, buildShadowCascades, cascadeSpheres, type ShadowBounds, type ShadowView } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import { MIRROR_MASK_DOWNSAMPLE_WGSL, MIRROR_MAT_BYTES, mirrorShaderWgsl, mirrorShadowWgsl } from "./shaders/passes/mirror"
 import { packHalf, type HdrImage } from "./hdr"
@@ -464,6 +470,9 @@ type ParentTrack = { keys: HeldParentKey[]; applied: number; seat: [number, numb
 type SunOptions = {
   /** Linear color of the sun lamp (Blender: Light > Color). */
   color?: Vec3
+  /** The rendering layers it keys, as bits; every layer by default. A
+   *  directional light from setLights takes the layers the sun leaves. */
+  layers?: number
   /** Lamp power in Blender units (Blender: Light > Strength). */
   strength?: number
   /** Direction sunlight travels (points FROM sun TO scene, Blender: -light.rotation.Z). */
@@ -619,8 +628,11 @@ export type ViewTransformOptions = {
    * reference Wuthering Waves projects render this way.
    *
    * "filmic" is Blender 3.6's Filmic, Medium High Contrast, baked as a LUT.
+   *
+   * "aether-gazer" is that game's own final curve, (1 - e^(-2.5x))^1.4 — what
+   * its scenes are graded through (composite.ts, agTransform).
    */
-  transform: "agx" | "filmic" | "standard"
+  transform: "agx" | "filmic" | "standard" | "aether-gazer"
 }
 
 // Matches the reference Blender project: Filmic view, Medium High Contrast look,
@@ -923,11 +935,10 @@ interface ModelInstance {
   shadowDrawCalls: DrawCall[]
   shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
-  /** Its own light — fill, sun and options — when setModelFill, setModelSun or
-   *  setModelFlatSky gave it one: a 48-byte ModelLight, and the CPU copy it is
-   *  written from. */
-  lightBuffer: GPUBuffer | null
-  modelLight: Float32Array | null
+  /** Its ObjectLight — rendering layers, its own ambient — and the CPU copy it
+   *  is written from. Every model has one: its layers decide its lights. */
+  lightBuffer: GPUBuffer
+  objectLight: Float32Array<ArrayBuffer>
   pickPerInstanceBindGroup: GPUBindGroup
   pickDrawCalls: PickDrawCall[]
   /** Environment geometry added via addStage — no physics, no IK, and it
@@ -1827,7 +1838,32 @@ export type SceneLight = {
   aim?: XYZ
   angle?: number
   innerAngle?: number
+  /**
+   * "directional": light along `aim` from infinitely far, as the sun is —
+   * position and radius unused; up to three, beside the sun. Otherwise a spot
+   * where an aim is given and a point where none is.
+   */
+  kind?: "point" | "spot" | "directional"
+  /**
+   * The rendering layers it reaches, as bits (RENDERING_LAYER_*). Omitted
+   * reaches every layer. A stage's daylight on RENDERING_LAYER_DEFAULT and the
+   * cast's key on RENDERING_LAYER_CHARACTER is how a game lights the two apart.
+   */
+  layers?: number
 }
+
+/**
+ * Rendering layers, as the game's pipeline (URP's rendering layers) uses them:
+ * every drawing carries layer bits and a light reaches it only where its mask
+ * shares one. A stage, prop or plane draws on DEFAULT; the cast on DEFAULT and
+ * CHARACTER, the bits Aether Gazer's characters carry (0x40000001).
+ */
+export const RENDERING_LAYER_DEFAULT = 1
+export const RENDERING_LAYER_CHARACTER = 1 << 30
+/** Every layer — what a light without a mask reaches. */
+const ALL_LAYERS = 0xffffffff
+/** Where the directional slots' layer bits sit in the light uniform, in words. */
+const DIR_LAYERS_AT = 108
 
 export class Engine {
   private static instance: Engine | null = null
@@ -1857,7 +1893,11 @@ export class Engine {
   // padded to 80. sh[0].w is the IBL flag: 0 = flat world colour, 1 = the sky.
   // …then the scene fog at [72..87] — see setSceneFog — and the cast's
   // shadow on a stage at [88..107] (colour, amount; its view-projection).
+  // …and the directional slots' rendering layers at [108..111], as u32 bits
+  // through lightDataWords — never through a float.
   private lightData = new Float32Array(112)
+  private lightDataWords = new Uint32Array(this.lightData.buffer)
+  private sunLayers = ALL_LAYERS
   private castShadow: StageCastShadow | null = null
   private castShadowTexture!: GPUTexture
   private castShadowView!: GPUTextureView
@@ -2036,7 +2076,6 @@ export class Engine {
   private mainPerFrameBindGroupLayout!: GPUBindGroupLayout
   private mainPerInstanceBindGroupLayout!: GPUBindGroupLayout
   /** What a model with no fill of its own binds: zero light. */
-  private noFillBuffer!: GPUBuffer
   private mainPerMaterialBindGroupLayout!: GPUBindGroupLayout
   private outlinePerFrameBindGroupLayout!: GPUBindGroupLayout
   private outlinePerMaterialBindGroupLayout!: GPUBindGroupLayout
@@ -2642,6 +2681,20 @@ export class Engine {
   /** Scene seconds, advanced by the frame delta — NOT wall time, so an offline
    *  export samples the same path the editor showed. */
   private sceneClock = 0
+  /** Models dressed in the game's own materials (unity/looks.ts); built on the
+   *  first look installed. */
+  private nativeLooks: NativeLooks | null = null
+  /** The scene pass's host for the game's shaders, and the shadow atlas's. */
+  private nativeHost: NativeHost | null = null
+  private nativeShadowHost: NativeHost | null = null
+  /** A game stage drawn by its own shaders (unity/stage.ts). */
+  private nativeStage: NativeStage | null = null
+  /** The frame's Unity globals, computed once for every native draw. */
+  private nativeGlobals: Record<string, NativeValue> = {}
+  private nativeFallback: Record<string, GPUTextureView> = {}
+  /** A 1x1 depth map at the far plane: a game shader's shadow lookup into a
+   *  map the scene does not have reads lit. */
+  private nativeNoShadowView: GPUTextureView | null = null
   private trailAccum = 0
   /** Trail samples owed this frame, computed once so every trail on every
    *  character samples in lockstep and their paths stay comparable. */
@@ -2719,8 +2772,9 @@ export class Engine {
   /** The user's own "no ground" switch — see setGroundVisible. Distinct from
    *  hasGround, which records whether a ground was ever built. */
   private groundHidden = false
-  private shadowMapTextures: GPUTexture[] = []
-  private shadowMapDepthViews: GPUTextureView[] = []
+  /** The sun's shadow atlas: every cascade in its own tile (shadow-cascades.ts). */
+  private shadowAtlasTexture!: GPUTexture
+  private shadowAtlasView!: GPUTextureView
   private brdfLutTexture!: GPUTexture
   private brdfLutView!: GPUTextureView
   private filmicLutTexture!: GPUTexture
@@ -3098,7 +3152,7 @@ export class Engine {
     // rebuilt per effect, so the compiled variant IS the flag.
     u[11] = this.backdropEquirectView ? 2 : showingWorld ? 3 : bg ? 1 : 0
     // Which display transform forms the frame (see viewTransform in composite.ts).
-    u[25] = v.transform === "agx" ? 2 : v.transform === "standard" ? 1 : 0
+    u[25] = v.transform === "aether-gazer" ? 3 : v.transform === "agx" ? 2 : v.transform === "standard" ? 1 : 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
@@ -5632,8 +5686,7 @@ export class Engine {
                 { binding: PARTICLE_LIGHT_BINDING, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" as const } },
                 { binding: PARTICLE_LIGHT_BINDING + 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" as const } },
                 { binding: PARTICLE_LIGHT_BINDING + 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" as const } },
-                { binding: PARTICLE_LIGHT_BINDING + 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" as const } },
-                { binding: PARTICLE_LIGHT_BINDING + 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" as const } },
+                { binding: PARTICLE_LIGHT_BINDING + 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" as const } },
               ]
             : []),
           // The live count's arguments, for the COUNT kernel's layout alone. The
@@ -5682,9 +5735,8 @@ export class Engine {
               ? [
                   { binding: PARTICLE_LIGHT_BINDING, resource: { buffer: this.lightUniformBuffer } },
                   { binding: PARTICLE_LIGHT_BINDING + 1, resource: { buffer: this.shadowLightVPBuffer } },
-                  { binding: PARTICLE_LIGHT_BINDING + 2, resource: this.shadowMapDepthViews[0] },
-                  { binding: PARTICLE_LIGHT_BINDING + 3, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
-                  { binding: PARTICLE_LIGHT_BINDING + 4, resource: this.shadowComparisonSampler },
+                  { binding: PARTICLE_LIGHT_BINDING + 2, resource: this.shadowAtlasView },
+                  { binding: PARTICLE_LIGHT_BINDING + 3, resource: this.shadowComparisonSampler },
                 ]
               : []),
             ...(withIndirect && indirect ? [{ binding: PARTICLE_INDIRECT_BINDING, resource: { buffer: indirect } }] : []),
@@ -7712,12 +7764,6 @@ export class Engine {
       [1, 1],
     )
 
-    this.noFillBuffer = this.device.createBuffer({
-      label: "model light (none)",
-      size: 48,
-      usage: GPUBufferUsage.UNIFORM,
-    })
-
     // Generic shared-toon ramp: lit white down to a soft cool shadow tone with
     // a tight terminator around the midpoint, approximating MMD's toon ramps.
     const TOON_H = 64
@@ -7813,10 +7859,10 @@ export class Engine {
         // The positional lights. Always bound, empty or not, so every material
         // pipeline shares one layout whether or not the scene has any.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        // The far cascade's shadow map, then the world's sky (8) and the BRDF
-        // LUT (9). The sky is always bound — the 1x1 fallback when the scene
-        // has none — so every material pipeline keeps sharing one layout.
-        { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+        // The world's sky (8) and the BRDF LUT (9). The sky is always bound —
+        // the 1x1 fallback when the scene has none — so every material
+        // pipeline keeps sharing one layout. (7 was the far cascade's map,
+        // which the atlas at 3 replaces.)
         { binding: 8, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         // The cast's shadow on a stage — setStageCastShadow.
@@ -8031,17 +8077,15 @@ export class Engine {
       magFilter: "linear",
       minFilter: "linear",
     })
-    // One map per cascade, each at its own resolution — the near one crisp,
-    // the far one wide. Same format so one pipeline records into both.
-    this.shadowMapTextures = SHADOW_CASCADES.map((c, i) =>
-      this.device.createTexture({
-        label: `shadow map cascade ${i}`,
-        size: [c.mapSize, c.mapSize],
-        format: Engine.SHADOW_DEPTH_FORMAT,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-      }),
-    )
-    this.shadowMapDepthViews = this.shadowMapTextures.map((t) => t.createView())
+    // One atlas, a tile per cascade — the layout the game's pipeline uses, and
+    // one binding for every reader.
+    this.shadowAtlasTexture = this.device.createTexture({
+      label: "sun shadow atlas",
+      size: [SHADOW_ATLAS_SIZE, SHADOW_ATLAS_SIZE],
+      format: Engine.SHADOW_DEPTH_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    this.shadowAtlasView = this.shadowAtlasTexture.createView()
     // The cast's shadow on a stage (setStageCastShadow): one map, only the cast
     // in it, from the stage's own direction. Always allocated so every material
     // bind group and every instance's shadow bind group stays one shape; drawn
@@ -8141,7 +8185,6 @@ export class Engine {
         // Same lights the materials read. A lamp that lit the cast and not the
         // floor under her would read as a sticker.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
         // The floor mirror: the mirror camera's view-projection, the reflection
         // resolve, an ordinary sampler beside the comparison one, and the
         // mirror pass's own depth for the depth-proportional blur.
@@ -10347,7 +10390,7 @@ export class Engine {
     if (
       !this.device ||
       !this.mainPerFrameBindGroupLayout ||
-      !this.shadowMapDepthViews?.length ||
+      !this.shadowAtlasView ||
       !this.cameraUniformBuffer ||
       !this.mirrorCameraBuffer ||
       !this.lightUniformBuffer ||
@@ -10373,11 +10416,10 @@ export class Engine {
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: { buffer: this.lightUniformBuffer } },
         { binding: 2, resource: this.materialSampler },
-        { binding: 3, resource: this.shadowMapDepthViews[0] },
+        { binding: 3, resource: this.shadowAtlasView },
         { binding: 4, resource: this.shadowComparisonSampler },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
-        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 8, resource: env },
         { binding: 9, resource: this.brdfLutView },
         { binding: 10, resource: this.castShadowView },
@@ -10390,11 +10432,10 @@ export class Engine {
         { binding: 0, resource: { buffer: this.mirrorCameraBuffer } },
         { binding: 1, resource: { buffer: this.lightUniformBuffer } },
         { binding: 2, resource: this.materialSampler },
-        { binding: 3, resource: this.shadowMapDepthViews[0] },
+        { binding: 3, resource: this.shadowAtlasView },
         { binding: 4, resource: this.shadowComparisonSampler },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
-        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 8, resource: env },
         { binding: 9, resource: this.brdfLutView },
         { binding: 10, resource: this.castShadowView },
@@ -10460,6 +10501,7 @@ export class Engine {
     this.lightData[base + 5] = this.sun.color.y
     this.lightData[base + 6] = this.sun.color.z
     this.lightData[base + 7] = this.sun.strength
+    this.lightDataWords[DIR_LAYERS_AT + index] = this.sunLayers
     if (index >= this.lightCount) this.lightCount = index + 1
     this.updateLightBuffer()
   }
@@ -10594,6 +10636,7 @@ export class Engine {
     if (options.color) this.sun.color = options.color
     if (options.strength !== undefined) this.sun.strength = options.strength
     if (options.shadow !== undefined) this.sunShadow = Math.min(Math.max(options.shadow, 0), 1)
+    if (options.layers !== undefined) this.sunLayers = options.layers >>> 0
     if (options.direction) {
       this.sun.direction = options.direction
       this.shadowLightVPDirty = true
@@ -10728,7 +10771,23 @@ export class Engine {
      *  literal typed into a console. Vec3 satisfies it either way. */
     lights: SceneLight[] | null,
   ): void {
-    const list = (lights ?? []).slice(0, MAX_LIGHTS)
+    // The directional ones go to the light uniform's slots beside the sun's —
+    // three of them, in order; the rest are records the grid indexes.
+    const directional = (lights ?? []).filter((l) => l.kind === "directional")
+    for (let k = 1; k < 4; k++) {
+      const l = directional[k - 1]
+      const base = 4 + k * 8
+      const a = l?.aim
+      const len = a ? Math.hypot(a.x, a.y, a.z) : 0
+      const i = l ? Math.max(l.intensity ?? 1, 0) : 0
+      this.lightData.set(
+        l && len > 0 ? [a!.x / len, a!.y / len, a!.z / len, 0, l.color.x * i, l.color.y * i, l.color.z * i, 1] : [0, 0, -1, 0, 0, 0, 0, 0],
+        base,
+      )
+      this.lightDataWords[DIR_LAYERS_AT + k] = l && len > 0 ? (l.layers ?? ALL_LAYERS) >>> 0 : 0
+    }
+    this.updateLightBuffer()
+    const list = (lights ?? []).filter((l) => l.kind !== "directional").slice(0, MAX_LIGHTS)
     this.docLightCount = list.length
     // RECORDS only — the header belongs to allocateLightSlots, the one writer.
     // This used to zero-and-upload the header region too, which left two CPU
@@ -10757,7 +10816,7 @@ export class Engine {
       // vector cannot be normalised, and a cone around nothing would light
       // nothing at all — a light that vanishes because its aim was left at the
       // default is worse than one that shines everywhere.
-      const len = l.aim ? Math.hypot(l.aim.x, l.aim.y, l.aim.z) : 0
+      const len = l.aim && l.kind !== "point" ? Math.hypot(l.aim.x, l.aim.y, l.aim.z) : 0
       this.lightsData[b + 7] = len > 0 ? 1 : 0
       this.lightsData[b + 8] = len > 0 ? l.aim!.x / len : 0
       this.lightsData[b + 9] = len > 0 ? l.aim!.y / len : 0
@@ -10769,7 +10828,8 @@ export class Engine {
       const inner = len > 0 ? Math.cos((Math.min(Math.max(l.innerAngle ?? (l.angle ?? 45) * 0.8, 0), 179) / 2) * (Math.PI / 180)) : -1
       this.lightsData[b + 11] = outer
       this.lightsData[b + 12] = Math.max(inner, outer)
-      this.lightsData[b + 13] = 0
+      // The layers it does NOT reach, as bits — inverted so a zero reaches all.
+      this.lightsWords[b + 13] = ~(l.layers ?? ALL_LAYERS) >>> 0
       this.lightsData[b + 14] = 0
       this.lightsData[b + 15] = 0
     }
@@ -11252,6 +11312,7 @@ export class Engine {
    *  ground plane must not draw, and the far shadow cascade has nothing to
    *  cover without one (see the cascade loop). */
   hasStage(): boolean {
+    if (this.nativeStage) return true
     for (const inst of this.modelInstances.values()) if (inst.isStage) return true
     return false
   }
@@ -11281,11 +11342,6 @@ export class Engine {
     this.groundHidden = !on
   }
 
-  /** Per cascade: does its map currently hold nothing but the cleared far plane?
-   *  Set by the cascade loop, which skips a cascade that is unwanted and already
-   *  cleared rather than re-clearing it every frame. */
-  private shadowCascadeCleared: boolean[] = []
-
   /**
    * Moves a model to a new key. Nothing about it is rebuilt — same GPU
    * buffers, same style groups, same physics — only which string the rest
@@ -11307,96 +11363,34 @@ export class Engine {
   }
 
   /**
-   * Light one model with more than the world gives it: a FILL, linear RGB times
-   * its surface colour, added after its material graph. Null takes it away again.
+   * One model's own ambient: the irradiance arriving at it, as the 27 floats of
+   * folded SH setWorldAmbient takes (ibl.ts), in place of the world's. Null
+   * gives it the world's again.
    *
-   * After the graph, not in its ambient: an NPR ramp read an ambient fill as
-   * light, so sliding it moved her shadows and flipped whole regions across a
-   * hard step. Added after, it brightens her evenly and every shadow stays put.
-   *
-   * A game lights its stage and its characters apart. Aether Gazer's rooms are
-   * lit by their lamps and a near-black ambient, while its characters take a
-   * flat base light of their own — so a stage whose World is right for the room
-   * leaves a face turned from the lamps in the dark. This is that second light,
-   * for the models the host counts as cast.
+   * The game's pipeline lights every renderer by its own probe sample, and a
+   * character by an ambient of its own; a loader that carries those hands them
+   * in here. Linear radiance, strength included.
    */
-  setModelFill(name: string, fill: Vec3 | null): boolean {
-    return this.writeModelLight(name, 0, fill)
-  }
-
-  /**
-   * A model's own sun: the colour and strength the scene's sun has FOR THIS
-   * MODEL, in place of the scene's. Null gives it the scene's sun back.
-   *
-   * The other half of lighting a stage and its cast apart. A game's stage is
-   * lit by its own daylight — Aether Gazer's kitchen at twenty times white —
-   * while its characters take a key light of their own that the stage never
-   * states. So a stage carries the sun it was lit by, and the scene's sun
-   * stays the cast's. Direction and shadow are still the scene's: one sun
-   * casts, and it casts the same way on both.
-   */
-  setModelSun(name: string, sun: Vec3 | null): boolean {
-    return this.writeModelLight(name, 4, sun)
-  }
-
-  /**
-   * Light one model by the sky's AVERAGE rather than its shape: the world's
-   * colour and brightness from every direction alike. False gives it the
-   * directional sky back.
-   *
-   * For a cast under an anime look. An HDRI's sky is brighter and warmer one
-   * way than another, and taken at each normal it shades a face with soft
-   * realistic gradients that no toon ramp drew — PBR on an anime face. Aether
-   * Gazer gives its characters one flat base light instead. World strength and
-   * colour still reach her; only the shape is gone. A flat World is its own
-   * average, so without an HDRI this changes nothing.
-   */
-  setModelFlatSky(name: string, flat: boolean): boolean {
-    return this.writeModelLight(name, 8, flat ? new Vec3(1, 0, 0) : null)
-  }
-
-  /** One part of a model's light, at `at` (0 the fill, 4 the sun, 8 its
-   *  options) in its ModelLight; w says whether that part is set. All unset
-   *  releases the buffer and the model takes the shared zero stand-in again. */
-  private writeModelLight(name: string, at: 0 | 4 | 8, value: Vec3 | null): boolean {
+  setModelAmbient(name: string, sh: ArrayLike<number> | null): boolean {
     const inst = this.modelInstances.get(name)
     if (!inst || !this.device) return false
-    const light = inst.modelLight ?? new Float32Array(12)
-    light.set(value ? [value.x, value.y, value.z, 1] : [0, 0, 0, 0], at)
-    const any = light[3] > 0 || light[7] > 0 || light[11] > 0
-    if (!any) {
-      if (!inst.lightBuffer) return true
-      const retired = inst.lightBuffer
-      inst.lightBuffer = null
-      inst.modelLight = null
-      inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, null)
-      this.bundlesDirty = true
-      // Retired once the GPU is done with it: an encoded frame may still name it.
-      void this.device.queue.onSubmittedWorkDone().then(() => retired.destroy())
-      return true
+    const o = inst.objectLight
+    o[4] = sh && sh.length >= 27 ? 1 : 0
+    for (let i = 0; i < 9; i++) {
+      o.set(sh && sh.length >= 27 ? [sh[i * 3], sh[i * 3 + 1], sh[i * 3 + 2], 0] : [0, 0, 0, 0], 8 + i * 4)
     }
-    inst.modelLight = light
-    if (!inst.lightBuffer) {
-      inst.lightBuffer = this.device.createBuffer({
-        label: `${name}: light`,
-        size: 48,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      })
-      inst.mainPerInstanceBindGroup = this.perInstanceBindGroup(name, inst.skinMatrixBuffer, inst.lightBuffer)
-      this.bundlesDirty = true
-    }
-    this.device.queue.writeBuffer(inst.lightBuffer, 0, light.buffer as ArrayBuffer)
+    this.device.queue.writeBuffer(inst.lightBuffer, 0, o)
     return true
   }
 
-  /** The per-model group: its skinning matrices and its light, or the zero stand-in. */
-  private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, light: GPUBuffer | null): GPUBindGroup {
+  /** The per-model group: its skinning matrices and its ObjectLight. */
+  private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, light: GPUBuffer): GPUBindGroup {
     return this.device.createBindGroup({
       label: `${name}: main per-instance bind group`,
       layout: this.mainPerInstanceBindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: skinMatrixBuffer } },
-        { binding: 1, resource: { buffer: light ?? this.noFillBuffer } },
+        { binding: 1, resource: { buffer: light } },
       ],
     })
   }
@@ -13081,8 +13075,10 @@ export class Engine {
     let changed = force
     for (let i = 0; i < this.cullDraws.length; i++) {
       const { inst, draw } = this.cullDraws[i]
+      // bit 0: switched off; bit 1: drawn by its native look, not its graph
       const v =
-        inst.hiddenMaterials.has(draw.materialName) || inst.morphHiddenMaterials.has(draw.materialName) ? 1 : 0
+        (inst.hiddenMaterials.has(draw.materialName) || inst.morphHiddenMaterials.has(draw.materialName) ? 1 : 0) |
+        (this.nativeLooks?.dresses(inst.name, draw.materialName) ? 2 : 0)
       if (out[i] !== v) {
         out[i] = v
         changed = true
@@ -13219,6 +13215,12 @@ export class Engine {
         minY = Math.min(minY, data[o + 17] - r); maxY = Math.max(maxY, data[o + 17] + r)
         minZ = Math.min(minZ, data[o + 18] - r); maxZ = Math.max(maxZ, data[o + 18] + r)
       }
+    }
+    if (this.nativeStage) {
+      const nb = this.nativeStage.bounds
+      minX = Math.min(minX, nb.min[0]); maxX = Math.max(maxX, nb.max[0])
+      minY = Math.min(minY, nb.min[1]); maxY = Math.max(maxY, nb.max[1])
+      minZ = Math.min(minZ, nb.min[2]); maxZ = Math.max(maxZ, nb.max[2])
     }
     if (!Number.isFinite(minX)) {
       this.shadowSceneBounds = null
@@ -14067,7 +14069,19 @@ export class Engine {
       }),
     )
 
-    const mainPerInstanceBindGroup = this.perInstanceBindGroup(name, skinMatrixBuffer, null)
+    // Its ObjectLight: the world's ambient, and the layers its kind draws on —
+    // the cast on the character layer as well as the default one. Words:
+    // layers [0..3], ambient flag [4..7], SH [8..43] — see materials/common.ts.
+    const objectLight = new Float32Array(44)
+    new Uint32Array(objectLight.buffer)[0] =
+      isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0
+    const lightBuffer = this.device.createBuffer({
+      label: `${name}: object light`,
+      size: objectLight.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.device.queue.writeBuffer(lightBuffer, 0, objectLight)
+    const mainPerInstanceBindGroup = this.perInstanceBindGroup(name, skinMatrixBuffer, lightBuffer)
 
     const pickPerInstanceBindGroup = this.device.createBindGroup({
       label: `${name}: pick per-instance bind group`,
@@ -14106,8 +14120,8 @@ export class Engine {
       shadowDrawCalls: [],
       shadowBindGroups,
       mainPerInstanceBindGroup,
-      lightBuffer: null,
-      modelLight: null,
+      lightBuffer,
+      objectLight,
       pickPerInstanceBindGroup,
       pickDrawCalls: [],
       isStage,
@@ -14378,7 +14392,6 @@ export class Engine {
     gb[3] = fadeStart
     gb[4] = fadeEnd
     gb[5] = shadowStrength
-    gb[6] = 1 / SHADOW_CASCADES[0].mapSize
     gb[7] = gridSpacing
     gb[8] = gridLineWidth
     gb[9] = gridLineOpacity
@@ -14400,19 +14413,6 @@ export class Engine {
     // Which variant the draw picks. Zero is the sharp shader, which is the one
     // that existed before softness did.
     this.groundSoft = gb[18] > 0
-    // gb[17] — does the FAR cascade hold anything?
-    //
-    // It holds something only when a stage is loaded; that is what it exists for
-    // and the cascade loop already skips drawing into it otherwise, leaving it
-    // cleared. A cleared depth map compares as "no occluder", so the ground's far
-    // branch is nine comparison taps whose answer is known in advance.
-    //
-    // That branch runs wherever the NEAR cascade does not reach, and the near one
-    // is a 64-unit box around the camera target — so on a floor receding to the
-    // horizon it is most of the visible pixels, on the most expensive
-    // full-coverage draw in the frame. Skipping it is free in the exact sense:
-    // the shader takes vis = 1.0, which is what the taps would have returned.
-    gb[17] = this.hasStage() ? 1 : 0
     // gb[20..23] — the caster sphere, refreshed every frame by
     // writeGroundCasterSphere. Zero here so a frame that renders before the
     // first cull (there is one) reads "nothing casts" and skips the taps, which
@@ -14477,12 +14477,11 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-        { binding: 2, resource: this.shadowMapDepthViews[0] },
+        { binding: 2, resource: this.shadowAtlasView },
         { binding: 3, resource: this.shadowComparisonSampler },
         { binding: 4, resource: { buffer: this.groundShadowMaterialBuffer } },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
-        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 8, resource: { buffer: this.mirrorVPBuffer } },
         // Created in handleResize, which runs during init — before any ground
         // can exist to bind it.
@@ -14500,12 +14499,11 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.mirrorCameraBuffer } },
         { binding: 1, resource: { buffer: this.lightUniformBuffer } },
-        { binding: 2, resource: this.shadowMapDepthViews[0] },
+        { binding: 2, resource: this.shadowAtlasView },
         { binding: 3, resource: this.shadowComparisonSampler },
         { binding: 4, resource: { buffer: this.groundShadowMaterialBuffer } },
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
-        { binding: 7, resource: this.shadowMapDepthViews[SHADOW_CASCADES.length - 1] },
         { binding: 8, resource: { buffer: this.mirrorVPBuffer } },
         // Stand-ins, not the live mirror textures: this group draws INTO the
         // mirror pass, where those are the attachments.
@@ -16456,52 +16454,51 @@ export class Engine {
     // the final frame's depth — and the ground, which draws on `hasGround` alone,
     // keeps PCF-sampling a character that is no longer in the scene. One clearing
     // pass on the transition to empty, then it stops.
-    if (hasModels || this.shadowMapPopulated) {
-      // The far cascade is the STAGE cascade, and it costs a full pass over the
-      // whole cast every frame to say so. Its own spec explains what it is for —
-      // "a set piece 100 units out still throws" — and a scene with no stage has
-      // no set piece: every caster sits inside the near cascade's 64-unit box,
-      // which follows the camera target, and the far map's only readers are
-      // ground pixels beyond that box, where nothing is casting.
-      //
-      // So when no stage is loaded it is drawn ONCE, cleared, and then skipped —
-      // the same shape as shadowMapPopulated above, and for the same reason. A
-      // cleared depth map reads as "no occluder", which is the correct answer
-      // here rather than a missing one. Load a stage and it comes straight back.
-      //
-      // 0.43 had ONE shadow map. This is half of what the second one costs.
+    // The game's globals before anything native draws: the stage's casters
+    // into the atlas are the first.
+    if (this.nativeStage || this.nativeLooks?.size) this.prepareNativeLooks(encoder)
+    if (hasModels || this.nativeStage || this.shadowMapPopulated) {
+      // The outer cascades are the STAGE's, and each costs a pass over the whole
+      // cast. A scene with no stage has no set piece out there: every caster
+      // sits inside the inner cascade, which follows the camera target, and
+      // the outer tiles' only readers are ground pixels beyond it, where
+      // nothing is casting. So without a stage only the inner tile is drawn;
+      // the others keep the far plane cascade 0's pass cleared the whole atlas
+      // to, which compares as "no occluder" — the correct answer there.
       const stage = this.hasStage()
       for (let ci = 0; ci < SHADOW_CASCADES.length; ci++) {
-        const wanted = ci === 0 || stage
-        // Already cleared and still unwanted — nothing to do, and the map still
-        // holds the far plane from the pass that cleared it.
-        if (!wanted && this.shadowCascadeCleared[ci]) continue
+        if (ci > 0 && !stage) continue
+        const c = SHADOW_CASCADES[ci]
         const sp = encoder.beginRenderPass({
-          // One timestamp pair exists for "shadow"; the near cascade wears it.
+          // One timestamp pair exists for "shadow"; the inner cascade wears it.
           timestampWrites: ci === 0 ? this.stamps("shadow") : undefined,
           colorAttachments: [],
           depthStencilAttachment: {
-            view: this.shadowMapDepthViews[ci],
+            view: this.shadowAtlasView,
             depthClearValue: 1.0,
-            depthLoadOp: "clear",
+            depthLoadOp: ci === 0 ? "clear" : "load",
             depthStoreOp: "store",
           },
         })
+        // The tile: a bundle draws through the pass's viewport, which it
+        // cannot set itself, so one recording serves whichever tile is live.
+        sp.setViewport(c.origin[0], c.origin[1], c.mapSize, c.mapSize, 0, 1)
         // The per-model `visible` test that used to guard this is gone: it is a
         // per-frame boolean, and baking it into a bundle would make toggling a
         // model re-record. It lives in the cull compute now, which zeroes the
         // instance count of an invisible model's draws.
-        if (wanted && this.shadowBundles[ci]) sp.executeBundles([this.shadowBundles[ci]])
+        if (this.shadowBundles[ci]) sp.executeBundles([this.shadowBundles[ci]])
         // The mirror throws shade like anything else standing on the floor.
         // Direct rather than in the bundle: the bundles are recorded on scene
         // STRUCTURE, and a mirror comes and goes with an effect's weight.
-        if (wanted && this.mirrorSurface && this.mirrorShadowPipeline) {
+        if (this.mirrorSurface && this.mirrorShadowPipeline) {
           sp.setPipeline(this.mirrorShadowPipeline)
           sp.setBindGroup(0, this.mirrorShadowBindGroups[ci])
           sp.draw(6)
         }
+        if (this.nativeStage && this.nativeShadowHost)
+          this.nativeStage.drawShadow(sp, this.nativeShadowHost, this.nativeGlobals, ci, this.shadowLightVPMatrix.subarray(ci * 16, ci * 16 + 16), 8)
         sp.end()
-        this.shadowCascadeCleared[ci] = !wanted
       }
       // The cast's shadow on a stage: drawn while a stage asks for it and has a
       // cast to shade it with; cleared once when it stops, then left alone.
@@ -16515,7 +16512,7 @@ export class Engine {
         cp.end()
         this.castShadowCleared = !castOn
       }
-      this.shadowMapPopulated = hasModels
+      this.shadowMapPopulated = hasModels || !!this.nativeStage
     }
 
     // Before the particles and before the field pass: both may read the grid,
@@ -16561,6 +16558,17 @@ export class Engine {
     // is FALSE for the cleared buffer — every such fragment silently rejected.
     // One redundant word against a whole class of invisible failure.
     pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    // The models dressed in the game's materials, and the game's character
+    // passes after them (unity/looks.ts). They set their own stencil
+    // references, so the engine's is put back after.
+    if (this.nativeLooks?.size) {
+      this.nativeLooks.drawOpaque(pass)
+      pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    }
+    if (this.nativeStage && this.nativeHost) {
+      this.nativeStage.drawOpaque(pass, this.nativeHost, this.nativeGlobals, this.nativeFrameTextures(), this.eyeArray())
+      pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    }
     if (this.hasGround) this.renderGround(pass)
     // After the ground for the same early-z reason, and before the transparent
     // phase so sheer fabric blends over the glass rather than being depth
@@ -16592,6 +16600,14 @@ export class Engine {
     // which was never this renderer's bottleneck.
     const camView = this.sceneView("camera")
     this.forEachInstance((inst) => this.renderModelTransparentPhase(pass, inst, camView))
+    if (this.nativeStage && this.nativeHost) {
+      this.nativeStage.drawTransparent(pass, this.nativeHost, this.nativeGlobals, this.nativeFrameTextures(), this.eyeArray())
+      pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    }
+    if (this.nativeLooks?.size) {
+      this.nativeLooks.drawTransparent(pass)
+      pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+    }
     // Last in the pass: depth-tested against everything drawn above, so a
     // particle behind the character is simply hidden, and still inside the HDR
     // target so an `#bloom` effect reaches the pyramid below.
@@ -17126,11 +17142,44 @@ export class Engine {
 
   // Compile a group's graph → WGSL → pipeline(s), install keyed by group id. Reuses the
   // install (pipeline + uniform buffer) when the graph/integration is byte-unchanged.
+  /** A graph's own images (ShaderGraph.images), fetched and decoded once per URL. */
+  private graphImageCache = new Map<string, Promise<ImageBitmap | null>>()
+
+  private graphImage(url: string): Promise<ImageBitmap | null> {
+    let p = this.graphImageCache.get(url)
+    if (!p) {
+      p = fetch(url)
+        .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(`${r.status} ${url}`))))
+        .then((b) => createImageBitmap(b, { colorSpaceConversion: "none", premultiplyAlpha: "none" }))
+        .catch((e) => {
+          console.warn(`[style] graph image: ${(e as Error).message}`)
+          return null
+        })
+      this.graphImageCache.set(url, p)
+    }
+    return p
+  }
+
+  /** The group with its graph's images, where the group brings none of its own. */
+  private async withGraphImages(group: StyleGroup): Promise<StyleGroup> {
+    const wanted = group.graph.images
+    if (!wanted?.length || group.images?.length) return group
+    const images = await Promise.all(
+      wanted.slice(0, 4).map(async (w) => {
+        if (!w) return null
+        const source = await this.graphImage(w.url)
+        return source ? { source, srgb: w.srgb ?? false } : null
+      }),
+    )
+    return { ...group, images }
+  }
+
   private async compileAndInstallGroup(
     inst: ModelInstance,
-    group: StyleGroup,
+    groupIn: StyleGroup,
     opts?: CompileOptions,
   ): Promise<ApplyStyleGroupResult> {
+    const group = await this.withGraphImages(groupIn)
     const renderClass = group.renderClass ?? "auto"
     const alphaMode = group.alphaMode ?? "opaque"
     // THE MAPS ARE PART OF THE SIGNATURE, because a matching one skips the
@@ -18284,6 +18333,257 @@ export class Engine {
     cd[anchorBase + 11] = count
   }
 
+  /**
+   * Dress a model in the game's own materials — a look exported with ag-rip
+   * (translated shaders, their images, per-material passes and values, and a
+   * character rig) — or take it off with null. The materials it names are
+   * drawn by the game's shaders from then on; the rest keep their graphs, and
+   * every one still casts its shadow through the engine's pass.
+   */
+  setModelNativeLook(name: string, look: NativeLook | null): boolean {
+    const inst = this.modelInstances.get(name)
+    if (!inst || !this.device) return false
+    if (!look) {
+      this.nativeLooks?.remove(name)
+      this.writeCullHidden(true)
+      return true
+    }
+    if (!this.nativeLooks) this.nativeLooks = new NativeLooks(this.device, this.ensureNativeHosts())
+    const skeleton = inst.model.getSkeleton()
+    const head = skeleton.bones.findIndex((b) => b.name === "頭")
+    // The head's rest position: a rigid inverse bind [R t] is the bind pose
+    // inverted, so the bind position is −Rᵀt.
+    let headRest: [number, number, number] = [0, 0, 0]
+    if (head >= 0) {
+      const m = skeleton.inverseBindMatrices.subarray(head * 16, head * 16 + 16)
+      headRest = [
+        -(m[0] * m[12] + m[1] * m[13] + m[2] * m[14]),
+        -(m[4] * m[12] + m[5] * m[13] + m[6] * m[14]),
+        -(m[8] * m[12] + m[9] * m[13] + m[10] * m[14]),
+      ]
+    }
+    const draws = inst.drawCalls
+      .filter((dc) => dc.baseBindGroupEntries)
+      .map((dc) => ({
+        materialName: dc.materialName,
+        firstIndex: dc.firstIndex,
+        count: dc.count,
+        diffuse: dc.baseBindGroupEntries!.find((e) => e.binding === 0)!.resource as GPUTextureView,
+      }))
+    this.nativeLooks.install(
+      {
+        name,
+        vertices: inst.model.getVertices(),
+        indices: inst.model.getIndices(),
+        vertexBuffer: inst.vertexBuffer,
+        jointsBuffer: inst.jointsBuffer,
+        weightsBuffer: inst.weightsBuffer,
+        skinMatrixBuffer: inst.skinMatrixBuffer,
+        indexBuffer: inst.indexBuffer,
+        draws,
+        hidden: (m) => inst.hiddenMaterials.has(m) || inst.morphHiddenMaterials.has(m),
+        headSkin: () => (head >= 0 ? inst.model.getSkinMatrices().subarray(head * 16, head * 16 + 16) : null),
+        headRest,
+        layers: new Uint32Array(inst.objectLight.buffer)[0],
+      },
+      look,
+    )
+    this.writeCullHidden(true)
+    return true
+  }
+
+  /** The hosts for the game's shaders: the scene pass's and the shadow atlas's,
+   *  with the stand-ins an empty slot reads. Built on first use. */
+  private ensureNativeHosts(): NativeHost {
+    if (this.nativeHost) return this.nativeHost
+    const d = this.device
+    const noShadow = d.createTexture({
+      label: "native: no shadow",
+      size: [1, 1],
+      format: "depth32float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    const enc = d.createCommandEncoder()
+    enc
+      .beginRenderPass({
+        colorAttachments: [],
+        depthStencilAttachment: { view: noShadow.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" },
+      })
+      .end()
+    d.queue.submit([enc.finish()])
+    this.nativeNoShadowView = noShadow.createView()
+    const solid = (label: string, rgba: number[], cube = false) => {
+      const t = d.createTexture({
+        label,
+        size: [1, 1, cube ? 6 : 1],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      for (let l = 0; l < (cube ? 6 : 1); l++) d.queue.writeTexture({ texture: t, origin: [0, 0, l] }, new Uint8Array(rgba), { bytesPerRow: 4 }, [1, 1])
+      return t.createView(cube ? { dimension: "cube" } : undefined)
+    }
+    const white = solid("native: white", [255, 255, 255, 255])
+    const black = solid("native: black", [0, 0, 0, 255])
+    // Unity's stand-ins for an empty slot, by the name a shader declares.
+    this.nativeFallback = {
+      white,
+      black,
+      "": white,
+      grey: solid("native: grey", [128, 128, 128, 255]),
+      gray: solid("native: gray", [128, 128, 128, 255]),
+      bump: solid("native: bump", [128, 128, 255, 255]),
+      red: solid("native: red", [255, 0, 0, 255]),
+    }
+    const fallback = {
+      white,
+      black,
+      blackCube: solid("native: black cube", [0, 0, 0, 255], true),
+      depth: this.nativeNoShadowView,
+      comparison: this.shadowComparisonSampler,
+    }
+    this.nativeHost = new NativeHost(
+      d,
+      {
+        colorFormats: sceneColorFormats(this.sceneFormats),
+        depthFormat: this.depthFormat,
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        reversedZ: this.reversedZ,
+      },
+      fallback,
+    )
+    this.nativeShadowHost = new NativeHost(d, { colorFormats: [], depthFormat: Engine.SHADOW_DEPTH_FORMAT, sampleCount: 1, reversedZ: false }, fallback)
+    return this.nativeHost
+  }
+
+  /**
+   * Load a game stage as the game draws it - a package ag-rip's
+   * stage_native.py exported (stage.json and the files beside it, read through
+   * `read` by their paths in it) - or remove the one loaded with null. Its
+   * scene settings (fog, tint, ambient, environment) become the game shaders'
+   * for the whole scene; its lights are the caller's to set, as lights.
+   */
+  async setNativeStage(pkg: NativeStagePackage | null, read?: NativeStageReader, onProgress?: (done: number, total: number) => void): Promise<void> {
+    const old = this.nativeStage
+    this.nativeStage = null
+    if (old) old.destroy([this.nativeHost!, this.nativeShadowHost!])
+    if (!pkg || !read || !this.device) return
+    const scene = this.ensureNativeHosts()
+    this.nativeStage = await NativeStage.load(
+      this.device,
+      pkg,
+      read,
+      { scene, shadow: this.nativeShadowHost! },
+      { mipmaps: (t, levels) => this.generateMipmaps(t, levels), fallback: this.nativeFallback },
+      onProgress,
+    )
+
+  }
+
+  /** What went wrong in the game's shaders, and the names nothing supplied. */
+  nativeReport(): { errors: string[]; missing: Record<string, number> } {
+    const errors = [...(this.nativeHost?.errors ?? []), ...(this.nativeShadowHost?.errors ?? [])]
+    const missing: Record<string, number> = {}
+    for (const h of [this.nativeHost, this.nativeShadowHost]) for (const [k, v] of h?.missing ?? []) missing[k] = (missing[k] ?? 0) + v
+    return { errors, missing }
+  }
+
+  private nativeFrameTextures(): Record<string, GPUTextureView | undefined> {
+    return { _MainLightShadowmapTexture: this.shadowAtlasView, sim_CharacterShadowmap: this.nativeNoShadowView ?? undefined }
+  }
+
+  private eyeArray(): [number, number, number] {
+    const e = this.camera.getEyePosition()
+    return [e.x, e.y, e.z]
+  }
+
+  /** Before the scene pass: the dressed models' skinning and the game's globals. */
+  private prepareNativeLooks(encoder: GPUCommandEncoder): void {
+    const looks = this.nativeLooks
+    const view = this.camera.getViewMatrix().values
+    const proj = this.camera.getProjectionMatrix().values
+    const eye = this.camera.getEyePosition()
+    const sun = this.sun
+    const dir = sun.direction.normalize()
+    const k = sun.strength
+    // The document's lamps as their records store them.
+    const lights = []
+    for (let i = 0; i < this.docLightCount; i++) {
+      const b = LIGHT_HEADER + i * LIGHT_STRIDE
+      const d = this.lightsData
+      lights.push({
+        position: [d[b], d[b + 1], d[b + 2]] as [number, number, number],
+        radius: d[b + 3],
+        color: [d[b + 4], d[b + 5], d[b + 6]] as [number, number, number],
+        aim: [d[b + 8], d[b + 9], d[b + 10]] as [number, number, number],
+        cosOuter: d[b + 11],
+        cosInner: d[b + 12],
+        layers: ~this.lightsWords[b + 13] >>> 0,
+      })
+    }
+    // A game stage brings its own lights: the game's shaders get exactly those
+    // (its sun, its lamps, all layers), whatever the scene's lamps are.
+    const stage = this.nativeStage
+    let sunDirection: [number, number, number] = [dir.x, dir.y, dir.z]
+    let sunColor: [number, number, number] = [sun.color.x * k, sun.color.y * k, sun.color.z * k]
+    let sunShadow = this.sunShadow
+    if (stage) {
+      // Its lamps are the stage's own; its key is the scene's sun, which the
+      // host sets from the stage (and a person may then move).
+      const L = stage.pkg.lights
+      const sc = stage.pkg.scale
+      lights.length = 0
+      for (const l of L.additional) {
+        lights.push({
+          position: [-l.position[0] * sc, l.position[1] * sc, -l.position[2] * sc] as [number, number, number],
+          radius: l.range * sc,
+          color: [l.color[0] * sc * sc, l.color[1] * sc * sc, l.color[2] * sc * sc] as [number, number, number],
+          aim: (l.aim ? gameDir(l.aim) : [0, 0, 0]) as [number, number, number],
+          cosOuter: l.cosOuter ?? -1,
+          cosInner: l.cosInner ?? -1,
+          layers: 0xffffffff,
+          unity: l.unity,
+        })
+      }
+    }
+    const s = this.world.strength
+    const sh = this.worldAmbientSH ?? this.worldSH ?? this.worldGradientSH
+    const g = unityFrameGlobals({
+        scale: 8,
+        view,
+        proj,
+        eye: [eye.x, eye.y, eye.z],
+        near: this.camera.near,
+        far: this.camera.far,
+        width: this.canvas.width,
+        height: this.canvas.height,
+        time: this.sceneClock,
+        dt: 1 / 60,
+        sunDirection,
+        sunColor,
+        sunShadow,
+        lights,
+        ambientSH: sh ? Array.from(sh, (v) => v * s) : null,
+        ambientFlat: [this.world.color.x * s, this.world.color.y * s, this.world.color.z * s],
+        shadow: {
+          viewProj: SHADOW_CASCADES.map((_, i) => this.shadowLightVPMatrix.subarray(i * 16, i * 16 + 16)),
+          tiles: SHADOW_CASCADES.map((c) => [c.origin[0], c.origin[1]] as [number, number]),
+          tileSize: SHADOW_CASCADES[0].mapSize,
+          atlasSize: SHADOW_ATLAS_SIZE,
+          spheres: cascadeSpheres(this.shadowView, this.shadowSceneBounds).map((p) => ({
+            center: [p.center.x, p.center.y, p.center.z] as [number, number, number],
+            radius: p.radius,
+          })),
+        },
+        settings: this.nativeStage?.pkg.settings ?? null,
+      })
+    g.sim_TowardMatrix = towardMatrix(gameDir([view[2], view[6], view[10]]))
+    g._OutlineMaxOffsetMultiplier = outlineMaxOffsetMultiplier(this.canvas.width)
+    this.nativeGlobals = stableGlobals(this.nativeGlobals, g)
+    this.nativeHost?.beginFrame()
+    this.nativeShadowHost?.beginFrame()
+    looks?.prepare(encoder, this.nativeGlobals, 8, this.nativeFrameTextures())
+  }
+
   private updateSkinMatrices() {
     this.forEachInstance((inst) => {
       // Only a pose pass can change these, and an idle stage did not run one —
@@ -18359,4 +18659,31 @@ export class Engine {
     this.stats.cpuPhysicsMs = Math.round(this.cpuPhysicsMs * 100) / 100
     this.stats.cpuRenderMs = Math.round(this.cpuRenderMs * 100) / 100
   }
+}
+
+/**
+ * This frame's Unity globals, keeping last frame's object for every value that
+ * did not change: the native host refills a uniform member only when its value
+ * object is new, so a light table or an SH that holds still costs nothing.
+ */
+function stableGlobals(prev: Record<string, NativeValue>, next: Record<string, NativeValue>): Record<string, NativeValue> {
+  for (const k in next) {
+    const a = prev[k]
+    if (a !== undefined && sameValue(a, next[k])) next[k] = a
+  }
+  return next
+}
+
+function sameValue(a: NativeValue, b: NativeValue): boolean {
+  if (typeof a === "number" || typeof b === "number") return a === b
+  if (a.length !== b.length) return false
+  if (a instanceof Uint32Array !== b instanceof Uint32Array) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] as number | ArrayLike<number>
+    const y = b[i] as number | ArrayLike<number>
+    if (typeof x === "number" || typeof y === "number") {
+      if (x !== y) return false
+    } else if (!sameValue(x, y)) return false
+  }
+  return true
 }

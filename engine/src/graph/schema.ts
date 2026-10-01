@@ -66,6 +66,15 @@ export type ShaderGraph = {
    *  matching (e.g. ["hair"]). Ignored by the compiler; round-tripped. A graph is pure
    *  shading — pass integration lives on the style group's renderClass, not here. */
   tags?: string[]
+  /**
+   * The images this look samples on `tex_image/0`…`tex_image/3`, by URL —
+   * a ramp, a matcap, the maps a game's look is built on. They belong to the
+   * LOOK, not to the model it is put on: they are read at coordinates the
+   * shading computes (a light amount, a reflection), never at the mesh's uvs,
+   * so one graph carries them to any model. A style group that brings its own
+   * images keeps those.
+   */
+  images?: ({ url: string; srgb?: boolean } | null)[]
 }
 
 export type Diagnostic = {

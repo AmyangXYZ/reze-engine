@@ -19,6 +19,8 @@ export {
   type MaterialPresetMap,
   type ModelTransform,
   type SceneLight,
+  RENDERING_LAYER_DEFAULT,
+  RENDERING_LAYER_CHARACTER,
   type ModelAttachment,
   type GizmoDragEvent,
   type GizmoDragCallback,
@@ -215,3 +217,12 @@ export {
  */
 export { EFFECT_MATH_API, PARTICLE_STRUCT_WGSL } from "./shaders/passes/hosted-api"
 export type { EyeTrackingOptions } from "./model"
+
+/**
+ * The game's own materials (src/unity): a stage package drawn by its translated
+ * shaders (Engine.setNativeStage) and a model dressed in a native look
+ * (Engine.setModelNativeLook) — the shapes their files take.
+ */
+export type { NativeStagePackage, NativeStageReader } from "./unity/stage"
+export type { NativeLook, NativeMaterialSpec, NativeTexture } from "./unity/looks"
+export type { NativeShader, NativeShaderInfo } from "./unity/host"

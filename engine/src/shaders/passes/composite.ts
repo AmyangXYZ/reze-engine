@@ -302,11 +302,23 @@ fn agxTransform(c: vec3f) -> vec3f {
   return vec3f(srgb_encode(linear.r), srgb_encode(linear.g), srgb_encode(linear.b));
 }
 
-/** Which display transform, chosen per frame at viewU[6].y (0 filmic, 1 standard, 2 agx).
+/**
+ * Aether Gazer's own curve, from its final pass (Hidden/SimPipeline/Final,
+ * decompiled): (1 - e^(-exposure x))^contrast, at the 2.5 and 1.4 its scenes
+ * set, into a linear target the swapchain then encodes. The game's ACES branch
+ * is off in every scene measured.
+ */
+fn agTransform(c: vec3f) -> vec3f {
+  let t = pow(max(vec3f(1.0) - exp(-2.5 * max(c, vec3f(0.0))), vec3f(0.0)), vec3f(1.4));
+  return vec3f(srgb_encode(t.r), srgb_encode(t.g), srgb_encode(t.b));
+}
+
+/** Which display transform, chosen per frame at viewU[6].y (0 filmic, 1 standard, 2 agx, 3 aether-gazer).
  *  A uniform branch rather than a pipeline variant: switching is rare, and both
  *  arms are cheap enough that specialising the pipeline would buy nothing. */
 fn viewTransform(c: vec3f) -> vec3f {
   let mode = viewU[6].y;
+  if (mode > 2.5) { return agTransform(c); }
   if (mode > 1.5) { return agxTransform(c); }
   if (mode > 0.5) { return vec3f(srgb_encode(c.r), srgb_encode(c.g), srgb_encode(c.b)); }
   return vec3f(filmic(c.r), filmic(c.g), filmic(c.b));

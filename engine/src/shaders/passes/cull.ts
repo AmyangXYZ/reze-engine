@@ -130,10 +130,14 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
   // a hidden material is not culled, it is switched off, and answering "is this
   // gone because of culling?" requires the two to stay separable.
   let off = frusta.counts.y == 0u;
-  let shown = hidden[i] == 0u;
+  // hidden: bit 0 switched off; bit 1 drawn by the native-material host
+  // (unity/host.ts) rather than by its graph — no camera or mirror draw here,
+  // and still its shadow, which the engine's pass casts for every material.
+  let shown = (hidden[i] & 1u) == 0u;
+  let graph = (hidden[i] & 2u) == 0u;
   let castsShadow = (dm.flags & DRAW_CASTS_SHADOW) != 0u;
-  cameraArgs[i * 5u + 1u] = select(0u, 1u, (inCamera || off) && shown);
+  cameraArgs[i * 5u + 1u] = select(0u, 1u, (inCamera || off) && shown && graph);
   shadowArgs[i * 5u + 1u] = select(0u, 1u, ((inLight && castsShadow) || off) && shown);
-  mirrorArgs[i * 5u + 1u] = select(0u, 1u, (inMirror || off) && shown);
+  mirrorArgs[i * 5u + 1u] = select(0u, 1u, (inMirror || off) && shown && graph);
 }
 `
