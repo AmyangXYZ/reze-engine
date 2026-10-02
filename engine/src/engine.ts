@@ -2674,6 +2674,8 @@ export class Engine {
   private cookieTexture!: GPUTexture
   private cookieView!: GPUTextureView
   private cookieLayers = new Map<string, number>()
+  /** Layers a load has claimed but not filled yet — see loadLightCookie. */
+  private cookiePending = new Map<string, number>()
   /** What setLights was last given, rewritten when a cookie it names arrives. */
   private sceneLights: SceneLight[] | null = null
   private static readonly COOKIE_SIZE = 512
@@ -2691,6 +2693,8 @@ export class Engine {
    *  scene has stayed put for PROBE_SETTLE_FRAMES (see maybeCaptureProbe). */
   private probeDirty = false
   private probeDirtyFrame = 0
+  /** The frame the current run of requests began — the cap's start. */
+  private probeAskedFrame = 0
   private probeFrame = 0
   private probeCapture: {
     msTargets: GPUTexture[]
@@ -2705,6 +2709,9 @@ export class Engine {
     filterGroups: GPUBindGroup[]
   } | null = null
   private static readonly PROBE_SETTLE_FRAMES = 20
+  /** However often it is asked, a capture is never further off than this:
+   *  a timeline animating a lamp every frame never holds still. */
+  private static readonly PROBE_MAX_WAIT_FRAMES = 120
   private skyPrefilterPipeline: GPURenderPipeline | null = null
   // The scene's user WGSL effect (setEffect). ONE per scene, mounted under the
   // scene, over it, or both — whichever of background()/foreground() the code
@@ -10496,7 +10503,11 @@ export class Engine {
    *  by the engine itself whenever the stage or its looks change; a host may
    *  call it after changing something the engine cannot see. */
   captureReflectionProbe(): void {
-    if (!this.probeDirty) this.probeDirtyFrame = this.probeFrame
+    // Debounced from the LAST request, capped from the first: an edit being
+    // dragged captures once it stops, and a light animated every frame is
+    // re-captured every couple of seconds rather than every twentieth frame.
+    if (!this.probeDirty) this.probeAskedFrame = this.probeFrame
+    this.probeDirtyFrame = this.probeFrame
     this.probeDirty = true
   }
 
@@ -10533,7 +10544,8 @@ export class Engine {
   private maybeCaptureProbe(): void {
     this.probeFrame++
     if (!this.probeDirty || !this.probeCaptureBindGroup) return
-    if (this.probeFrame - this.probeDirtyFrame < Engine.PROBE_SETTLE_FRAMES) return
+    const settled = this.probeFrame - this.probeDirtyFrame >= Engine.PROBE_SETTLE_FRAMES
+    if (!settled && this.probeFrame - this.probeAskedFrame < Engine.PROBE_MAX_WAIT_FRAMES) return
     this.probeDirty = false
     const bounds = this.stageBounds()
     if (!bounds) {
@@ -11150,6 +11162,8 @@ export class Engine {
       this.worldGradientSH = options.gradient ? gradientIrradianceSH(options.gradient) : null
     }
     this.writeWorld()
+    // The probe holds the stage as this light shows it.
+    this.captureReflectionProbe()
   }
 
   /** Update the main light (Unity's directional Sun). Direction change marks shadow VP dirty. */
@@ -11163,6 +11177,7 @@ export class Engine {
       this.shadowLightVPDirty = true
     }
     this.writeSun(0)
+    this.captureReflectionProbe()
   }
 
   getWorld(): Readonly<{ color: Vec3; strength: number }> {
@@ -11406,23 +11421,32 @@ export class Engine {
    */
   async loadLightCookie(key: string, source: Blob | ImageBitmap): Promise<boolean> {
     if (!this.device) return false
-    let layer = this.cookieLayers.get(key)
+    // The layer is claimed BEFORE the await: two cookies loading at once
+    // (a scene whose spots name different patterns) both found layer 0 free,
+    // and the second picture overwrote the first.
+    let layer = this.cookieLayers.get(key) ?? this.cookiePending.get(key)
     if (layer === undefined) {
-      const used = new Set(this.cookieLayers.values())
+      const used = new Set([...this.cookieLayers.values(), ...this.cookiePending.values()])
       for (let k = 0; k < Engine.COOKIE_LAYERS && layer === undefined; k++) if (!used.has(k)) layer = k
       if (layer === undefined) {
         console.warn(`[reze] light cookie "${key}": all ${Engine.COOKIE_LAYERS} cookie layers are in use`)
         return false
       }
     }
+    this.cookiePending.set(key, layer)
     const size = Engine.COOKIE_SIZE
-    const bmp = await createImageBitmap(source, {
-      resizeWidth: size,
-      resizeHeight: size,
-      resizeQuality: "high",
-      colorSpaceConversion: "none",
-      premultiplyAlpha: "none",
-    })
+    let bmp: ImageBitmap
+    try {
+      bmp = await createImageBitmap(source, {
+        resizeWidth: size,
+        resizeHeight: size,
+        resizeQuality: "high",
+        colorSpaceConversion: "none",
+        premultiplyAlpha: "none",
+      })
+    } finally {
+      this.cookiePending.delete(key)
+    }
     // The real array on the first cookie, and every group that binds the
     // stand-in rebuilt against it (the stand-in itself is a 1x1 and stays).
     if (this.cookieTexture.width === 1) {
