@@ -1,7 +1,7 @@
 // Eye as a ShaderGraph — port of shaders/materials/eye.ts. The published preset
 // author's instruction: "keep eyes in the default nodegraph, add emission 1.5".
-// So it's the default Principled BSDF plus an Emission of the diffuse texture at
-// 1.5× (Blender's Principled Emission socket, decomposed as a separate Emission +
+// So it's the default Lit plus an emission of the diffuse texture at
+// 1.5× (the emission, decomposed as a separate scale +
 // Add Shader — the emission feeds bloom pre-tonemap).
 //
 // The rear-view gate and the see-through stencil stamp are slot-owned (built-in eye
@@ -23,11 +23,11 @@ export const EYE_GRAPH: ShaderGraph = {
     { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     {
       id: "principled",
-      type: "principled",
-      inputs: { metallic: 0.0, specular_ior_level: 0.5, roughness: 0.5, spec_clamp: 1e30, sheen_weight: 0.0, sheen_tint: 0.0 },
+      type: "lit",
+      inputs: { metallic: 0.0, smoothness: 0.2929 },
     },
-    { id: "emission", type: "emission", inputs: { strength: 1.5 } },
-    { id: "add", type: "add_shader" },
+    { id: "emission", type: "vector_math/scale", inputs: { scale: 1.5 } },
+    { id: "add", type: "vector_math/add" },
     // The iris glow follows the key round her head: full (1.5) lit from the
     // front, easing to 0.2 of it lit from behind - a fixed 1.5 left the eyes
     // bright white in a backlit face. head_basis.forward · L, half-Lambert,
@@ -44,9 +44,9 @@ export const EYE_GRAPH: ShaderGraph = {
     { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },
     { from: { node: "mat_diffuse", socket: "color" }, to: { node: "tex_base", socket: "b" } },
     { from: { node: "tex_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
-    { from: { node: "tex_base", socket: "color" }, to: { node: "emission", socket: "color" } },
+    { from: { node: "tex_base", socket: "color" }, to: { node: "emission", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "add", socket: "a" } },
-    { from: { node: "emission", socket: "color" }, to: { node: "add", socket: "b" } },
+    { from: { node: "emission", socket: "vector" }, to: { node: "add", socket: "b" } },
     { from: { node: "eye_hb", socket: "forward" }, to: { node: "eye_fl", socket: "a" } },
     { from: { node: "eye_lt", socket: "direction" }, to: { node: "eye_fl", socket: "b" } },
     { from: { node: "eye_fl", socket: "value" }, to: { node: "eye_half", socket: "a" } },
@@ -54,7 +54,7 @@ export const EYE_GRAPH: ShaderGraph = {
     { from: { node: "eye_lt", socket: "shadow" }, to: { node: "eye_sh", socket: "b" } },
     { from: { node: "eye_sh", socket: "value" }, to: { node: "eye_lvl", socket: "value" } },
     { from: { node: "eye_lvl", socket: "value" }, to: { node: "eye_str", socket: "a" } },
-    { from: { node: "eye_str", socket: "value" }, to: { node: "emission", socket: "strength" } },
+    { from: { node: "eye_str", socket: "value" }, to: { node: "emission", socket: "scale" } },
   ],
-  output: { node: "add", socket: "color" },
+  output: { node: "add", socket: "vector" },
 }

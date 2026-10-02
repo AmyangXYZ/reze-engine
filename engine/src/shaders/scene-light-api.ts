@@ -131,6 +131,7 @@ export function sceneLightApi(on: boolean, group: number, binding: number): stri
     return /* wgsl */ `
 fn rzShadow(p: vec3f) -> f32 { return 1.0; }
 fn rzWorldAmbient(n: vec3f) -> vec3f { return vec3f(0.0); }
+fn rzWorldAmbientAvg() -> vec3f { return vec3f(0.0); }
 `
   }
   const n = SHADOW_CASCADES.length

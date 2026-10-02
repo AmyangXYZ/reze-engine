@@ -566,9 +566,11 @@ export class Model {
     rigidbodies: Rigidbody[] = [],
     joints: Joint[] = [],
     loadWarnings: string[] = [],
-    edgeScales: Float32Array | null = null
+    edgeScales: Float32Array | null = null,
+    additionalUvs: Float32Array[] = []
   ) {
     this.edgeScales = edgeScales
+    this.additionalUvs = additionalUvs
     // Store base vertex data (original positions before morphing)
     this.baseVertexData = new Float32Array(vertexData)
     this.vertexData = vertexData
@@ -1006,6 +1008,14 @@ export class Model {
 
   /** PMX per-vertex edge scale, when the source had one. */
   private edgeScales: Float32Array | null = null
+  private additionalUvs: Float32Array[]
+
+  /** A PMX additional UV channel (1–4) as loaded, four floats a vertex — or
+   *  null when the file has fewer. Its morphs (types 4–7) are in getMorphing(),
+   *  with uvOffsets; the engine applies neither, a native look reads both. */
+  getAdditionalUv(channel: number): Float32Array | null {
+    return this.additionalUvs[channel - 1] ?? null
+  }
   private outlineVertices: Float32Array<ArrayBuffer> | null = null
 
   /**
@@ -1130,6 +1140,28 @@ export class Model {
     const idx = this.runtimeSkeleton.nameIndex[boneName]
     if (idx === undefined || idx < 0) return null
     return this.runtimeSkeleton.worldMatrices[idx].getPosition()
+  }
+
+  /**
+   * The point `distance` model units down a bone's own axis, posed — where
+   * `#anchor <bone> along <d>` puts an effect. The axis is the bone's rest tail
+   * direction (the way a PMX editor draws it pointing) turned by the bone's
+   * pose, the same mapping the named-points tips use. Model space, like
+   * getBoneWorldPosition. A bone with no tail has no axis: the joint itself.
+   */
+  getBonePointAlong(boneName: string, distance: number): Vec3 | null {
+    const idx = this.runtimeSkeleton.nameIndex[boneName]
+    if (idx === undefined || idx < 0) return null
+    const w = this.runtimeSkeleton.worldMatrices[idx].values
+    const t = this.skeleton.bones[idx]?.tail
+    const len = t ? Math.hypot(t[0], t[1], t[2]) : 0
+    if (!t || len < 1e-6) return new Vec3(w[12], w[13], w[14])
+    const k = distance / len
+    return new Vec3(
+      w[12] + (w[0] * t[0] + w[4] * t[1] + w[8] * t[2]) * k,
+      w[13] + (w[1] * t[0] + w[5] * t[1] + w[9] * t[2]) * k,
+      w[14] + (w[2] * t[0] + w[6] * t[1] + w[10] * t[2]) * k,
+    )
   }
 
   /**

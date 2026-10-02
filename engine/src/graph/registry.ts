@@ -116,18 +116,6 @@ const RAMP_OUTPUTS: Record<string, SockT> = { color: "color", alpha: "float", fa
 // routing through the BT.601 color→float conversion instead would change the value.
 const RAMP_SELECT = { color: ".rgb", alpha: ".a", fac_out: ".r" }
 
-/** Principled v2 reflectance, evaluated at compile time when it can be. */
-function foldSpecular(ior: string, level: string): string {
-  const i = Number(ior)
-  const l = Number(level)
-  if (!Number.isFinite(i) || !Number.isFinite(l)) return `principled_specular(${ior}, ${level})`
-  const r = (i - 1) / Math.max(i + 1, 1e-6)
-  // Snapped to 9 significant digits: the arithmetic leaves double noise
-  // (0.2² · 2 · 0.5 / 0.08 = 0.5000000000000001) that is meaningless in an f32
-  // and only makes the emitted shader harder to read.
-  return fmtFloat(Number(((r * r * 2 * Math.max(l, 0)) / 0.08).toPrecision(9)))
-}
-
 const uberNode = (slot: number): NodeSpec => ({
   inputs: {
     base: C([1, 1, 1], true),
@@ -175,6 +163,37 @@ const faceSdfNode = (slot: number): NodeSpec => ({
   emit: (a) => `ag_face_sdf(${slot}u, ${a.uv}.xy, ${a.direction}, ${a.normal}, ${a.smoothness}, ${a.invert})`,
 })
 const FACE_SDF_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_face_sdf/${s}`, faceSdfNode(s)]))
+
+// A packed property map on the slot the type names — the game's material
+// contract: R metal, G perceptual roughness (answered as smoothness, Unity's
+// word for 1 − r), B occlusion, A emission mask, each remapped through the
+// material's own min/max (see rz_property_map). The four
+// plain values are what the surface is WITHOUT a map, so one look serves a
+// converted set that brought maps and a hand-made stage that brought none.
+// Defaults are the game's: the full 0–1 range, and the glow off (min = max = 1).
+const propertyMapNode = (slot: number): NodeSpec => ({
+  inputs: {
+    uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" },
+    metallic: F(0),
+    smoothness: F(0.5),
+    occlusion: F(1),
+    emission: F(0),
+    metal_min: F(0),
+    metal_max: F(1),
+    rough_min: F(0),
+    rough_max: F(1),
+    ao_min: F(0),
+    ao_max: F(1),
+    emission_min: F(1),
+    emission_max: F(1),
+  },
+  outputs: { metallic: "float", smoothness: "float", occlusion: "float", emission: "float" },
+  outputSelect: { metallic: ".x", smoothness: ".y", occlusion: ".z", emission: ".w" },
+  emit: (a) =>
+    `rz_property_map(group_tex${slot}(${a.uv}.xy), rz_group_bound${slot}(), vec4f(${a.metallic}, ${a.smoothness}, ${a.occlusion}, ${a.emission}), ` +
+    `vec4f(${a.metal_min}, ${a.rough_min}, ${a.ao_min}, ${a.emission_min}), vec4f(${a.metal_max}, ${a.rough_max}, ${a.ao_max}, ${a.emission_max}))`,
+})
+const PROPERTY_MAP_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`property_map/${s}`, propertyMapNode(s)]))
 
 export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // ── Context inputs (template locals; no emission) ──
@@ -409,18 +428,42 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputs: { color: "color" },
     emit: (a) => `mix(${a.color}, rgb_curve(${a.color}, ${a.y0}, ${a.y1}, ${a.y2}, ${a.y3}, ${a.y4}), ${a.fac})`,
   },
-  // UV Map — one layer on a PMX, which is the mesh UV the texture node uses.
+  // UV Map — the mesh UV the texture node uses, and the second set: a PMX's
+  // second additional UV (xy) where it has one, else the first UV again.
   uv_map: {
     inputs: {},
-    outputs: { uv: "vector" },
-    contextOutputs: { uv: "vec3f(input.uv, 0.0)" },
+    outputs: { uv: "vector", uv2: "vector" },
+    contextOutputs: { uv: "vec3f(input.uv, 0.0)", uv2: "vec3f(input.uv2, 0.0)" },
+  },
+  // Whether each group image slot holds a real map, 1 or 0. A slot nobody
+  // filled is a 1×1 white stand-in, and white is not "no map" to a normal or
+  // a property map — this is how a look tells the two apart and keeps the
+  // surface's own normal where the model brought none.
+  image_bound: {
+    inputs: {},
+    outputs: { slot0: "float", slot1: "float", slot2: "float", slot3: "float" },
+    contextOutputs: {
+      slot0: "select(0.0, 1.0, rz_group_bound0())",
+      slot1: "select(0.0, 1.0, rz_group_bound1())",
+      slot2: "select(0.0, 1.0, rz_group_bound2())",
+      slot3: "select(0.0, 1.0, rz_group_bound3())",
+    },
   },
 
   // ── Normal Map, Vector Transform ──
+  // Strength scales the map's tilt, so above 1 steepens it (Unity's
+  // _NormalScale, Blender's strength); 0 is the surface's own normal.
   normal_map: {
     inputs: { color: C([0.5, 0.5, 1], true), strength: F(1) },
     outputs: { normal: "vector" },
     emit: (a) => `node_normal_map(${a.color}, ${a.strength}, n, input.worldPos, input.uv)`,
+  },
+  // A normal map packed as game engines store one (DXT5nm/BC5: X in alpha, Y
+  // in green, Z rebuilt). Link the image's colour and its alpha.
+  "normal_map/packed": {
+    inputs: { color: C([1, 0.5, 1], true), alpha: F(0.5), strength: F(1) },
+    outputs: { normal: "vector" },
+    emit: (a) => `node_normal_map_packed(vec4f(${a.color}, ${a.alpha}), ${a.strength}, n, input.worldPos, input.uv)`,
   },
   "vector_transform/world_to_camera": {
     inputs: { vector: V([0, 0, 0], true) },
@@ -439,27 +482,20 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   },
 
   // ── Shader nodes. Shaders travel as RGB here (see shader_to_rgb_diffuse), so
-  // a "transparent" shader is the colour that contributes nothing; the actual
-  // cutout is the group's alphaMode, which is where transparency belongs in a
-  // rasteriser without order-independent blending.
-  bsdf_transparent: { inputs: {}, outputs: { color: "color" }, emit: () => `vec3f(0.0)` },
-  bsdf_diffuse: {
-    inputs: { color: C([0.8, 0.8, 0.8], true) },
-    outputs: { color: "color" },
-    emit: (a) => `${a.color} * shader_to_rgb_lit(n, l, sun, amb, shadow)`,
-  },
 
   // ── Nodes with no meaning on a PMX, answered honestly with a constant ──
   // Each returns what Blender returns for the absent case, so a graph that reads
   // one degrades to a sensible look instead of failing to compile. Documented
   // rather than silently wrong.
   //
-  // attribute: MMD meshes carry no vertex colour layer, so Color reads white and
-  // Fac reads 1 — the identity for the multiply these usually feed.
+  // attribute: the vertex colour. A PMX carries none of its own, so a model
+  // keeps it in its first additional UV (RGBA) — what a converted game stage
+  // writes there, a plant's occlusion in the alpha. A model without one reads
+  // white and alpha 1, the identity for the multiply these usually feed.
   attribute: {
     inputs: {},
-    outputs: { color: "color", fac: "float" },
-    contextOutputs: { color: "vec3f(1.0)", fac: "1.0" },
+    outputs: { color: "color", fac: "float", alpha: "float" },
+    contextOutputs: { color: "input.vcolor.rgb", fac: "color_to_value(input.vcolor.rgb)", alpha: "input.vcolor.a" },
   },
   // object_info: one model, one instance — Random is the only field with a real
   // use (per-instance variation) and there are no instances to vary.
@@ -595,6 +631,66 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // Defaults are 104903's skin.
   ...UBER_NODES,
   ...FACE_SDF_NODES,
+  ...PROPERTY_MAP_NODES,
+
+  /**
+   * Lit — Unity's Lit (URP's PBR), term for term: what a stage, a prop or
+   * the weather is shaded with, so a surface authored with Unity's inputs
+   * looks here as it does there. See urp_lit in nodes.ts for the formula.
+   *
+   * smoothness is Unity's (1 − perceptual roughness). emission is added on
+   * top, as HDR colour. alpha < 1 is Transparent with Preserve Specular
+   * Lighting — the diffuse fades, the reflection does not; the `alpha`
+   * output is the coverage to hand the graph's opacity, on a group blending
+   * "premultiplied".
+   */
+  lit: {
+    inputs: {
+      base_color: C([0.8, 0.8, 0.8], true),
+      metallic: F(0),
+      smoothness: F(0.5),
+      /** A dielectric's reflectance, as Unreal's and HDRP's Specular: 0.5 is
+       *  URP's fixed 0.04, 1 is 0.08 — glossy cloth, lacquer, wet skin. */
+      specular: F(0.5),
+      occlusion: F(1),
+      emission: C([0, 0, 0]),
+      alpha: F(1),
+      normal: { type: "vector", contextDefault: "n" },
+    },
+    outputs: { color: "color", alpha: "float" },
+    outputSelect: { color: ".rgb", alpha: ".a" },
+    emit: (a) =>
+      `urp_lit(${a.base_color}, ${a.metallic}, ${a.smoothness}, ${a.specular}, ${a.occlusion}, ${a.emission}, ${a.alpha}, ` +
+      `${a.normal}, l, v, sun, amb, shadow, input.worldPos, true)`,
+    takesLight: true,
+  },
+
+  /**
+   * The scene's reflection along a direction — the stage's own reflection
+   * probe, box-projected to the stage's bounds, where the engine captured one;
+   * the sky where it did not. Roughness picks the blur on the game's curve.
+   * Its default vector is this surface's reflection, so a glass shell or a
+   * water surface wires only what it bends.
+   */
+  /**
+   * The highlights alone: the sun's and the lamps' specular on a GGX lobe
+   * (URP's, α = r²), untinted. A water or glass look that computes its own
+   * reflection multiplies this by its reflectance for the glints.
+   */
+  glossy_direct: {
+    inputs: { smoothness: F(0.9), normal: { type: "vector", contextDefault: "n" } },
+    outputs: { color: "color" },
+    emit: (a) => `rz_glossy_direct(${a.normal}, l, v, sun, shadow, input.worldPos, 1.0 - (${a.smoothness}))`,
+    takesLight: true,
+  },
+  reflection_probe: {
+    inputs: {
+      vector: { type: "vector", contextDefault: "reflect(-v, n)" },
+      smoothness: F(1),
+    },
+    outputs: { color: "color" },
+    emit: (a) => `rzProbeSpecular(${a.vector}, input.worldPos, 1.0 - (${a.smoothness}))`,
+  },
 
   // ── Blender 5.2 colour utilities ──
   separate_color: {
@@ -793,26 +889,6 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputs: { color: "color" },
     emit: (a) => `${a.a} + vec3f(${a.b})`,
   },
-  // Blender Emission shader: color × strength. In the ShaderToRGB-era ports the
-  // emission result feeds a Mix Shader directly as radiance. Color may be a literal
-  // (body's rim tints) or linked.
-  emission: {
-    inputs: { color: C([1, 1, 1]), strength: F(1) },
-    outputs: { color: "color" },
-    emit: (a) => `${a.color} * ${a.strength}`,
-  },
-  // Blender Add Shader — radiance sum of two evaluated shading results.
-  add_shader: {
-    inputs: { a: C([0, 0, 0], true), b: C([0, 0, 0], true) },
-    outputs: { color: "color" },
-    emit: (a) => `${a.a} + ${a.b}`,
-  },
-  // Mix Shader — plain lerp between two evaluated shading results.
-  mix_shader: {
-    inputs: { fac: F(0.5), a: C([0, 0, 0], true), b: C([0, 0, 0]) },
-    outputs: { color: "color" },
-    emit: (a) => `mix(${a.a}, ${a.b}, ${a.fac})`,
-  },
 
   // ── View-dependent scalars ──
   fresnel: { inputs: { ior: F(1.45) }, outputs: { value: "float" }, emit: (a) => `fresnel(${a.ior}, n, v)` },
@@ -833,38 +909,19 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     emit: (a) => `layer_weight_facing(${a.blend}, ${a.normal}, v)`,
   },
 
-  /**
-   * The world's radiance from a direction — Blender's Environment Texture, read
-   * off the scene's own sky rather than off an image a material carries.
-   *
-   * ITS DEFAULT VECTOR IS THE REFLECTION, which is the whole point: wire
-   * nothing and it answers what this surface reflects. The roughness input
-   * picks how blurred the answer is; at 0 it is a mirror.
-   *
-   * A scene with no HDRI has no sky to reflect, and this returns the flat world
-   * colour — the same value the ambient already carries, so such a scene looks
-   * exactly as it did.
-   */
-  environment: {
-    inputs: {
-      vector: { type: "vector", contextDefault: "reflect(-v, n)" },
-      roughness: F(0),
-    },
-    outputs: { color: "color" },
-    emit: (a) => `rzWorldSpecular(${a.vector}, ${a.roughness})`,
-  },
 
   // ── Lighting capture ──
   /**
-   * Shader → RGB on a white diffuse closure, reduced to a scalar.
-   *
-   * Rec.709 luminance, kept exactly as it was: every shipped preset ramps this,
-   * and changing the weights would move every terminator in the library.
+   * Lambert — URP's LightingLambert for the main light, plus the ambient:
+   * what a white surface facing `normal` receives. A toon look ramps `value`
+   * (its luminance) into a terminator, or tints by `color`. Shader Graph's
+   * custom-lighting idiom, in one node.
    */
-  shader_to_rgb_diffuse: {
-    inputs: {},
-    outputs: { value: "float" },
-    emit: () => `shader_to_rgb_diffuse(n, l, sun, amb, shadow)`,
+  lambert: {
+    inputs: { normal: { type: "vector", contextDefault: "n" } },
+    outputs: { color: "color", value: "float" },
+    outputSelect: { color: ".rgb", value: ".a" },
+    emit: (a) => `urp_lambert(${a.normal}, l, sun, amb, shadow)`,
   },
   /**
    * Hands this surface to the screen-space scattering pass: the colour passes
@@ -878,24 +935,6 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     emit: (a) => `rz_subsurface(${a.strength}, ${a.color})`,
   },
 
-  /**
-   * The same closure as a COLOUR, which is what Blender's Shader to RGB
-   * actually returns.
-   *
-   * A warm sun against a cool ambient radiates warm light and cool shadow, and
-   * that colour IS the look in most of this style. Reducing it to luminance
-   * first — the only thing reachable before — leaves every ramp working on grey.
-   *
-   * Linking this into a scalar socket still yields a float, because Blender's
-   * own implicit Color → Value conversion (BT.601) happens at the link. So the
-   * two nodes differ only in whether the graph wants the colour or the scalar,
-   * and each gets Blender's answer for its own question.
-   */
-  shader_to_rgb: {
-    inputs: {},
-    outputs: { color: "color" },
-    emit: () => `shader_to_rgb_lit(n, l, sun, amb, shadow)`,
-  },
 
   // ── Vector ──
   separate_xyz: {
@@ -956,70 +995,6 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // ── Principled BSDF (frozen 3.6 legacy-EEVEE semantics: eval_principled port) ──
   // normal defaults to the template's shading normal; link a bump/normal_map chain
   // to perturb it (body/cloth_rough noise bump).
-  /**
-   * Principled BSDF, Blender 5.2 socket names.
-   *
-   * v2 (4.0+) renamed most of what a graph touches and re-derived one of them,
-   * which is exactly where a transcribed port goes quietly wrong: Specular
-   * became "Specular IOR Level" and no longer sets reflectance directly — IOR
-   * does, and the level scales it. So f0 is computed the v2 way here, and the
-   * defaults land on 0.04 for ior 1.5 at level 0.5, matching both versions at
-   * their defaults while tracking v2 when a preset moves either.
-   *
-   * Emission Strength defaults to 0 in v2 where 3.6's Emission was visible, so a
-   * naive port turns every emissive material black. Following v2 means honouring
-   * that default and letting the preset say otherwise.
-   *
-   * Not implemented, and not silently wrong — a graph setting these gets the
-   * base BSDF rather than a wrong approximation of them: Coat, Transmission,
-   * Subsurface, Anisotropic, Thin Film. They need path-traced or
-   * multi-scatter machinery this renderer does not have.
-   */
-  principled: {
-    inputs: {
-      base_color: C([0.8, 0.8, 0.8], true),
-      metallic: F(0),
-      roughness: F(0.5),
-      ior: F(1.5),
-      specular_ior_level: F(0.5),
-      sheen_weight: F(0),
-      sheen_tint: F(0),
-      emission_color: C([1, 1, 1]),
-      emission_strength: F(0),
-      normal: { type: "vector", contextDefault: "n" },
-      /** Ours, not Blender's: caps firefly speculars from noise-bumped NDF
-       *  aliasing, which EEVEE hides behind TAA and we have none. */
-      spec_clamp: F(1e30),
-      /** Ours: how roughness picks the reflection's blur. 0 is the engine's
-       *  sqrt ramp; 1 is Unity's probe curve, p·(1.7−0.7p) mip-steps per
-       *  eighth, stopping where a cube's last face texel does — what a stage
-       *  ripped from a Unity game was authored against. See rzWorldSpecularLod. */
-      reflection_lod: F(0),
-      /** Ours: 1 shades the sun's and the lamps' highlights with URP's
-       *  direct-light BRDF, as a stage from a Unity game was lit — see bsdf_urp. */
-      unity_direct: F(0),
-    },
-    outputs: { color: "color" },
-    emit: (a) => {
-      // Fold the reflectance when both sockets are literals, which is nearly
-      // always. It keeps the emitted WGSL as tight as the 3.6 form was — and at
-      // the defaults it folds to exactly 0.5, which is what 3.6's Specular held,
-      // so the two versions agree byte-for-byte where a preset changed nothing.
-      const spec = foldSpecular(a.ior, a.specular_ior_level)
-      const bsdf =
-        `eval_principled(PrincipledIn(${a.base_color}, ${a.metallic}, ` +
-        `${spec}, ${a.roughness}, ` +
-        `${a.spec_clamp}, ${a.sheen_weight}, ${a.sheen_tint}, ${a.reflection_lod}, ${a.unity_direct}), ${a.normal}, l, v, sun, amb, shadow, input.worldPos)`
-      // v2 defaults Emission Strength to 0, which is the overwhelming case. Emit
-      // the term only when it can do something, so the common shader carries no
-      // dead add and the output stays readable.
-      const lit = a.emission_strength === "0.0" ? bsdf : `${bsdf} + ${a.emission_color} * ${a.emission_strength}`
-      // Unity mode also ends as SimPipeline's surfaces end: saturate()d, so no
-      // lit or glowing surface passes 1.0 before the post — its bloom works on
-      // what is left under that. A literal, as every stage graph states it.
-      return a.unity_direct === "1.0" ? `min(${lit}, vec3f(1.0))` : lit
-    },
-  },
 }
 
 // ─── Blender socket parity ────────────────────────────────────────────

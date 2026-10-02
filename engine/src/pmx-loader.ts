@@ -36,6 +36,10 @@ export class PmxLoader {
   private inverseBindMatrices: Float32Array | null = null
   private joints0: Uint16Array | null = null
   private weights0: Uint8Array | null = null
+  /** The PMX's additional UV channels (1–4), each four floats a vertex. The
+   *  engine's own shading reads none of them; a native look can name one as
+   *  the carrier of a game vertex stream (NativeLook.streams). */
+  private additionalUvs: Float32Array[] = []
   /** PMX per-vertex edge scale — the outline's width multiplier, as the
    *  game's outline takes vertex colour alpha. */
   private edgeScales: Float32Array | null = null
@@ -154,6 +158,7 @@ export class PmxLoader {
     const joints = new Uint16Array(count * 4)
     const weights = new Uint8Array(count * 4) // UNORM8, will be normalized to 255
     const edgeScales = new Float32Array(count)
+    this.additionalUvs = Array.from({ length: this.additionalVec4Count }, () => new Float32Array(count * 4))
 
     for (let i = 0; i < count; i++) {
       const px = this.getFloat32()
@@ -171,7 +176,10 @@ export class PmxLoader {
       // PMX UVs are in the same orientation as WebGPU sampling; no flip
       uvs.push(u, v)
 
-      this.offset += this.additionalVec4Count * 16
+      for (let k = 0; k < this.additionalVec4Count; k++) {
+        const a = this.additionalUvs[k]
+        for (let c = 0; c < 4; c++) a[i * 4 + c] = this.getFloat32()
+      }
       const type = this.getUint8()
       const base = i * 4
       // Initialize defaults
@@ -1142,7 +1150,8 @@ export class PmxLoader {
       this.rigidbodies,
       this.joints,
       this.warnings,
-      this.edgeScales
+      this.edgeScales,
+      this.additionalUvs
     )
   }
 

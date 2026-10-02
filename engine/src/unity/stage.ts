@@ -21,6 +21,7 @@
 import { NativeHost, type NativeShader, type NativeStream, type NativeValue, type ValueSource } from "./host"
 import type { PassState } from "./state"
 import { gameToEngine, invert4, mul4, scale4, flipY } from "./globals"
+import { SHADOW_CASCADES } from "../shadow-cascades"
 
 export type NativeStageMesh = {
   id: string
@@ -78,6 +79,12 @@ export type NativeStageLights = {
     direction: [number, number, number]
     color: [number, number, number]
     shadow: number
+    /** As the game's pipeline packed it, recorded: _MainLightColor and
+     *  SimMainLightColor (linear, intensity in w), SimMainLightColorNoInt. */
+    unity?: { color: number[]; simColor: number[]; simColorNoInt: number[] }
+    /** The Light's shadowBias and shadowNormalBias, in shadow-map texels. */
+    shadowBias?: number
+    shadowNormalBias?: number
   }
   additional: {
     position: [number, number, number]
@@ -147,6 +154,15 @@ export class NativeStage {
     min: [number, number, number]
     max: [number, number, number]
   }
+  /**
+   * How far the stage reaches from the origin, in engine units: every
+   * renderer's box, casters or not. A game's sky is a dome in the stage
+   * (X317's reaches 1900 units out), and the camera's far plane has to reach it.
+   */
+  get extent(): number {
+    return this.reach
+  }
+  private reach = 0
   private buffers: GPUBuffer[] = []
   private textures: GPUTexture[] = []
   private opaque: Item[] = []
@@ -389,6 +405,7 @@ export class NativeStage {
         ey = b.size[1] / 2,
         ez = b.size[2] / 2
       const half = [0, 1, 2].map((i) => (Math.abs(m[i]) * ex + Math.abs(m[4 + i]) * ey + Math.abs(m[8 + i]) * ez) * s)
+      this.reach = Math.max(this.reach, Math.hypot(center[0], center[1], center[2]) + Math.hypot(half[0], half[1], half[2]))
       const world = Float32Array.from(m)
       const det = m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (m[1] * m[6] - m[5] * m[2])
       const perDraw: ValueSource = {
@@ -550,18 +567,24 @@ export class NativeStage {
     engineScale: number,
   ): void {
     const vp = flipY(mul4(viewProj, gameToEngine(engineScale)))
-    // ShadowUtils.GetShadowBias as the game set it: half a texel along the light
-    // and half a texel in along the normal, a texel being this tile's width in
-    // game units over its resolution (2048).
+    // ShadowUtils.GetShadowBias as the game sets it: (texel x the light's
+    // shadowBias, -texel x its shadowNormalBias), a texel being this tile's
+    // width in game units over its resolution. The stage's casters read it as
+    // _ShadowBias (Replica's CascadeShadowPass); the character's DrawShadowPass
+    // names it sim_ShadowBias. A package that predates the recorded biases
+    // takes half a texel of each.
     const rowLen = Math.hypot(vp[0], vp[4], vp[8])
-    const texel = rowLen > 0 ? 2 / rowLen / 2048 : 0
+    const texel = rowLen > 0 ? 2 / rowLen / SHADOW_CASCADES[cascade].mapSize : 0
+    const main = this.pkg.lights.main
+    const bias = [texel * (main.shadowBias ?? 0.5), -texel * (main.shadowNormalBias ?? 0.5), 0, 0]
     const g: Record<string, NativeValue> = {
       ...globals,
       unity_MatrixVP: vp,
       unity_MatrixV: scale4(1),
       unity_MatrixP: vp,
       glstate_matrix_projection: vp,
-      sim_ShadowBias: [0.5 * texel, -0.5 * texel, 0, 0],
+      _ShadowBias: bias,
+      sim_ShadowBias: bias,
     }
     for (const it of this.casters) this.draw(pass, host, it, g, {}, `|c${cascade}`)
   }

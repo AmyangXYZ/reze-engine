@@ -23,8 +23,8 @@ const HAIR_BODY_INLINE = [
   "  let n_rim_pow = math_power(n_rim_mul, 0.6300000548362732); // @node:rim_pow",
   "  let n_sep_n = n; // @node:sep_n",
   "  let n_bevel_clamp = saturate(n_sep_n.y); // @node:bevel_clamp",
-  "  let n_str = shader_to_rgb_diffuse(n, l, sun, amb, shadow); // @node:str",
-  "  let n_ramp_008 = ramp_constant(n_str, 0.0, vec4f(0.0, 0.0, 0.0, 1.0), 0.2966, vec4f(1.0, 1.0, 1.0, 1.0)); // @node:ramp_008",
+  "  let n_str = urp_lambert(n, l, sun, amb, shadow); // @node:str",
+  "  let n_ramp_008 = ramp_cardinal(n_str.a, 0.2466, vec4f(0.0, 0.0, 0.0, 1.0), 0.3466, vec4f(1.0, 1.0, 1.0, 1.0)); // @node:ramp_008",
   "  let n_gate = math_greater_than(color_to_value(tex_color), 0.15000000596046448); // @node:gate",
   "  let n_gate_scale = math_multiply(n_gate, 0.1); // @node:gate_scale",
   "  let n_tex_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:tex_base",
@@ -34,14 +34,14 @@ const HAIR_BODY_INLINE = [
   "  let n_mix_004 = mix_blend(n_ramp_008.r, n_hs_002, n_hs_001); // @node:mix_004",
   "  let n_bc = bright_contrast(n_mix_004, 0.1, 0.2); // @node:bc",
   "  let n_mix_003 = mix_blend(n_bevel_clamp, n_bc, n_hs_002); // @node:mix_003",
-  "  let n_mix_shader_002 = mix(n_mix_003, vec3f(0.1673291176557541), n_rim_pow); // @node:mix_shader_002",
+  "  let n_mix_shader_002 = mix_blend(n_rim_pow, n_mix_003, vec3f(0.1673291176557541)); // @node:mix_shader_002",
   "  let n_npr_add = n_mix_shader_002 + vec3f(n_gate_scale); // @node:npr_add",
-  "  let n_principled = eval_principled(PrincipledIn(n_bc, 0.0, 1.0, 0.3, 10.0, 0.0, 0.0), n, l, v, sun, amb, shadow, input.worldPos); // @node:principled",
-  "  let n_mix_shader_001 = mix(n_npr_add, n_principled, 0.2); // @node:mix_shader_001",
+  "  let n_principled = urp_lit(n_bc, 0.0, 0.4523, 1.0, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+  "  let n_mix_shader_001 = mix_blend(0.2, n_npr_add, n_principled.rgb); // @node:mix_shader_001",
   "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
 ].join("\n")
 
-test("default graph: MMD-correct neutral base (texture × material diffuse → PBSDF)", () => {
+test("default graph: MMD-correct neutral base (texture × material diffuse → Lit)", () => {
   const r = compileGraph(DEFAULT_GRAPH, { inlineParams: true })
   assert.equal(r.ok, true)
   assert.deepEqual(r.diagnostics, [])
@@ -49,8 +49,8 @@ test("default graph: MMD-correct neutral base (texture × material diffuse → P
     r.fsBody,
     [
       "  let n_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:base",
-      "  let n_principled = eval_principled(PrincipledIn(n_base, 0.0, 0.5, 0.5, 10.0, 0.0, 0.0), n, l, v, sun, amb, shadow, input.worldPos); // @node:principled",
-      "  let final_color = n_principled; // @node:principled",
+      "  let n_principled = urp_lit(n_base, 0.0, 0.2929, 0.5, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, true); // @node:principled",
+      "  let final_color = n_principled.rgb; // @node:principled",
     ].join("\n"),
   )
   // The ungrouped default renders neutral — no stencil / render-class overrides.
@@ -66,8 +66,8 @@ test("cloth_smooth graph matches the hand-written shader (snapshot)", () => {
     [
       "  let n_sep_n = n; // @node:sep_n",
       "  let n_bevel_clamp = saturate(n_sep_n.y); // @node:bevel_clamp",
-      "  let n_str = shader_to_rgb_diffuse(n, l, sun, amb, shadow); // @node:str",
-      "  let n_ramp_008 = ramp_constant_edge_aa(n_str, 0.2966, vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0)); // @node:ramp_008",
+      "  let n_str = urp_lambert(n, l, sun, amb, shadow); // @node:str",
+      "  let n_ramp_008 = ramp_cardinal(n_str.a, 0.2466, vec4f(0.0, 0.0, 0.0, 1.0), 0.3466, vec4f(1.0, 1.0, 1.0, 1.0)); // @node:ramp_008",
       "  let n_mix04_fac = math_multiply(n_ramp_008.r, 0.5); // @node:mix04_fac",
       "  let n_tex_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:tex_base",
       "  let n_dark_tex = hue_sat_id(1.0, 0.19999998807907104, 1.0, n_tex_base); // @node:dark_tex",
@@ -75,10 +75,10 @@ test("cloth_smooth graph matches the hand-written shader (snapshot)", () => {
       "  let n_mix_003 = mix_blend(n_bevel_clamp, n_mix_004, n_dark_tex); // @node:mix_003",
       "  let n_hue_004 = hue_sat_id(0.800000011920929, 2.0, 1.0, n_mix_003); // @node:hue_004",
       "  let n_npr_overlay = mix_overlay(1.0, n_mix_003, n_hue_004); // @node:npr_overlay",
-      "  let n_npr_emit = n_npr_overlay * 18.200000762939453; // @node:npr_emit",
+      "  let n_npr_emit = vector_scale(n_npr_overlay, 18.200000762939453); // @node:npr_emit",
       "  let n_principled_base = hue_sat_id(1.0, 0.800000011920929, 1.0, n_tex_base); // @node:principled_base",
-      "  let n_principled = eval_principled(PrincipledIn(n_principled_base, 0.0, 0.8, 0.5, 10.0, 0.0, 0.0), n, l, v, sun, amb, shadow, input.worldPos); // @node:principled",
-      "  let n_mix_shader_001 = mix(n_npr_emit, n_principled, 0.8999999761581421); // @node:mix_shader_001",
+      "  let n_principled = urp_lit(n_principled_base, 0.0, 0.2929, 0.8, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+      "  let n_mix_shader_001 = mix_blend(0.8999999761581421, n_npr_emit, n_principled.rgb); // @node:mix_shader_001",
       "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
     ].join("\n"),
   )
@@ -91,8 +91,8 @@ test("metal graph matches the hand-written shader (snapshot)", () => {
   assert.equal(
     r.fsBody,
     [
-      "  let n_str = shader_to_rgb_diffuse(n, l, sun, amb, shadow); // @node:str",
-      "  let n_ramp_008 = ramp_constant_edge_aa(n_str, 0.2966, vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0)); // @node:ramp_008",
+      "  let n_str = urp_lambert(n, l, sun, amb, shadow); // @node:str",
+      "  let n_ramp_008 = ramp_cardinal(n_str.a, 0.2466, vec4f(0.0, 0.0, 0.0, 1.0), 0.3466, vec4f(1.0, 1.0, 1.0, 1.0)); // @node:ramp_008",
       "  let n_mix04_fac = math_multiply(n_ramp_008.r, 0.5); // @node:mix04_fac",
       "  let n_tex_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:tex_base",
       "  let n_tex_tint = hue_sat_id(1.0, 0.800000011920929, 1.0, n_tex_base); // @node:tex_tint",
@@ -101,13 +101,13 @@ test("metal graph matches the hand-written shader (snapshot)", () => {
       "  let n_mix_004 = mix_blend(n_mix04_fac, n_dark_tex, n_tex_tint); // @node:mix_004",
       "  let n_hue_004 = hue_sat_id(1.0, 2.0, 1.0, n_mix_004); // @node:hue_004",
       "  let n_npr_overlay = mix_overlay(1.0, n_mix_004, n_hue_004); // @node:npr_overlay",
-      "  let n_npr_emit = n_npr_overlay * 8.100000381469727; // @node:npr_emit",
+      "  let n_npr_emit = vector_scale(n_npr_overlay, 8.100000381469727); // @node:npr_emit",
       "  let n_voro_cross = vect_math_cross(reflect(-v, n), vec3f(0.0, 1.0, 0.0)); // @node:voro_cross",
       "  let n_voro = tex_voronoi_color(n_voro_cross, 4.3); // @node:voro",
       "  let n_voro_ramp = ramp_linear(color_to_value(n_voro), 0.0, vec4f(0.0, 0.0, 0.0, 1.0), 1.0, vec4f(1.0, 1.0, 1.0, 1.0)); // @node:voro_ramp",
       "  let n_albedo = mix_blend(n_voro_ramp.r, vec3f(n_voro_ramp.r), n_hue_006); // @node:albedo",
-      "  let n_principled = eval_principled(PrincipledIn(n_albedo, 1.0, 1.0, 0.3, 1e+30, 0.0, 0.0), n, l, v, sun, amb, shadow, input.worldPos); // @node:principled",
-      "  let n_mix_shader_001 = mix(n_npr_emit, n_principled, 0.6967); // @node:mix_shader_001",
+      "  let n_principled = urp_lit(n_albedo, 1.0, 0.4523, 1.0, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+      "  let n_mix_shader_001 = mix_blend(0.6967, n_npr_emit, n_principled.rgb); // @node:mix_shader_001",
       "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
     ].join("\n"),
   )
@@ -121,10 +121,10 @@ test("cloth_rough graph matches the hand-written shader (key terms)", () => {
   assert.ok(r.fsBody.includes("let n_bump = bump_lh(1.0, n_noise_ramp.r, n, input.worldPos);"))
   assert.ok(
     r.fsBody.includes(
-      "eval_principled(PrincipledIn(n_principled_base, 0.0, 0.8, 0.8187, 10.0, 0.0, 0.0), n_bump, l, v, sun, amb, shadow, input.worldPos)",
+      "urp_lit(n_principled_base, 0.0, 0.0, 0.25, 1.0, vec3f(0.0), 1.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
     ),
   )
-  assert.ok(r.fsBody.includes("mix(n_npr_emit, n_principled, 0.8999999761581421)"))
+  assert.ok(r.fsBody.includes("mix_blend(0.8999999761581421, n_npr_emit, n_principled.rgb)"))
 })
 
 test("body graph matches the hand-written shader (key terms)", () => {
@@ -135,17 +135,17 @@ test("body graph matches the hand-written shader (key terms)", () => {
     "let n_map = mapping_point(input.restPos, vec3f(0.0), vec3f(0.0), vec3f(1.0, 1.0, 1.5));",
     "let n_noise = tex_noise_d2(n_map, 1.0);",
     "let n_bump = bump_lh(0.324644535779953, n_noise_ramp.r, n, input.worldPos);",
-    "let n_rim1 = vec3f(0.984157919883728, 0.6110184788703918, 0.5736401677131653) * n_rim1_str;",
+    "let n_rim1 = vector_scale(n_rim1_color, n_rim1_str);",
     "let n_rim2_pow = math_power(n_rim2_lw, 1.4300000667572021);",
     "let n_toon_color = mix_blend(n_toon.r, n_shadow_tint, n_lit_tint);",
-    "let n_emission3 = n_bc * 4.0;",
+    "let n_emission3 = vector_scale(n_bc, 4.0);",
     "let n_warm_add = math_add(n_toon.r, 0.5);",
-    "let n_warm_emit = n_warm_ramp.rgb * 0.30000001192092896;",
-    "let n_rim2_mix = mix(n_emission3, vec3f(1.0, 0.4303792119026184, 0.3315804898738861), n_rim2_ramp.r);",
-    "let n_npr_stack = n_npr_add1 + n_warm_emit;",
-    "eval_principled(PrincipledIn(n_principled_base, 0.0, 0.5, 0.3, 10.0, 0.0, 0.0), n_bump, l, v, sun, amb, shadow, input.worldPos)",
-    "let n_p_sum = n_principled + n_p_emit;",
-    "let n_mix_shader_001 = mix(n_npr_stack, n_p_sum, 0.5);",
+    "let n_warm_emit = vector_scale(n_warm_ramp.rgb, 0.30000001192092896);",
+    "let n_rim2_mix = mix_blend(n_rim2_ramp.r, n_emission3, vec3f(1.0, 0.4303792119026184, 0.3315804898738861));",
+    "let n_npr_stack = vector_add(n_npr_add1, n_warm_emit);",
+    "urp_lit(n_principled_base, 0.0, 0.4523, 0.5, 1.0, vec3f(0.0), 1.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
+    "let n_p_sum = vector_add(n_principled.rgb, n_p_emit);",
+    "let n_mix_shader_001 = mix_blend(0.5, n_npr_stack, n_p_sum);",
   ]
   for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
 })
@@ -160,8 +160,8 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
     "let n_mix_001 = mix_blend(0.5, vec3f(1.0), vec3f(n_ramp_face.r));",
     "let n_mask = mix_lighten(0.5, n_mix_001, vec3f(n_ramp_002.r));",
     "let n_emission_hs = hue_sat_id(1.0, 5.0, 1.0, n_tex_base);",
-    "eval_principled(PrincipledIn(n_tex_base, 0.1, 1.0, 0.5, 1e+30, 0.7017999887466431, 0.5), n, l, v, sun, amb, shadow, input.worldPos)",
-    "mix(n_emission_hs, n_principled, color_to_value(n_mask))",
+    "urp_lit(n_tex_base, 0.1, 0.2929, 1.0, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false)",
+    "mix_blend(color_to_value(n_mask), n_emission_hs, n_principled.rgb)",
   ]
   for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
   // Slot-owned behaviors: Wyman hash gate replaces the alpha threshold; alpha out = 1.
@@ -172,28 +172,33 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
   // the two ENDS of the expression rather than the whole of it, because pinning
   // the whole of it is what made this test fail the first time anything was
   // added to the epilogue — which the note it replaces predicted.
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuseOnce(input.worldPos, n) * albedo"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + (rzLightsDiffuseOnce(input.worldPos, n) + objectLight.fill.rgb) * albedo"))
   assert.ok(r.wgsl.includes(", 1.0);"))
   assert.ok(!r.wgsl.includes("if (alpha < 0.001)"))
 })
 
-test("eye graph: default Principled + emission, rear-gate from renderClass", () => {
+test("eye graph: Lit + emission, rear-gate from renderClass", () => {
   const r = compileGraph(EYE_GRAPH, { inlineParams: true, renderClass: "eye" })
   assert.equal(r.ok, true)
   assert.deepEqual(r.diagnostics, [])
   assert.equal(
     r.fsBody,
     [
+      "  let n_eye_fl = vector_dot((-normalize(skinMats[u32(max(material.headBoneIndex, 0.0))][2].xyz)), l); // @node:eye_fl",
+      "  let n_eye_half = math_multiply_add(n_eye_fl, 0.5, 0.5); // @node:eye_half",
+      "  let n_eye_sh = math_multiply(n_eye_half, shadow); // @node:eye_sh",
+      "  let n_eye_lvl = map_range_clamped(n_eye_sh, 0.0, 1.0, 0.2, 1.0); // @node:eye_lvl",
+      "  let n_eye_str = math_multiply(n_eye_lvl, 1.5); // @node:eye_str",
       "  let n_tex_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:tex_base",
-      "  let n_emission = n_tex_base * 1.5; // @node:emission",
-      "  let n_principled = eval_principled(PrincipledIn(n_tex_base, 0.0, 0.5, 0.5, 1e+30, 0.0, 0.0), n, l, v, sun, amb, shadow, input.worldPos); // @node:principled",
-      "  let n_add = n_principled + n_emission; // @node:add",
+      "  let n_emission = vector_scale(n_tex_base, n_eye_str); // @node:emission",
+      "  let n_principled = urp_lit(n_tex_base, 0.0, 0.2929, 0.5, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+      "  let n_add = vector_add(n_principled.rgb, n_emission); // @node:add",
       "  let final_color = n_add; // @node:add",
     ].join("\n"),
   )
   // Slot-owned: rear-view gate in the prelude, standard alpha epilogue.
   assert.ok(r.wgsl.includes("if (dot(faceDir, v) < -0.15) { discard; }"))
-  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + rzLightsDiffuseOnce(input.worldPos, n) * albedo"))
+  assert.ok(r.wgsl.includes("out.color = vec4f(final_color + (rzLightsDiffuseOnce(input.worldPos, n) + objectLight.fill.rgb) * albedo"))
   assert.ok(r.wgsl.includes(", alpha);"))
 })
 
@@ -202,27 +207,27 @@ test("face graph matches the hand-written shader (key terms)", () => {
   assert.equal(r.ok, true)
   assert.deepEqual(r.diagnostics, [])
   const expect = [
-    "let n_toon = ramp_constant_edge_aa(n_str, 0.2966, vec4f(0.0, 0.0, 0.0, 1.0), vec4f(1.0, 1.0, 1.0, 1.0));",
+    "let n_toon = ramp_cardinal(n_str.a, 0.2466, vec4f(0.0, 0.0, 0.0, 1.0), 0.3466, vec4f(1.0, 1.0, 1.0, 1.0));",
     "let n_shadow_tint = hue_sat(0.46000000834465027, 2.0, 0.3499999940395355, 1.0, n_tex_base);",
     "let n_lit_tint = hue_sat(0.46000000834465027, 1.600000023841858, 1.5, 1.0, n_tex_base);",
     "let n_toon_color = mix_blend(n_toon.r, n_shadow_tint, n_lit_tint);",
-    "let n_emission3 = n_bc * 2.5;",
+    "let n_emission3 = vector_scale(n_bc, 2.5);",
     "let n_warm_mul = math_multiply(n_toon.r, 0.5);",
     "let n_warm_add = math_add(n_warm_mul, 0.5);",
-    "let n_warm_emit = n_warm_ramp.rgb * 0.30000001192092896;",
-    "let n_rim1 = vec3f(0.984157919883728, 0.6110184788703918, 0.5736401677131653) * n_rim1_str;",
+    "let n_warm_emit = vector_scale(n_warm_ramp.rgb, 0.30000001192092896);",
+    "let n_rim1 = vector_scale(n_rim1_color, n_rim1_str);",
     "let n_rim2_raw = math_multiply(n_rim2_fres, n_rim2_lw);",
     "let n_rim2_pow = math_power(n_rim2_raw, 0.6300000548362732);",
-    "let n_rim2_mix = mix(n_emission3, vec3f(1.0, 0.4684903025627136, 0.3698573112487793), n_rim2_pow);",
+    "let n_rim2_mix = mix_blend(n_rim2_pow, n_emission3, vec3f(1.0, 0.4684903025627136, 0.3698573112487793));",
     "let n_gate = math_greater_than(color_to_value(tex_color), 0.9300000071525574);",
-    "let n_npr_add2 = n_npr_add1 + vec3f(n_gate_scale);",
+    "let n_npr_add2 = vector_add(n_npr_add1, vec3f(n_gate_scale));",
     "let n_map = mapping_point(input.restPos, vec3f(0.0), vec3f(0.0), vec3f(1.0, 1.0, 1.5));",
     "let n_noise = tex_noise_d2(n_map, 1.0);",
     "let n_bump = bump_lh(0.324644535779953, n_noise_ramp.r, n, input.worldPos);",
     "let n_principled_base = mix_blend(n_noise_ramp.r, n_bc, vec3f(0.6832, 0.1947, 0.1373));",
-    "eval_principled(PrincipledIn(n_principled_base, 0.0, 0.5, 0.3, 10.0, 0.0, 0.0), n_bump, l, v, sun, amb, shadow, input.worldPos)",
-    "let n_p_sum = n_principled + n_p_emit;",
-    "let n_mix_shader_001 = mix(n_npr_stack, n_p_sum, 0.5);",
+    "urp_lit(n_principled_base, 0.0, 0.4523, 0.5, 1.0, vec3f(0.0), 1.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
+    "let n_p_sum = vector_add(n_principled.rgb, n_p_emit);",
+    "let n_mix_shader_001 = mix_blend(0.5, n_npr_stack, n_p_sum);",
   ]
   for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
 })
@@ -253,8 +258,8 @@ const HAIR_WITH_PARAMS = {
   params: [
     { id: "npr_mix", label: "Realism", target: { node: "mix_shader_001", socket: "fac" }, kind: "float", default: 0.2 },
     { id: "rim", label: "Rim Power", target: { node: "rim_pow", socket: "b" }, kind: "float", default: 0.6300000548362732 },
-    { id: "shadow_edge", label: "Shadow Edge", target: { node: "ramp_008", socket: "pos1" }, kind: "float", default: 0.2966 },
-    { id: "gloss", label: "Gloss", target: { node: "principled", socket: "roughness" }, kind: "float", default: 0.3 },
+    { id: "shadow_edge", label: "Shadow Edge", target: { node: "ramp_008", socket: "pos1" }, kind: "float", default: 0.3466 },
+    { id: "gloss", label: "Gloss", target: { node: "principled", socket: "smoothness" }, kind: "float", default: 0.4523 },
   ],
 }
 
@@ -267,7 +272,7 @@ test("live mode: params become style.p reads, slots pack 4 floats into one vec4"
     ["style.p[0].x", "style.p[0].y", "style.p[0].z", "style.p[0].w"],
   )
   assert.ok(r.fsBody.includes("math_power(n_rim_mul, style.p[0].y)"))
-  assert.ok(r.fsBody.includes("mix(n_npr_add, n_principled, style.p[0].x)"))
+  assert.ok(r.fsBody.includes("mix_blend(style.p[0].x, n_npr_add, n_principled.rgb)"))
 })
 
 test("param defaults inline to the same WGSL as the paramless preset", () => {

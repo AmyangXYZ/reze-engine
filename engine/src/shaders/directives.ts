@@ -28,6 +28,30 @@
 // each directive was, so every diagnostic's line number still points at the
 // line the author is looking at.
 
+/**
+ * A bone an effect follows: `#anchor <bone> [trail] [along <d>]`.
+ *
+ * `along` is for an effect that comes off a point ON the bone rather than at its
+ * joint — threads leaving the knuckles, not the wrist; a flame at a sword's tip.
+ * The point is `d` model units down the bone's own axis: the direction a PMX
+ * editor draws the bone pointing (its tail, as an offset or as the bone it
+ * points at), turned by the bone's pose, scaled with the model. A left and a
+ * right wrist point opposite ways, so one number mirrors itself. A bone with no
+ * tail has no axis, and the point stays at the joint.
+ *
+ * Everything the anchor feeds reads the moved point: rzAnchor, the trail, the
+ * ribbon. Two effects naming the same bone at different `along` are two anchors.
+ *
+ * `trail step d` records the path the way a game's trail does (Unity's
+ * minVertexDistance): the newest point follows the bone every frame, and a
+ * point is only LEFT BEHIND once the bone is `d` world units from the last one.
+ * Sampled on the clock alone, a slowing hand leaves a knot of tiny segments
+ * whose directions jitter, and a wide ribbon fans across them into a starburst;
+ * a stepped path has no segment shorter than `d`. Ages stay true — each point
+ * keeps the time it was left. Different steps are different anchors.
+ */
+export type EffectAnchor = { bone: string; trail: boolean; along?: number; step?: number }
+
 /** A knob an effect exposes, for a host to build a control from. */
 export type EffectParamDecl = {
   name: string
@@ -40,8 +64,10 @@ export type EffectParamDecl = {
 }
 
 export type EffectDirectives = {
-  /** Bones this effect follows, in declaration order — slot 0 is the first. */
-  anchors: { bone: string; trail: boolean }[]
+  /** Bones this effect follows, in declaration order — slot 0 is the first.
+   *  `along` (model units, absent = 0) moves the point down the bone's own
+   *  axis, its rest tail direction posed with it: see EffectAnchor. */
+  anchors: EffectAnchor[]
   params: EffectParamDecl[]
   /** Field layer: 0 full, 1 half. Full unless `#halfres` says otherwise. */
   fieldLayer: 0 | 1
@@ -54,6 +80,16 @@ export type EffectDirectives = {
    *  every real grass renderer does, and the only thing that bounds a dense
    *  lawn's cost by the pixels it covers rather than by how deep it stacks. */
   particleBlend: "alpha" | "additive" | "cutout"
+  /** How RIBBONS land, a separate axis from the particles': additive unless
+   *  the file says `#blend over`. Ribbons ignored #blend until that keyword,
+   *  and every shipped ribbon was tuned additive — so the default stays, and
+   *  `over` is the opt-in. The same line sets particles to plain alpha, which
+   *  already IS premultiplied over for them. */
+  trailBlend: "additive" | "over"
+  /** `#depth always`: the particles are drawn over the scene, not depth
+   *  tested — a game glow its material draws with ZTest Always (a moon's halo
+   *  in front of the sky dome it sits behind). Depth tested otherwise. */
+  depthAlways: boolean
   particles: number
   lights: number
   grid: number
@@ -130,6 +166,7 @@ const SPEC = {
   halfres: 0,
   layer: 1,
   blend: 1,
+  depth: 1,
   particles: 1,
   lights: 1,
   grid: 1,
@@ -190,6 +227,8 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     fieldLayer: 0,
     additiveLayer: false,
     particleBlend: "alpha",
+    trailBlend: "additive",
+    depthAlways: false,
     particles: 0,
     lights: 0,
     grid: 0,
@@ -223,11 +262,40 @@ export function parseDirectives(wgsl: string): DirectiveResult {
 
     switch (tag) {
       case "anchor": {
-        if (args.length < 1 || args.length > 2 || (args[1] && args[1] !== "trail")) {
-          errors.push(`${at}: #anchor takes a bone name and optionally the word "trail"`)
+        // <bone> [trail [step <d>]] [along <d>], in that order.
+        const usage = `${at}: #anchor takes a bone name, optionally "trail" (and "step" with a distance), then optionally "along" and a distance`
+        if (args.length < 1) {
+          errors.push(usage)
           return
         }
-        d.anchors.push({ bone: args[0], trail: args[1] === "trail" })
+        let k = 1
+        const trail = args[k] === "trail"
+        if (trail) k++
+        let step: number | undefined
+        if (trail && args[k] === "step") {
+          const v = num(args[k + 1])
+          if (v === null || v <= 0) {
+            errors.push(`${at}: #anchor ... trail step needs a positive distance in world units, like "step 0.24"`)
+            return
+          }
+          step = v
+          k += 2
+        }
+        let along: number | undefined
+        if (args[k] === "along") {
+          const v = num(args[k + 1])
+          if (v === null) {
+            errors.push(`${at}: #anchor ... along needs a distance in model units, like "along 0.9"`)
+            return
+          }
+          along = v
+          k += 2
+        }
+        if (k !== args.length) {
+          errors.push(usage)
+          return
+        }
+        d.anchors.push({ bone: args[0], trail, ...(step ? { step } : {}), ...(along ? { along } : {}) })
         return
       }
       case "param": {
@@ -284,14 +352,28 @@ export function parseDirectives(wgsl: string): DirectiveResult {
         d.additiveLayer = true
         return
       case "blend":
+        // `over` is for ribbons: laid over the scene by their alpha instead of
+        // added. For particles it is the default alpha, which is already over.
+        if (args[0] === "over") {
+          d.trailBlend = "over"
+          d.particleBlend = "alpha"
+          return
+        }
         if (args[0] !== "additive" && args[0] !== "cutout") {
-          errors.push(`${at}: #blend takes "additive" or "cutout" — alpha is the default`)
+          errors.push(`${at}: #blend takes "additive", "cutout" or "over" — alpha is the default`)
           return
         }
         d.particleBlend = args[0]
         return
       case "bloom":
         d.bloom = true
+        return
+      case "depth":
+        if (args[0] !== "always") {
+          errors.push(`${at}: #depth takes "always" — depth tested is the default`)
+          return
+        }
+        d.depthAlways = true
         return
       case "ground": {
         const m = /^#([0-9a-fA-F]{6})$/.exec(args[0] ?? "")

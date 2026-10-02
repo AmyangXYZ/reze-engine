@@ -71,9 +71,16 @@ function modulesFor(wgsl) {
   const alias = buildAnchorTable([anchors], 8).alias[0]
   const trailed = anchors.map((a, i) => (a.trail ? i : -1)).filter((i) => i >= 0)
   const cast = { ...CAST, alias, trailCount: trailed.length }
+  // The #param block, as the engine generates it: an effect reads params.<name>,
+  // and a module built without the struct would report every one undeclared.
+  const decls = parseDirectives(wgsl).directives.params
+  const paramsDecl = decls.length
+    ? `struct EffectParams {\n${decls.map((p) => `  ${p.name}: ${p.kind === "float" ? "f32" : "vec3f"},`).join("\n")}\n}\n` +
+      `@group(0) @binding(7) var<uniform> params: EffectParams;\n`
+    : ""
   const effect = {
     wgsl,
-    paramsDecl: "",
+    paramsDecl,
     hasBackground: /\bfn\s+background\s*\(/.test(wgsl),
     hasForeground: /\bfn\s+foreground\s*\(/.test(wgsl),
     simSize: /\bfn\s+simStep\s*\(/.test(wgsl) ? 256 : 0,
@@ -88,14 +95,14 @@ function modulesFor(wgsl) {
     out.push(["field", buildFieldShader(effect)])
   }
   if (/\bfn\s+particleInit\s*\(/.test(wgsl)) {
-    const src = { wgsl, count: parseDirectives(wgsl).directives.particles || 64, blend: "alpha", bloom: false }
+    const src = { wgsl, count: parseDirectives(wgsl).directives.particles || 64, blend: "alpha", bloom: false, paramsDecl }
     out.push(
       ["particle compute", buildParticleComputeShader(src, cast)],
       ["particle render", buildParticleRenderShader(src, cast)],
     )
   }
   if (/\bfn\s+trailWidth\s*\(/.test(wgsl)) {
-    const src = { wgsl, slots: trailed.length, ribbonSlots: trailed, blend: "additive", bloom: false }
+    const src = { wgsl, slots: trailed.length, ribbonSlots: trailed, blend: "additive", bloom: false, paramsDecl }
     out.push(["trail", buildTrailShader(src, cast)])
   }
   // The emit stage gets the same scene API and the same alias the drawing half

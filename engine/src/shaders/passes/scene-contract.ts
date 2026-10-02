@@ -98,6 +98,12 @@ type SceneRenderClass =
    *  X309's night sky was. Out of WRITES_ID for the mirror's reason — a sheet of
    *  light is not an object anything should be able to pick or outline. */
   | "material-additive"
+  /** A material whose colour arrives ALREADY weighted by its coverage — a
+   *  game's glass (Blend One OneMinusSrcAlpha): the pane's diffuse fades with
+   *  its alpha while its reflection does not, which a src-alpha blend cannot
+   *  express. Out of WRITES_ID for the mirror's reason: a window is not what a
+   *  click on the figure behind it means. */
+  | "material-premultiplied"
   /** Particles and ribbons in their default, non-additive mode. */
   | "particle"
   /** Particles declaring `#blend additive` — LIGHT rather than matter, so
@@ -110,6 +116,13 @@ type SceneRenderClass =
    *  whole, and an ordinary alpha-over aux so a ribbon's mask does not
    *  saturate along every overlap. */
   | "trail"
+  /** Ribbons declaring `#blend over` — MATTER rather than light: laid over
+   *  what is behind them by their own alpha, the way a game's trail material
+   *  with Blend One OneMinusSrcAlpha draws. A dark band then darkens, which an
+   *  additive ribbon can never do; it is how a deep-blue smoke tail reads as a
+   *  tail at all. The fragment writes straight colour, so the colour blend is
+   *  src-alpha like any other alpha-over class. */
+  | "trail-over"
   /** The transparent depth prepass: it exists to write DEPTH after the fabric's
    *  colour blended, so an outline drawn later is occluded behind it. It must
    *  therefore write no colour at all — the targets exist only to make the
@@ -183,6 +196,9 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
   // The same pair the additive particles use: light into the colour target, and
   // coverage that still accumulates so bloom and the composite can see it.
   "material-additive": [ADD_KEEP_ALPHA, ADD_BOTH],
+  // The colour premultiplied by the graph (game_pbr's glass); the aux is
+  // written straight, as every material's is.
+  "material-premultiplied": [PREMULTIPLIED_OVER, ALPHA_OVER],
   // PREMULTIPLIED, like the ground and for the same reason: what a mirror
   // writes is a sample of the HDR target, and that target already holds colour
   // premultiplied by its own alpha. Handed to the src-alpha blend it would be
@@ -201,6 +217,7 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
   particle: [PREMULTIPLIED_OVER, ALPHA_OVER],
   "particle-additive": [ADD_KEEP_ALPHA, ADD_BOTH],
   trail: [ADD_PREMULTIPLIED, ALPHA_OVER],
+  "trail-over": [ALPHA_OVER, ALPHA_OVER],
 }
 
 /**

@@ -49,7 +49,7 @@ const particlesSrc = read("../src/shaders/passes/particles.ts")
  *  here is about count, order and blend rather than which float it is. */
 const FORMATS = { hdr: "rgba16float", aux: "rg8unorm" }
 
-const CLASSES = ["material", "material-additive", "ground", "mirror", "outline", "particle", "particle-additive", "trail", "depth-prepass"]
+const CLASSES = ["material", "material-additive", "material-premultiplied", "ground", "mirror", "outline", "particle", "particle-additive", "trail", "trail-over", "depth-prepass"]
 
 /** Classes whose shaders write an id, and so declare a third fragment output. */
 const WRITES_ID = ["material", "ground"]
@@ -567,4 +567,16 @@ test("every render target handleResize replaces is released first", () => {
     assert.ok(assign > 0, `${name} is not allocated in buildBloomTargets`)
     assert.match(build.slice(0, assign), new RegExp(`this\\.${name}\\?\\.destroy\\(\\)`), `${name} is replaced without releasing the one it replaces`)
   }
+})
+
+test("an over ribbon covers what it crosses, by its own alpha", () => {
+  // `#blend over`: straight colour from the fragment, laid over like any
+  // alpha-over class — so a dark strand darkens, which "trail" never can.
+  const [color, aux] = sceneTargets("trail-over", FORMATS)
+  assert.equal(color.blend.color.srcFactor, "src-alpha")
+  assert.equal(color.blend.color.dstFactor, "one-minus-src-alpha")
+  assert.equal(color.blend.alpha.dstFactor, "one-minus-src-alpha")
+  assert.equal(aux.blend.color.dstFactor, "one-minus-src-alpha")
+  // and the default ribbon is still light
+  assert.equal(sceneTargets("trail", FORMATS)[0].blend.color.dstFactor, "one")
 })

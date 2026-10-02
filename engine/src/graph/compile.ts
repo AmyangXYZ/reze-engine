@@ -340,6 +340,10 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
       args.distortion.literal === 0
     )
       return `tex_noise_d2(${raw.vector}, ${raw.scale})`
+    // Lit is the SURFACE only when it is the graph's output: then it shades the
+    // lamps' diffuse by its own albedo, as URP does. Mixed in as a layer (a
+    // toon look's gloss), the lamps stay the epilogue's, on the whole material.
+    if (node.type === "lit" && node.id !== out.node) return spec(node).emit!(raw).replace(/, true\)$/, ", false)")
     return spec(node).emit!(raw)
   }
 

@@ -145,7 +145,7 @@ struct MirrorVP { viewProj: mat4x4f, params: vec4f, };
 struct MirrorClip { plane: vec4f, on: f32, _p0: f32, _p1: f32, _p2: f32, };
 @group(0) @binding(14) var<uniform> clip: MirrorClip;
 ${WORLD_AMBIENT_WGSL}
-${lightsApi(0, 6, "1u")}
+${lightsApi(0, 6, "1u", { binding: 15, sampler: "linearSampler" })}
 
 struct VO { @builtin(position) position: vec4f, @location(0) worldPos: vec3f, @location(1) normal: vec3f, };
 @vertex fn vs(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f) -> VO {

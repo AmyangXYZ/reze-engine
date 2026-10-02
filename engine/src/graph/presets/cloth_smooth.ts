@@ -1,6 +1,6 @@
 // M_Smooth_Cloth as a ShaderGraph — port of shaders/materials/cloth_smooth.ts.
 // NPR toon + bevel + overlay-boosted emission (18.2×) mixed 10/90 against a plain
-// Principled BSDF. The Blender graph's dead bump subtree is omitted (as in the hand
+// Lit layer. The Blender graph's dead bump subtree is omitted (as in the hand
 // port). hue_sat nodes with hue=0.5 compile to the hue_sat_id specialization.
 
 import type { ShaderGraph } from "../schema"
@@ -18,7 +18,7 @@ export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
     { id: "mat_diffuse", type: "material_diffuse" },
     { id: "tex_base", type: "mix/multiply", inputs: { fac: 1.0 } },
     { id: "geo", type: "geometry" },
-    { id: "str", type: "shader_to_rgb_diffuse" },
+    { id: "str", type: "lambert" },
     { id: "ramp_008", type: "ramp_cardinal", inputs: { pos0: 0.2466, pos1: 0.3466 } },
     { id: "mix04_fac", type: "math/multiply", inputs: { b: 0.5 } },
     { id: "dark_tex", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.19999998807907104, fac: 1.0 } },
@@ -28,14 +28,14 @@ export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
     { id: "mix_003", type: "mix/blend" },
     { id: "hue_004", type: "hue_sat", inputs: { hue: 0.5, saturation: 0.800000011920929, value: 2.0, fac: 1.0 } },
     { id: "npr_overlay", type: "mix/overlay", inputs: { fac: 1.0 } },
-    { id: "npr_emit", type: "emission", inputs: { strength: 18.200000762939453 } },
+    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 18.200000762939453 } },
     { id: "principled_base", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.800000011920929, fac: 1.0 } },
     {
       id: "principled",
-      type: "principled",
-      inputs: { metallic: 0.0, specular_ior_level: 0.8, roughness: 0.5, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
+      type: "lit",
+      inputs: { metallic: 0.0, smoothness: 0.2929, specular: 0.8 },
     },
-    { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.8999999761581421 } },
+    { id: "mix_shader_001", type: "mix/blend", inputs: { fac: 0.8999999761581421 } },
   ],
   links: [
     { from: { node: "str", socket: "value" }, to: { node: "ramp_008", socket: "fac" } },
@@ -54,10 +54,10 @@ export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
     { from: { node: "mix_003", socket: "color" }, to: { node: "hue_004", socket: "color" } },
     { from: { node: "mix_003", socket: "color" }, to: { node: "npr_overlay", socket: "a" } },
     { from: { node: "hue_004", socket: "color" }, to: { node: "npr_overlay", socket: "b" } },
-    { from: { node: "npr_overlay", socket: "color" }, to: { node: "npr_emit", socket: "color" } },
+    { from: { node: "npr_overlay", socket: "color" }, to: { node: "npr_emit", socket: "a" } },
     { from: { node: "tex_base", socket: "color" }, to: { node: "principled_base", socket: "color" } },
     { from: { node: "principled_base", socket: "color" }, to: { node: "principled", socket: "base_color" } },
-    { from: { node: "npr_emit", socket: "color" }, to: { node: "mix_shader_001", socket: "a" } },
+    { from: { node: "npr_emit", socket: "vector" }, to: { node: "mix_shader_001", socket: "a" } },
     { from: { node: "principled", socket: "color" }, to: { node: "mix_shader_001", socket: "b" } },
   ],
   output: { node: "mix_shader_001", socket: "color" },

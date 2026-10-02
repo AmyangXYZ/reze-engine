@@ -132,3 +132,12 @@ test("an effect that owns its table still gets the identity mapping", () => {
   // The cheap path is worth keeping: with one effect this folds to `return local`.
   assert.match(anchorAliasWgsl([0, 1, 2]), /return local/)
 })
+
+test("a point along a bone is its own anchor, not the joint's", () => {
+  // Sharing the joint's ring would hand one of them the other's path.
+  const t = buildAnchorTable([[a("右手首", true)], [{ bone: "右手首", trail: true, along: 0.9 }], [{ bone: "右手首", trail: false, along: 0.9 }]], 8)
+  assert.equal(t.entries.length, 2)
+  assert.deepEqual(t.alias, [[0], [1], [1]])
+  assert.equal(t.entries[1].along, 0.9)
+  assert.equal(t.entries[0].along, undefined)
+})

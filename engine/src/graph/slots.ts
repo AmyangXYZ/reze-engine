@@ -208,8 +208,12 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   const BURN = ` + RZ_BURN_COLOR * rz_burn`
   // The scene fog, last, as the game lays it over a lit surface; an
   // emission-only graph takes none (the game's effect shaders have no fog).
+  // A premultiplied colour takes its fog premultiplied too: the haze a pane
+  // adds is the haze over its own coverage, the rest arrives through what is
+  // behind it (the game scales its fog by the output alpha the same way).
+  const fogOver = blend === "premultiplied" ? " * out.color.a" : ""
   const FOG = takesLight
-    ? `  out.color = vec4f(mix(mix(out.color.rgb, light.fog[0].rgb, input.fog.x), light.fog[2].rgb, input.fog.y), out.color.a);\n`
+    ? `  out.color = vec4f(mix(mix(out.color.rgb, light.fog[0].rgb${fogOver}, input.fog.x), light.fog[2].rgb${fogOver}, input.fog.y), out.color.a);\n`
     : ""
   if (renderClass === "hair") {
     return `${ALBEDO}  var outAlpha = ${alphaBase};

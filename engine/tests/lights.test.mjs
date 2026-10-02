@@ -20,7 +20,7 @@ import { buildLightGrid } from "../dist/light-grid.js"
 import { COMMON_MATERIAL_PRELUDE_WGSL } from "../dist/shaders/materials/common.js"
 import { groundShaderWgsl } from "../dist/shaders/passes/ground.js"
 
-const wgsl = lightsApi(0, 6)
+const wgsl = lightsApi(0, 6, "1u", { binding: 9, sampler: "diffuseSampler" })
 
 test("the buffer is the header, the records, then the grid", () => {
   assert.equal(LIGHT_GRID_BASE, LIGHT_HEADER + MAX_LIGHTS * LIGHT_STRIDE)
@@ -31,14 +31,15 @@ test("the buffer is the header, the records, then the grid", () => {
   assert.equal(LIGHT_GRID_BASE % 4, 0, "the grid must start on a vec4")
 })
 
-test("a cell's lamp bits are one vec4u, and the shader walks all four words", () => {
-  // The walk is unrolled over m.x..m.w. Raising the cap past 128 without
-  // widening both would drop lamps 128 and up in silence.
-  assert.equal(LIGHT_MASK_WORDS, 4)
+test("a cell's lamp bits are two vec4u, and the shader walks all eight words", () => {
+  // The walk is unrolled over m.lo.x..m.hi.w. Raising the cap past 256 without
+  // widening both would drop lamps 256 and up in silence.
+  assert.equal(LIGHT_MASK_WORDS, 8)
   assert.equal(MAX_LIGHTS, LIGHT_MASK_WORDS * 32)
   const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
-  for (const [w, base] of [["x", 0], ["y", 32], ["z", 64], ["w", 96]]) {
-    assert.match(body, new RegExp(`_rzLightWord\\(m\\.${w}, ${base}u, p, n\\)`))
+  const words = [["lo", "x"], ["lo", "y"], ["lo", "z"], ["lo", "w"], ["hi", "x"], ["hi", "y"], ["hi", "z"], ["hi", "w"]]
+  for (const [k, [half, w]] of words.entries()) {
+    assert.match(body, new RegExp(`_rzLightWord\\(m\\.${half}\\.${w}, ${k * 32}u, p, n\\)`))
   }
 })
 
@@ -90,7 +91,7 @@ test("both surfaces that shade get the same accessors", () => {
 
 /** The shader's falloff and cone, reimplemented against the same constants.
  *  `aim` and `cone` default to what a POINT light stores. */
-const LAMP_NEAR = 2.5
+const LAMP_NEAR = 0.0625
 function contribution(light, p, n) {
   const aim = light.aim ?? [0, 0, 0]
   const cone = light.cone ?? [-1, -1]
@@ -105,8 +106,8 @@ function contribution(light, p, n) {
   const falloff = (1 - t ** 4) ** 2 / Math.max(dist * dist, LAMP_NEAR * LAMP_NEAR)
   const axis = -(toLight[0] * aim[0] + toLight[1] * aim[1] + toLight[2] * aim[2])
   const lit = Math.min(Math.max((axis - cone[0]) / Math.max(cone[1] - cone[0], 1e-4), 0), 1)
-  // Blender's Lambert: albedo × irradiance / π.
-  return (ndl * falloff * lit * lit) / Math.PI
+  // Unity's units: albedo × light × N·L, no 1/π.
+  return ndl * falloff * lit * lit
 }
 
 /** The cosine pair setLights stores for a cone of `deg` degrees, inner 80% of it. */
@@ -134,17 +135,49 @@ test("the falloff is finite at the source", () => {
   // geometry would blow the frame out rather than look bright.
   const light = { pos: [0, 0, 0], radius: 5 }
   const v = contribution(light, [0, 0, 1e-5], [0, 0, -1])
-  assert.ok(Number.isFinite(v) && v <= 1.0, `contribution at the source was ${v}`)
+  assert.ok(Number.isFinite(v) && v <= 1 / (LAMP_NEAR * LAMP_NEAR), `contribution at the source was ${v}`)
 })
 
 test("a light falls off as the inverse square, flat inside its bulb", () => {
   const light = { pos: [0, 12, -6], radius: 25 }
   const chest = contribution(light, [0, 12, 0], [0, 0, -1])
-  const expected = (1 - (6 / 25) ** 4) ** 2 / 36 / Math.PI
+  const expected = (1 - (6 / 25) ** 4) ** 2 / 36
   assert.ok(Math.abs(chest - expected) < 1e-9, `six units in, ${chest} rather than ${expected}`)
-  const touching = contribution(light, [0, 12, -5.5], [0, 0, -1])
-  assert.ok(Math.abs(touching - (1 - (0.5 / 25) ** 4) ** 2 / (LAMP_NEAR * LAMP_NEAR) / Math.PI) < 1e-9, "inside the bulb it is held flat")
+  const touching = contribution(light, [0, 12, -5.95], [0, 0, -1])
+  assert.ok(Math.abs(touching - (1 - (0.05 / 25) ** 4) ** 2 / (LAMP_NEAR * LAMP_NEAR)) < 1e-6, "inside the bulb it is held flat")
   assert.equal(contribution(light, [0, 12, 20], [0, 0, -1]), 0)
+})
+
+test("a lamp's own bulb is record word 14, and 0 is the default", () => {
+  // engine.ts writes near at b+14 — the fourth vec4's z. A game lamp's bulb is
+  // 8 sqrt(shapeRadius): Unity holds 1/d² flat inside sqrt(shapeRadius), and a
+  // rig tuned with a bulb wider than its reach is a lamp of one strength across
+  // its sphere, which a shared constant cannot spell.
+  assert.match(wgsl, /fn rzLightNear\(i: u32\) -> f32 \{ let r = _rzLightVec\(i, 3u\)\.z; return select\(RZ_LAMP_NEAR, r, r > 0\.0\); \}/)
+  const body = wgsl.slice(wgsl.indexOf("fn _rzLightOne"))
+  assert.match(body, /let bulb = rzLightNear\(i\);\s+let falloff = window \* window \/ max\(dist \* dist, bulb \* bulb\);/)
+  // The principled walk lights with the same reach.
+  const walk = COMMON_MATERIAL_PRELUDE_WGSL + readFileSync(new URL("../dist/shaders/materials/nodes.js", import.meta.url), "utf8")
+  assert.match(walk, /let bulb = rzLightNear\(i\);/)
+  assert.doesNotMatch(wgsl + walk, /max\(dist \* dist, RZ_LAMP_NEAR \* RZ_LAMP_NEAR\)/, "no walk keeps the shared bulb")
+})
+
+test("a bulb wider than the reach is one strength across the sphere, as Unity's is", () => {
+  // Unity: C min(1/d², 1/shape) (1 - (d²/r²)²)², d in game units. The engine at
+  // 8x, in Unity's units: colour·intensity (1 - (D/R)⁴)² / max(D², near²). With
+  // colour·intensity = 64 C and near = 8 sqrt(shape) the two agree at every distance.
+  const shape = 14.1
+  const r = 0.83
+  const C = 53.23
+  const near = 8 * Math.sqrt(shape)
+  for (const d of [0.05, 0.2, 0.4, 0.6, 0.8]) {
+    const game = C * Math.min(1 / (d * d), 1 / shape) * (1 - ((d * d) / (r * r)) ** 2) ** 2
+    const D = 8 * d
+    const R = 8 * r
+    const t = D / R
+    const engine = (64 * C * (1 - t ** 4) ** 2) / Math.max(D * D, near * near)
+    assert.ok(Math.abs(engine - game) < 1e-9 * game, `${d} m: engine ${engine} vs game ${game}`)
+  }
 })
 
 // ── The lightEmit mount ──
@@ -352,11 +385,11 @@ test("the cap clears a game stage's rig", () => {
   // A Unity stage arrives with a lamp per fixture: a resort brought 33, a lit
   // interior brings past a hundred. The loop runs over the scene's count, so
   // this bounds the buffer and the worst case rather than the ordinary one, and
-  // the buffer is storage — 128 records is 8 KiB.
-  assert.ok(MAX_LIGHTS >= 128, `MAX_LIGHTS is ${MAX_LIGHTS}`)
-  // Header, 128 records, and 32k cells of four words — about half a megabyte,
+  // the buffer is storage — 256 records is 16 KiB, URP's Forward+ budget.
+  assert.ok(MAX_LIGHTS >= 256, `MAX_LIGHTS is ${MAX_LIGHTS}`)
+  // Header, 256 records, and 32k cells of eight words — about a megabyte,
   // bound once to every material.
-  assert.equal(LIGHTS_FLOATS * 4, 532544)
+  assert.equal(LIGHTS_FLOATS * 4, (20 + 256 * 16 + 32768 * 8) * 4)
 })
 
 test("the record holds a spot's aim and cone where the writer puts them", () => {
@@ -466,7 +499,19 @@ test("the shader and the builder agree on the cell order", () => {
   // x fastest, then y, then z — the builder's index and the shader's. Drift
   // here shows as lamps lighting the wrong corner of the stage.
   assert.match(wgsl, /\(ci\.z \* dims\.y \+ ci\.y\) \* dims\.x \+ ci\.x/)
-  assert.match(wgsl, new RegExp(`_rzLights\\[${LIGHT_GRID_BASE / 4}u \\+ `))
+  assert.match(wgsl, new RegExp(`let at = ${LIGHT_GRID_BASE / 4}u \\+ \\(\\(ci\\.z`))
   const src = readFileSync(new URL("../src/light-grid.ts", import.meta.url), "utf8")
   assert.match(src, /\(\(z \* dims\[1\] \+ y\) \* dims\[0\] \+ x\) \* LIGHT_MASK_WORDS/)
+})
+
+test("a spot's cookie tints both lamp walks, and lives in record word 15", () => {
+  // The diffuse walk and the PBR walk must both take it, or a gobo would
+  // pattern the floor and not the highlights on it.
+  assert.match(wgsl, /return rzLightColor\(i\) \* rzLightCookie\(i, toLight\) \* \(ndl/)
+  const walk = readFileSync(new URL("../dist/shaders/materials/nodes.js", import.meta.url), "utf8")
+  assert.match(walk, /let c = rzLightColor\(i\) \* rzLightCookie\(i, toLight\);/)
+  // Word 15 is (cookie layer + 1): vec 3's w.
+  assert.match(wgsl, /let k = _rzLightVec\(i, 3u\)\.w;/)
+  const engine = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
+  assert.match(engine, /this\.lightsData\[b \+ 15\] = cookie !== undefined \? cookie \+ 1 : 0/)
 })

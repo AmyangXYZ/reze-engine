@@ -23,6 +23,12 @@
 interface AnchorRequest {
   bone: string
   trail: boolean
+  /** Model units down the bone's own axis (`#anchor ... along d`); absent = 0,
+   *  the joint itself. */
+  along?: number
+  /** World units the bone must move before its trail keeps a point
+   *  (`trail step d`); absent = every 60 Hz tick. */
+  step?: number
 }
 
 /** The empty table — a scene with no effect installed asks for no bones. */
@@ -48,6 +54,11 @@ export interface AnchorTable {
  * Order is first-come, so a single effect gets the identity alias and the whole
  * mechanism is a no-op until a second effect exists — which is what makes this
  * safe to land before setEffects does.
+ *
+ * A point ALONG a bone is a different point: `#anchor 右手首 trail along 0.9`
+ * and a bare `#anchor 右手首` are two entries, keyed by bone and distance, since
+ * sharing one ring would hand one of them the other's path. So is a trail
+ * recorded at a different `step`: its ring keeps different points.
  */
 export function buildAnchorTable(requests: AnchorRequest[][], max: number): AnchorTable {
   const entries: AnchorRequest[] = []
@@ -58,7 +69,8 @@ export function buildAnchorTable(requests: AnchorRequest[][], max: number): Anch
   for (let e = 0; e < requests.length; e++) {
     const local: number[] = []
     for (const req of requests[e]) {
-      let g = index.get(req.bone)
+      const key = req.along || req.step ? `${req.bone}\u0000${req.along ?? 0}\u0000${req.step ?? 0}` : req.bone
+      let g = index.get(key)
       if (g === undefined) {
         if (entries.length >= max) {
           // Refused, and the effect still installs: an effect that loses one of
@@ -69,8 +81,8 @@ export function buildAnchorTable(requests: AnchorRequest[][], max: number): Anch
           continue
         }
         g = entries.length
-        index.set(req.bone, g)
-        entries.push({ bone: req.bone, trail: req.trail })
+        index.set(key, g)
+        entries.push({ bone: req.bone, trail: req.trail, ...(req.along ? { along: req.along } : {}), ...(req.step ? { step: req.step } : {}) })
       } else if (req.trail) {
         // A later request for the same bone can only ever ADD the trail — the
         // ring is shared, and turning it on for one reader turns it on for all.

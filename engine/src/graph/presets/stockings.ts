@@ -1,6 +1,6 @@
 // M_Stockings as a ShaderGraph — port of shaders/materials/stockings.ts.
 // A bbox-gradient × facing-rim mask drives a Mix Shader between an HSV-boosted
-// emission (val 5×) and a sheen Principled. The hashed-alpha discard and the
+// emission (val 5×) and a Lit layer. The hashed-alpha discard and the
 // alpha=1 output are slot-owned (see STOCKINGS_TEMPLATE in slots.ts) — the graph
 // computes only the radiance. Blender's Generated coord is approximated with UV,
 // as in the hand port. The grayscale mask feeds Mix Shader Fac through Blender's
@@ -32,17 +32,10 @@ export const STOCKINGS_GRAPH: ShaderGraph = {
     { id: "emission_hs", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 5.0, fac: 1.0 } },
     {
       id: "principled",
-      type: "principled",
-      inputs: {
-        metallic: 0.1,
-        specular_ior_level: 1.0,
-        roughness: 0.5,
-        spec_clamp: 1e30,
-        sheen_weight: 0.7017999887466431,
-        sheen_tint: 0.5,
-      },
+      type: "lit",
+      inputs: { metallic: 0.1, smoothness: 0.2929, specular: 1.0 },
     },
-    { id: "mix_shader_001", type: "mix_shader" },
+    { id: "mix_shader_001", type: "mix/blend" },
   ],
   links: [
     { from: { node: "geo", socket: "uv" }, to: { node: "map", socket: "vector" } },

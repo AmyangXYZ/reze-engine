@@ -54,6 +54,21 @@ export type NativeValue = number | ArrayLike<number> | ArrayLike<ArrayLike<numbe
 /** Name -> value; the first source that has a name wins. */
 export type ValueSource = Record<string, NativeValue | undefined>
 
+/** Whether two values carry the same numbers (and the same integer-ness). */
+export function sameValue(a: NativeValue, b: NativeValue): boolean {
+  if (typeof a === "number" || typeof b === "number") return a === b
+  if (a.length !== b.length) return false
+  if (a instanceof Uint32Array !== b instanceof Uint32Array) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] as number | ArrayLike<number>
+    const y = b[i] as number | ArrayLike<number>
+    if (typeof x === "number" || typeof y === "number") {
+      if (x !== y) return false
+    } else if (!sameValue(x, y)) return false
+  }
+  return true
+}
+
 /** One vertex stream a draw binds, by the semantic a shader input names. */
 export type NativeStream = {
   buffer: GPUBuffer
@@ -87,14 +102,25 @@ export function wrapFragment(frag: string, ids: boolean): string {
   const at = frag.lastIndexOf("@fragment")
   if (at < 0) throw new Error("native shader: no fragment entry point")
   const head = frag.slice(at)
-  const sig = /->\s*@location\(0\)\s*vec4<f32>\s*\{/
-  if (!sig.test(head)) throw new Error("native shader: the fragment entry does not return one vec4 target")
+  // A target narrower than four channels (a float3 SV_Target) leaves the rest
+  // unwritten: widened here with zeros and an alpha of one.
+  const sig = /->\s*@location\(0\)\s*(vec4<f32>|vec3<f32>|vec2<f32>|f32)\s*\{/
+  const kind = sig.exec(head)?.[1]
+  if (!kind) throw new Error("native shader: the fragment entry does not return one float target")
   let body = head.replace(sig, "-> RzNativeOut {")
   const ret = /return\s+(_e\d+)\s*;\s*\}\s*$/
   const m = ret.exec(body)
   if (!m) throw new Error("native shader: the fragment entry's return is not the translator's")
-  const v = m[1]
-  body = body.replace(ret, `return RzNativeOut(${v}, vec4f(1.0, 1.0, 0.0, ${v}.a)${ids ? ", vec2u(0u)" : ""});\n}\n`)
+  const e = m[1]
+  const v =
+    kind === "vec4<f32>"
+      ? e
+      : kind === "vec3<f32>"
+        ? `vec4f(${e}, 1.0)`
+        : kind === "vec2<f32>"
+          ? `vec4f(${e}, 0.0, 1.0)`
+          : `vec4f(${e}, 0.0, 0.0, 1.0)`
+  body = body.replace(ret, `let rzColor = ${v};\n  return RzNativeOut(rzColor, vec4f(1.0, 1.0, 0.0, rzColor.a)${ids ? ", vec2u(0u)" : ""});\n}\n`)
   const struct = `struct RzNativeOut {\n  @location(0) color: vec4f,\n  @location(1) mask: vec4f,\n${ids ? "  @location(2) id: vec2u,\n" : ""}};\n`
   // After the module's directives (diagnostic, enable): WGSL wants them first.
   const pre = frag.slice(0, at)
@@ -190,6 +216,7 @@ export class NativeHost {
       white: GPUTextureView
       black: GPUTextureView
       blackCube: GPUTextureView
+      emptyVolume: GPUTextureView
       depth: GPUTextureView
       comparison: GPUSampler
     },
@@ -598,14 +625,17 @@ export class NativeHost {
     if (!samplers) return this.sampler
     const bare = name.replace(/^sampler_?/, "")
     const tex = info.bindings[bare] ? bare : info.bindings[`_${bare}`] ? `_${bare}` : bare
-    return samplers[tex] ?? this.sampler
+    return samplers[tex] ?? samplers[tex.replace(/_+$/, "")] ?? this.sampler
   }
 
   private textureView(name: string, type: string, textures: Record<string, GPUTextureView | undefined>): GPUTextureView {
-    const v = textures[name]
+    // naga renames a binding that ends in a digit with a trailing "_", as it
+    // does a member (lookupFrom): _AlbedoTex_1 is declared _AlbedoTex_1_
+    const v = textures[name] ?? (name.endsWith("_") ? textures[name.replace(/_+$/, "")] : undefined)
     if (v) return v
     if (/texture_depth/.test(type)) return this.fallback.depth
     if (/texture_cube/.test(type)) return this.fallback.blackCube
+    if (/texture_3d/.test(type)) return this.fallback.emptyVolume
     return this.fallback.white
   }
 

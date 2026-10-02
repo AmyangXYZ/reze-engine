@@ -388,9 +388,15 @@ ${src.orient ? `  // the author's own plane (particleOrient): a card on a surfac
   let o = particleOrient(p, ii);
   right = o[0];
   up = o[1];
-` : ""}  let s = sin(p.rot);
+` : ""}${/\bfn\s+particlePivot\s*\(/.test(src.wgsl) ? `  // the card's pivot (particlePivot, in half-size units of the quad): the
+  // corners are offset by it BEFORE the turn, so the card turns about its
+  // pivot rather than its centre — Unity's renderer pivot, a lighthouse beam
+  // whose card starts at the lamp instead of straddling it
+  let cp = c + particlePivot(p, ii);
+` : `  let cp = c;
+`}  let s = sin(p.rot);
   let k = cos(p.rot);
-  var r = vec2f(c.x * k - c.y * s, c.x * s + c.y * k);
+  var r = vec2f(cp.x * k - cp.y * s, cp.x * s + cp.y * k);
   // Stretched along the direction of travel ON SCREEN — which is not the world
   // direction once the camera is off-axis. Rain falling straight down is nearly
   // a point when viewed from above and a long streak from the side, and taking
@@ -402,7 +408,7 @@ ${src.orient ? `  // the author's own plane (particleOrient): a card on a surfac
     let vlen = length(vec2f(vr, vu));
     if (vlen > 1e-5) {
       let d = vec2f(vr, vu) / vlen;
-      r = vec2f(d.y, -d.x) * c.x + d * (c.y * p.stretch);
+      r = vec2f(d.y, -d.x) * cp.x + d * (cp.y * p.stretch);
     }
   }
   let world = p.pos + (right * r.x + up * r.y) * p.size;

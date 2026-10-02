@@ -4,7 +4,7 @@
 // (golden test #1 — see tests/graph.test.mjs).
 //
 // Inherited authoring decisions from the hand port: the noise→bump subtree on
-// Principled.Normal is omitted (imperceptible at 0.2 mix weight), and Blender's bevel
+// the Lit layer's normal is omitted (imperceptible at 0.2 mix weight), and Blender's bevel
 // node is approximated by saturate(normal.y) — Blender Z-up ⇒ engine Y-up.
 //
 // The object is pure JSON (no functions/undefined) — JSON.stringify round-trips it,
@@ -28,7 +28,7 @@ export const HAIR_GRAPH: ShaderGraph = {
     { id: "hs_shadow", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.2, value: 0.5, fac: 1.0 } },
     { id: "hs_002", type: "hue_sat", inputs: { hue: 0.48, saturation: 1.2, value: 0.7, fac: 1.0 } },
     { id: "hs_001", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.5, value: 1.0, fac: 1.0 } },
-    { id: "str", type: "shader_to_rgb_diffuse" },
+    { id: "str", type: "lambert" },
     { id: "ramp_008", type: "ramp_cardinal", inputs: { pos0: 0.2466, color0: [0, 0, 0, 1], pos1: 0.3466, color1: [1, 1, 1, 1] } },
     { id: "mix_004", type: "mix/blend" },
     { id: "bc", type: "bright_contrast", inputs: { bright: 0.1, contrast: 0.2 } },
@@ -41,7 +41,7 @@ export const HAIR_GRAPH: ShaderGraph = {
     { id: "rim_pow", type: "math/power", inputs: { b: 0.6300000548362732 } },
     {
       id: "mix_shader_002",
-      type: "mix_shader",
+      type: "mix/blend",
       inputs: { b: [0.1673291176557541, 0.1673291176557541, 0.1673291176557541] },
     },
     { id: "gate", type: "math/greater_than", inputs: { b: 0.15000000596046448 } },
@@ -49,10 +49,10 @@ export const HAIR_GRAPH: ShaderGraph = {
     { id: "npr_add", type: "mix/add_emit" },
     {
       id: "principled",
-      type: "principled",
-      inputs: { metallic: 0.0, specular_ior_level: 1.0, roughness: 0.3, spec_clamp: 10.0, sheen_weight: 0.0, sheen_tint: 0.0 },
+      type: "lit",
+      inputs: { metallic: 0.0, smoothness: 0.4523, specular: 1.0 },
     },
-    { id: "mix_shader_001", type: "mix_shader", inputs: { fac: 0.2 } },
+    { id: "mix_shader_001", type: "mix/blend", inputs: { fac: 0.2 } },
   ],
   links: [
     { from: { node: "tex", socket: "color" }, to: { node: "tex_base", socket: "a" } },

@@ -25,8 +25,6 @@ import {
   normalizeAssetPath,
   type AssetReader,
 } from "./asset-reader"
-import { BRDF_LUT_SIZE, BRDF_LUT_BAKE_WGSL } from "./shaders/dfg_lut"
-import { LTC_MAG_LUT_SIZE, LTC_MAG_LUT_DATA } from "./shaders/ltc_mag_lut"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
@@ -46,10 +44,10 @@ import {
 import { parentKeySpan, type ModelParentKey } from "./parent-keys"
 import { NativeHost } from "./unity/host"
 import { NativeLooks, type NativeLook } from "./unity/looks"
-import { NativeStage, type NativeStagePackage, type NativeStageReader } from "./unity/stage"
+import { NativeStage, type NativeStageLights, type NativeStagePackage, type NativeStageReader } from "./unity/stage"
 import { gameDir, unityFrameGlobals } from "./unity/globals"
 import { outlineMaxOffsetMultiplier, towardMatrix } from "./unity/character"
-import type { NativeValue } from "./unity/host"
+import { sameValue, type NativeValue } from "./unity/host"
 import { SHADOW_ATLAS_SIZE, SHADOW_CASCADES, buildShadowCascades, cascadeSpheres, type ShadowBounds, type ShadowView } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import {
@@ -159,6 +157,17 @@ import {
 import { buildTrailShader, trailEntryPoints, TRAIL_SUBDIVISIONS } from "./shaders/passes/trails"
 import { PICK_SHADER_WGSL } from "./shaders/passes/pick"
 import { MIPMAP_BLIT_SHADER_WGSL } from "./shaders/passes/mipmap"
+import {
+  PROBE_CAPTURE_LEVELS,
+  PROBE_CAPTURE_SIZE,
+  PROBE_COMPOSE_WGSL,
+  PROBE_FILTER_WGSL,
+  PROBE_LEVELS,
+  PROBE_SIZE,
+  SKY_PREFILTER_WGSL,
+  probeLevelRoughness,
+  skyLevelRoughness,
+} from "./shaders/passes/probe"
 import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
 import type { Diagnostic, ShaderGraph } from "./graph/schema"
 import type { AlphaMode, RenderClass, StyleBlend } from "./graph/render-class"
@@ -361,12 +370,13 @@ export type LoadModelFromFilesOptions = {
   pmxFile?: File
 }
 
-// Blender-style scene config. World = environment lighting (ambient);
-// Sun = the single directional lamp; Camera = view framing.
+// Scene config, as Unity's Lighting window lays it out: World = Environment
+// Lighting (ambient and reflections); Sun = the main directional light;
+// Camera = view framing.
 type WorldOptions = {
-  /** Linear scene-referred color of the World Background (Blender: World > Surface > Color). */
+  /** Linear colour of the ambient when the World is a flat colour (Unity: Environment Lighting > Source Color). */
   color?: Vec3
-  /** Multiplier on world color (Blender: World > Surface > Strength). */
+  /** Multiplier on the ambient and the sky's reflection (Unity: the Environment Lighting intensity multiplier). */
   strength?: number
   /**
    * A sky that changes with the direction you look: one colour overhead, one at
@@ -474,14 +484,14 @@ type HeldParentKey = { time: number; parent: string | null; bone: string; positi
 type ParentTrack = { keys: HeldParentKey[]; applied: number; seat: [number, number, number] }
 
 type SunOptions = {
-  /** Linear color of the sun lamp (Blender: Light > Color). */
+  /** Linear colour of the main light (Unity: Light > Color). */
   color?: Vec3
   /** The rendering layers it keys, as bits; every layer by default. A
    *  directional light from setLights takes the layers the sun leaves. */
   layers?: number
-  /** Lamp power in Blender units (Blender: Light > Strength). */
+  /** Unity's light intensity: a white sun of 1 lights albedo 1:1 at N·L = 1. */
   strength?: number
-  /** Direction sunlight travels (points FROM sun TO scene, Blender: -light.rotation.Z). */
+  /** Direction sunlight travels (points FROM the sun TO the scene, Unity: the light's forward). */
   direction?: Vec3
   /**
    * How much shadow the sun casts: 1 full, 0 none, and anything between.
@@ -570,8 +580,9 @@ export type BloomOptions = {
   /** Brightest-channel level where the glow starts (the game's per-scene
    *  threshold). The soft knee is always half of it. */
   threshold: number
-  /** 0..1: how far each level leans toward the wider one on the way up — low is
-   *  a tight halo, high a wide haze. The game: 0.77. */
+  /** 0..1, URP's Scatter: how far each level leans toward the wider one on the
+   *  way up, as lerp(0.05, 0.95, scatter) — low is a tight halo, high a wide
+   *  haze, and the top still keeps the finest level. 0.8 is the game's 0.77. */
   scatter: number
   /** Tint on the glow; white is the game. */
   color: Vec3
@@ -582,7 +593,7 @@ export type BloomOptions = {
 export const DEFAULT_BLOOM_OPTIONS: BloomOptions = {
   enabled: true,
   threshold: 0.7,
-  scatter: 0.77,
+  scatter: 0.8,
   color: new Vec3(1, 1, 1),
   intensity: 1,
 }
@@ -755,7 +766,7 @@ export type EngineOptions = {
 
 const DEFAULT_ENGINE_OPTIONS = {
   world: { color: new Vec3(0.4014, 0.4944, 0.647), strength: 0.3 },
-  sun: { color: new Vec3(1.0, 1.0, 1.0), strength: 2.0, direction: new Vec3(-0.0873, -0.3844, 0.919) },
+  sun: { color: new Vec3(1.0, 1.0, 1.0), strength: 0.64, direction: new Vec3(-0.0873, -0.3844, 0.919) },
   camera: { distance: 26.6, target: new Vec3(0, 12.5, 0), fov: Math.PI / 4 },
   onRaycast: undefined,
 }
@@ -939,6 +950,9 @@ interface ModelInstance {
   indexBuffer: GPUBuffer
   jointsBuffer: GPUBuffer
   weightsBuffer: GPUBuffer
+  /** Vertex colour and second UV, per vertex — the material pipelines' slot 4.
+   *  See createAttributeBuffer. */
+  attributeBuffer: GPUBuffer
   /** The outline hull's own stream — smoothed normal + PMX edge scale per
    *  vertex (outline-normals.ts). Made with the first edge-flagged material,
    *  so a model with no outline never pays for it. */
@@ -1758,7 +1772,7 @@ interface EffectInstance {
   distVariant: number
   /** Bones this source asked for, in ITS OWN declaration order. The scene table
    *  maps these onto shared addresses; this list is what it is rebuilt from. */
-  anchors: { bone: string; trail: boolean }[]
+  anchors: { bone: string; trail: boolean; along?: number; step?: number }[]
   /** Where this effect's own clock started, in scene seconds. */
   epochScene: number
   /**
@@ -1863,6 +1877,17 @@ export type SceneLight = {
    * cast's key on RENDERING_LAYER_CHARACTER is how a game lights the two apart.
    */
   layers?: number
+  /**
+   * The bulb's radius in engine units: inside it the lamp stops getting
+   * brighter (intensity / max(d², near²)). Omitted keeps the default small
+   * bulb; a large soft lamp (a game rig light's shape radius) is wider.
+   */
+  near?: number
+  /**
+   * A spot's cookie: the key of a picture given to loadLightCookie, projected
+   * along the cone the way a stage light throws a gobo. Ignored on a point.
+   */
+  cookie?: string
 }
 
 /**
@@ -1938,6 +1963,9 @@ export class Engine {
   private mainPipelineLayout!: GPUPipelineLayout
   private sceneTargets!: GPUColorTargetState[]
   private sceneTargetsAdditive!: GPUColorTargetState[]
+  /** A group blending "premultiplied" — see scene-contract's
+   *  material-premultiplied. */
+  private sceneTargetsPremultiplied!: GPUColorTargetState[]
   /** The scene pass's attachment formats, settled at init once the device has
    *  said which HDR format it will blend. Every scene-pass pipeline asks
    *  scene-contract for its targets against these. */
@@ -1945,6 +1973,11 @@ export class Engine {
     return { hdr: this.hdrFormat, aux: Engine.BLOOM_MASK_FORMAT }
   }
   private fullVertexBufferLayouts!: GPUVertexBufferLayout[]
+  /** What a MATERIAL pipeline reads: the full set, then (slot 4, past the
+   *  outline hull's slot 3) the model's attribute stream — vertex colour and a
+   *  second UV (see createAttributeBuffer). Only the material shaders declare
+   *  those inputs; every other pass keeps fullVertexBufferLayouts. */
+  private materialVertexBufferLayouts!: (GPUVertexBufferLayout | null)[]
   // 1×64 vertical ramp for shared-toon materials: lit (top) → soft shadow
   // tone (bottom). Stand-in for MMD's toon01–10.bmp, which we can't ship.
   private defaultToonRampTexture!: GPUTexture
@@ -2097,6 +2130,8 @@ export class Engine {
   private multisampleTexture!: GPUTexture
   private hdrResolveTexture!: GPUTexture
   private static readonly MULTISAMPLE_COUNT = 4
+  /** Floats per vertex in a model's attribute stream: colour RGBA, then UV2. */
+  private static readonly ATTRIBUTE_FLOATS = 6
   /**
    * Shadow map depth format — 16-bit, deliberately.
    *
@@ -2490,6 +2525,9 @@ export class Engine {
   /** Where addGround put the floor. The mirror reflects across it, so a raised
    *  floor that kept y = 0 would reflect the scene into the wrong plane. */
   private groundY = 0
+  /** The built-in floor's half size on x and z — what it covers, for the
+   *  shadow's reach (updateShadowSceneBounds). */
+  private groundHalf: [number, number] = [0, 0]
   private mirrorPlane = new Float32Array([0, 1, 0, 0])
   private mirrorCameraData = new Float32Array(40)
   private mirrorCameraBuffer!: GPUBuffer
@@ -2624,6 +2662,50 @@ export class Engine {
   private worldAmbientSH: Float32Array | null = null
   private fallbackEquirectTexture!: GPUTexture
   private fallbackEquirectView!: GPUTextureView
+  // ── The stage's reflection probe (captureReflectionProbe) ──
+  /** The cube the materials read: 64² GGX-prefiltered down seven levels. */
+  private probeTexture!: GPUTexture
+  private probeView!: GPUTextureView
+  /** 1×1 black cube, bound while a probe is being captured so no material
+   *  reads the cube it is drawing into. */
+  private probeFallbackView!: GPUTextureView
+  /** The spot lamps' cookies: one picture a layer of a 512² array, made on the
+   *  first cookie (a 1×1 white stand-in until then), and the layer each key holds. */
+  private cookieTexture!: GPUTexture
+  private cookieView!: GPUTextureView
+  private cookieLayers = new Map<string, number>()
+  /** What setLights was last given, rewritten when a cookie it names arrives. */
+  private sceneLights: SceneLight[] | null = null
+  private static readonly COOKIE_SIZE = 512
+  private static readonly COOKIE_LAYERS = 16
+  /** ProbeUniforms for the scene (centre + strength, box min + on-flag, box
+   *  max), and a zeroed copy — the off flag — for the capture's own draws. */
+  private probeUniformBuffer!: GPUBuffer
+  private probeOffBuffer!: GPUBuffer
+  private probeData = new Float32Array(12)
+  /** The capture camera: CameraUniforms for one cube face at a time. */
+  private probeCameraBuffer!: GPUBuffer
+  private probeCameraData = new Float32Array(40)
+  private probeCaptureBindGroup: GPUBindGroup | null = null
+  /** Set when the stage or what it wears changes; the capture runs once the
+   *  scene has stayed put for PROBE_SETTLE_FRAMES (see maybeCaptureProbe). */
+  private probeDirty = false
+  private probeDirtyFrame = 0
+  private probeFrame = 0
+  private probeCapture: {
+    msTargets: GPUTexture[]
+    depth: GPUTexture
+    color: GPUTexture
+    aux: GPUTexture
+    cube: GPUTexture
+    steps: GPUBuffer
+    composePipeline: GPURenderPipeline
+    filterPipeline: GPURenderPipeline
+    composeGroups: GPUBindGroup[]
+    filterGroups: GPUBindGroup[]
+  } | null = null
+  private static readonly PROBE_SETTLE_FRAMES = 20
+  private skyPrefilterPipeline: GPURenderPipeline | null = null
   // The scene's user WGSL effect (setEffect). ONE per scene, mounted under the
   // scene, over it, or both — whichever of background()/foreground() the code
   // defines. The composite pipelines are REBUILT with the user code injected;
@@ -2691,7 +2773,7 @@ export class Engine {
    *  shader's index 0 is now — written by unshifting rather than by tracking a
    *  head, because 64 is short and the alternative is an index the GPU side
    *  would also have to know about. */
-  private anchorTrail = new Map<string, { pos: number[]; t: number[] }>()
+  private anchorTrail = new Map<string, { pos: number[]; t: number[]; live?: boolean }>()
   /** Scene seconds, advanced by the frame delta — NOT wall time, so an offline
    *  export samples the same path the editor showed. */
   private sceneClock = 0
@@ -2806,8 +2888,6 @@ export class Engine {
   /** The sun's shadow atlas: every cascade in its own tile (shadow-cascades.ts). */
   private shadowAtlasTexture!: GPUTexture
   private shadowAtlasView!: GPUTextureView
-  private brdfLutTexture!: GPUTexture
-  private brdfLutView!: GPUTextureView
   private shadowDepthPipeline!: GPURenderPipeline
   private shadowLightVPBuffer!: GPUBuffer
   // The shadow PASS reads one cascade's matrix per pass, and a uniform binding
@@ -3075,8 +3155,8 @@ export class Engine {
     }
   }
 
-  /** Sensor grain: how much, and whether it moves. */
-  private grain = { amount: 0, animated: true }
+  /** Sensor grain: how much. */
+  private grain = { amount: 0 }
 
   /**
    * Film grain over the rendered scene, 0–1.
@@ -3086,19 +3166,14 @@ export class Engine {
    * a background image or a backdrop video, which arrived with grain of their
    * own and would be graded rather than matched by a second helping.
    *
-   * `animated` false freezes it. A still photograph's grain does not move, and
-   * noise crawling over a frozen picture makes the rendering look more alive
-   * than the thing it is standing in.
-   *
    * Costs one hash per pixel in a pass that already runs, and nothing at all at
    * zero — the branch is on a uniform.
    */
-  setFilmGrain(amount: number, animated = true): void {
+  setFilmGrain(amount: number): void {
     this.grain.amount = Math.min(Math.max(amount, 0), 1)
-    this.grain.animated = animated
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
-  getFilmGrain(): Readonly<{ amount: number; animated: boolean }> {
+  getFilmGrain(): Readonly<{ amount: number }> {
     return this.grain
   }
 
@@ -3152,10 +3227,8 @@ export class Engine {
     // a uniform branch that skips the pow entirely in the common case.
     u[1] = 1.0 / Math.max(v.gamma, 1e-4)
     u[2] = this.grain.amount
-    // The seed. Zero means STILL: a plate that is one photograph has grain that
-    // does not move, and CG noise crawling over a frozen picture makes the CG
-    // look more alive than the footage — the opposite of the point.
-    u[3] = this.grain.animated ? Math.floor(this.sceneClock * 24) % 1024 : 0
+    // The seed, stepped at 24 a second like a film gate.
+    u[3] = Math.floor(this.sceneClock * 24) % 1024
     u[4] = b.color.x
     u[5] = b.color.y
     u[6] = b.color.z
@@ -3167,7 +3240,7 @@ export class Engine {
     // exposure and view transform as the scene — a sun rolls off like a sun).
     // The camera basis at u[12..23] is refreshed per frame.
     // In modes 2 and 3 the colour slot is dead, so mode 3 carries the world
-    // STRENGTH in u[8] — Blender's world-strength dial, the SAME number that
+    // STRENGTH in u[8] — the World's intensity, the SAME number that
     // scales the irradiance. A sky you can see at full brightness while it
     // lights at two thirds is two skies.
     const bg = this.backgroundColor
@@ -4688,7 +4761,7 @@ export class Engine {
    * whether or not it is the thing you see — and it IS the thing you see until
    * a backdrop is set, which is what an HDRI on its own has always done.
    *
-   * `strength` is Blender's world-strength dial and is folded into the
+   * `strength` is the World's intensity and is folded into the
    * coefficients, so what lights her is what you see.
    */
   setWorldEquirect(source: HdrImage | null): void {
@@ -4755,8 +4828,11 @@ export class Engine {
           [w, h],
         )
       }
-      this.worldEquirectTexture = tex
-      this.worldEquirectView = tex.createView()
+      // The box chain above is the SOURCE: the levels the materials read are
+      // the GGX convolution of it, one roughness per level (prefilterSky).
+      const filtered = this.prefilterSky(tex, source.width, source.height, levels)
+      this.worldEquirectTexture = filtered
+      this.worldEquirectView = filtered.createView()
       // The sky lights the scene, not only backs it. The sun keeps the toon
       // ramp — this is the ambient term, exactly where the flat world colour
       // used to sit.
@@ -4776,6 +4852,9 @@ export class Engine {
     this.worldBindingsDirty = true
     this.rebuildPerFrameBindGroups()
     this.rebuildCompositeBindGroup()
+    // The probe's compose step binds the sky it lays in behind the stage.
+    this.dropProbeCapture()
+    this.captureReflectionProbe()
     if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
   }
 
@@ -4902,7 +4981,7 @@ export class Engine {
     params: Record<string, EffectParamValue> | undefined,
     /** This effect's own declarations, already parsed by the caller — which had
      *  to read them anyway to build the scene table. */
-    anchors: { bone: string; trail: boolean }[],
+    anchors: { bone: string; trail: boolean; along?: number; step?: number }[],
     /** Its row of that table: local slot → scene slot. */
     alias: number[],
     /** The pictures for `#textures`, as the host passed them. */
@@ -5574,7 +5653,7 @@ export class Engine {
     /** What the file declared. Read here rather than re-parsed: the source no
      *  longer carries the lines, and two readers is how they drift. */
     d: EffectDirectives,
-    anchors: { bone: string; trail: boolean }[],
+    anchors: { bone: string; trail: boolean; along?: number; step?: number }[],
     /** This effect's local→scene slot map. Passed rather than read off the
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
@@ -5862,7 +5941,11 @@ export class Engine {
         // shading ten layers and shading about three.
         depthStencil: prepass
           ? { format: this.depthFormat, depthWriteEnabled: false, depthCompare: "equal" }
-          : { format: this.depthFormat, depthWriteEnabled: cutout, depthCompare: this.depthAhead },
+          : d.depthAlways
+            ? // `#depth always`: over the scene, Unity's ZTest Always (a moon's halo
+              // drawn in front of the sky dome it sits behind)
+              { format: this.depthFormat, depthWriteEnabled: false, depthCompare: "always" }
+            : { format: this.depthFormat, depthWriteEnabled: cutout, depthCompare: this.depthAhead },
         multisample: { count: Engine.MULTISAMPLE_COUNT },
       }),
     ])
@@ -5946,7 +6029,7 @@ export class Engine {
     wgsl: string,
     count: number,
     alias: number[],
-    anchors: { bone: string; trail: boolean }[],
+    anchors: { bone: string; trail: boolean; along?: number; step?: number }[],
     params: EffectParamsBinding,
   ): Promise<{ ok: true; state: NonNullable<EffectInstance["lights"]> } | { ok: false; diagnostics: string[] }> {
     const layout = this.device.createBindGroupLayout({
@@ -6200,7 +6283,7 @@ export class Engine {
     /** What the file declared. Read here rather than re-parsed: the source no
      *  longer carries the lines, and two readers is how they drift. */
     d: EffectDirectives,
-    anchors: { bone: string; trail: boolean }[],
+    anchors: { bone: string; trail: boolean; along?: number; step?: number }[],
     /** This effect's local→scene slot map. Passed rather than read off the
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
@@ -6290,8 +6373,10 @@ export class Engine {
     // point: a layer composited after tone mapping can never bloom.
     //
     // Additive, where this used to be MAX. Max was right for a post-tonemap
-    // layer; in HDR before bloom, overlapping light sums.
-    const targets = sceneTargetsFor("trail", this.sceneFormats)
+    // layer; in HDR before bloom, overlapping light sums. `#blend over` lays the
+    // ribbon over the scene by its alpha instead — a game trail's own blend,
+    // under which its dark smoke darkens rather than vanishing.
+    const targets = sceneTargetsFor(d.trailBlend === "over" ? "trail-over" : "trail", this.sceneFormats)
     this.device.pushErrorScope("validation")
     try {
       const pipeline = await this.device.createRenderPipelineAsync({
@@ -6709,7 +6794,7 @@ export class Engine {
     /** What the file declared. Read here rather than re-parsed: the source no
      *  longer carries the lines, and two readers is how they drift. */
     d: EffectDirectives,
-    anchors: { bone: string; trail: boolean }[],
+    anchors: { bone: string; trail: boolean; along?: number; step?: number }[],
     /** This effect's local→scene slot map. Passed rather than read off the
      *  engine: the builders run BEFORE the swap, so this.anchorTable still
      *  describes the effect that is still on screen. */
@@ -7304,7 +7389,9 @@ export class Engine {
     u[0] = Math.max(0, b.threshold)
     u[1] = Math.max(0, b.threshold) * 0.5
     u[2] = Engine.BLOOM_CLAMP
-    u[3] = Math.min(1, Math.max(0, b.scatter))
+    // URP's mapping: never all the way to the widest level, which alone is a
+    // few pixels smeared over the screen — the glow would vanish.
+    u[3] = 0.05 + 0.9 * Math.min(1, Math.max(0, b.scatter))
     this.device.queue.writeBuffer(this.bloomUniformBuffer, 0, u)
   }
 
@@ -7528,81 +7615,6 @@ export class Engine {
     this.device.queue.submit([encoder.finish()])
   }
 
-  private bakeBrdfLut() {
-    if (BRDF_LUT_SIZE !== LTC_MAG_LUT_SIZE) {
-      throw new Error("BRDF LUT bake requires DFG size == LTC size (both 64).")
-    }
-
-    // Temp rg16float LTC source — loaded 1:1 by the bake fragment shader, then dropped.
-    const ltcTemp = this.device.createTexture({
-      label: "LTC mag LUT (bake input)",
-      size: [LTC_MAG_LUT_SIZE, LTC_MAG_LUT_SIZE],
-      format: "rg16float",
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    const n = LTC_MAG_LUT_DATA.length
-    const half = new Uint16Array(n)
-    const f32 = new Float32Array(1)
-    const u32 = new Uint32Array(f32.buffer)
-    for (let i = 0; i < n; i++) {
-      f32[0] = LTC_MAG_LUT_DATA[i]
-      const x = u32[0]
-      const sign = (x >>> 16) & 0x8000
-      let exp = ((x >>> 23) & 0xff) - 127 + 15
-      const mant = x & 0x7fffff
-      if (exp <= 0) {
-        half[i] = sign
-      } else if (exp >= 31) {
-        half[i] = sign | 0x7c00
-      } else {
-        half[i] = sign | (exp << 10) | (mant >>> 13)
-      }
-    }
-    this.device.queue.writeTexture(
-      { texture: ltcTemp },
-      half,
-      { bytesPerRow: LTC_MAG_LUT_SIZE * 4, rowsPerImage: LTC_MAG_LUT_SIZE },
-      { width: LTC_MAG_LUT_SIZE, height: LTC_MAG_LUT_SIZE, depthOrArrayLayers: 1 },
-    )
-
-    this.brdfLutTexture = this.device.createTexture({
-      label: "BRDF LUT (DFG + LTC packed)",
-      size: [BRDF_LUT_SIZE, BRDF_LUT_SIZE],
-      format: "rgba8unorm",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    })
-    this.brdfLutView = this.brdfLutTexture.createView()
-
-    const module = this.device.createShaderModule({ label: "BRDF LUT bake", code: BRDF_LUT_BAKE_WGSL })
-    const pipeline = this.device.createRenderPipeline({
-      label: "BRDF LUT bake pipeline",
-      layout: "auto",
-      vertex: { module, entryPoint: "vs" },
-      fragment: { module, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
-      primitive: { topology: "triangle-list" },
-    })
-
-    const bakeBindGroup = this.device.createBindGroup({
-      label: "BRDF LUT bake bind group",
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: ltcTemp.createView() }],
-    })
-
-    const enc = this.device.createCommandEncoder({ label: "BRDF LUT bake encoder" })
-    const pass = enc.beginRenderPass({
-      colorAttachments: [
-        { view: this.brdfLutView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
-      ],
-    })
-    pass.setPipeline(pipeline)
-    pass.setBindGroup(0, bakeBindGroup)
-    pass.draw(3, 1, 0, 0)
-    pass.end()
-    this.device.queue.submit([enc.finish()])
-
-    ltcTemp.destroy()
-  }
-
   private createRenderPipeline(config: Parameters<Engine["renderPipelineDesc"]>[0]): GPURenderPipeline {
     return this.createModelPipeline(this.renderPipelineDesc(config))
   }
@@ -7611,7 +7623,7 @@ export class Engine {
     label: string
     layout: GPUPipelineLayout
     shaderModule: GPUShaderModule
-    vertexBuffers: GPUVertexBufferLayout[]
+    vertexBuffers: (GPUVertexBufferLayout | null)[]
     fragmentTarget?: GPUColorTargetState
     fragmentTargets?: GPUColorTargetState[]
     fragmentEntryPoint?: string
@@ -7928,7 +7940,22 @@ export class Engine {
     // The same attachments blended as light — for a group that declared
     // blend: "additive". See scene-contract's material-additive.
     this.sceneTargetsAdditive = sceneTargetsFor("material-additive", this.sceneFormats)
+    this.sceneTargetsPremultiplied = sceneTargetsFor("material-premultiplied", this.sceneFormats)
     this.fullVertexBufferLayouts = fullVertexBuffers
+    // Slot 3 stays empty: the outline hull binds its own stream there between
+    // two material draws, and a material reading slot 3 would pick it up.
+    const materialVertexBuffers: (GPUVertexBufferLayout | null)[] = [
+      ...fullVertexBuffers,
+      null,
+      {
+        arrayStride: Engine.ATTRIBUTE_FLOATS * 4,
+        attributes: [
+          { shaderLocation: 5, offset: 0, format: "float32x4" as GPUVertexFormat },
+          { shaderLocation: 6, offset: 4 * 4, format: "float32x2" as GPUVertexFormat },
+        ],
+      },
+    ]
+    this.materialVertexBufferLayouts = materialVertexBuffers
 
     // group 0: per-frame (camera + light + sampler + shadow) — bound once per pass
     this.mainPerFrameBindGroupLayout = this.device.createBindGroupLayout({
@@ -7944,14 +7971,19 @@ export class Engine {
         // The positional lights. Always bound, empty or not, so every material
         // pipeline shares one layout whether or not the scene has any.
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
-        // The world's sky (8) and the BRDF LUT (9). The sky is always bound —
-        // the 1x1 fallback when the scene has none — so every material
-        // pipeline keeps sharing one layout. (7 was the far cascade's map,
-        // which the atlas at 3 replaces.)
+        // The world's sky (8). Always bound — the 1x1 fallback when the scene
+        // has none — so every material pipeline keeps sharing one layout. (7
+        // was the far cascade's map, which the atlas at 3 replaces.)
         { binding: 8, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
-        { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        // The spot lamps' cookies (loadLightCookie), a 1x1 white until one loads.
+        { binding: 9, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
         // The cast's shadow on a stage — setStageCastShadow.
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } },
+        // The stage's reflection probe and where it projects — see
+        // captureReflectionProbe. Always bound: a 1x1 cube and the off flag
+        // when there is no stage.
+        { binding: 11, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "cube" } },
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
     // group 1: per-instance (skinMats) — bound once per model
@@ -8024,7 +8056,7 @@ export class Engine {
         label: "neutral base pipeline",
         layout: mainPipelineLayout,
         shaderModule: neutralModule,
-        vertexBuffers: fullVertexBuffers,
+        vertexBuffers: materialVertexBuffers,
         fragmentTargets: sceneTargets,
         cullMode: "none",
         depthStencil: {
@@ -8042,7 +8074,7 @@ export class Engine {
         label: "neutral base pipeline (no depth write)",
         layout: mainPipelineLayout,
         shaderModule: neutralModule,
-        vertexBuffers: fullVertexBuffers,
+        vertexBuffers: materialVertexBuffers,
         fragmentTargets: sceneTargets,
         cullMode: "none",
         depthStencil: {
@@ -8212,7 +8244,6 @@ export class Engine {
     })
 
     // One-shot bake of Blender EEVEE's combined BRDF LUT (DFG + LTC packed rgba8unorm).
-    this.bakeBrdfLut()
     this.bakeGroundNoise()
     // The mipmap blit for the formats model textures arrive in, built here so
     // the first texture of the first model does not compile it synchronously
@@ -8269,6 +8300,48 @@ export class Engine {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     })
     this.fallbackEquirectView = this.fallbackEquirectTexture.createView()
+    // The reflection probe's resources, bound from the first frame: the cube
+    // (empty and switched off until a stage is captured), its stand-in and the
+    // uniforms. Before the per-frame groups, which bind all of them.
+    this.probeTexture = this.device.createTexture({
+      label: "reflection probe",
+      size: [PROBE_SIZE, PROBE_SIZE, 6],
+      format: "rgba16float",
+      mipLevelCount: PROBE_LEVELS,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    this.probeView = this.probeTexture.createView({ dimension: "cube" })
+    this.probeFallbackView = this.device
+      .createTexture({
+        label: "reflection probe stand-in",
+        size: [1, 1, 6],
+        format: "rgba16float",
+        usage: GPUTextureUsage.TEXTURE_BINDING,
+      })
+      .createView({ dimension: "cube" })
+    this.cookieTexture = this.device.createTexture({
+      label: "light cookies (none yet)",
+      size: [1, 1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    })
+    this.device.queue.writeTexture({ texture: this.cookieTexture }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1, 1])
+    this.cookieView = this.cookieTexture.createView({ dimension: "2d-array" })
+    this.probeUniformBuffer = this.device.createBuffer({
+      label: "reflection probe uniforms",
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.probeOffBuffer = this.device.createBuffer({
+      label: "reflection probe uniforms (off)",
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.probeCameraBuffer = this.device.createBuffer({
+      label: "reflection probe capture camera",
+      size: 40 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
 
     // Zero-filled = zero lines, which every accessor answers gracefully.
     this.lyricsBuffer = this.device.createBuffer({
@@ -8316,6 +8389,8 @@ export class Engine {
         { binding: 13, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         // The mirror's plane, and whether this draw is inside the mirror pass.
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The spot lamps' cookies — the floor takes their patterns too.
+        { binding: 15, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d-array" } },
       ],
     })
     this.groundShadowPipelineDesc = {
@@ -10391,6 +10466,415 @@ export class Engine {
    *  Retried at the top of a frame until one of them takes. */
   private worldBindingsDirty = false
 
+  // ─── The stage's reflection probe ───────────────────────────────────
+  //
+  // What a game bakes for every room: a cube of the stage itself, seen from
+  // its middle, prefiltered down its mips by the specular lobe, and read by
+  // every surface box-projected onto the stage's bounds — so a lacquered
+  // counter reflects the bottles behind it and a wet floor the lamps above,
+  // not a sky the room has no window onto. Captured here automatically once a
+  // stage has loaded and its looks have settled; nothing to set.
+
+  /** Drop the capture's resources, so the next capture rebinds the sky. */
+  private dropProbeCapture(): void {
+    const cap = this.probeCapture
+    if (!cap) return
+    this.probeCapture = null
+    void this.device.queue.onSubmittedWorkDone().then(() => {
+      for (const t of cap.msTargets) t.destroy()
+      cap.depth.destroy()
+      cap.color.destroy()
+      cap.aux.destroy()
+      cap.cube.destroy()
+      cap.steps.destroy()
+    })
+  }
+
+  /** Ask for a fresh capture of the stage's reflection probe. It runs at the
+   *  start of a frame once the scene has held still for a moment — asked for
+   *  by the engine itself whenever the stage or its looks change; a host may
+   *  call it after changing something the engine cannot see. */
+  captureReflectionProbe(): void {
+    if (!this.probeDirty) this.probeDirtyFrame = this.probeFrame
+    this.probeDirty = true
+  }
+
+  /** The stage's world-space bounds: every stage model's material boxes
+   *  through its placement. Null without a stage. */
+  private stageBounds(): { min: [number, number, number]; max: [number, number, number] } | null {
+    const min: [number, number, number] = [Infinity, Infinity, Infinity]
+    const max: [number, number, number] = [-Infinity, -Infinity, -Infinity]
+    const p = new Vec3(0, 0, 0)
+    let any = false
+    for (const inst of this.modelInstances.values()) {
+      if (!inst.isStage || !inst.model.visible) continue
+      const m = inst.model
+      for (const draw of inst.drawCalls) {
+        const b = draw.bounds
+        if (!b || b.length < 6 || !(b[0] <= b[3])) continue
+        // The eight corners of the material's model-space box, placed.
+        for (let k = 0; k < 8; k++) {
+          p.setXYZ((k & 1 ? b[3] : b[0]) * m.scale, (k & 2 ? b[4] : b[1]) * m.scale, (k & 4 ? b[5] : b[2]) * m.scale)
+          Quat.rotateVecInto(m.rotation, p, p)
+          const w = [p.x + m.position.x, p.y + m.position.y, p.z + m.position.z]
+          for (let a = 0; a < 3; a++) {
+            if (w[a] < min[a]) min[a] = w[a]
+            if (w[a] > max[a]) max[a] = w[a]
+          }
+          any = true
+        }
+      }
+    }
+    return any ? { min, max } : null
+  }
+
+  /** Run a pending capture once the scene has settled — see captureReflectionProbe. */
+  private maybeCaptureProbe(): void {
+    this.probeFrame++
+    if (!this.probeDirty || !this.probeCaptureBindGroup) return
+    if (this.probeFrame - this.probeDirtyFrame < Engine.PROBE_SETTLE_FRAMES) return
+    this.probeDirty = false
+    const bounds = this.stageBounds()
+    if (!bounds) {
+      // No stage: the probe goes dark and every reader falls back to the sky.
+      this.probeData.fill(0)
+      this.device.queue.writeBuffer(this.probeUniformBuffer, 0, this.probeData)
+      return
+    }
+    try {
+      this.renderProbe(bounds)
+    } catch (e) {
+      console.warn("[reze-engine] reflection probe capture failed:", e)
+    }
+  }
+
+  private ensureProbeCapture(): NonNullable<Engine["probeCapture"]> {
+    if (this.probeCapture) return this.probeCapture
+    const size = PROBE_CAPTURE_SIZE
+    const formats = sceneColorFormats(this.sceneFormats)
+    const msTargets = formats.map((format, i) =>
+      this.device.createTexture({
+        label: `reflection probe capture target ${i}`,
+        size: [size, size],
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      }),
+    )
+    const depth = this.device.createTexture({
+      label: "reflection probe capture depth",
+      size: [size, size],
+      sampleCount: Engine.MULTISAMPLE_COUNT,
+      format: this.depthFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    const layered = (label: string, format: GPUTextureFormat) =>
+      this.device.createTexture({
+        label,
+        size: [size, size, 6],
+        format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+    // The resolves take the scene pass's own formats: colour and coverage.
+    const color = layered("reflection probe capture colour", formats[0])
+    const aux = layered("reflection probe capture coverage", formats[1])
+    const cube = this.device.createTexture({
+      label: "reflection probe capture cube",
+      size: [size, size, 6],
+      format: "rgba16float",
+      mipLevelCount: PROBE_CAPTURE_LEVELS,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    })
+    // One 256-byte slot per step: 6 composes, then the capture's mips, then
+    // the probe's levels, six faces each.
+    const slots = 6 + PROBE_CAPTURE_LEVELS * 6 + PROBE_LEVELS * 6
+    const steps = this.device.createBuffer({
+      label: "reflection probe steps",
+      size: slots * 256,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const composeModule = this.device.createShaderModule({ label: "reflection probe compose", code: PROBE_COMPOSE_WGSL })
+    const composePipeline = this.device.createRenderPipeline({
+      label: "reflection probe compose",
+      layout: "auto",
+      vertex: { module: composeModule, entryPoint: "vs_full" },
+      fragment: { module: composeModule, entryPoint: "fs_compose", targets: [{ format: "rgba16float" }] },
+      primitive: { topology: "triangle-list" },
+    })
+    const filterModule = this.device.createShaderModule({ label: "reflection probe filter", code: PROBE_FILTER_WGSL })
+    const filterPipeline = this.device.createRenderPipeline({
+      label: "reflection probe filter",
+      layout: "auto",
+      vertex: { module: filterModule, entryPoint: "vs_full" },
+      fragment: { module: filterModule, entryPoint: "fs_filter", targets: [{ format: "rgba16float" }] },
+      primitive: { topology: "triangle-list" },
+    })
+    const colorArray = color.createView({ dimension: "2d-array" })
+    const auxArray = aux.createView({ dimension: "2d-array" })
+    const composeLayout = composePipeline.getBindGroupLayout(0)
+    const composeGroups: GPUBindGroup[] = []
+    for (let f = 0; f < 6; f++) {
+      composeGroups.push(
+        this.device.createBindGroup({
+          label: `reflection probe compose ${f}`,
+          layout: composeLayout,
+          entries: [
+            { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+            { binding: 2, resource: this.materialSampler },
+            { binding: 8, resource: this.worldEquirectView ?? this.fallbackEquirectView },
+            { binding: 20, resource: colorArray },
+            { binding: 21, resource: auxArray },
+            { binding: 22, resource: { buffer: steps, offset: f * 256, size: 32 } },
+          ],
+        }),
+      )
+    }
+    const filterLayout = filterPipeline.getBindGroupLayout(0)
+    const cubeView = cube.createView({ dimension: "cube" })
+    const filterGroups: GPUBindGroup[] = []
+    for (let i = 0; i < PROBE_LEVELS * 6; i++) {
+      filterGroups.push(
+        this.device.createBindGroup({
+          label: `reflection probe level ${i}`,
+          layout: filterLayout,
+          entries: [
+            { binding: 0, resource: cubeView },
+            { binding: 1, resource: this.materialSampler },
+            { binding: 2, resource: { buffer: steps, offset: (6 + PROBE_CAPTURE_LEVELS * 6 + i) * 256, size: 32 } },
+          ],
+        }),
+      )
+    }
+    this.probeCapture = {
+      msTargets,
+      depth,
+      color,
+      aux,
+      cube,
+      steps,
+      composePipeline,
+      filterPipeline,
+      composeGroups,
+      filterGroups,
+    }
+    return this.probeCapture
+  }
+
+  /**
+   * Capture the probe: the stage drawn six times from one point into a 128²
+   * cube, the sky laid in behind it, a mip chain, and the GGX convolution
+   * into the 64² cube the materials read.
+   *
+   * WHERE: the middle of the stage's bounds across the floor, at about a
+   * character's chest height above the floor (y = 0 where the bounds span it,
+   * the MMD convention, else their bottom) — where a game puts the probe of a
+   * room the player stands in. The box it projects onto is the bounds.
+   *
+   * WHAT: the stage alone, in its own looks, lit by the scene's sun, lamps
+   * and sky as they stand. The cast is not in it (a baked probe never holds
+   * the characters), nor are effects.
+   */
+  private renderProbe(bounds: { min: [number, number, number]; max: [number, number, number] }): void {
+    const cap = this.ensureProbeCapture()
+    const { min, max } = bounds
+    const floor = min[1] <= 0 && max[1] >= 0 ? 0 : min[1]
+    const eye: [number, number, number] = [
+      (min[0] + max[0]) * 0.5,
+      Math.min(floor + 12, (min[1] + max[1]) * 0.5),
+      (min[2] + max[2]) * 0.5,
+    ]
+    const span = Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2])
+    const near = 0.25
+    const far = Math.max(span * 2, 100)
+    // Each face's forward and up, in the convention the GPU samples a cube
+    // with (see rz_face_dir in passes/probe.ts): +X, -X, +Y, -Y, +Z, -Z.
+    const faces: [number, number, number, number, number, number][] = [
+      [1, 0, 0, 0, 1, 0],
+      [-1, 0, 0, 0, 1, 0],
+      [0, 1, 0, 0, 0, -1],
+      [0, -1, 0, 0, 0, 1],
+      [0, 0, 1, 0, 1, 0],
+      [0, 0, -1, 0, 1, 0],
+    ]
+    const cam = this.probeCameraData
+    const view = { perFrame: this.probeCaptureBindGroup!, args: "probe" as const, outlines: false }
+    const formats = sceneColorFormats(this.sceneFormats)
+    for (let f = 0; f < 6; f++) {
+      const [fx, fy, fz, ux, uy, uz] = faces[f]
+      Mat4.lookAtInto(cam.subarray(0, 16), eye[0], eye[1], eye[2], eye[0] + fx, eye[1] + fy, eye[2] + fz, ux, uy, uz)
+      if (this.reversedZ) Mat4.perspectiveInto(cam.subarray(16, 32), Math.PI / 2, 1, far, near)
+      else Mat4.perspectiveInto(cam.subarray(16, 32), Math.PI / 2, 1, near, far)
+      cam[32] = eye[0]
+      cam[33] = eye[1]
+      cam[34] = eye[2]
+      cam[35] = PROBE_CAPTURE_SIZE
+      cam[36] = this.sceneClock
+      this.device.queue.writeBuffer(this.probeCameraBuffer, 0, cam)
+      const encoder = this.device.createCommandEncoder({ label: `reflection probe face ${f}` })
+      const colorAttachments: GPURenderPassColorAttachment[] = formats.map((_, i) => ({
+        view: cap.msTargets[i].createView(),
+        resolveTarget:
+          i === 0
+            ? cap.color.createView({ dimension: "2d", baseArrayLayer: f, arrayLayerCount: 1 })
+            : i === 1
+              ? cap.aux.createView({ dimension: "2d", baseArrayLayer: f, arrayLayerCount: 1 })
+              : undefined,
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        loadOp: "clear",
+        storeOp: "discard",
+      }))
+      const pass = encoder.beginRenderPass({
+        label: `reflection probe face ${f}`,
+        colorAttachments,
+        depthStencilAttachment: {
+          view: cap.depth.createView(),
+          depthClearValue: this.depthClear,
+          depthLoadOp: "clear",
+          depthStoreOp: "discard",
+          stencilClearValue: 0,
+          stencilLoadOp: "clear",
+          stencilStoreOp: "discard",
+        },
+      })
+      pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
+      for (const inst of this.modelInstances.values()) {
+        if (!inst.isStage || !inst.model.visible) continue
+        this.setModelDrawState(pass, inst)
+        this.drawMaterials(pass, inst, "opaque", view)
+      }
+      for (const inst of this.modelInstances.values()) {
+        if (!inst.isStage || !inst.model.visible) continue
+        this.setModelDrawState(pass, inst)
+        this.drawMaterials(pass, inst, "transparent", view)
+      }
+      pass.end()
+      this.device.queue.submit([encoder.finish()])
+    }
+
+    // The steps: compose, capture mips, then the probe's levels.
+    const steps = new ArrayBuffer((6 + PROBE_CAPTURE_LEVELS * 6 + PROBE_LEVELS * 6) * 256)
+    const put = (slot: number, face: number, lod: number, roughness: number, srcSize: number, mode: number) => {
+      const u = new Uint32Array(steps, slot * 256, 8)
+      const fl = new Float32Array(steps, slot * 256, 8)
+      u[0] = face
+      fl[1] = lod
+      fl[2] = roughness
+      fl[3] = srcSize
+      u[4] = mode
+    }
+    for (let f = 0; f < 6; f++) put(f, f, 0, 0, PROBE_CAPTURE_SIZE, 0)
+    for (let m = 0; m < PROBE_CAPTURE_LEVELS; m++)
+      for (let f = 0; f < 6; f++) put(6 + m * 6 + f, f, Math.max(m - 1, 0), 0, PROBE_CAPTURE_SIZE, 0)
+    for (let m = 0; m < PROBE_LEVELS; m++)
+      for (let f = 0; f < 6; f++)
+        // Level 0 is the capture at the probe's size: one tap of the 128²
+        // level-0 cube at a 64² texel's centre is its 2×2 average.
+        put(6 + PROBE_CAPTURE_LEVELS * 6 + m * 6 + f, f, 0, probeLevelRoughness(m), PROBE_CAPTURE_SIZE, m === 0 ? 0 : 1)
+    this.device.queue.writeBuffer(cap.steps, 0, steps)
+
+    const encoder = this.device.createCommandEncoder({ label: "reflection probe filter" })
+    const run = (target: GPUTextureView, pipeline: GPURenderPipeline, group: GPUBindGroup) => {
+      const p = encoder.beginRenderPass({ colorAttachments: [{ view: target, loadOp: "clear", storeOp: "store" }] })
+      p.setPipeline(pipeline)
+      p.setBindGroup(0, group)
+      p.draw(3)
+      p.end()
+    }
+    const face = (tex: GPUTexture, level: number, f: number) =>
+      tex.createView({ dimension: "2d", baseMipLevel: level, mipLevelCount: 1, baseArrayLayer: f, arrayLayerCount: 1 })
+    for (let f = 0; f < 6; f++) run(face(cap.cube, 0, f), cap.composePipeline, cap.composeGroups[f])
+    // Each level from the one above. The source view spans the whole chain,
+    // which a pass writing one of its levels may not bind — so the reads go
+    // through a view of the levels ABOVE the one being written.
+    for (let m = 1; m < PROBE_CAPTURE_LEVELS; m++) {
+      const above = cap.cube.createView({ dimension: "cube", baseMipLevel: 0, mipLevelCount: m })
+      for (let f = 0; f < 6; f++) {
+        const group = this.device.createBindGroup({
+          label: `reflection probe capture mip ${m}/${f}`,
+          layout: cap.filterPipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: above },
+            { binding: 1, resource: this.materialSampler },
+            { binding: 2, resource: { buffer: cap.steps, offset: (6 + m * 6 + f) * 256, size: 32 } },
+          ],
+        })
+        run(face(cap.cube, m, f), cap.filterPipeline, group)
+      }
+    }
+    for (let m = 0; m < PROBE_LEVELS; m++)
+      for (let f = 0; f < 6; f++) run(face(this.probeTexture, m, f), cap.filterPipeline, cap.filterGroups[m * 6 + f])
+    this.device.queue.submit([encoder.finish()])
+
+    this.probeData.set([eye[0], eye[1], eye[2], 1, min[0], min[1], min[2], 1, max[0], max[1], max[2], 0])
+    this.device.queue.writeBuffer(this.probeUniformBuffer, 0, this.probeData)
+  }
+
+  /**
+   * The sky's mips, convolved with the GGX lobe each stands for — the box
+   * average the upload built is only the source. Level 0 is copied as it is
+   * (it is also what the backdrop draws); every level below it becomes the
+   * sky as a surface of that roughness reflects it (skyLevelRoughness).
+   */
+  private prefilterSky(source: GPUTexture, width: number, height: number, levels: number): GPUTexture {
+    if (levels <= 1) return source
+    if (!this.skyPrefilterPipeline) {
+      const module = this.device.createShaderModule({ label: "sky prefilter", code: SKY_PREFILTER_WGSL })
+      this.skyPrefilterPipeline = this.device.createRenderPipeline({
+        label: "sky prefilter",
+        layout: "auto",
+        vertex: { module, entryPoint: "vs_full" },
+        fragment: { module, entryPoint: "fs_sky", targets: [{ format: "rgba16float" }] },
+        primitive: { topology: "triangle-list" },
+      })
+    }
+    const pipeline = this.skyPrefilterPipeline
+    const out = this.device.createTexture({
+      label: "world equirect (HDR, GGX-prefiltered)",
+      size: [width, height],
+      format: "rgba16float",
+      mipLevelCount: levels,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    })
+    const encoder = this.device.createCommandEncoder({ label: "sky prefilter" })
+    encoder.copyTextureToTexture({ texture: source, mipLevel: 0 }, { texture: out, mipLevel: 0 }, [width, height])
+    const params = this.device.createBuffer({
+      label: "sky prefilter steps",
+      size: levels * 256,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const data = new Float32Array(levels * 64)
+    for (let m = 1; m < levels; m++) data.set([skyLevelRoughness(m, levels), width, height, 0], m * 64)
+    this.device.queue.writeBuffer(params, 0, data)
+    const srcView = source.createView()
+    for (let m = 1; m < levels; m++) {
+      const group = this.device.createBindGroup({
+        label: `sky prefilter ${m}`,
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: srcView },
+          { binding: 1, resource: this.materialSampler },
+          { binding: 2, resource: { buffer: params, offset: m * 256, size: 16 } },
+        ],
+      })
+      const p = encoder.beginRenderPass({
+        label: `sky prefilter ${m}`,
+        colorAttachments: [
+          { view: out.createView({ baseMipLevel: m, mipLevelCount: 1 }), loadOp: "clear", storeOp: "store" },
+        ],
+      })
+      p.setPipeline(pipeline)
+      p.setBindGroup(0, group)
+      p.draw(3)
+      p.end()
+    }
+    this.device.queue.submit([encoder.finish()])
+    // The box chain and the steps are done with once that work is: the source
+    // retires with the skies (destroyed at the next frame's start).
+    this.retiredSkies.push(source)
+    void this.device.queue.onSubmittedWorkDone().then(() => params.destroy())
+    return out
+  }
+
   /** Returns whether it actually rebuilt — see rebuildCompositeBindGroup. */
   private rebuildPerFrameBindGroups(): boolean {
     // EVERY resource, not just the layout. This runs twice: once at init, where
@@ -10409,7 +10893,7 @@ export class Engine {
       !this.shadowLightVPBuffer ||
       !this.materialSampler ||
       !this.shadowComparisonSampler ||
-      !this.brdfLutView ||
+      !this.probeUniformBuffer ||
       !(this.worldEquirectView ?? this.fallbackEquirectView)
     ) {
       return false
@@ -10432,8 +10916,31 @@ export class Engine {
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
         { binding: 8, resource: env },
-        { binding: 9, resource: this.brdfLutView },
+        { binding: 9, resource: this.cookieView },
         { binding: 10, resource: this.castShadowView },
+        { binding: 11, resource: this.probeView },
+        { binding: 12, resource: { buffer: this.probeUniformBuffer } },
+      ],
+    })
+    // The probe's own view of the scene: one cube face at a time through its
+    // capture camera, and the probe itself switched off — a material inside
+    // the capture reflects the sky, never the cube being filled.
+    this.probeCaptureBindGroup = this.device.createBindGroup({
+      label: "reflection probe capture per-frame bind group",
+      layout: this.mainPerFrameBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.probeCameraBuffer } },
+        { binding: 1, resource: { buffer: this.lightUniformBuffer } },
+        { binding: 2, resource: this.materialSampler },
+        { binding: 3, resource: this.shadowAtlasView },
+        { binding: 4, resource: this.shadowComparisonSampler },
+        { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
+        { binding: 6, resource: { buffer: this.lightsBuffer } },
+        { binding: 8, resource: env },
+        { binding: 9, resource: this.cookieView },
+        { binding: 10, resource: this.castShadowView },
+        { binding: 11, resource: this.probeFallbackView },
+        { binding: 12, resource: { buffer: this.probeOffBuffer } },
       ],
     })
     this.mirrorPerFrameBindGroup = this.device.createBindGroup({
@@ -10448,8 +10955,10 @@ export class Engine {
         { binding: 5, resource: { buffer: this.shadowLightVPBuffer } },
         { binding: 6, resource: { buffer: this.lightsBuffer } },
         { binding: 8, resource: env },
-        { binding: 9, resource: this.brdfLutView },
+        { binding: 9, resource: this.cookieView },
         { binding: 10, resource: this.castShadowView },
+        { binding: 11, resource: this.probeView },
+        { binding: 12, resource: { buffer: this.probeUniformBuffer } },
       ],
     })
     return true
@@ -10511,13 +11020,13 @@ export class Engine {
     this.lightData[base + 4] = this.sun.color.x
     this.lightData[base + 5] = this.sun.color.y
     this.lightData[base + 6] = this.sun.color.z
+    // Unity's light intensity: a white sun of 1 lights albedo 1:1 at N·L = 1.
     this.lightData[base + 7] = this.sun.strength
     this.lightDataWords[DIR_LAYERS_AT + index] = this.sunLayers
     if (index >= this.lightCount) this.lightCount = index + 1
     this.updateLightBuffer()
   }
 
-  /** Update the world environment (Blender: World Background). Ambient recomputes immediately. */
   /**
    * Distance fog on every lit surface, as a game on SimPipeline lays it: per
    * layer, t = saturate(f − (1 − f)·h) with f = saturate(depth·distance[0] +
@@ -10642,7 +11151,7 @@ export class Engine {
     this.writeWorld()
   }
 
-  /** Update the sun lamp (Blender: Light > Sun). Direction change marks shadow VP dirty. */
+  /** Update the main light (Unity's directional Sun). Direction change marks shadow VP dirty. */
   setSun(options: SunOptions): void {
     if (options.color) this.sun.color = options.color
     if (options.strength !== undefined) this.sun.strength = options.strength
@@ -10730,6 +11239,7 @@ export class Engine {
       ...options,
     }
     this.groundY = opts.y
+    this.groundHalf = [opts.width / 2, opts.height / 2]
     this.createGroundGeometry(opts.width, opts.height, opts.y)
     this.createShadowGroundResources(opts)
     this.hasGround = true
@@ -10782,6 +11292,7 @@ export class Engine {
      *  literal typed into a console. Vec3 satisfies it either way. */
     lights: SceneLight[] | null,
   ): void {
+    this.sceneLights = lights
     // The directional ones go to the light uniform's slots beside the sun's —
     // three of them, in order; the rest are records the grid indexes.
     const directional = (lights ?? []).filter((l) => l.kind === "directional")
@@ -10841,8 +11352,12 @@ export class Engine {
       this.lightsData[b + 12] = Math.max(inner, outer)
       // The layers it does NOT reach, as bits — inverted so a zero reaches all.
       this.lightsWords[b + 13] = ~(l.layers ?? ALL_LAYERS) >>> 0
-      this.lightsData[b + 14] = 0
-      this.lightsData[b + 15] = 0
+      // The bulb's radius (rzLightNear): 0 keeps the engine's default
+      this.lightsData[b + 14] = l.near !== undefined && Number.isFinite(l.near) && l.near > 0 ? l.near : 0
+      // Its cookie's layer + 1, 0 for none or one not loaded yet (a load
+      // rewrites the lamps when it lands).
+      const cookie = l.cookie !== undefined ? this.cookieLayers.get(l.cookie) : undefined
+      this.lightsData[b + 15] = cookie !== undefined ? cookie + 1 : 0
     }
     // The grid, from the records as STORED — normalised aim, clamped reach, the
     // cosines in f32 — so it indexes exactly what the shader will evaluate.
@@ -10879,6 +11394,58 @@ export class Engine {
     // The effects' bases move when the document's count does; the header —
     // count included — is written there.
     this.allocateLightSlots()
+  }
+
+  /**
+   * A cookie, under `key`, for every spot lamp that names it (SceneLight.cookie):
+   * the picture a stage light throws through its gobo, projected along the
+   * cone — its RGB is the light let through, so black blocks, white passes and
+   * a colour tints. Square, stretched to 512². Up to 16 at once; loading a key
+   * again replaces its picture. False when every layer is taken.
+   */
+  async loadLightCookie(key: string, source: Blob | ImageBitmap): Promise<boolean> {
+    if (!this.device) return false
+    let layer = this.cookieLayers.get(key)
+    if (layer === undefined) {
+      const used = new Set(this.cookieLayers.values())
+      for (let k = 0; k < Engine.COOKIE_LAYERS && layer === undefined; k++) if (!used.has(k)) layer = k
+      if (layer === undefined) {
+        console.warn(`[reze] light cookie "${key}": all ${Engine.COOKIE_LAYERS} cookie layers are in use`)
+        return false
+      }
+    }
+    const size = Engine.COOKIE_SIZE
+    const bmp = await createImageBitmap(source, {
+      resizeWidth: size,
+      resizeHeight: size,
+      resizeQuality: "high",
+      colorSpaceConversion: "none",
+      premultiplyAlpha: "none",
+    })
+    // The real array on the first cookie, and every group that binds the
+    // stand-in rebuilt against it (the stand-in itself is a 1x1 and stays).
+    if (this.cookieTexture.width === 1) {
+      this.cookieTexture = this.device.createTexture({
+        label: "light cookies",
+        size: [size, size, Engine.COOKIE_LAYERS],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.cookieView = this.cookieTexture.createView({ dimension: "2d-array" })
+      this.worldBindingsDirty = true
+      this.buildGroundBindGroup()
+    }
+    this.device.queue.copyExternalImageToTexture({ source: bmp }, { texture: this.cookieTexture, origin: [0, 0, layer] }, [size, size, 1])
+    bmp.close()
+    this.cookieLayers.set(key, layer)
+    if (this.sceneLights) this.setLights(this.sceneLights)
+    return true
+  }
+
+  /** Forget a cookie: lamps naming it light plainly again. */
+  removeLightCookie(key: string): void {
+    if (!this.cookieLayers.delete(key)) return
+    if (this.sceneLights) this.setLights(this.sceneLights)
   }
 
   /** How many positional lights the scene is carrying. */
@@ -13171,8 +13738,12 @@ export class Engine {
       const d = positions[i] * positions[i] + positions[i + 1] * positions[i + 1] + positions[i + 2] * positions[i + 2]
       if (d > most) most = d
     }
-    const extent = Math.sqrt(most)
-    if (extent <= this.sceneExtent) return
+    this.raiseSceneExtent(Math.sqrt(most))
+  }
+
+  /** Raise the scene's reach (never lower it) and hand it to the camera. */
+  private raiseSceneExtent(extent: number): void {
+    if (!(extent > this.sceneExtent)) return
     this.sceneExtent = extent
     this.camera?.setSceneExtent(extent)
   }
@@ -13252,6 +13823,16 @@ export class Engine {
         minY = Math.min(minY, data[o + 17] - r); maxY = Math.max(maxY, data[o + 17] + r)
         minZ = Math.min(minZ, data[o + 18] - r); maxZ = Math.max(maxZ, data[o + 18] + r)
       }
+    }
+    // The built-in floor, while it is drawn. It is no draw of the cull table,
+    // so without this the box ended at the cast: the cascades stopped just
+    // past her, and a low sun's long shadow ran off the last of them — the
+    // floor beyond read as lit and her head and shoulders went missing.
+    if (this.hasGround && !this.groundIsSuppressed()) {
+      const [hx, hz] = this.groundHalf
+      minX = Math.min(minX, -hx); maxX = Math.max(maxX, hx)
+      minY = Math.min(minY, this.groundY); maxY = Math.max(maxY, this.groundY)
+      minZ = Math.min(minZ, -hz); maxZ = Math.max(maxZ, hz)
     }
     if (this.nativeStage) {
       const nb = this.nativeStage.bounds
@@ -13557,6 +14138,10 @@ export class Engine {
    */
   private recordBundles(): void {
     this.bundlesDirty = false
+    // What the bundles record is what the probe would see: a stage arriving or
+    // leaving, a look installed on it, a pipeline landing. Re-captured once it
+    // settles (and switched off when the stage is gone).
+    this.captureReflectionProbe()
     const scene = {
       colorFormats: sceneColorFormats(this.sceneFormats),
       depthStencilFormat: this.depthFormat,
@@ -13820,10 +14405,17 @@ export class Engine {
   private issueDraw(
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     draw: DrawCall,
-    kind: "camera" | "shadow" | "mirror",
+    kind: "camera" | "shadow" | "mirror" | "probe",
   ): void {
+    // The probe's cube faces have no cull of their own: drawn whole.
     const args =
-      kind === "shadow" ? this.cullShadowArgs : kind === "mirror" ? this.cullMirrorArgs : this.cullCameraArgs
+      kind === "probe"
+        ? null
+        : kind === "shadow"
+          ? this.cullShadowArgs
+          : kind === "mirror"
+            ? this.cullMirrorArgs
+            : this.cullCameraArgs
     if (args && draw.cullIndex >= 0) {
       pass.drawIndexedIndirect(args, draw.cullIndex * Engine.CULL_ARG_WORDS * 4)
     } else {
@@ -14127,7 +14719,8 @@ export class Engine {
       entries: [{ binding: 0, resource: { buffer: skinMatrixBuffer } }],
     })
 
-    const gpuBuffers: GPUBuffer[] = [vertexBuffer, indexBuffer, jointsBuffer, weightsBuffer, skinMatrixBuffer]
+    const attributeBuffer = this.createAttributeBuffer(name, model)
+    const gpuBuffers: GPUBuffer[] = [vertexBuffer, indexBuffer, jointsBuffer, weightsBuffer, skinMatrixBuffer, attributeBuffer]
 
     const gpuMorph = this.createGpuMorph(name, model, vertexBuffer, gpuBuffers)
 
@@ -14152,6 +14745,7 @@ export class Engine {
       indexBuffer,
       jointsBuffer,
       weightsBuffer,
+      attributeBuffer,
       skinMatrixBuffer,
       wireEdges: new Map(),
       drawCalls: [],
@@ -14196,6 +14790,46 @@ export class Engine {
     this.cullListDirty = true
     this.bundlesDirty = true
     this.updateOrderDirty = true
+  }
+
+  /**
+   * A model's attribute stream: vertex colour (RGBA) and a second UV set, six
+   * floats a vertex, read by the material pipelines at slot 4.
+   *
+   * PMX has no vertex colour and one UV, but it has four ADDITIONAL UV
+   * channels of four floats each, and that is where a model that needs more
+   * keeps it: the first additional UV is the vertex colour, the second's xy
+   * the second UV — the convention a converted game stage is written in (a
+   * plant's occlusion rides in its vertex alpha, a light card's mask in its
+   * second UV). A model without them reads white and its own UV, which is
+   * what every graph that reads neither already assumed.
+   */
+  private createAttributeBuffer(name: string, model: Model): GPUBuffer {
+    const vertices = model.getVertices()
+    const count = Math.floor(vertices.length / 8)
+    const data = new Float32Array(count * Engine.ATTRIBUTE_FLOATS)
+    const color = model.getAdditionalUv(1)
+    const uv2 = model.getAdditionalUv(2)
+    for (let i = 0; i < count; i++) {
+      const o = i * Engine.ATTRIBUTE_FLOATS
+      if (color) {
+        data[o] = color[i * 4]
+        data[o + 1] = color[i * 4 + 1]
+        data[o + 2] = color[i * 4 + 2]
+        data[o + 3] = color[i * 4 + 3]
+      } else {
+        data[o] = data[o + 1] = data[o + 2] = data[o + 3] = 1
+      }
+      data[o + 4] = uv2 ? uv2[i * 4] : vertices[i * 8 + 6]
+      data[o + 5] = uv2 ? uv2[i * 4 + 1] : vertices[i * 8 + 7]
+    }
+    const buffer = this.device.createBuffer({
+      label: `${name}: attribute buffer`,
+      size: Math.max(data.byteLength, 4 * Engine.ATTRIBUTE_FLOATS),
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    })
+    if (data.byteLength > 0) this.device.queue.writeBuffer(buffer, 0, data)
+    return buffer
   }
 
   // Build the per-model GPU vertex-morph state. Returns null (and leaves the model on the
@@ -14530,6 +15164,7 @@ export class Engine {
         { binding: 12, resource: this.groundNoiseView },
         { binding: 13, resource: this.mirrorMaskView! },
         { binding: 14, resource: { buffer: this.groundClipOffBuffer } },
+        { binding: 15, resource: this.cookieView },
       ],
     })
     this.groundMirrorViewBindGroup = this.device.createBindGroup({
@@ -14552,6 +15187,7 @@ export class Engine {
         { binding: 12, resource: this.groundNoiseView },
         { binding: 13, resource: this.mirrorDummyColorView! },
         { binding: 14, resource: { buffer: this.groundClipMirrorBuffer } },
+        { binding: 15, resource: this.cookieView },
       ],
     })
     if (this.groundDrawCall) this.groundDrawCall.bindGroup = this.groundShadowBindGroup
@@ -15854,38 +16490,6 @@ export class Engine {
   }
 
   // World-space ray from camera through a canvas pixel. Uses WebGPU's NDC z ∈ [0,1].
-  /**
-   * Where a point on the canvas lands on a horizontal plane.
-   *
-   * `px,py` are canvas-relative pixels, top-left origin — what a pointer event
-   * gives you after subtracting the element's rect. Returns null when the ray
-   * cannot reach the plane: parallel to it, or pointing the other way, which is
-   * what a click on the sky above the horizon is.
-   *
-   * The one primitive a placement UI needs. Dragging a thing across the floor is
-   * otherwise three sliders in world units, which asks someone to guess numbers
-   * that have no visible relation to the picture they are looking at — and it
-   * throws away the property that makes pointing work at all: under perspective,
-   * moving something further away makes it smaller by exactly the right amount,
-   * so position and size stop being two controls to tune against each other.
-   */
-  groundPointAt(px: number, py: number, planeY = 0): Vec3 | null {
-    const ray = this.buildMouseRay(px, py)
-    if (!ray) return null
-    // Parallel to the plane: no intersection, and a huge one is not an answer.
-    if (Math.abs(ray.dir.y) < 1e-6) return null
-    const t = (planeY - ray.origin.y) / ray.dir.y
-    // Behind the camera — the plane is there, but not in this shot.
-    if (!(t > 0) || !isFinite(t)) return null
-    return new Vec3(ray.origin.x + ray.dir.x * t, planeY, ray.origin.z + ray.dir.z * t)
-  }
-
-  /** Hand the pointer to something else — a placement drag, a gizmo, a host's own
-   *  overlay — so the orbit does not also act on it. */
-  setCameraInputLocked(locked: boolean): void {
-    this.camera?.setInputLocked(locked)
-  }
-
   private buildMouseRay(px: number, py: number): { origin: Vec3; dir: Vec3 } | null {
     if (!this.camera) return null
     const width = this.canvas.clientWidth
@@ -16477,6 +17081,10 @@ export class Engine {
       const idsRead = this.idDebug || this.effects.some((e) => e.readsIds || e.readsCastDistance)
       idAtt.storeOp = idsRead ? "store" : "discard"
     }
+
+    // The stage's reflection probe, when one is due: its own submits, ahead of
+    // this frame's, so every material below reads the fresh cube.
+    if (hasModels) this.maybeCaptureProbe()
 
     const encoder = this.device.createCommandEncoder()
 
@@ -17481,7 +18089,7 @@ export class Engine {
     const base = {
       label: `style ${renderClass}${overEyes ? " (over eyes)" : ""}`,
       layout: this.mainPipelineLayout,
-      vertex: { module, buffers: this.fullVertexBufferLayouts },
+      vertex: { module, buffers: this.materialVertexBufferLayouts },
       // The eye front-culls — the see-through-hair look is draw order plus that
       // cull plus the stencil stamp, and it is the deployed appearance of every
       // published scene. In the MIRROR the winding is flipped (determinant -1,
@@ -17538,7 +18146,16 @@ export class Engine {
     }
     const desc: GPURenderPipelineDescriptor = {
       ...base,
-      fragment: { module, constants, targets: blend === "additive" ? this.sceneTargetsAdditive : this.sceneTargets },
+      fragment: {
+        module,
+        constants,
+        targets:
+          blend === "additive"
+            ? this.sceneTargetsAdditive
+            : blend === "premultiplied"
+              ? this.sceneTargetsPremultiplied
+              : this.sceneTargets,
+      },
       depthStencil,
     }
     return this.cachedRenderPipeline(desc).then((pipeline) => {
@@ -17786,6 +18403,46 @@ export class Engine {
    * makes outlines compose like MMD: every material drawn later in the author's
    * order covers earlier hulls, and each hull sits over everything drawn before it.
    */
+  /**
+   * A stage's draws, far to near from the eye: its transparent queue, in the
+   * order a game sorts one. Each draw's distance is its material box's centre,
+   * placed, against the camera — a pane or a water surface is one material,
+   * which is the unit a game sorts too. The array is kept per instance and
+   * re-sorted in place, so an unchanged order costs a comparison per draw.
+   */
+  private backToFront(inst: ModelInstance): DrawCall[] {
+    let list = this.sortedDraws.get(inst)
+    if (!list || list.length !== inst.drawCalls.length || list.some((d) => !inst.drawCalls.includes(d))) {
+      list = [...inst.drawCalls]
+      this.sortedDraws.set(inst, list)
+    }
+    const m = inst.model
+    const ex = this.cameraMatrixData[32]
+    const ey = this.cameraMatrixData[33]
+    const ez = this.cameraMatrixData[34]
+    const p = this.sortScratch
+    const dist = this.sortDistance
+    dist.clear()
+    for (const d of list) {
+      const b = d.bounds
+      if (!b || b.length < 6 || !(b[0] <= b[3])) {
+        dist.set(d, 0)
+        continue
+      }
+      p.setXYZ(((b[0] + b[3]) * 0.5) * m.scale, ((b[1] + b[4]) * 0.5) * m.scale, ((b[2] + b[5]) * 0.5) * m.scale)
+      Quat.rotateVecInto(m.rotation, p, p)
+      const dx = p.x + m.position.x - ex
+      const dy = p.y + m.position.y - ey
+      const dz = p.z + m.position.z - ez
+      dist.set(d, dx * dx + dy * dy + dz * dz)
+    }
+    list.sort((a, b) => dist.get(b)! - dist.get(a)!)
+    return list
+  }
+  private sortedDraws = new WeakMap<ModelInstance, DrawCall[]>()
+  private sortScratch = new Vec3(0, 0, 0)
+  private sortDistance = new Map<DrawCall, number>()
+
   /** Is this draw's compiled class "hair"? Ungrouped draws never are — the
    *  neutral pipeline is the auto class. */
   private isHairDraw(inst: ModelInstance, dc: DrawCall): boolean {
@@ -17798,7 +18455,7 @@ export class Engine {
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
     type: "opaque" | "transparent",
-    view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+    view: { perFrame: GPUBindGroup; args: "camera" | "mirror" | "probe"; outlines: boolean },
     // The opaque phase walks its author order twice — non-hair, then hair — so
     // the hair depth prime can sit between the eye's stencil write and the hair
     // colour that must respect it. See renderModelOpaquePhase.
@@ -17806,9 +18463,17 @@ export class Engine {
   ): void {
     let currentPipeline: GPURenderPipeline | null = null
     let bound = false
-    for (const draw of inst.drawCalls) {
+    const outlined: DrawCall[] = []
+    // A stage's glass and water in the camera pass go far to near, as a
+    // game's transparent queue does: author order put a far pane over a near
+    // one wherever the author listed it last. Characters keep MMD's author
+    // order — their layers are fabric, built around it.
+    const draws = type === "transparent" && inst.isStage && view.args === "camera" ? this.backToFront(inst) : inst.drawCalls
+    for (const draw of draws) {
       if (draw.type !== type) continue
       if (only && (only === "hair") !== this.isHairDraw(inst, draw)) continue
+      // The probe draws directly, past the cull: honour the switches it holds.
+      if (view.args === "probe" && !this.shouldRenderDrawCall(inst, draw)) continue
       if (!bound) {
         pass.setBindGroup(0, view.perFrame)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)
@@ -17822,35 +18487,42 @@ export class Engine {
       }
       pass.setBindGroup(2, draw.bindGroup)
       this.issueDraw(pass, draw, view.args)
-      if (draw.outline && this.outlineEnabled && view.outlines) {
-        // Same index range; own pipeline + groups 0/2. Group 1 (skinMats) is
-        // layout-identical between the main and outline pipelines and stays
-        // bound. Restore group 0 afterwards and force a pipeline re-set.
-        const mirrored = view.args === "mirror"
-        pass.setPipeline(mirrored ? this.outlineMirrorPipeline : this.outlinePipeline)
-        pass.setBindGroup(0, mirrored ? this.outlineMirrorPerFrameBindGroup : this.outlinePerFrameBindGroup)
-        pass.setBindGroup(2, draw.outline.bindGroup)
-        // Slot 3: the hull's smoothed normals + edge scale. Only the outline
-        // pipeline reads it; the others leave the slot alone.
-        if (inst.outlineVertexBuffer) pass.setVertexBuffer(3, inst.outlineVertexBuffer)
+      if (draw.outline && this.outlineEnabled && view.outlines) outlined.push(draw)
+    }
+    // THE HULLS AFTER THE SURFACES, as MMD draws a model's edges. A hull held
+    // at the minimum width is faded, and it still writes depth: drawn between
+    // two materials it hid the second wherever it stood in front of it — a
+    // shoe's sole's hull cut the upper behind it, and the floor showed through
+    // as pale lines along the seam. After every surface of this phase it only
+    // ever blends over finished ones. Same index ranges; own pipeline and
+    // groups 0/2 — group 1 (skinMats) is layout-identical and stays bound.
+    if (outlined.length) {
+      const mirrored = view.args === "mirror"
+      pass.setPipeline(mirrored ? this.outlineMirrorPipeline : this.outlinePipeline)
+      pass.setBindGroup(0, mirrored ? this.outlineMirrorPerFrameBindGroup : this.outlinePerFrameBindGroup)
+      // Slot 3: the hull's smoothed normals + edge scale. Only the outline
+      // pipeline reads it; the others leave the slot alone.
+      if (inst.outlineVertexBuffer) pass.setVertexBuffer(3, inst.outlineVertexBuffer)
+      for (const draw of outlined) {
+        pass.setBindGroup(2, draw.outline!.bindGroup)
         this.issueDraw(pass, draw, view.args)
-        pass.setBindGroup(0, view.perFrame)
-        currentPipeline = null
       }
+      pass.setBindGroup(0, view.perFrame)
     }
   }
 
   /**
    * Main-pass render sequence for one model instance — babylon-mmd parity:
    * opaque bucket, the hair-over-eyes stencil pass, then alpha-blend materials
-   * in PMX author order with depth write ON (forceDepthWrite). Outlines are not
-   * a separate phase: drawMaterials draws each edge-flagged material's hull
-   * right after the material itself, like MMD's per-mesh outline stage.
+   * in PMX author order with depth write ON (forceDepthWrite). Outlines close
+   * each drawMaterials call: the edge-flagged materials' hulls after all of its
+   * surfaces, as MMD draws a model's edges.
    */
   private setModelDrawState(pass: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance): void {
     pass.setVertexBuffer(0, inst.vertexBuffer)
     pass.setVertexBuffer(1, inst.jointsBuffer)
     pass.setVertexBuffer(2, inst.weightsBuffer)
+    pass.setVertexBuffer(4, inst.attributeBuffer)
     pass.setIndexBuffer(inst.indexBuffer, "uint32")
     // The stencil reference used to be set here. It is pass state, not bundle
     // state — GPURenderBundleEncoder has no setStencilReference at all — so it
@@ -18217,7 +18889,7 @@ export class Engine {
       // still pattern welded to the picture. On the SCENE clock like everything
       // else here, so an export reproduces the editor exactly rather than
       // scattering differently at whatever rate the encoder ran.
-      u[3] = this.grain.animated ? Math.floor((this.sceneClock * 24) % 1024) : 0
+      u[3] = Math.floor((this.sceneClock * 24) % 1024)
       u[26] = this.canvas.width
       u[27] = this.canvas.height
       // Camera world position (viewU[10]) — the other half of bgWorldPos. It
@@ -18451,7 +19123,10 @@ export class Engine {
     }
     for (let s = 0; s < anchors.length; s++) {
       const a = CAST_SUBJECT_VEC4S * 4 + (s * MAX_EFFECT_SUBJECTS + n) * 12
-      const pos = m.getBoneWorldPosition(anchors[s].bone)
+      // `along`: the point that far down the bone's own axis, still model space
+      // here, so the placement below turns and scales it like the joint.
+      const along = anchors[s].along
+      const pos = along ? m.getBonePointAlong(anchors[s].bone, along) : m.getBoneWorldPosition(anchors[s].bone)
       if (!pos) {
         cd[a + 3] = 0
         continue
@@ -18473,7 +19148,7 @@ export class Engine {
       cd[a + 4] = vx
       cd[a + 5] = vy
       cd[a + 6] = vz
-      if (anchors[s].trail) this.writeTrail(inst.name, s, n, pos, cd, a)
+      if (anchors[s].trail) this.writeTrail(inst.name, s, n, pos, cd, a, anchors[s].step)
       const fwd = m.getBoneWorldForward(anchors[s].bone)
       if (fwd) {
         Quat.rotateVecInto(m.rotation, fwd, fwd)
@@ -18515,7 +19190,7 @@ export class Engine {
     this.castData.fill(0, CAST_SUBJECT_VEC4S * 4)
   }
 
-  private writeTrail(model: string, slot: number, n: number, pos: Vec3, cd: Float32Array, anchorBase: number): void {
+  private writeTrail(model: string, slot: number, n: number, pos: Vec3, cd: Float32Array, anchorBase: number, step?: number): void {
     const key = `${model}\u0000${slot}`
     let ring = this.anchorTrail.get(key)
     if (!ring) {
@@ -18536,9 +19211,44 @@ export class Engine {
       if (Math.hypot(dx, dy, dz) / dt > 50) {
         ring.pos.length = 0
         ring.t.length = 0
+        ring.live = false
       }
     }
-    if (this.trailDue > 0 || ring.pos.length === 0) {
+    if (step && ring.pos.length > 0) {
+      // `trail step d` — the path a game's trail keeps (Unity's
+      // minVertexDistance). Point 0 is the LIVE head: it follows the bone every
+      // frame. It is left behind as a kept point only on a tick, and only once
+      // the bone is `step` from the last point kept, so no segment is shorter
+      // than that and a slowing hand cannot leave a knot of jittery stubs for a
+      // wide ribbon to fan across. Still at most one point per tick, so a stepped
+      // ring never covers LESS time than a sampled one.
+      const live = ring.live === true
+      const k = live ? 3 : 0
+      const far = Math.hypot(pos.x - ring.pos[k], pos.y - ring.pos[k + 1], pos.z - ring.pos[k + 2]) >= step
+      if (live && !(far && this.trailDue > 0)) {
+        ring.pos[0] = pos.x
+        ring.pos[1] = pos.y
+        ring.pos[2] = pos.z
+        ring.t[0] = this.sceneClock
+      } else {
+        // keep the head where it is as a point (live) or start a new head
+        if (live) {
+          ring.pos[0] = pos.x
+          ring.pos[1] = pos.y
+          ring.pos[2] = pos.z
+          ring.t[0] = this.sceneClock
+          ring.live = false
+        } else {
+          ring.pos.unshift(pos.x, pos.y, pos.z)
+          ring.t.unshift(this.sceneClock)
+          ring.live = !(far && this.trailDue > 0)
+        }
+        if (ring.t.length > TRAIL_SAMPLES) {
+          ring.t.length = TRAIL_SAMPLES
+          ring.pos.length = TRAIL_SAMPLES * 3
+        }
+      }
+    } else if (this.trailDue > 0 || ring.pos.length === 0) {
       // ONE sample per frame, never one per due tick. A frame that spanned
       // several 60Hz ticks only knows where the bone is NOW, and unshifting that
       // position once per tick fabricated duplicate samples — same point, same
@@ -18622,6 +19332,9 @@ export class Engine {
         headSkin: () => (head >= 0 ? inst.model.getSkinMatrices().subarray(head * 16, head * 16 + 16) : null),
         headRest,
         layers: new Uint32Array(inst.objectLight.buffer)[0],
+        additionalUv: (channel) => inst.model.getAdditionalUv(channel),
+        morphs: inst.model.getMorphing().morphs,
+        morphWeights: () => inst.model.getEffectiveMorphWeights(),
       },
       look,
     )
@@ -18634,6 +19347,20 @@ export class Engine {
    *  sit out — a host reveals the model after this to avoid that gap. */
   nativeLookReady(name: string): Promise<void> {
     return this.nativeLooks?.ready(name) ?? Promise.resolve()
+  }
+
+  /**
+   * Set some of the values of one material a model's native look dresses —
+   * its Unity material properties by name, colours linear, as the look's
+   * `values` hold them — over the look's own, until set again. What a game
+   * animates on a material over a take (its timeline's material curves)
+   * reaches the shaders this way, one frame at a time: the caller samples its
+   * keys on its own clock and sets what it got. Only the names the material's
+   * look carries are taken, and a value equal to the one in place writes
+   * nothing. False when the model wears no look dressing that material.
+   */
+  setModelNativeUniforms(name: string, material: string, values: Record<string, number | ArrayLike<number>>): boolean {
+    return this.nativeLooks?.setUniforms(name, material, values) ?? false
   }
 
   /** The hosts for the game's shaders: the scene pass's and the shadow atlas's,
@@ -18682,6 +19409,18 @@ export class Engine {
       white,
       black,
       blackCube: solid("native: black cube", [0, 0, 0, 255], true),
+      // an empty volume (a froxel buffer no pass filled): no in-scatter, no extinction
+      emptyVolume: (() => {
+        const t = d.createTexture({
+          label: "native: empty volume",
+          size: [1, 1, 1],
+          dimension: "3d",
+          format: "rgba8unorm",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        })
+        d.queue.writeTexture({ texture: t }, new Uint8Array([0, 0, 0, 0]), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1, 1])
+        return t.createView({ dimension: "3d" })
+      })(),
       depth: this.nativeNoShadowView,
       comparison: this.shadowComparisonSampler,
     }
@@ -18720,7 +19459,8 @@ export class Engine {
       { mipmaps: (t, levels) => this.generateMipmaps(t, levels), fallback: this.nativeFallback },
       onProgress,
     )
-
+    // The stage's sky is in it: the far plane reaches as far as the stage does.
+    this.raiseSceneExtent(this.nativeStage.extent)
   }
 
   /** What went wrong in the game's shaders, and the names nothing supplied. */
@@ -18770,11 +19510,17 @@ export class Engine {
     let sunDirection: [number, number, number] = [dir.x, dir.y, dir.z]
     let sunColor: [number, number, number] = [sun.color.x * k, sun.color.y * k, sun.color.z * k]
     let sunShadow = this.sunShadow
+    let sunUnity: NativeStageLights["main"]["unity"] | null = null
     if (stage) {
       // Its lamps are the stage's own; its key is the scene's sun, which the
-      // host sets from the stage (and a person may then move).
+      // host sets from the stage (and a person may then move) - along the
+      // scene sun's direction, in the stage's own main-light colour. The scene
+      // sun's colour is the cast's key, which the game keeps apart (a
+      // character's light is _ProbeLightingBase, not the stage's main light).
       const L = stage.pkg.lights
       const sc = stage.pkg.scale
+      sunColor = [L.main.color[0], L.main.color[1], L.main.color[2]]
+      sunUnity = L.main.unity ?? null
       lights.length = 0
       for (const l of L.additional) {
         lights.push({
@@ -18804,6 +19550,7 @@ export class Engine {
         dt: 1 / 60,
         sunDirection,
         sunColor,
+        sunUnity,
         sunShadow,
         lights,
         ambientSH: sh ? Array.from(sh, (v) => v * s) : null,
@@ -18916,18 +19663,4 @@ function stableGlobals(prev: Record<string, NativeValue>, next: Record<string, N
     if (a !== undefined && sameValue(a, next[k])) next[k] = a
   }
   return next
-}
-
-function sameValue(a: NativeValue, b: NativeValue): boolean {
-  if (typeof a === "number" || typeof b === "number") return a === b
-  if (a.length !== b.length) return false
-  if (a instanceof Uint32Array !== b instanceof Uint32Array) return false
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i] as number | ArrayLike<number>
-    const y = b[i] as number | ArrayLike<number>
-    if (typeof x === "number" || typeof y === "number") {
-      if (x !== y) return false
-    } else if (!sameValue(x, y)) return false
-  }
-  return true
 }

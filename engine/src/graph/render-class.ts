@@ -12,8 +12,11 @@ export type RenderClass = "auto" | "eye" | "hair"
 export type AlphaMode = "opaque" | "hashed"
 
 /** How a group's colour meets the frame. "over" is the ordinary alpha blend;
- *  "additive" adds its light and never reads alpha — see StyleGroup.blend. */
-export type StyleBlend = "over" | "additive"
+ *  "additive" adds its light and never reads alpha; "premultiplied" takes a
+ *  colour already weighted by its own coverage (One, OneMinusSrcAlpha) — a
+ *  game's glass, whose reflection must not fade with its transparency. See
+ *  StyleGroup.blend. */
+export type StyleBlend = "over" | "additive" | "premultiplied"
 
 /** Descriptive manifest for hosts (reze-design) so the render-class picker is data-driven
  *  instead of hardcoding strings. The effect implementations stay engine-side; this only

@@ -172,3 +172,27 @@ test("an install reports the effect's own declarations back", () => {
   // different shape from a successful one and a caller has to test for it.
   assert.doesNotMatch(src, /mounts: noMounts, params: \[\] \}/)
 })
+
+test("#anchor takes a point along the bone, after the trail word", () => {
+  // Threads that leave the knuckles, not the wrist: model units down the
+  // bone's own axis. Absent means the joint, and the field is left off.
+  assert.deepEqual(ok("#anchor 右手首 trail along 0.909 — the knuckle line\n").anchors, [
+    { bone: "右手首", trail: true, along: 0.909 },
+  ])
+  assert.deepEqual(ok("#anchor 頭 along 1.5\n").anchors, [{ bone: "頭", trail: false, along: 1.5 }])
+  assert.deepEqual(ok("#anchor 左手首 trail\n").anchors, [{ bone: "左手首", trail: true }])
+  for (const src of ["#anchor 右手首 along\n", "#anchor 右手首 along far\n", "#anchor 右手首 along 1 trail\n", "#anchor 右手首 trial\n"]) {
+    assert.equal(parseDirectives(src).errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
+  }
+})
+
+test("ribbons stay additive unless the file says #blend over", () => {
+  // Every shipped ribbon was tuned additive while #blend did not reach them,
+  // so the default cannot move; `over` is the opt-in, and for the particles in
+  // the same file it is the alpha they already had.
+  assert.equal(ok("fn trailWidth() {}\n").trailBlend, "additive")
+  assert.equal(ok("#blend additive\n").trailBlend, "additive")
+  const d = ok("#blend over\n")
+  assert.equal(d.trailBlend, "over")
+  assert.equal(d.particleBlend, "alpha")
+})

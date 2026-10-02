@@ -71,6 +71,9 @@ export type UnityFrameInput = {
   /** The direction the main light travels, unit; null for none. */
   sunDirection: [number, number, number] | null
   sunColor: [number, number, number]
+  /** A game stage's own main light as its pipeline packed it (recorded), which
+   *  its shaders get in place of sunColor; null for the scene sun's. */
+  sunUnity?: { color: number[]; simColor: number[]; simColorNoInt: number[] } | null
   sunShadow: number
   lights: UnityLight[]
   /** Ambient as the engine's folded SH9 (27 floats, ibl.ts), or null for flat. */
@@ -257,12 +260,13 @@ export function unityFrameGlobals(f: UnityFrameInput): Record<string, NativeValu
   if (f.sunDirection) {
     const d = gameDir(f.sunDirection)
     g.SimMainLightDir = [-d[0], -d[1], -d[2], 0]
-    g.SimMainLightColor = [...f.sunColor, 1]
-    g.SimMainLightColorNoInt = [...f.sunColor, 1]
+    const u = f.sunUnity
+    g.SimMainLightColor = u ? u.simColor.slice(0, 4) : [...f.sunColor, 1]
+    g.SimMainLightColorNoInt = u ? u.simColorNoInt.slice(0, 4) : [...f.sunColor, 1]
     // As the game's pipeline leaves it (recorded): the way the light travels.
     g._MainLightPosition = [d[0], d[1], d[2], 0]
     g.sim_ShadowLightDirection = [-d[0], -d[1], -d[2], 0]
-    g._MainLightColor = [...f.sunColor, 1]
+    g._MainLightColor = u ? u.color.slice(0, 4) : [...f.sunColor, 1]
   } else {
     g.SimMainLightDir = [0, 0, 0, 0]
     g.SimMainLightColor = [0, 0, 0, 0]

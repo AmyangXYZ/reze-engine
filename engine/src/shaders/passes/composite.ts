@@ -636,11 +636,9 @@ const COMPOSITE_BODY = /* wgsl */ `
   // ── Film grain, on the SCENE ONLY ─────────────────────────────────────────
   //
   // Applied here, before the background is composited under, so it rides on what
-  // the engine drew and nothing else. That placement is the whole point when the
-  // background is footage: the plate came off a real sensor and already carries
-  // its own grain, and a second helping over the top would grade the photograph
-  // rather than match it. A clean CG figure on a grainy plate is one of the
-  // loudest tells there is — the noise gives it away long before the geometry.
+  // the engine drew and nothing else: a backdrop photo or video already carries
+  // its own grain, and a second helping over the top would grade the picture
+  // rather than match it.
   //
   // Multiplicative and weighted toward the mid-tones, which is how film behaves:
   // little grain in the blacks, and the highlights clip it off.

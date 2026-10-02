@@ -17,11 +17,11 @@ import { subjectMaskApi } from "./cast-api"
 // the handful standing near it. The lamps an EFFECT emits are placed by a
 // compute pass every frame, which the grid never sees, and are walked in full.
 //
-// LAYOUT, in 32-bit words, read by the shader as vec4u. A 16-word header:
+// LAYOUT, in 32-bit words, read by the shader as vec4u. A 20-word header:
 //
 //   [0] light count (f32)       [1] how many are the document's (f32)
 //   [4..6] grid origin (f32)    [7] 1 / cell edge (f32)
-//   [8..10] grid dims (u32)     [12..15] the OUTSIDE mask (u32 bits)
+//   [8..10] grid dims (u32)     [12..19] the OUTSIDE mask (u32 bits)
 //
 // then MAX_LIGHTS records of 16 floats — four vec4s:
 //
@@ -29,7 +29,9 @@ import { subjectMaskApi } from "./cast-api"
 //   [4..6] colour PREMULTIPLIED by intensity   [7] type
 //   [8..10] aim, unit, pointing away from the light   [11] cos of the outer angle
 //   [12] cos of the inner angle
-//   [13] the rendering layers it does NOT reach (u32 bits)   [14..15] spare
+//   [13] the rendering layers it does NOT reach (u32 bits)
+//   [14] its bulb: the distance inside which the inverse square is held flat
+//        (0 = RZ_LAMP_NEAR)                    [15] its cookie: layer + 1, 0 none
 //
 // then the grid: LIGHT_MASK_WORDS words of lamp bits per cell.
 //
@@ -59,8 +61,8 @@ import { pointsApi } from "./points-api"
 import { textureApi } from "./texture-api"
 
 /** Words before the first record: the counts, the grid's placement and the
- *  outside mask, four vec4s — see the layout above. */
-export const LIGHT_HEADER = 16
+ *  outside mask, five vec4s — see the layout above. */
+export const LIGHT_HEADER = 20
 /** Floats per light — see the layout above. */
 export const LIGHT_STRIDE = 16
 /**
@@ -75,10 +77,11 @@ export const LIGHT_STRIDE = 16
  * forty-eight each cut a real scene in half. Past this the extras are dropped.
  *
  * A fragment pays for the document lamps its grid cell names, so the cost
- * follows how many reach a place rather than how many the scene holds. It is
- * also why the cap is 128: one vec4u of bits per cell.
+ * follows how many reach a place rather than how many the scene holds. 256,
+ * two vec4u of bits per cell, is URP's own Forward+ budget for visible lights
+ * — and holds a lit interior's whole rig (X317's 153).
  */
-export const MAX_LIGHTS = 128
+export const MAX_LIGHTS = 256
 /** Words of lamp bits per grid cell — one bit per lamp the cap allows. */
 export const LIGHT_MASK_WORDS = MAX_LIGHTS / 32
 /** The grid's cell budget. 32k cells over a stage a couple of hundred units
@@ -105,6 +108,9 @@ struct RzLight {
   color: vec3f,
   intensity: f32,
   radius: f32,
+  /** Its bulb: the distance inside which it stops getting brighter. 0 is the
+   *  engine's default; a glow worn on a hand wants one the size of the glow. */
+  near: f32,
 }
 `
 
@@ -244,7 +250,7 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   _rzLightsOut[b + 11u] = -1.0;
   _rzLightsOut[b + 12u] = -1.0;
   _rzLightsOut[b + 13u] = 0.0;
-  _rzLightsOut[b + 14u] = 0.0;
+  _rzLightsOut[b + 14u] = select(0.0, max(l.near, 0.0), finite && l.near == l.near);
   _rzLightsOut[b + 15u] = 0.0;
 }
 `
@@ -252,7 +258,12 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
 
 /** The rz*Light accessors, with the buffer declared at the given binding.
  *  `layers` is the WGSL expression for the drawing's rendering-layer bits. */
-export function lightsApi(group: number, binding: number, layers: string): string {
+export function lightsApi(
+  group: number,
+  binding: number,
+  layers: string,
+  cookies: { binding: number; sampler: string },
+): string {
   const R = LIGHT_HEADER / 4
   const S = LIGHT_STRIDE / 4
   return /* wgsl */ `
@@ -260,13 +271,16 @@ export function lightsApi(group: number, binding: number, layers: string): strin
 // out through bitcast; the bits must NOT pass through f32 on the way, where a
 // mask that happens to spell a NaN is not guaranteed to survive a load.
 @group(${group}) @binding(${binding}) var<storage, read> _rzLights: array<vec4u>;
+// The spot lamps' cookies, one picture a layer (Engine.loadLightCookie).
+@group(${group}) @binding(${cookies.binding}) var _rzCookies: texture_2d_array<f32>;
 
 const RZ_MAX_LIGHTS: u32 = ${MAX_LIGHTS}u;
-// A lamp's bulb, in world units: the inverse square is held flat inside it,
-// so the spike beside the lamp is finite. Aether Gazer's lamps are
-// 0.1 m across (their shapeRadius, capping 1/d² at 1/0.1), which at MMD scale
-// is 2.5 units.
-const RZ_LAMP_NEAR: f32 = 2.5;
+// The DEFAULT bulb, in world units, for a record that names none (word 14):
+// the inverse square is held flat inside it, so the spike beside the lamp is
+// finite. URP's own floor — distance² at least HALF_MIN, 6.1e-5 m² — which at
+// MMD scale (8 units a metre) is a bulb of 0.0625. A lamp with a real size (a
+// game rig's shapeRadius) says so in word 14.
+const RZ_LAMP_NEAR: f32 = 0.0625;
 
 /** How many positional lights the scene has. Zero is the ordinary case. */
 fn rzLightCount() -> u32 { return min(u32(bitcast<f32>(_rzLights[0].x)), RZ_MAX_LIGHTS); }
@@ -290,6 +304,34 @@ fn rzLightColor(i: u32) -> vec3f { return _rzLightVec(i, 1u).xyz; }
 /** Where light i points, away from itself. The zero vector for a point light. */
 fn rzLightAim(i: u32) -> vec3f { return _rzLightVec(i, 2u).xyz; }
 
+/** A spot's cookie, as URP's: its picture projected along the cone, so the
+ *  light a point takes is the picture's colour there. The picture's square
+ *  spans the cone's outer angle, up on the picture toward world up (or +z for
+ *  a lamp aimed straight up or down). 1 for a lamp without one, and for a
+ *  point lamp, whose cookie would need a cube. */
+fn rzLightCookie(i: u32, toLight: vec3f) -> vec3f {
+  let k = _rzLightVec(i, 3u).w;
+  let a = rzLightAim(i);
+  if (k < 0.5 || dot(a, a) < 0.5) { return vec3f(1.0); }
+  let up0 = select(vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(a.y) > 0.99);
+  let right = normalize(cross(up0, a));
+  let up = cross(a, right);
+  let d = -toLight;
+  let c = rzLightCone(i).x;
+  let spread = sqrt(max(1.0 - c * c, 0.0)) / max(c, 1e-4);
+  let z = max(dot(d, a), 1e-4);
+  let uv = vec2f(dot(d, right), -dot(d, up)) / (z * spread) * 0.5 + 0.5;
+  return textureSampleLevel(_rzCookies, ${cookies.sampler}, uv, i32(k) - 1, 0.0).rgb;
+}
+
+/** Light i's bulb: inside this distance the inverse square is held flat. A
+ *  record that names none (0, every writer that predates the word) takes
+ *  RZ_LAMP_NEAR. A game lamp's is its shapeRadius: Unity caps 1/d² at
+ *  1/shapeRadius, so the flat core is sqrt(shapeRadius) - and a character rig
+ *  tuned with a bulb wider than its reach is a lamp of constant strength inside
+ *  a soft sphere, which a single global bulb cannot spell. */
+fn rzLightNear(i: u32) -> f32 { let r = _rzLightVec(i, 3u).z; return select(RZ_LAMP_NEAR, r, r > 0.0); }
+
 /** The cosines a spot fades between: x its outer edge, y its inner one. A point
  *  light stores (-1, -1), which saturates the cone term to 1. */
 fn rzLightCone(i: u32) -> vec2f { return vec2f(_rzLightVec(i, 2u).w, _rzLightVec(i, 3u).x); }
@@ -298,30 +340,34 @@ fn rzLightCone(i: u32) -> vec2f { return vec2f(_rzLightVec(i, 2u).w, _rzLightVec
  *  a float — see the layout. */
 fn _rzLightReaches(i: u32) -> bool { return ((${layers}) & ~_rzLights[${R}u + i * ${S}u + 3u].y) != 0u; }
 
-/** The document lamps that can reach p: its grid cell's bits, or the outside
- *  mask beyond the grid. Written so a NaN position fails the inside test. */
-fn _rzLightCellMask(p: vec3f) -> vec4u {
+/** The document lamps that can reach p — 256 bits, lamps 0..127 in .lo and
+ *  128..255 in .hi: its grid cell's, or the outside mask beyond the grid.
+ *  Written so a NaN position fails the inside test. */
+struct _RzLampMask { lo: vec4u, hi: vec4u };
+fn _rzLightCellMask(p: vec3f) -> _RzLampMask {
   let g = bitcast<vec4f>(_rzLights[1]);
   let dims = _rzLights[2].xyz;
   let c = floor((p - g.xyz) * g.w);
-  if (!(all(c >= vec3f(0.0)) && all(c < vec3f(dims)))) { return _rzLights[3]; }
+  if (!(all(c >= vec3f(0.0)) && all(c < vec3f(dims)))) { return _RzLampMask(_rzLights[3], _rzLights[4]); }
   let ci = vec3u(c);
-  return _rzLights[${LIGHT_GRID_BASE / 4}u + (ci.z * dims.y + ci.y) * dims.x + ci.x];
+  let at = ${LIGHT_GRID_BASE / 4}u + ((ci.z * dims.y + ci.y) * dims.x + ci.x) * 2u;
+  return _RzLampMask(_rzLights[at], _rzLights[at + 1u]);
 }
 
 /**
  * One light's contribution at a surface point.
  *
  * A LIGHT FALLS OFF AS THE INVERSE SQUARE, the curve Unity, Unreal, Blender and
- * glTF all light with: intensity / max(d², RZ_LAMP_NEAR²), so its intensity is
+ * glTF all light with: intensity / max(d², bulb²) (rzLightNear), so its intensity is
  * the brightness one unit away, windowed by (1 − (d/R)⁴)² so it is exactly zero
  * at its radius and the bound the grid is built from is real.
  *
- * THE UNITS ARE BLENDER'S. Intensity is radiant intensity, a point light's
- * power over 4π, and a Lambertian surface returns albedo × irradiance / π —
- * the π the sun term already carries. So a stage exported from Blender lights
- * here as it lit there, and a lamp's intensity is what Blender's exporter
- * writes in candela over 683.
+ * LIGHT UNITS ARE UNITY'S, for every light in this engine — the sun, the
+ * directional slots and these lamps: a surface returns albedo × light × N·L
+ * with no 1/π (URP folds it into its intensities), and a highlight is the
+ * lobe as URP writes it. So a white lamp of intensity 1 one unit away lights
+ * albedo 1:1 head on, as a Unity point light does. A Blender light carries
+ * divided by π (the app's GLB loader does it).
  */
 fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   if (!_rzLightReaches(i)) { return vec3f(0.0); }
@@ -340,14 +386,15 @@ fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
   let t2 = t * t;
   let window = 1.0 - t2 * t2;
-  let falloff = window * window / max(dist * dist, RZ_LAMP_NEAR * RZ_LAMP_NEAR);
+  let bulb = rzLightNear(i);
+  let falloff = window * window / max(dist * dist, bulb * bulb);
   // How far inside the cone this point sits: 1 within the inner angle, 0 past
   // the outer one, squared for the same soft edge the falloff has. A point
   // light's (-1, -1) divides by the floor and clamps to 1, so it pays one
   // dot product and no branch.
   let cone = rzLightCone(i);
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
-  return rzLightColor(i) * (ndl * falloff * aim * aim);
+  return rzLightColor(i) * rzLightCookie(i, toLight) * (ndl * falloff * aim * aim);
 }
 
 /** The lamps named by one word of a cell's bits, lowest first. */
@@ -373,7 +420,7 @@ fn _rzLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f) -> vec3f {
  * every material must cost nothing until someone asks for a light.
  */
 fn rzLightsDiffuse(p: vec3f, n: vec3f) -> vec3f {
-  return _rzLightsIrradiance(p, n) * (1.0 / 3.141592653589793);
+  return _rzLightsIrradiance(p, n);
 }
 
 // ONE WALK PER FRAGMENT. A principled closure walks the lamps for its specular
@@ -402,8 +449,10 @@ fn _rzLightsIrradiance(p: vec3f, n: vec3f) -> vec3f {
   // The document's lamps: only those the grid says can reach this cell.
   if (docs > 0u) {
     let m = _rzLightCellMask(p);
-    acc = acc + _rzLightWord(m.x, 0u, p, n) + _rzLightWord(m.y, 32u, p, n) +
-      _rzLightWord(m.z, 64u, p, n) + _rzLightWord(m.w, 96u, p, n);
+    acc = acc + _rzLightWord(m.lo.x, 0u, p, n) + _rzLightWord(m.lo.y, 32u, p, n) +
+      _rzLightWord(m.lo.z, 64u, p, n) + _rzLightWord(m.lo.w, 96u, p, n) +
+      _rzLightWord(m.hi.x, 128u, p, n) + _rzLightWord(m.hi.y, 160u, p, n) +
+      _rzLightWord(m.hi.z, 192u, p, n) + _rzLightWord(m.hi.w, 224u, p, n);
   }
   // The effects' lamps, which move every frame on the GPU: all of them.
   for (var i = docs; i < count; i = i + 1u) {

@@ -134,6 +134,13 @@ struct VertexOutput {
   /** The scene fog's two amounts, computed PER VERTEX as the game does — see
    *  Engine.setSceneFog — and interpolated across the face. */
   @location(5) fog: vec2f,
+  /** The vertex colour, RGBA — white on a mesh that carries none. A PMX keeps
+   *  it in its first additional UV (what a converted game stage writes there:
+   *  a plant's occlusion rides in its alpha). The attribute node reads it. */
+  @location(6) vcolor: vec4f,
+  /** The second UV set — a PMX's second additional UV (xy), else the first
+   *  UV again. The uv_map node's uv2. */
+  @location(7) uv2: vec2f,
 };
 
 /** One fog layer's amount at a vertex of view depth d and world height y. */
@@ -165,6 +172,18 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 // The cast's own shadow map for a stage's floor — see _rzCastShadow.
 @group(0) @binding(10) var castShadowMap: texture_depth_2d;
 
+/** The stage's reflection probe (Engine.captureReflectionProbe): where it was
+ *  captured (xyz) and its strength (w); the box it projects onto, min with the
+ *  on-flag in w, then max. Off (boxMin.w 0) the sky stands in. */
+struct ProbeUniforms {
+  center: vec4f,
+  boxMin: vec4f,
+  boxMax: vec4f,
+};
+// A cube, GGX-prefiltered down its mips — see rzProbeSpecular in nodes.ts.
+@group(0) @binding(11) var probeCube: texture_cube<f32>;
+@group(0) @binding(12) var<uniform> probe: ProbeUniforms;
+
 /**
  * How much of the cast stands between this point and the stage's shadow
  * direction, 0–1 — setStageCastShadow. A 5×5 comparison filter at 1.5 texels:
@@ -186,7 +205,6 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
   }
   return 1.0 - lit / 25.0;
 }
-// binding(9) brdfLut is declared inside NODES_WGSL (nodes.ts).
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 // What this object's lighting is, apart from the scene's, as the game's
 // pipeline gives each renderer its own:
@@ -303,9 +321,14 @@ const COMMON_VS_WGSL = /* wgsl */ `
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
   @location(3) joints0: vec4<u32>,
-  @location(4) weights0: vec4<f32>
+  @location(4) weights0: vec4<f32>,
+  // The extra stream (Engine: the model's attribute buffer, slot 4).
+  @location(5) vcolor: vec4<f32>,
+  @location(6) uv2: vec2<f32>
 ) -> VertexOutput {
   var output: VertexOutput;
+  output.vcolor = vcolor;
+  output.uv2 = uv2;
   let pos4 = vec4f(position, 1.0);
   let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
   let invWeightSum = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
@@ -507,4 +530,4 @@ fn rz_dissolve_threshold(restPos: vec3f) -> f32 {
 // The FSOut struct is NOT in here any more — see commonFsOutWgsl above. Every
 // consumer of this constant appends it immediately, which is where it was.
 export const COMMON_MATERIAL_PRELUDE_WGSL =
-  COMMON_BINDINGS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6, "objectLight.layers.x") + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL
+  COMMON_BINDINGS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6, "objectLight.layers.x", { binding: 9, sampler: "diffuseSampler" }) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL

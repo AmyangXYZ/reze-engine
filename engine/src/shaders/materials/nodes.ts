@@ -1,16 +1,9 @@
-// Shared WGSL primitives for Blender-style NPR material nodes.
-// Every function here maps 1:1 to a Blender shader node type used in the preset JSONs.
+// Shared WGSL primitives for the material graph's nodes: Unity's lighting
+// (Lit, Lambert, the reflection probe) and the colour and vector maths a
+// Shader Graph builds from.
 // Hand-ported material shaders concatenate this block before their own code.
 
 export const NODES_WGSL = /* wgsl */ `
-
-// Baked 64×64 rgba8unorm combined BRDF LUT — created once at engine init by dfg_lut.ts.
-//   .rg = split-sum DFG (Karis: tint = f0·x + f90·y)  → F_brdf_*_scatter
-//   .ba = Heitz 2016 LTC magnitude (ltc_mag_ggx)       → ltc_brdf_scale_from_lut
-// Paired with group(0) binding(2) diffuseSampler (linear filter). Sample once per
-// fragment via brdf_lut_sample() — callers feed .rg and the whole vec4 into the
-// helpers below, halving LUT taps on the default Principled path.
-@group(0) @binding(9) var brdfLut: texture_2d<f32>;
 
 // ─── RGB ↔ HSV ──────────────────────────────────────────────────────
 
@@ -275,8 +268,23 @@ fn node_normal_map(color: vec3f, strength: f32, N: vec3f, worldPos: vec3f, uv: v
   let B = safe_normal(cross(N, T));
   // Tangent-space [0,1] → [-1,1], then into world.
   let t = color * 2.0 - vec3f(1.0);
-  let mapped = safe_normal(T * t.x + B * t.y + N * t.z);
-  return safe_normal(mix(N, mapped, clamp(strength, 0.0, 1.0)));
+  // Strength scales the tangent tilt (x, y), as Unity's _NormalScale and
+  // Blender's Normal Map strength both do — so it may exceed 1 and steepen a
+  // shallow map, which a lerp toward the map could never do.
+  let s = max(strength, 0.0);
+  return safe_normal(T * (t.x * s) + B * (t.y * s) + N * t.z);
+}
+
+/**
+ * The same, for a map packed the way game engines store normals (DXT5nm /
+ * BC5): X in alpha, Y in green, Z rebuilt from the two. Aether Gazer's stage
+ * normals are packed so (and its red channel is a constant 1). A converter
+ * normally swizzles these to a plain RGB map; this reads one that was not.
+ */
+fn node_normal_map_packed(color: vec4f, strength: f32, N: vec3f, worldPos: vec3f, uv: vec2f) -> vec3f {
+  let xy = vec2f(color.a * color.r, color.g) * 2.0 - vec2f(1.0);
+  let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
+  return node_normal_map(vec3f(xy, z) * 0.5 + vec3f(0.5), strength, N, worldPos, uv);
 }
 
 /** Vector Transform, world ↔ camera. Object space IS world here: a PMX model is
@@ -793,6 +801,15 @@ fn luminance_rec709_linear(c: vec3f) -> f32 {
   return dot(max(c, vec3f(0.0)), vec3f(0.2126, 0.7152, 0.0722));
 }
 
+/** URP's LightingLambert for the main light, plus the ambient: the light a
+ *  white surface facing n receives — light·max(N·L, 0)·shadow + ambient, in
+ *  Unity's units. What a toon shader in Shader Graph ramps. .rgb is the light,
+ *  .a its luminance (Unity's Luminance, Rec. 709). */
+fn urp_lambert(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f, shadow: f32) -> vec4f {
+  let c = sun_rgb * (max(dot(n, l), 0.0) * shadow) + ambient_rgb;
+  return vec4f(c, luminance_rec709_linear(c));
+}
+
 // ─── FRESNEL node ───────────────────────────────────────────────────
 // Schlick approximation matching Blender's Fresnel node
 
@@ -832,36 +849,6 @@ fn layer_weight_facing(blend: f32, n: vec3f, v: vec3f) -> f32 {
 // ─── SHADER_TO_RGB (white DiffuseBSDF) ──────────────────────────────
 // Eevee captures lit diffuse: (albedo/π)*sun*N·L*shadow + ambient (linear). Albedo=1.
 // Matches default.ts direct term scale so VALTORGB thresholds from Blender JSON stay valid.
-
-/**
- * Shader → RGB on a white diffuse closure, as a COLOUR.
- *
- * Blender's ShaderToRGB hands back what the closure actually radiates, and that
- * is coloured: a warm sun against a cool ambient gives warm light and cool
- * shadow, which is most of what an NPR ramp is reading. Collapsing it to
- * luminance first — which this used to do — throws that away and leaves every
- * ramp working on grey.
- *
- * Feeding this into a scalar socket still yields a float, because Blender's own
- * implicit Color → Value conversion (BT.601, see color_to_value) does it at the
- * link. So a graph that wants the scalar gets Blender's scalar, and one that
- * wants the colour now gets that too.
- *
- * The maths matches 5.2's bxdf_diffuse_eval, which is saturate(dot(N,L))
- * integrated against a cosine distribution: radiance = E·N·L/π for the sun, plus
- * the world's own irradiance. EEVEE Next's extra transport — probe GI, virtual
- * shadow maps, ray-traced bounce — is machinery rather than a term, and is not
- * here.
- */
-fn shader_to_rgb_lit(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f, shadow: f32) -> vec3f {
-  const PI_S: f32 = 3.141592653589793;
-  let ndotl = max(dot(n, l), 0.0);
-  return sun_rgb * (ndotl * shadow / PI_S) + ambient_rgb;
-}
-
-fn shader_to_rgb_diffuse(n: vec3f, l: vec3f, sun_rgb: vec3f, ambient_rgb: vec3f, shadow: f32) -> f32 {
-  return luminance_rec709_linear(shader_to_rgb_lit(n, l, sun_rgb, ambient_rgb, shadow));
-}
 
 // ─── SUBSURFACE node ────────────────────────────────────────────────
 // Marks this fragment for the screen-space scattering pass (passes/subsurface.ts)
@@ -1074,41 +1061,12 @@ fn normal_map(strength: f32, map_color: vec3f, normal: vec3f, tangent: vec3f, bi
   return normalize(mix(normal, perturbed, strength));
 }
 
-// ─── EEVEE Principled BSDF primitives ───────────────────────────────
-// Ports from Blender 3.6 source/blender/draw/engines/eevee/shaders/
-//   bsdf_common_lib.glsl + gpu_shader_material_principled.glsl.
-// Usage pattern (see material shaders): direct spec = bsdf_ggx × sun × shadow
-// (NL baked in, no F yet); ambient spec = probe_radiance; tint both with
-// reflection_color = F_brdf_multi_scatter(f0, f90, split_sum) AFTER summing.
-
-const EEVEE_PI: f32 = 3.141592653589793;
-
-// Fused analytic GGX specular (direct lights). Returns BRDF × NL.
-// 4·NL·NV is cancelled via G1_Smith reciprocal form — see bsdf_common_lib.glsl:115.
-// Caller passes NL, NV (already computed for diffuse + brdf_lut_sample) so WebKit
-// can reuse them instead of recomputing dot products across the function boundary.
-fn bsdf_ggx(N: vec3f, L: vec3f, V: vec3f, NL_in: f32, NV_in: f32, roughness: f32) -> f32 {
-  let a = max(roughness, 1e-4);
-  let a2 = a * a;
-  let H = normalize(L + V);
-  let NH = max(dot(N, H), 1e-8);
-  let NL = max(NL_in, 1e-8);
-  let NV = max(NV_in, 1e-8);
-  // G1_Smith_GGX_opti reciprocal form — denominator piece only.
-  let G1L = NL + sqrt(NL * (NL - NL * a2) + a2);
-  let G1V = NV + sqrt(NV * (NV - NV * a2) + a2);
-  let G = G1L * G1V;
-  // D_ggx_opti = pi * denom² — reciprocal D × a².
-  let tmp = (NH * a2 - NH) * NH + 1.0;
-  let D_opti = EEVEE_PI * tmp * tmp;
-  return NL * a2 / (D_opti * G);
-}
+// ─── URP's direct specular ──────────────────────────────────────────
 
 // URP's direct-light specular, as a game on URP (or a fork of it) shades its
 // lamps and sun: D·V·F folded into a2 / (d²·max(0.1, LoH²)·(4a + 2)), a the
-// SQUARED roughness. Unity folds π into its light units, and a light that came
-// from one reaches this engine with that π restored (see the app's stage
-// loader), so it comes back out here. Returns BRDF × NL, like bsdf_ggx.
+// SQUARED roughness, exactly as URP writes it — this engine's lights are in
+// Unity's units (LIGHT UNITS). Returns BRDF × NL.
 fn bsdf_urp(N: vec3f, L: vec3f, V: vec3f, NL: f32, roughness: f32) -> f32 {
   let a = max(roughness * roughness, 6.1035156e-5);
   let a2 = a * a;
@@ -1116,94 +1074,10 @@ fn bsdf_urp(N: vec3f, L: vec3f, V: vec3f, NL: f32, roughness: f32) -> f32 {
   let NH = max(dot(N, H), 0.0);
   let LH = max(dot(L, H), 0.0);
   let d = NH * NH * (a2 - 1.0) + 1.00001;
-  return a2 / (d * d * max(0.1, LH * LH) * (a * 4.0 + 2.0)) * NL / EEVEE_PI;
+  return a2 / (d * d * max(0.1, LH * LH) * (a * 4.0 + 2.0)) * NL;
 }
 
-/** The direct-light lobe a principled closure asked for: 0 the engine's own,
- *  1 URP's (principled's unity_direct). */
-fn _rzDirectLobe(N: vec3f, L: vec3f, V: vec3f, NL: f32, NV: f32, roughness: f32, unity: f32) -> f32 {
-  if (unity > 0.5) { return bsdf_urp(N, L, V, NL, roughness); }
-  return bsdf_ggx(N, L, V, NL, NV, roughness);
-}
 
-// Split-sum DFG LUT — Karis 2013 curve fit stand-in for the 64×64 baked LUT.
-// Returns (lut.x, lut.y) in Blender convention: tint = f0·lut.x + f90·lut.y.
-fn brdf_lut_approx(NV: f32, roughness: f32) -> vec2f {
-  let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
-  let c1 = vec4f(1.0, 0.0425, 1.04, -0.04);
-  let r = roughness * c0 + c1;
-  let a004 = min(r.x * r.x, exp2(-9.28 * NV)) * r.x + r.y;
-  return vec2f(-1.04, 1.04) * a004 + r.zw;
-}
-
-// Baked combined BRDF LUT — exact port of Blender bsdf_lut_frag.glsl packed with
-// ltc_mag_ggx from eevee_lut.c. Single sample returns DFG (.rg) and LTC mag (.ba).
-// Addressed as Blender's common_utiltex_lib.glsl:lut_coords:
-//   coords = (roughness, sqrt(1 - NV)), then half-texel bias for filtering.
-// Requires group(0) binding(9) brdfLut + binding(2) diffuseSampler in the host shader.
-fn brdf_lut_sample(NV: f32, roughness: f32) -> vec4f {
-  let LUT_SIZE: f32 = 64.0;
-  var uv = vec2f(saturate(roughness), sqrt(saturate(1.0 - NV)));
-  uv = uv * ((LUT_SIZE - 1.0) / LUT_SIZE) + 0.5 / LUT_SIZE;
-  return textureSampleLevel(brdfLut, diffuseSampler, uv, 0.0);
-}
-
-fn F_brdf_single_scatter(f0: vec3f, f90: vec3f, lut: vec2f) -> vec3f {
-  return lut.y * f90 + lut.x * f0;
-}
-
-// Fdez-Agüera 2019 multi-scatter compensation (EEVEE do_multiscatter=1).
-fn F_brdf_multi_scatter(f0: vec3f, f90: vec3f, lut: vec2f) -> vec3f {
-  let FssEss = lut.y * f90 + lut.x * f0;
-  let Ess = lut.x + lut.y;
-  let Ems = 1.0 - Ess;
-  let Favg = f0 + (1.0 - f0) / 21.0;
-  let Fms = FssEss * Favg / (1.0 - (1.0 - Ess) * Favg);
-  return FssEss + Fms * Ems;
-}
-
-// EEVEE direct-specular energy compensation factor — closure_eval_glossy_lib.glsl:79-81:
-//   ltc_brdf_scale = (ltc.x + ltc.y) / (split_sum.x + split_sum.y)
-// Blender evaluates direct lights via LTC (Heitz 2016) but indirect via split-sum;
-// direct radiance is rescaled so total-energy matches the split-sum LUT.
-// Takes a pre-sampled vec4f from brdf_lut_sample() to share the fetch with
-// F_brdf_multi_scatter on the same fragment.
-fn ltc_brdf_scale_from_lut(lut: vec4f) -> f32 {
-  return (lut.z + lut.w) / max(lut.x + lut.y, 1e-6);
-}
-
-// Luminance-normalized hue extraction — Blender tint_from_color (isolates hue+sat).
-fn tint_from_color(color: vec3f) -> vec3f {
-  let lum = dot(color, vec3f(0.3, 0.6, 0.1));
-  return select(vec3f(1.0), color / lum, lum > 0.0);
-}
-
-// ─── Principled sheen (gpu_shader_material_principled.glsl:8-14) ────
-// Empirical NV-only curve that approximates grazing retroreflection on cloth/velvet.
-// Scales the sheen layer's diffuse contribution; no sheen call site has sheen=0
-// shortcut because the multiplier is tiny at normal view angles anyway.
-fn principled_sheen(NV: f32) -> f32 {
-  let f = 1.0 - NV;
-  return f * f * f * 0.077 + f * 0.01 + 0.00026;
-}
-
-// ─── Principled BSDF eval ───────────────────────────────────────────
-// Shared EEVEE Principled path used by every material in the engine — metallic,
-// dielectric, and sheen variants all fold into these ~15 lines via the struct
-// fields. NPR materials still compute a separate toon/rim/warm stack on top and
-// mix(npr_stack, eval_principled(...), fac); see body.ts / face.ts / etc.
-//
-// Field conventions:
-//   base           — diffuse albedo. Mixed into f0 only when metallic > 0.
-//   metallic       — 0 = dielectric (f0 from specular), 1 = pure metal (f0 = base).
-//   specular       — Principled Specular input (0.5 default → f0 = 0.04). sqrt for f90.
-//   roughness      — GGX roughness; drives BRDF LUT coord + bsdf_ggx.
-//   spec_clamp     — EEVEE Light Clamp equivalent. Caps firefly spec from noise-bumped
-//                    NDF aliasing (Blender hides this via TAA which we don't have).
-//                    Pass 1e30 (effectively disabled) for materials that don't bump.
-//   sheen          — 0 disables. Scales the sheen diffuse add; cloth/stockings use ~0.7.
-//   sheen_tint     — 0 = white sheen, 1 = fully tinted by base. Multiplied by sheen,
-//                    so value is don't-care when sheen=0.
 // The PMX sphere map, applied the way MMD applies it: the texture is a
 // VIEW-SPACE lighting mask, sampled by the camera-space normal rather than by
 // any UV the mesh carries, which is why it tracks the viewer and reads as a
@@ -1225,20 +1099,6 @@ fn pmx_sphere_map(base: vec3f, strength: f32, N: vec3f) -> vec3f {
   return base + sphere_rgb * amount;
 }
 
-/**
- * Principled v2 reflectance: IOR sets it, the level scales it.
- *
- * Blender 3.6 took Specular directly, where 0.5 meant f0 = 0.04. v2 computes
- * f0 from IOR — ((ior-1)/(ior+1))² — and Specular IOR Level scales that, with
- * 0.5 meaning "the IOR's own value". Returned in the 3.6 convention the BSDF
- * below still speaks (f0 = 0.08 · specular), so the two agree at their defaults
- * and v2 wins whenever a preset moves either socket.
- */
-fn principled_specular(ior: f32, level: f32) -> f32 {
-  let r = (ior - 1.0) / max(ior + 1.0, 1e-6);
-  return (r * r * 2.0 * max(level, 0.0)) / 0.08;
-}
-
 // ─── The scene's lamps, on a PBR closure ───────────────────────────
 //
 // A lamp reaches a material as rzLightsDiffuse, added outside the graph and
@@ -1248,7 +1108,7 @@ fn principled_specular(ior: f32, level: f32) -> f32 {
 // REFLECTS a lamp instead of having it painted on — without this a ported
 // stage is a photograph of itself, lit but never shining.
 //
-// Same reach as _rzLightOne: the inverse square past RZ_LAMP_NEAR, the
+// Same reach as _rzLightOne: the inverse square past the lamp's bulb, the
 // (1 − (d/R)⁴)² window that makes the radius real, the squared cone. N·L is
 // inside bsdf_ggx. Declared here for bsdf_ggx and resolved against the lights
 // API the material prelude brings; the ground pass takes that API without
@@ -1263,7 +1123,7 @@ fn principled_specular(ior: f32, level: f32) -> f32 {
 // second pass over the grid. See lights.ts.
 struct _RzLampPair { d: vec3f, s: vec3f };
 
-fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> _RzLampPair {
+fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPair {
   var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
   if (!_rzLightReaches(i)) { return out; }
   let pr = _rzLightVec(i, 0u);
@@ -1277,140 +1137,200 @@ fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, un
   let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
   let t2 = t * t;
   let window = 1.0 - t2 * t2;
-  let falloff = window * window / max(dist * dist, RZ_LAMP_NEAR * RZ_LAMP_NEAR);
+  let bulb = rzLightNear(i);
+  let falloff = window * window / max(dist * dist, bulb * bulb);
   let cone = rzLightCone(i);
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
-  let c = rzLightColor(i);
+  let c = rzLightColor(i) * rzLightCookie(i, toLight);
   if (ndlD > 0.0) { out.d = c * (ndlD * falloff * aim * aim); }
-  if (ndl > 0.0) { out.s = c * (_rzDirectLobe(n, toLight, v, ndl, ndv, roughness, unity) * falloff * aim * aim); }
+  if (ndl > 0.0) { out.s = c * (bsdf_urp(n, toLight, v, ndl, roughness) * falloff * aim * aim); }
   return out;
 }
 
-fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> _RzLampPair {
+fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPair {
   var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
   var bits = bits0;
   loop {
     if (bits == 0u) { break; }
     let i = base + firstTrailingBit(bits);
     bits = bits & (bits - 1u);
-    let one = _rzLampOne(i, p, n, v, ndv, roughness, unity);
+    let one = _rzLampOne(i, p, n, v, roughness);
     acc.d = acc.d + one.d;
     acc.s = acc.s + one.s;
   }
   return acc;
 }
 
-fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, ndv: f32, roughness: f32, unity: f32) -> vec3f {
+fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
   var d = vec3f(0.0);
   var s = vec3f(0.0);
   let count = rzLightCount();
   let docs = _rzLightDocCount();
   if (docs > 0u) {
     let m = _rzLightCellMask(p);
-    let wx = _rzLampWord(m.x, 0u, p, n, v, ndv, roughness, unity);
-    let wy = _rzLampWord(m.y, 32u, p, n, v, ndv, roughness, unity);
-    let wz = _rzLampWord(m.z, 64u, p, n, v, ndv, roughness, unity);
-    let ww = _rzLampWord(m.w, 96u, p, n, v, ndv, roughness, unity);
-    d = d + wx.d + wy.d + wz.d + ww.d;
-    s = s + wx.s + wy.s + wz.s + ww.s;
+    let w0 = _rzLampWord(m.lo.x, 0u, p, n, v, roughness);
+    let w1 = _rzLampWord(m.lo.y, 32u, p, n, v, roughness);
+    let w2 = _rzLampWord(m.lo.z, 64u, p, n, v, roughness);
+    let w3 = _rzLampWord(m.lo.w, 96u, p, n, v, roughness);
+    let w4 = _rzLampWord(m.hi.x, 128u, p, n, v, roughness);
+    let w5 = _rzLampWord(m.hi.y, 160u, p, n, v, roughness);
+    let w6 = _rzLampWord(m.hi.z, 192u, p, n, v, roughness);
+    let w7 = _rzLampWord(m.hi.w, 224u, p, n, v, roughness);
+    d = d + w0.d + w1.d + w2.d + w3.d + w4.d + w5.d + w6.d + w7.d;
+    s = s + w0.s + w1.s + w2.s + w3.s + w4.s + w5.s + w6.s + w7.s;
   }
   for (var i = docs; i < count; i = i + 1u) {
-    let one = _rzLampOne(i, p, n, v, ndv, roughness, unity);
+    let one = _rzLampOne(i, p, n, v, roughness);
     d = d + one.d;
     s = s + one.s;
   }
   // The first closure's walk speaks for the fragment; a second principled in
   // the same graph shares p and the prelude normal, so its answer is the same.
   if (!_rzLampDiffuseSet) {
-    _rzLampDiffuse = d * (1.0 / 3.141592653589793);
+    _rzLampDiffuse = d;
     _rzLampDiffuseSet = true;
   }
   return s;
 }
 
-struct PrincipledIn {
-  base: vec3f,
-  metallic: f32,
-  specular: f32,
-  roughness: f32,
-  spec_clamp: f32,
-  sheen: f32,
-  sheen_tint: f32,
-  reflection_lod: f32,
-  unity_direct: f32,
-};
+// ─── Lit: URP's PBR, term for term ─────────────
+//
+// What Unity's Lit shader (URP's UniversalFragmentPBR) computes, so a
+// surface authored with its inputs looks the way it does in Unity: stage,
+// props, scenery and weather. Light units are Unity's (see LIGHT UNITS in
+// lights.ts) — no 1/π anywhere.
 
-fn eval_principled(
-  p: PrincipledIn,
-  N: vec3f, L: vec3f, V: vec3f,
-  sun_rgb: vec3f, amb_rgb: vec3f, shadow: f32, wp: vec3f
-) -> vec3f {
-  let NL = max(dot(N, L), 0.0);
+/** URP's EnvironmentBRDFSpecular: the reflection's reflectance —
+ *  1/(α² + 1)·mix(f0, grazing, (1 − N·V)⁴), grazing = saturate(s + reflectivity). */
+fn urp_env_brdf(f0: vec3f, roughness: f32, smoothness: f32, reflectivity: f32, NV: f32) -> vec3f {
+  let a = max(roughness * roughness, 0.0078125);
+  let grazing = saturate(smoothness + reflectivity);
+  let f = pow(1.0 - NV, 4.0);
+  return (1.0 / (a * a + 1.0)) * mix(f0, vec3f(grazing), f);
+}
+
+/**
+ * A box projection: where a ray from p along d leaves the box, seen from the
+ * probe's capture point. What turns one cube captured at the middle of a room
+ * into a reflection that lines up with that room from anywhere inside it —
+ * the floor near the bar reflects the bar, not whatever was opposite the
+ * capture point. A point outside the box (or a box of zero size) keeps the
+ * plain direction.
+ */
+fn rz_box_project(d: vec3f, p: vec3f, bmin: vec3f, bmax: vec3f, c: vec3f) -> vec3f {
+  let dd = select(d, vec3f(1e-5), abs(d) < vec3f(1e-5));
+  let far = max((bmax - p) / dd, (bmin - p) / dd);
+  let t = min(min(far.x, far.y), far.z);
+  let inside = all(p > bmin) && all(p < bmax);
+  return select(d, normalize(p + d * t - c), inside && t > 0.0);
+}
+
+/**
+ * The scene's reflection: the stage's own reflection probe where the engine
+ * captured one (Engine reflection probe — rendered from the stage's middle,
+ * GGX-prefiltered, box-projected to the stage's bounds), else the world's sky.
+ *
+ * ROUGHNESS PICKS THE MIP ON UNITY'S CURVE, r·(1.7 − 0.7r)·6 on a cube of
+ * seven levels (64² down to 1²) — URP's PerceptualRoughnessToMipmapLevel with
+ * UNITY_SPECCUBE_LOD_STEPS 6, which the prefilter that built the levels assumed.
+ */
+fn rzProbeSpecular(dir: vec3f, wp: vec3f, roughness: f32) -> vec3f {
+  let r = clamp(roughness, 0.0, 1.0);
+  if (probe.boxMin.w < 0.5) { return rzWorldSpecularLod(dir, r, 1.0); }
+  let levels = f32(textureNumLevels(probeCube) - 1u);
+  let lod = min(r * (1.7 - 0.7 * r) * 6.0, levels);
+  let d = rz_box_project(normalize(dir), wp, probe.boxMin.xyz, probe.boxMax.xyz, probe.center.xyz);
+  return textureSampleLevel(probeCube, diffuseSampler, d, lod).rgb * probe.center.w;
+}
+
+/**
+ * URP's Lit, whole: the sun and every lamp, the ambient, the reflection and
+ * the emission, as UniversalFragmentPBR adds them.
+ *
+ *   diffuse  = base·(1 − f)·(1 − m)     specular = mix(f, base, m),  f = 0.08·spec
+ *   (spec 0.5 is URP's own dielectric 0.04 — Unreal's and HDRP's Specular)
+ *   direct   = (diffuse + specular·DirectBRDFSpecular)·light·N·L·shadow
+ *   indirect = (diffuse·SH(n) + probe(R, mip(1 − s))·EnvironmentBRDF)·occlusion
+ *   out      = direct + indirect + emission
+ *
+ * Alpha below 1 is Transparent with Preserve Specular Lighting (URP's
+ * _ALPHAPREMULTIPLY_ON): the diffuse is weighted by alpha, reflection and
+ * highlights are not, and the coverage is alpha·0.96(1 − m) + reflectivity —
+ * a window keeps its reflections at any transparency. Pair it with a group
+ * blending "premultiplied". The result is .rgb and that coverage is .a.
+ *
+ * As the surface (the graph's output), the lamps' diffuse is
+ * shaded here by THIS surface's albedo and the epilogue adds none; as a layer
+ * of a larger look it leaves them to the epilogue. The cast's shadow on a
+ * stage multiplies the lit part.
+ */
+fn urp_lit(base: vec3f, metallic: f32, smoothness: f32, spec: f32, occlusion: f32, emission: vec3f, alpha: f32,
+           N: vec3f, L: vec3f, V: vec3f, sun_rgb: vec3f, amb_rgb: vec3f, shadow: f32, wp: vec3f,
+           surface: bool) -> vec4f {
+  let m = clamp(metallic, 0.0, 1.0);
+  let sm = clamp(smoothness, 0.0, 1.0);
+  let r = 1.0 - sm;
+  let a = clamp(alpha, 0.0, 1.0);
+  let NL = saturate(dot(N, L));
   let NV = max(dot(N, V), 1e-4);
-
-  // f0/f90 per gpu_shader_material_principled.glsl. specular_tint=0 is assumed
-  // (all presets in this engine use the default white dielectric tint).
-  let dielectric_f0 = vec3f(0.08 * p.specular);
-  let f0 = mix(dielectric_f0, p.base, p.metallic);
-  let f90 = mix(f0, vec3f(1.0), sqrt(p.specular));
-
-  // Single LUT tap feeds both F_brdf_multi_scatter (split-sum DFG) and
-  // ltc_brdf_scale_from_lut (LTC mag in .ba). See nodes.ts brdf_lut_sample.
-  let lut = brdf_lut_sample(NV, p.roughness);
-  let reflection_color = F_brdf_multi_scatter(f0, f90, lut.xy);
-
-  // Direct glossy — bsdf_ggx already includes NL; no F applied here (tinted after
-  // accum with reflection_color). ltc_brdf_scale rescales direct to match the
-  // split-sum indirect path, matching EEVEE closure_eval_glossy_lib behavior.
-  // The sun, and every lamp that reaches this point. One clamp over the pair:
-  // a candle a hand's width from a polished floor is a firefly otherwise.
-  // URP's lobe carries its own normalisation, so the LTC rescale that matches
-  // EEVEE's direct light to its split-sum indirect does not apply to it.
-  let direct_scale = select(ltc_brdf_scale_from_lut(lut), 1.0, p.unity_direct > 0.5);
-  let spec_direct_raw = (_rzDirectLobe(N, L, V, NL, NV, p.roughness, p.unity_direct) * sun_rgb * shadow
-                        + rzLampsSpecular(wp, N, V, NV, p.roughness, p.unity_direct))
-                       * direct_scale;
-  let spec_direct = min(spec_direct_raw, vec3f(p.spec_clamp));
-  // Indirect specular reads the world ALONG THE REFLECTION, at a roughness-
-  // picked level — EEVEE's probe_evaluate_world_spec, where the diffuse half
-  // below is probe_evaluate_world_diff along the normal. Taking the diffuse
-  // answer for both gave every surface the same flat wash whatever its
-  // roughness, so a chrome rail mirrored what a matte wall did and a stage's
-  // metal only ever lost its diffuse. A uniform sky gives the same number
-  // either way, so this moves direction, not energy.
-  let spec_indirect = rzWorldSpecularLod(reflect(-V, N), p.roughness, p.reflection_lod);
-  // URP tints a lamp's highlight by f0 alone — its D·V·F already folds the
-  // Fresnel in — where the split-sum reflectance grows toward grazing; applied
-  // to the direct term it made a far glossy floor several times brighter than
-  // the game draws it. Reflections keep the split sum either way.
-  let direct_tint = select(reflection_color, f0, p.unity_direct > 0.5);
-  let spec_radiance = spec_direct * direct_tint + spec_indirect * reflection_color;
-
-  // Sheen add — when p.sheen=0 the whole term collapses, leaving diffuse_color=base.
-  let base_tint = tint_from_color(p.base);
-  let sheen_color = mix(vec3f(1.0), base_tint, p.sheen_tint);
-  let diffuse_color = p.base + p.sheen * sheen_color * principled_sheen(NV);
-
-  // diffuse_weight = (1-metallic). Indirect diffuse uses amb (L_w) with no π factor
-  // (probe_evaluate_world_diff returns SH-projected radiance, not cosine-convolved).
-  let diffuse_weight = 1.0 - p.metallic;
-  var diffuse_radiance = diffuse_color * (sun_rgb * NL * shadow / EEVEE_PI + amb_rgb) * diffuse_weight;
-  // The lamps' diffuse, in Unity mode, as URP shades it: THIS surface's albedo
-  // — its tint and its maps, not the raw texture the epilogue would use —
-  // times 0.96·(1 − metal). X340's floor wears a 0.588 tint the epilogue never
-  // saw, and every lamp on it landed 1.7× too bright.
-  if (p.unity_direct > 0.5 && !_rzLampDiffuseTaken) {
-    diffuse_radiance += p.base * (0.96 * (1.0 - p.metallic)) * rzLightsDiffuseOnce(wp, N);
+  let f = 0.08 * clamp(spec, 0.0, 1.0);
+  let oneMinusReflectivity = (1.0 - f) * (1.0 - m);
+  let reflectivity = 1.0 - oneMinusReflectivity;
+  let diffuse = base * oneMinusReflectivity * a;
+  let specular = mix(vec3f(f), base, m);
+  // The lamps first: their walk caches the diffuse layer it passes over.
+  let lampSpec = rzLampsSpecular(wp, N, V, r);
+  var lampDiff = vec3f(0.0);
+  if (surface) {
+    lampDiff = rzLightsDiffuseOnce(wp, N);
     _rzLampDiffuseTaken = true;
   }
-
-  // The cast's shadow on a stage (Unity mode): the game lays its character
-  // shadow over the whole lit surface as a multiply toward the shadow colour.
-  var lit = diffuse_radiance + spec_radiance;
-  if (p.unity_direct > 0.5) {
-    lit = lit * mix(vec3f(1.0), light.castShadow.rgb, _rzCastShadow(wp) * light.castShadow.w);
-  }
-  return lit;
+  let ao = clamp(occlusion, 0.0, 1.0);
+  let direct = diffuse * (sun_rgb * (NL * shadow) + lampDiff)
+             + specular * (bsdf_urp(N, L, V, NL, r) * sun_rgb * shadow + lampSpec);
+  let indirect = diffuse * amb_rgb * ao
+               + rzProbeSpecular(reflect(-V, N), wp, r) * ao * urp_env_brdf(specular, r, sm, reflectivity, NV);
+  var lit = direct + indirect;
+  lit = lit * mix(vec3f(1.0), light.castShadow.rgb, _rzCastShadow(wp) * light.castShadow.w);
+  return vec4f(lit + max(emission, vec3f(0.0)), a * oneMinusReflectivity + reflectivity);
 }
+
+/**
+ * A packed property map, read the game's way: R metal, G perceptual
+ * roughness (answered as Unity's smoothness, 1 − r), B occlusion, A emission
+ * mask, each remapped through the material's own range — v = min +
+ * (max − min)·tex for the first three, and
+ * e = max((A − min)/(max − min), 0) for the glow, so max is the alpha that
+ * means "full glow" and anything brighter overdrives. A min equal to its max
+ * turns the glow off (the game's default, 1 and 1).
+ *
+ * A slot with no map in it (the 1×1 stand-in) answers with the constants
+ * instead, which is how one look serves a set that brought maps and a model
+ * that did not. Returns (metal, smoothness, occlusion, emission).
+ */
+fn rz_property_map(t: vec4f, bound: bool, consts: vec4f, mn: vec4f, mx: vec4f) -> vec4f {
+  if (!bound) { return consts; }
+  let mro = mn.xyz + (mx.xyz - mn.xyz) * t.xyz;
+  let span = mx.w - mn.w;
+  let e = select(0.0, max((t.w - mn.w) / span, 0.0), abs(span) > 1e-6);
+  return vec4f(mro.x, 1.0 - mro.y, mro.z, e);
+}
+
+/** The highlights alone: the sun's and every lamp's specular on a GGX lobe
+ *  (URP's, α = r²), untinted — light, to be multiplied by whatever the
+ *  surface's reflectance is. What a water or a glass shader adds as its glint
+ *  on top of a reflection it computes itself. */
+fn rz_glossy_direct(N: vec3f, L: vec3f, V: vec3f, sun_rgb: vec3f, shadow: f32, wp: vec3f, roughness: f32) -> vec3f {
+  let r = clamp(roughness, 0.0, 1.0);
+  let NL = saturate(dot(N, L));
+  return bsdf_urp(N, L, V, NL, r) * sun_rgb * shadow + rzLampsSpecular(wp, N, V, r);
+}
+
+/** Does group slot k hold a real image, rather than the 1×1 stand-in a
+ *  missing map is bound as? */
+fn rz_group_bound0() -> bool { return textureDimensions(groupTexture0).x > 1u; }
+fn rz_group_bound1() -> bool { return textureDimensions(groupTexture1).x > 1u; }
+fn rz_group_bound2() -> bool { return textureDimensions(groupTexture2).x > 1u; }
+fn rz_group_bound3() -> bool { return textureDimensions(groupTexture3).x > 1u; }
 
 `;
