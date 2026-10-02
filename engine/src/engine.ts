@@ -4791,7 +4791,8 @@ export class Engine {
         size: [source.width, source.height],
         format: "rgba16float",
         mipLevelCount: levels,
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        // COPY_SRC: prefilterSky copies its level 0 into the filtered chain.
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
       })
       let data = source.data
       let w = source.width
