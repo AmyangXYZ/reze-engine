@@ -126,12 +126,23 @@ struct RzProbeStep { face: u32, lod: f32, roughness: f32, srcSize: f32 };
 @group(0) @binding(21) var rzCaptureAux: texture_2d_array<f32>;
 @group(0) @binding(22) var<uniform> rzStep: RzProbeStep;
 
+/** Radiance the probe can hold: finite, not negative, inside half float.
+ *  One pixel that is not — a NaN from any surface in the capture, or an
+ *  emissive sheet that overflowed the half-float target to infinity — spreads
+ *  through every GGX level built from it (each texel averages up to 128
+ *  samples), and every Lit surface reading the probe went dark with it. A
+ *  bad pixel here costs one texel, not the stage. */
+fn rz_probe_radiance(c: vec3f) -> vec3f {
+  let finite = (c == c) & (abs(c) < vec3f(65000.0));
+  return clamp(select(vec3f(0.0), c, finite), vec3f(0.0), vec3f(65000.0));
+}
+
 @fragment fn fs_compose(in: RzFullOut) -> @location(0) vec4f {
   let size = textureDimensions(rzCaptureColor);
   let px = vec2u(min(in.pos.xy, vec2f(size) - vec2f(1.0)));
-  let c = textureLoad(rzCaptureColor, px, rzStep.face, 0).rgb;
+  let c = rz_probe_radiance(textureLoad(rzCaptureColor, px, rzStep.face, 0).rgb);
   let cover = saturate(textureLoad(rzCaptureAux, px, rzStep.face, 0).g);
-  let sky = rzWorldSpecularLod(rz_face_dir(rzStep.face, in.uv), 0.0, 0.0);
+  let sky = rz_probe_radiance(rzWorldSpecularLod(rz_face_dir(rzStep.face, in.uv), 0.0, 0.0));
   return vec4f(c + sky * (1.0 - cover), 1.0);
 }
 `
