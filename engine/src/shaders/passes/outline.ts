@@ -27,6 +27,12 @@ import { DISSOLVE_WGSL } from "../materials/common"
  * edgeSize 16..20, so this is 20.
  */
 export const RZ_OUTLINE_DISSOLVE_OFFSET = 20
+/** Where the scene-wide width multiplier sits, in bytes — the float after
+ *  dissolve (Engine.setOutlineWidth). */
+export const RZ_OUTLINE_WIDTH_OFFSET = 24
+/** Where the scene-wide colour override sits, in bytes: rgb and a weight, 0
+ *  for the material's own edge colour (Engine.setOutlineColor). */
+export const RZ_OUTLINE_COLOR_OFFSET = 32
 
 export function outlineShaderWgsl(): string {
   return /* wgsl */ `
@@ -40,7 +46,7 @@ struct CameraUniforms {
   viewportHeight: f32,
 };
 
-// THE HULL'S OWN BLOCK, not the material's. 32 bytes of edge data, which is all
+// THE HULL'S OWN BLOCK, not the material's. 48 bytes of edge data, which is all
 // this pass shades with — and dissolve, which it has to obey.
 //
 // It reached for the material block's own layout first, declaring the skipped
@@ -53,8 +59,14 @@ struct MaterialUniforms {
   edgeColor: vec4f,
   edgeSize: f32,
   dissolve: f32,
-  _padding2: f32,
+  /** The scene's width multiplier (setOutlineWidth), the same on every hull:
+   *  scales the author's edgeSize rather than replacing it, so a model's thin
+   *  and thick lines keep their proportion. */
+  widthScale: f32,
   _padding3: f32,
+  /** The scene's colour in place of edgeColor.rgb, by .a (0 or 1). The
+   *  material's own alpha still holds — a line its author made sheer stays so. */
+  colorOverride: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -158,7 +170,7 @@ const RZ_OUTLINE_MIN_PX = 1.5;
   // multiplies it all, as vertex colour alpha does in the game.
   let w = max(clipPos.w, 1e-4);
   let breakDepth = RZ_OUTLINE_FULL_FIGURE * camera.projection[1][1];
-  let nearNdc = viewNormal.xy * (material.edgeSize * outlineNormal.w * 4.0 / refViewport);
+  let nearNdc = viewNormal.xy * (material.edgeSize * material.widthScale * outlineNormal.w * 4.0 / refViewport);
   var ndc = nearNdc * (min(w, breakDepth) / w);
 
   // Antialiased minimum (the game's _OutlineAntialias): held at the minimum
@@ -212,7 +224,8 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
   // alpha above), it is drawn right after the surface it traces so what lies
   // under a faded line is already there, and 4× MSAA would quantize a fade to
   // four steps.
-  out.color = vec4f(material.edgeColor.rgb, material.edgeColor.a * texA * input.coverage);
+  let rgb = mix(material.edgeColor.rgb, material.colorOverride.rgb, material.colorOverride.a);
+  out.color = vec4f(rgb, material.edgeColor.a * texA * input.coverage);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${sceneIdPadWgsl("out")}  return out;
 }

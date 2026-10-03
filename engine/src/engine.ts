@@ -79,7 +79,7 @@ import {
 } from "./shaders/lights"
 import { buildLightGrid } from "./light-grid"
 import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
-import { outlineShaderWgsl, RZ_OUTLINE_DISSOLVE_OFFSET } from "./shaders/passes/outline"
+import { outlineShaderWgsl, RZ_OUTLINE_COLOR_OFFSET, RZ_OUTLINE_DISSOLVE_OFFSET, RZ_OUTLINE_WIDTH_OFFSET } from "./shaders/passes/outline"
 import { transparentDepthPrepassWgsl } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
 import { GIZMO_SHADER_WGSL } from "./shaders/passes/gizmo"
@@ -3322,6 +3322,51 @@ export class Engine {
     // few switches that genuinely has to re-record. It is a user toggle, not a
     // per-frame state, which is what makes that affordable.
     this.bundlesDirty = true
+  }
+
+  /**
+   * Every outline's width, as a multiple of what each PMX material asked for
+   * (its edgeSize): 1 is the author's own, 0 draws none. A multiplier rather
+   * than a width because a model's lines are not one width — the hair's rim
+   * and a sleeve's crease differ on purpose, and scaling keeps that.
+   *
+   * A write, not a re-record: one float in each hull's uniform, so a slider
+   * can drive it. Hulls built later take the current value at creation.
+   */
+  private outlineWidth = 1
+  setOutlineWidth(scale: number): void {
+    const v = Number.isFinite(scale) ? Math.max(0, scale) : 1
+    if (this.outlineWidth === v) return
+    this.outlineWidth = v
+    if (!this.device) return
+    const one = new Float32Array([v])
+    for (const inst of this.modelInstances.values()) {
+      for (const buffer of inst.outlineUniformBuffers) {
+        this.device.queue.writeBuffer(buffer, RZ_OUTLINE_WIDTH_OFFSET, one)
+      }
+    }
+  }
+
+  /**
+   * One colour for every outline, in place of each PMX material's edge colour;
+   * null hands each material its own back. Written as the edge colour is —
+   * the values a PMX would carry — so a picked black is MMD's black. The
+   * material's edge ALPHA is kept: only the hue is the scene's.
+   *
+   * A write, like setOutlineWidth: hulls built later take it at creation.
+   */
+  private outlineColor: [number, number, number, number] = [0, 0, 0, 0]
+  setOutlineColor(color: Vec3 | { x: number; y: number; z: number } | null): void {
+    const next: [number, number, number, number] = color ? [color.x, color.y, color.z, 1] : [0, 0, 0, 0]
+    if (next.every((v, i) => v === this.outlineColor[i])) return
+    this.outlineColor = next
+    if (!this.device) return
+    const data = new Float32Array(next)
+    for (const inst of this.modelInstances.values()) {
+      for (const buffer of inst.outlineUniformBuffers) {
+        this.device.queue.writeBuffer(buffer, RZ_OUTLINE_COLOR_OFFSET, data)
+      }
+    }
   }
 
   /**
@@ -9981,6 +10026,46 @@ export class Engine {
     if (this.cameraPoseOverride) this.camera.setVmdPose(this.cameraPoseOverride)
   }
 
+  /**
+   * The host's adjustment to a camera track, added to every pose it samples.
+   *
+   * A downloaded camera motion is framed for whoever it was made with: a
+   * shorter model wants it lower, a wider stage wants it further back. This
+   * moves the shot without touching its ANGLE — the motion's rotation and roll
+   * are its choreography, and they stay the track's.
+   *
+   * - `target`: world units, added to the look-at point, so the whole shot
+   *   slides with the angle unchanged.
+   * - `distance`: positive pulls the eye further back along its own line of
+   *   sight. VMD distances are signed (negative is behind the target, the usual
+   *   case), so "further" means away from zero on whichever side it is.
+   * - `fov`: radians, added to the track's lens, never below a sliver.
+   *
+   * Only a loaded track reads it: the orbit has its own sliders, and a pose
+   * forced through setCameraPose is a statement of where the camera IS.
+   */
+  private cameraTrackOffset = { target: new Vec3(0, 0, 0), distance: 0, fov: 0 }
+  setCameraTrackOffset(offset: { target?: { x: number; y: number; z: number }; distance?: number; fov?: number } | null): void {
+    const t = offset?.target
+    this.cameraTrackOffset = {
+      target: new Vec3(t?.x ?? 0, t?.y ?? 0, t?.z ?? 0),
+      distance: offset?.distance ?? 0,
+      fov: offset?.fov ?? 0,
+    }
+  }
+
+  /** A sampled track pose with the host's offset laid on. */
+  private offsetTrackPose(pose: CameraPose): CameraPose {
+    const o = this.cameraTrackOffset
+    if (o.distance === 0 && o.fov === 0 && o.target.x === 0 && o.target.y === 0 && o.target.z === 0) return pose
+    return {
+      target: new Vec3(pose.target.x + o.target.x, pose.target.y + o.target.y, pose.target.z + o.target.z),
+      rotation: pose.rotation,
+      distance: pose.distance + Math.sign(pose.distance || -1) * o.distance,
+      fov: Math.min(Math.PI * 0.95, Math.max(0.01, pose.fov + o.fov)),
+    }
+  }
+
   /** The pose currently forced from outside, or null when nothing is. */
   getCameraPoseOverride(): CameraPose | null {
     return this.cameraPoseOverride
@@ -10974,6 +11059,12 @@ export class Engine {
         { binding: 12, resource: { buffer: this.probeUniformBuffer } },
       ],
     })
+    // The recorded phases bind these groups by value (sceneView), so a rebuild
+    // they never hear about leaves them drawing with the old one: the first
+    // light cookie landed on the ground (re-bound each frame) and not on the
+    // cast, and a swapped sky kept reflecting the one it replaced. Only init,
+    // a world install and the first cookie get here, so re-recording is cheap.
+    this.bundlesDirty = true
     return true
   }
 
@@ -15458,8 +15549,14 @@ export class Engine {
           // block's layout would be 32 bytes of padding per outlined material
           // to carry one float. See RZ_OUTLINE_DISSOLVE_OFFSET.
           1,
+          // The scene's width multiplier, at RZ_OUTLINE_WIDTH_OFFSET.
+          this.outlineWidth,
           0,
-          0,
+          // The scene's colour override, at RZ_OUTLINE_COLOR_OFFSET.
+          this.outlineColor[0],
+          this.outlineColor[1],
+          this.outlineColor[2],
+          this.outlineColor[3],
         ])
         const outlineUniformBuffer = this.createUniformBuffer(`${prefix}outline: ${mat.name}`, materialUniformData)
         inst.gpuBuffers.push(outlineUniformBuffer)
@@ -17035,7 +17132,7 @@ export class Engine {
     } else if (this.camera.vmdDriven && this.cameraAnimation) {
       // Drive the shot from the camera VMD (synced to the animated model's clock).
       const pose = this.cameraAnimation.sample(this.transportTime())
-      if (pose) this.camera.setVmdPose(pose)
+      if (pose) this.camera.setVmdPose(this.offsetTrackPose(pose))
     }
 
     // Before the cast is written, which carries every subject's dissolve to the
