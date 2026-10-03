@@ -683,6 +683,21 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     emit: (a) => `rz_glossy_direct(${a.normal}, l, v, sun, shadow, input.worldPos, 1.0 - (${a.smoothness}))`,
     takesLight: true,
   },
+  /**
+   * The lamps, handed to the graph — Shader Graph's Additional Lights: their
+   * diffuse at `normal`, and a Blinn-Phong highlight pow(N·H, exponent), both
+   * untinted. A graph that reads them combines them as its shader does (the
+   * game's water adds the diffuse into its body before its colour, and glints
+   * each lamp at exponent 128·smoothness), and owns the lamps' diffuse: the
+   * layer the engine otherwise adds after the graph is not added.
+   */
+  additional_lights: {
+    inputs: { exponent: F(64), normal: { type: "vector", contextDefault: "n" } },
+    outputs: { diffuse: "color", specular: "color" },
+    outputSelect: { diffuse: ".d", specular: ".s" },
+    emit: (a) => `rz_additional_lights(input.worldPos, ${a.normal}, v, ${a.exponent})`,
+    takesLight: true,
+  },
   reflection_probe: {
     inputs: {
       vector: { type: "vector", contextDefault: "reflect(-v, n)" },

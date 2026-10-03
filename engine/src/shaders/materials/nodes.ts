@@ -1193,6 +1193,81 @@ fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
   return s;
 }
 
+// ─── Additional lights, handed to the graph ─────────────
+//
+// Shader Graph's "Additional Lights" idiom: every lamp's diffuse and a
+// Blinn-Phong highlight, pow(N·H, e), for the graph to combine the way its
+// shader does. The game's water adds the diffuse into its body BEFORE tinting
+// it by its own colour and glints each lamp on that lobe — neither of which
+// the epilogue's layer (lamps × the slot-0 picture, added after) can say. So a
+// graph that reads them owns the lamps' diffuse and the epilogue adds none.
+//
+// Same reach as _rzLightOne: bulb, window, squared cone, cookie. A point
+// behind the surface gets neither term, as the game's step(N·L ≥ 0) has it.
+
+fn _rzAddLightOne(i: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
+  var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  if (!_rzLightReaches(i)) { return out; }
+  let pr = _rzLightVec(i, 0u);
+  let d = pr.xyz - p;
+  let dist = length(d);
+  if (dist >= pr.w) { return out; }
+  let toLight = d / max(dist, 1e-4);
+  let ndl = dot(n, toLight);
+  if (ndl < 0.0) { return out; }
+  let t = clamp(dist / max(pr.w, 1e-4), 0.0, 1.0);
+  let t2 = t * t;
+  let window = 1.0 - t2 * t2;
+  let bulb = rzLightNear(i);
+  let falloff = window * window / max(dist * dist, bulb * bulb);
+  let cone = rzLightCone(i);
+  let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
+  let reach = rzLightColor(i) * rzLightCookie(i, toLight) * (falloff * aim * aim);
+  out.d = reach * ndl;
+  out.s = reach * pow(saturate(dot(n, normalize(toLight + v))), e);
+  return out;
+}
+
+fn _rzAddLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
+  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  var bits = bits0;
+  loop {
+    if (bits == 0u) { break; }
+    let i = base + firstTrailingBit(bits);
+    bits = bits & (bits - 1u);
+    let one = _rzAddLightOne(i, p, n, v, e);
+    acc.d = acc.d + one.d;
+    acc.s = acc.s + one.s;
+  }
+  return acc;
+}
+
+fn rz_additional_lights(p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
+  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  let count = rzLightCount();
+  let docs = _rzLightDocCount();
+  if (docs > 0u) {
+    let m = _rzLightCellMask(p);
+    let w0 = _rzAddLightWord(m.lo.x, 0u, p, n, v, e);
+    let w1 = _rzAddLightWord(m.lo.y, 32u, p, n, v, e);
+    let w2 = _rzAddLightWord(m.lo.z, 64u, p, n, v, e);
+    let w3 = _rzAddLightWord(m.lo.w, 96u, p, n, v, e);
+    let w4 = _rzAddLightWord(m.hi.x, 128u, p, n, v, e);
+    let w5 = _rzAddLightWord(m.hi.y, 160u, p, n, v, e);
+    let w6 = _rzAddLightWord(m.hi.z, 192u, p, n, v, e);
+    let w7 = _rzAddLightWord(m.hi.w, 224u, p, n, v, e);
+    acc.d = w0.d + w1.d + w2.d + w3.d + w4.d + w5.d + w6.d + w7.d;
+    acc.s = w0.s + w1.s + w2.s + w3.s + w4.s + w5.s + w6.s + w7.s;
+  }
+  for (var i = docs; i < count; i = i + 1u) {
+    let one = _rzAddLightOne(i, p, n, v, e);
+    acc.d = acc.d + one.d;
+    acc.s = acc.s + one.s;
+  }
+  _rzLampDiffuseTaken = true;
+  return acc;
+}
+
 // ─── Lit: URP's PBR, term for term ─────────────
 //
 // What Unity's Lit shader (URP's UniversalFragmentPBR) computes, so a
