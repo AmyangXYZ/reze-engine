@@ -24,7 +24,7 @@ export const BODY_GRAPH: ShaderGraph = {
     { id: "lit_tint", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.5, value: 1.0, fac: 1.0 } },
     { id: "toon_color", type: "mix/blend" },
     { id: "bc", type: "bright_contrast", inputs: { bright: 0.1, contrast: 0.2 } },
-    { id: "emission3", type: "vector_math/scale", inputs: { scale: 4.0 } },
+    { id: "emission3", type: "vector_math/scale", inputs: { scale: 3.2 } },
     { id: "warm_add", type: "math/add", inputs: { b: 0.5 } },
     { id: "warm_clamp", type: "math/clamp01" },
     {

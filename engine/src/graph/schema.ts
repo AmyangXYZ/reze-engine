@@ -75,6 +75,20 @@ export type ShaderGraph = {
    * images keeps those.
    */
   images?: ({ url: string; srgb?: boolean } | null)[]
+  /**
+   * The look's outline, the anime game's in place of MMD's flat edge: the
+   * material's picture × colour, toward shadowColor where the key light leaves
+   * it, `width` world units wide (held 1.2–3 px of a 1920-wide frame) — an Aether
+   * Gazer _OutlineWidth w is w·1.3/1920·8 here. Unset, the PMX edge stands.
+   */
+  outline?: {
+    color: [number, number, number]
+    shadowColor: [number, number, number]
+    width: number
+    /** One of `images` (its index) whose colour multiplies the outline at the
+     *  mesh's uvs — the game's per-texel outline mask. */
+    tint?: number
+  }
 }
 
 export type Diagnostic = {

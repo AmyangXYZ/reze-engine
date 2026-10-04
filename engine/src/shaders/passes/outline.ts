@@ -33,6 +33,13 @@ export const RZ_OUTLINE_WIDTH_OFFSET = 24
 /** Where the scene-wide colour override sits, in bytes: rgb and a weight, 0
  *  for the material's own edge colour (Engine.setOutlineColor). */
 export const RZ_OUTLINE_COLOR_OFFSET = 32
+/** Where a style graph's outline (ShaderGraph.outline) sits, in bytes: the
+ *  textured flag at 28, then its shadow colour at 48. Unset, a hull draws its
+ *  PMX edge colour flat, as MMD does. */
+export const RZ_OUTLINE_TEXTURED_OFFSET = 28
+export const RZ_OUTLINE_SHADOW_OFFSET = 48
+/** The hull's own block, in floats. */
+export const RZ_OUTLINE_UNIFORM_FLOATS = 16
 
 export function outlineShaderWgsl(): string {
   return /* wgsl */ `
@@ -63,17 +70,30 @@ struct MaterialUniforms {
    *  scales the author's edgeSize rather than replacing it, so a model's thin
    *  and thick lines keep their proportion. */
   widthScale: f32,
-  _padding3: f32,
+  /** 1: a style graph's outline, the game's (Uber pass "Outline"): edgeSize is
+   *  a world width, held between 1.2 and 3 px of a 1920-wide frame, and the
+   *  colour is the picture × lerp(shadowColor, edgeColor, the key's
+   *  half-Lambert). 0: the PMX edge, flat. */
+  textured: f32,
   /** The scene's colour in place of edgeColor.rgb, by .a (0 or 1). The
    *  material's own alpha still holds — a line its author made sheer stays so. */
   colorOverride: vec4f,
+  shadowColor: vec4f,
 };
+
+struct OutlineLight { direction: vec4f, color: vec4f, };
+/** The head of the scene's light block: the key is lights[0]. */
+struct OutlineLights { ambientColor: vec4f, lights: array<OutlineLight, 4>, };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var edgeSampler: sampler;
+@group(0) @binding(2) var<uniform> light: OutlineLights;
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 @group(2) @binding(0) var<uniform> material: MaterialUniforms;
 @group(2) @binding(1) var diffuseTexture: texture_2d<f32>;
+/** A look's outline tint (ShaderGraph.outline.tint): one of its images, white
+ *  when it names none. */
+@group(2) @binding(2) var tintTexture: texture_2d<f32>;
 
 struct VertexOutput {
   @builtin(position) position: vec4f,
@@ -88,6 +108,7 @@ struct VertexOutput {
   /** How much of a pixel-wide line this one really is (1 = all of it): a line
    *  held at the minimum width fades by what it was short. */
   @location(3) coverage: f32,
+  @location(4) normal: vec3f,
 };
 
 /**
@@ -109,6 +130,11 @@ const RZ_OUTLINE_FULL_FIGURE = 12.5;
  *  device pixels). A line due to be thinner is drawn this wide and faded by
  *  the shortfall, so far lines thin out without aliasing into dashes. */
 const RZ_OUTLINE_MIN_PX = 1.5;
+
+fn safe_normal2(v: vec2f) -> vec2f {
+  let l = length(v);
+  return select(vec2f(0.0), v / l, l > 1e-6);
+}
 
 @vertex fn vs(
   @location(0) position: vec3f,
@@ -169,21 +195,40 @@ const RZ_OUTLINE_MIN_PX = 1.5;
   // once the frame is taller than a figure. The PMX per-vertex edge scale
   // multiplies it all, as vertex colour alpha does in the game.
   let w = max(clipPos.w, 1e-4);
-  let breakDepth = RZ_OUTLINE_FULL_FIGURE * camera.projection[1][1];
-  let nearNdc = viewNormal.xy * (material.edgeSize * material.widthScale * outlineNormal.w * 4.0 / refViewport);
-  var ndc = nearNdc * (min(w, breakDepth) / w);
-
-  // Antialiased minimum (the game's _OutlineAntialias): held at the minimum
-  // width and faded by the shortfall, never thinner. The game fades by
-  // sqrt(coverage.x · coverage.y), per axis; for one width that is the ratio
-  // itself.
-  let px = length(ndc * deviceViewport * 0.5);
-  let minPx = RZ_OUTLINE_MIN_PX * max(1.0, camera.viewportHeight / 1080.0);
+  var ndc: vec2f;
   var coverage = 1.0;
-  if (px < minPx) {
-    coverage = px / minPx;
-    ndc = select(vec2f(0.0), ndc * (minPx / px), px > 1e-6);
+  if (material.textured > 0.5) {
+    // The game's: a view-space offset of edgeSize world units along the view
+    // normal, projected, then each axis held between 1.2 px and 1.2 px ×
+    // (1 + _OutlineMaxOffsetMultiplier, 1.5) of a 1920-wide frame; a line the
+    // minimum had to push fades by how far it was pushed.
+    let off = viewNormal.xy * material.edgeSize * material.widthScale * outlineNormal.w;
+    let d1 = vec2f(off.x * camera.projection[0][0], off.y * camera.projection[1][1]) / w;
+    // the minimum along the push direction (the game's dir · 2/screen · 1.2)
+    let pxNdc = 2.0 / refViewport * 1.2 * safe_normal2(viewNormal.xy);
+    let mx = abs(pxNdc) * 2.5;
+    let o = min(mx, max(abs(d1), abs(pxNdc)));
+    // fadeOut = min(length(saturate(off − |d1|))·75, 1), on clip offsets (× w)
+    // in game units: w here is MMD units, 8 to the game's metre
+    coverage = 1.0 - min(length(saturate((o - abs(d1)) * w / 8.0)) * 75.0, 1.0);
+    ndc = o * select(vec2f(1.0), sign(d1), abs(d1) > vec2f(0.0));
+  } else {
+    let breakDepth = RZ_OUTLINE_FULL_FIGURE * camera.projection[1][1];
+    let nearNdc = viewNormal.xy * (material.edgeSize * material.widthScale * outlineNormal.w * 4.0 / refViewport);
+    ndc = nearNdc * (min(w, breakDepth) / w);
+
+    // Antialiased minimum (the game's _OutlineAntialias): held at the minimum
+    // width and faded by the shortfall, never thinner. The game fades by
+    // sqrt(coverage.x · coverage.y), per axis; for one width that is the ratio
+    // itself.
+    let px = length(ndc * deviceViewport * 0.5);
+    let minPx = RZ_OUTLINE_MIN_PX * max(1.0, camera.viewportHeight / 1080.0);
+    if (px < minPx) {
+      coverage = px / minPx;
+      ndc = select(vec2f(0.0), ndc * (minPx / px), px > 1e-6);
+    }
   }
+  output.normal = worldNormal;
   output.coverage = coverage;
   output.position = vec4f(clipPos.xy + ndc * w, clipPos.z, clipPos.w);
   output.uv = uv;
@@ -215,7 +260,8 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
   // bind-pose position — three passes, one rule, or they disagree about which
   // pieces are still there.
   if (material.dissolve < 0.9995 && input.faceT > material.dissolve) { discard; }
-  let texA = textureSample(diffuseTexture, edgeSampler, input.uv).a;
+  let tex = textureSample(diffuseTexture, edgeSampler, input.uv);
+  let texA = tex.a;
   if (texA < 0.05) {
     discard;
   }
@@ -224,7 +270,12 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
   // alpha above), it is drawn right after the surface it traces so what lies
   // under a faded line is already there, and 4× MSAA would quantize a fade to
   // four steps.
-  let rgb = mix(material.edgeColor.rgb, material.colorOverride.rgb, material.colorOverride.a);
+  var rgb = mix(material.edgeColor.rgb, material.colorOverride.rgb, material.colorOverride.a);
+  if (material.textured > 0.5) {
+    let lit = dot(-light.lights[0].direction.xyz, normalize(input.normal)) * 0.5 + 0.5;
+    let tint = textureSample(tintTexture, edgeSampler, input.uv).rgb;
+    rgb = tex.rgb * tint * mix(material.shadowColor.rgb, rgb, lit);
+  }
   out.color = vec4f(rgb, material.edgeColor.a * texA * input.coverage);
   out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
 ${sceneIdPadWgsl("out")}  return out;

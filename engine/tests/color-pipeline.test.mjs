@@ -179,10 +179,15 @@ test("the view transforms are soft, neutral, aces and none — soft first, the d
   assert.doesNotMatch(compositeSrc, /filmicLut|agxLut/, "no Blender LUTs left")
 })
 
-test("soft is the game's curve: (1 - e^(-2.5x))^1.4, then sRGB", () => {
+test("soft is the game's curve: (1 - e^(-2.5x))^contrast, 1.4 by default, then sRGB", () => {
   const body = compositeSrc.slice(compositeSrc.indexOf("fn softTransform("))
   assert.match(body, /exp\(-2\.5 \* max\(c, vec3f\(0\.0\)\)\)/)
-  assert.match(body, /vec3f\(1\.4\)/)
+  // The power is the scene's own (SceneSetting._contrast), in its own vec4 —
+  // viewU[11..14] hold the cast's positions whenever an effect runs.
+  assert.match(body, /vec3f\(viewU\[15\]\.x\)/)
+  const engineSrc = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
+  assert.match(engineSrc, /u\[60\] = v\.contrast/)
+  assert.match(engineSrc, /contrast: 1\.4,/)
   const soft = (x) => srgbEncode(Math.pow(1 - Math.exp(-2.5 * x), 1.4))
   // Mid grey lands light, white lands just short of the top: the game's look.
   assert.ok(Math.abs(soft(0.18) - 0.529) < 0.005, `linear 0.18 -> ${soft(0.18).toFixed(3)}`)
@@ -289,16 +294,18 @@ test("the outline's struct describes the buffer that is actually bound", () => {
   const struct = shader
     .slice(shader.indexOf("struct MaterialUniforms"), shader.indexOf("@group(0) @binding(0)"))
     .replace(/\/\*[\s\S]*?\*\//g, "")
-  // edgeColor 0..16, edgeSize 16..20, dissolve 20..24, widthScale 24..28, a
-  // pad to 32, colorOverride 32..48.
-  assert.match(struct, /edgeColor: vec4f,\s*edgeSize: f32,\s*dissolve: f32,\s*widthScale: f32,\s*_padding3: f32,\s*colorOverride: vec4f,/)
+  // edgeColor 0..16, edgeSize 16..20, dissolve 20..24, widthScale 24..28,
+  // textured 28..32, colorOverride 32..48, shadowColor 48..64.
+  assert.match(struct, /edgeColor: vec4f,\s*edgeSize: f32,\s*dissolve: f32,\s*widthScale: f32,\s*textured: f32,\s*colorOverride: vec4f,\s*shadowColor: vec4f,/)
   assert.doesNotMatch(struct, /_skip/, "no reach into the material block's layout")
   assert.match(shader, /export const RZ_OUTLINE_DISSOLVE_OFFSET = 20/)
   assert.match(shader, /export const RZ_OUTLINE_WIDTH_OFFSET = 24/)
   assert.match(shader, /export const RZ_OUTLINE_COLOR_OFFSET = 32/)
+  assert.match(shader, /export const RZ_OUTLINE_TEXTURED_OFFSET = 28/)
+  assert.match(shader, /export const RZ_OUTLINE_SHADOW_OFFSET = 48/)
 
   const engine = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
-  // TWELVE FLOATS, the struct's 48 bytes. A count that disagrees with the
+  // SIXTEEN FLOATS, the struct's 64 bytes. A count that disagrees with the
   // struct is the same validation failure from the other direction.
   const at = engine.indexOf("mat.edgeColor[0]")
   const made = engine
@@ -309,8 +316,8 @@ test("the outline's struct describes the buffer that is actually bound", () => {
     .replace("new Float32Array([", "")
   assert.equal(
     made.split(",").filter((l) => l.trim().length).length,
-    12,
-    "the outline uniform is twelve floats",
+    16,
+    "the outline uniform is sixteen floats",
   )
   // Written through the shared constant, never a literal — the two ends cannot
   // drift if only one of them names the number.

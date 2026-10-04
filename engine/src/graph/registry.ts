@@ -123,7 +123,11 @@ const uberNode = (slot: number): NodeSpec => ({
     roughness: F(0.6),
     occlusion: F(1),
     normal: { type: "vector", contextDefault: "n" },
-    direction: { type: "vector", requiresLink: true },
+    // The key light: this draw's, by default — the sun, or the light on the
+    // character's own layer — its way and its colour (the game's _LocalLightDir,
+    // _LocalLightColor). Linked, a look supplies its own (ag_key_light).
+    direction: { type: "vector", contextDefault: "l" },
+    light_color: { type: "color", contextDefault: "sun" },
     // Unity's v into the ramp: the property map's alpha, which picks a
     // surface's band (skin 0.702, hair and pale cloth 0.506).
     row: F(0.702),
@@ -137,24 +141,45 @@ const uberNode = (slot: number): NodeSpec => ({
     rim_in_light: F(1),
     emission: C([0, 0, 0]),
     reflection: F(1),
+    // THE STUDIO AMBIENT (_GlobalIlluminationOverride): the game blends a
+    // character's ambient from its own reflection cube's smallest mip — near
+    // neutral, 0.4–0.9 across the newer skins — over the scene's light, by the
+    // material's blend (bodies 0.8, hair 1, faces 0.5). It is what keeps a
+    // character clean on a coloured stage.
+    studio: C([0.6, 0.6, 0.6]),
+    studio_blend: F(0),
     // A face's SDF shade (ag_face_sdf); left at -1, the material reads N·L.
     shade: F(-1),
     // 1: the game's FACE_MODE — no GGX, the environment at a flat 0.0157.
     face: F(0),
+    // A face's SDF highlight (ag_face_spec), in place of GGX.
+    face_spec: F(0),
+    // 1: hair (_ANISOTROPIC_SPECULAR) — its ring (ag_hair_ring) in place of GGX,
+    // the environment at a flat 0.0157.
+    hair: F(0),
+    hair_spec: C([0, 0, 0]),
   },
   outputs: { color: "color" },
   emit: (a) =>
-    `ag_uber(${slot}u, ${a.base}, ${a.metallic}, ${a.roughness}, ${a.occlusion}, ${a.normal}, ${a.direction}, ${a.row}, ${a.receive_shadow}, ` +
-    `${a.rim_mask}, ${a.rim_mid}, ${a.rim_width}, ${a.rim_tint}, ${a.rim_intensity}, ${a.rim_albedo}, ${a.rim_in_light}, ${a.emission}, ${a.reflection}, ${a.shade}, ${a.face}, input.worldPos, v)`,
+    `ag_uber(${slot}u, ${a.base}, ${a.metallic}, ${a.roughness}, ${a.occlusion}, ${a.normal}, ${a.direction}, ${a.light_color}, ${a.row}, ${a.receive_shadow}, ` +
+    `${a.rim_mask}, ${a.rim_mid}, ${a.rim_width}, ${a.rim_tint}, ${a.rim_intensity}, ${a.rim_albedo}, ${a.rim_in_light}, ${a.emission}, ${a.reflection}, ${a.studio}, ${a.studio_blend}, ${a.shade}, ${a.face}, ${a.face_spec}, ${a.hair}, ${a.hair_spec}, input.worldPos, v)`,
   takesLight: true,
 })
 const UBER_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_uber/${s}`, uberNode(s)]))
-// The face's SDF shade, the image on the slot the type names — 104903's face
-// template (SDF_04_shaonv) by default in the AG pack.
+// How much a colour reads as skin (ag_skin): what picks a surface's ramp row in
+// a general look, where the game would read its property mask.
+const AG_SKIN: NodeSpec = {
+  inputs: { color: C([1, 1, 1], true) },
+  outputs: { value: "float" },
+  emit: (a) => `ag_skin(${a.color})`,
+}
+// The face's SDF shade, the image on the slot the type names. An empty slot
+// reads white: the whole face takes one shade from where the key light stands
+// to the head, the game's flat face for a model without its SDF.
 const faceSdfNode = (slot: number): NodeSpec => ({
   inputs: {
     uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" },
-    direction: { type: "vector", requiresLink: true },
+    direction: { type: "vector", contextDefault: "l" },
     normal: { type: "vector", contextDefault: "n" },
     smoothness: F(0.1),
     invert: F(0),
@@ -163,6 +188,55 @@ const faceSdfNode = (slot: number): NodeSpec => ({
   emit: (a) => `ag_face_sdf(${slot}u, ${a.uv}.xy, ${a.direction}, ${a.normal}, ${a.smoothness}, ${a.invert})`,
 })
 const FACE_SDF_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_face_sdf/${s}`, faceSdfNode(s)]))
+// The newer SDF (_SDFType 1): a painted face normal, not a threshold field.
+const faceSdfNewNode = (slot: number): NodeSpec => ({
+  ...faceSdfNode(slot),
+  emit: (a) => `ag_face_sdf_new(${slot}u, ${a.uv}.xy, ${a.direction}, ${a.normal}, ${a.smoothness}, ${a.invert})`,
+})
+const FACE_SDF_NEW_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_face_sdf_new/${s}`, faceSdfNewNode(s)]))
+// The face's highlight from the newer SDF's green and blue.
+const faceSpecNode = (slot: number): NodeSpec => ({
+  inputs: {
+    uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" },
+    direction: { type: "vector", contextDefault: "l" },
+    normal: { type: "vector", contextDefault: "n" },
+    anisotropy: F(1),
+    shift: F(0),
+  },
+  outputs: { value: "float" },
+  emit: (a) => `ag_face_spec(${slot}u, ${a.uv}.xy, ${a.direction}, ${a.normal}, v, ${a.anisotropy}, ${a.shift})`,
+})
+// The hair's angel ring, the band on the slot's image.
+const hairRingNode = (slot: number): NodeSpec => ({
+  inputs: {
+    uv: { type: "vector", contextDefault: "vec3f(input.uv, 0.0)" },
+    normal: { type: "vector", contextDefault: "n" },
+    color: C([1, 1, 1]),
+    anisotropy: F(1),
+    shift: F(0),
+  },
+  outputs: { color: "color" },
+  emit: (a) => `ag_hair_ring(${slot}u, ${a.uv}.xy, ${a.normal}, v, ${a.color}, ${a.anisotropy}, ${a.shift})`,
+})
+const HAIR_RING_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_hair_ring/${s}`, hairRingNode(s)]))
+// The game's pupil (SimPipeline/Character/Eye): unlit relief, matcap and
+// glints — slots: 0 depth, 1 normal, 2 matcap, 3 glint mask.
+const AG_EYE: NodeSpec = {
+  inputs: {
+    height_scale: F(0.2), min_layer: F(8), max_layer: F(32), intensity: F(0.9),
+    main_color: C([1, 1, 1]), matcap_color: C([1, 1, 1]), matcap_pow: F(1),
+    mask_scale: F(0.15), mask_soft: F(0.014),
+    mask2: F(0), mask2_color: C([1, 1, 1]), mask3: F(0), mask3_color: C([1, 1, 1]),
+    blink: F(0), blink_scale: F(10), scale_speed: F(0.1), rotate_speed: F(0.6), blink_angle: F(5),
+    level: F(1),
+  },
+  outputs: { color: "color" },
+  emit: (a) =>
+    `ag_eye(input.uv, n, v, input.worldPos, ${a.height_scale}, ${a.min_layer}, ${a.max_layer}, ${a.intensity}, ${a.main_color}, ` +
+    `${a.matcap_color}, ${a.matcap_pow}, ${a.mask_scale}, ${a.mask_soft}, ${a.mask2}, ${a.mask2_color}, ${a.mask3}, ${a.mask3_color}, ` +
+    `${a.blink}, ${a.blink_scale}, ${a.scale_speed}, ${a.rotate_speed}, ${a.blink_angle}, ${a.level})`,
+}
+const FACE_SPEC_NODES: Record<string, NodeSpec> = Object.fromEntries([0, 1, 2, 3].map((s) => [`ag_face_spec/${s}`, faceSpecNode(s)]))
 
 // A packed property map on the slot the type names — the game's material
 // contract: R metal, G perceptual roughness (answered as smoothness, Unity's
@@ -630,7 +704,12 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
   // Principled is one: the ramp image on the group slot named by the type.
   // Defaults are 104903's skin.
   ...UBER_NODES,
+  ag_skin: AG_SKIN,
   ...FACE_SDF_NODES,
+  ...FACE_SDF_NEW_NODES,
+  ...FACE_SPEC_NODES,
+  ag_eye: AG_EYE,
+  ...HAIR_RING_NODES,
   ...PROPERTY_MAP_NODES,
 
   /**

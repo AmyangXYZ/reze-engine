@@ -27,7 +27,7 @@ export const METAL_GRAPH: ShaderGraph = {
     { id: "mix_004", type: "mix/blend" },
     { id: "hue_004", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 2.0, fac: 1.0 } },
     { id: "npr_overlay", type: "mix/overlay", inputs: { fac: 1.0 } },
-    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 8.100000381469727 } },
+    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 6.48 } },
     { id: "voro_cross", type: "vect_cross", inputs: { b: [0, 1, 0] } },
     { id: "voro", type: "tex_voronoi/color", inputs: { scale: 4.3 } },
     { id: "voro_ramp", type: "ramp_linear", inputs: { pos0: 0.0, pos1: 1.0 } },

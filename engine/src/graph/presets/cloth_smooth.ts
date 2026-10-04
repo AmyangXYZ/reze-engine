@@ -28,7 +28,7 @@ export const CLOTH_SMOOTH_GRAPH: ShaderGraph = {
     { id: "mix_003", type: "mix/blend" },
     { id: "hue_004", type: "hue_sat", inputs: { hue: 0.5, saturation: 0.800000011920929, value: 2.0, fac: 1.0 } },
     { id: "npr_overlay", type: "mix/overlay", inputs: { fac: 1.0 } },
-    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 18.200000762939453 } },
+    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 14.56 } },
     { id: "principled_base", type: "hue_sat", inputs: { hue: 0.5, saturation: 1.0, value: 0.800000011920929, fac: 1.0 } },
     {
       id: "principled",

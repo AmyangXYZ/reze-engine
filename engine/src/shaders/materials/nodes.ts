@@ -471,9 +471,10 @@ fn _ag_ramp(slot: u32, uv: vec2f) -> vec4f {
  * Lamps and fog are the engine's, laid on after.
  */
 fn ag_uber(slot: u32, base: vec3f, metallic: f32, roughness: f32, occlusion: f32, n: vec3f, l: vec3f,
-           row: f32, receive: f32, rimMask: f32, rimMid: f32, rimWidth: f32, rimTint: vec3f,
+           lightColor: vec3f, row: f32, receive: f32, rimMask: f32, rimMid: f32, rimWidth: f32, rimTint: vec3f,
            rimIntensity: f32, rimAlbedo: f32, rimInLight: f32, emissive: vec3f, reflection: f32,
-           shade: f32, face: f32, wp: vec3f, v: vec3f) -> vec3f {
+           studio: vec3f, studioBlend: f32, shade: f32, face: f32, faceSpec: f32, hair: f32, hairSpec: vec3f,
+           wp: vec3f, v: vec3f) -> vec3f {
   let diffuse = base * (1.0 - metallic);
   let f0 = mix(vec3f(0.04), base, metallic);
   let pr = clamp(roughness, 0.0, 1.0);
@@ -510,9 +511,15 @@ fn ag_uber(slot: u32, base: vec3f, metallic: f32, roughness: f32, occlusion: f32
   let rim = tint * edge * (1.0 + rimInLight * (u - 1.0));
 
   // A face (FACE_MODE) takes no GGX: its light is the ramp, the rim and its
-  // optional SDF highlight (off unless _FaceSpecular).
+  // SDF highlight (ag_face_spec), grey, × (0.9u + 0.1).
   let isFace = face > 0.5;
-  let direct = (select(spec * f0, vec3f(0.0), isFace) + rim) * u + diffuse * ramp;
+  // Hair (_ANISOTROPIC_SPECULAR) takes its angel ring (ag_hair_ring) in place of
+  // GGX, not × F0: × (0.29u + 0.1/π).
+  let isHair = hair > 0.5;
+  var hl = select(spec * f0, hairSpec * (0.29 * u + 0.03183099), isHair);
+  hl = select(hl, vec3f(faceSpec * (0.9 * u + 0.1)), isFace);
+  // under the key light's colour, as the pass ends its direct term (× _LocalLightColor)
+  let direct = ((hl + rim) * u + diffuse * ramp) * lightColor;
 
   // the environment, with the game's fit of the split-sum
   let a004 = min((1.0 - pr) * (1.0 - pr), exp2(-9.28 * ndv)) * (1.0 - pr) + (0.0425 - 0.0275 * pr);
@@ -522,10 +529,32 @@ fn ag_uber(slot: u32, base: vec3f, metallic: f32, roughness: f32, occlusion: f32
   let env = rzWorldSpecularLod(reflect(-v, n), pr, 1.0) * reflection;
 
   // ... and the environment at a flat 0.0157 rather than through the BRDF fit.
-  let envTerm = select((f0 * A + B) * env, env * 0.0157, isFace);
-  return emissive + rzObjectAmbient(n) * diffuse + envTerm + direct;
+  let envTerm = select((f0 * A + B) * env, env * 0.0157, isFace || isHair);
+  // the ambient: the scene's, blended toward the studio's by the material
+  let ambient = mix(rzObjectAmbient(n), studio, saturate(studioBlend));
+  return emissive + ambient * diffuse + envTerm + direct;
 }
 
+
+/**
+ * How much an albedo reads as skin, 0..1 — for a general look that has no
+ * game property mask to pick a surface's ramp row with. Skin across the game's
+ * newer characters (and the PMX textures ripped from them) is warm — red over
+ * green over blue, a hue within about 0..45 degrees — moderately saturated and
+ * fairly light; cloth, hair, metal and eyes are rarely all three.
+ */
+fn ag_skin(c: vec3f) -> f32 {
+  let s = clamp(c, vec3f(0.0), vec3f(1.0));
+  let mx = max(s.r, max(s.g, s.b));
+  let mn = min(s.r, min(s.g, s.b));
+  let sat = (mx - mn) / max(mx, 1e-4);
+  // hue in degrees for the red-to-yellow sextant, where skin lives
+  let hue = select(-1.0, 60.0 * (s.g - s.b) / max(mx - mn, 1e-4), s.r >= s.g && s.g >= s.b && mx - mn > 1e-4);
+  let warm = smoothstep(-2.0, 4.0, hue) * (1.0 - smoothstep(38.0, 52.0, hue));
+  let tinted = smoothstep(0.06, 0.14, sat) * (1.0 - smoothstep(0.55, 0.75, sat));
+  let light = smoothstep(0.35, 0.55, mx);
+  return warm * tinted * light;
+}
 
 /**
  * The face's shade from its SDF image (Uber FACE_MODE, _SDFType 0), in place of
@@ -560,9 +589,149 @@ fn ag_face_sdf(slot: u32, uv: vec2f, l: vec3f, n: vec3f, smoothness: f32, invert
   var m2 = max(saturate((b - th - 1.0) / k + 0.5), saturate((a - w) / k + 0.5));
   m2 = min(m2, min(saturate((a + w) / k + 0.5), saturate((b + w) / k + 0.5)));
   var r = flag * (m1 - m2) + m2;
-  r *= (1.0 - abs(lf.z)) * 0.5 + 0.5;
+  r *= (1.0 - abs(lf.y)) * 0.5 + 0.5;
   r *= saturate(dot(n, l)) * 0.5 + 0.5;
   return r;
+}
+
+/** The game's face frame (_World2Face) from the head bone: x to the face's
+ *  right, y up, z out of it — a vector in world space taken into it. */
+fn _ag_face_frame(d: vec3f) -> vec3f {
+  let hb = skinMats[u32(max(material.headBoneIndex, 0.0))];
+  return vec3f(dot(d, -normalize(hb[0].xyz)), dot(d, normalize(hb[1].xyz)), dot(d, -normalize(hb[2].xyz)));
+}
+
+/**
+ * The face's shade from its newer SDF image (Uber FACE_MODE, _SDFType 1), in
+ * place of N·L. The image paints, per texel, a normal in the face's level
+ * plane (alpha: its angle off the face's forward, toward the side the light
+ * is on) and how far it replaces the surface's own (red); three taps soften
+ * it. The painted normal yields to the real one as the light climbs, and the
+ * shade is a linear step of it against the light, _BlendSmoothness wide.
+ */
+fn ag_face_sdf_new(slot: u32, uv: vec2f, l: vec3f, n: vec3f, smoothness: f32, invert: f32) -> f32 {
+  let lf = normalize(_ag_face_frame(l));
+  let nf = normalize(_ag_face_frame(n));
+  let flip = lf.x > 0.0;
+  // Unity's v runs up: uv is the mesh's (PMX, v down)
+  let ub = vec2f(mix(uv.x, 1.0 - uv.x, invert), 1.0 - uv.y);
+  let x0 = select(ub.x, 1.0 - ub.x, flip);
+  let x1 = select(ub.x - 0.004, 1.0 - (ub.x - 0.004), flip);
+  let x2 = select(ub.x + 0.004, 1.0 - (ub.x + 0.004), flip);
+  let t0 = _ag_ramp(slot, vec2f(x0, ub.y));
+  let t1 = _ag_ramp(slot, vec2f(x1, ub.y - 0.004));
+  let t2 = _ag_ramp(slot, vec2f(x2, ub.y - 0.004));
+  let w = (t0.r + t1.r + t2.r) / 3.0;
+  let th = ((t0.a + t1.a + t2.a) / 3.0 * 2.0 - 1.0) * 1.5707964;
+  let side = select(vec3f(-1.0, 0.0, 0.0), vec3f(1.0, 0.0, 0.0), flip);
+  var ns = side * sin(th) + vec3f(0.0, 0.0, 1.0) * cos(th);
+  ns = normalize(mix(ns, nf, lf.y * lf.y));
+  ns = normalize(mix(nf, ns, w));
+  let sm = max(smoothness, 0.001);
+  let lo = -sm * w;
+  let hi = w * (sm - 1.0) + 1.0;
+  return (clamp(dot(ns, lf), lo, hi) - lo) / (hi - lo);
+}
+
+/**
+ * The face's highlight (Uber FACE_MODE with the newer SDF), its GGX: the
+ * SDF image's green and blue paint a nose and cheek glint per light angle, lit
+ * where both pass a threshold set by how far the light, swung 85% toward the
+ * camera, comes from the front; the painted band slides up with the view
+ * (_AnisotropyShift). × _Anisotropy/π, the light's frontality and N·V. The
+ * pass lays it on as u·(0.9u + 0.1)·this — ag_uber's face_spec.
+ */
+fn ag_face_spec(slot: u32, uv: vec2f, l: vec3f, n: vec3f, v: vec3f, anisotropy: f32, shift: f32) -> f32 {
+  let lf = _ag_face_frame(l);
+  let lxz = lf.xz * inverseSqrt(max(dot(lf.xz, lf.xz), 1.1754944e-38));
+  // unity_CameraToWorld column 2: OpenGL-style, the camera's BACK, toward the viewer
+  let cf = _ag_face_frame(vector_camera_to_world(vec3f(0.0, 0.0, 1.0))).xz;
+  let hd = normalize(mix(lxz, cf, 0.85));
+  let ub = vec2f(uv.x, 1.0 - uv.y);
+  let s = _ag_ramp(slot, vec2f(select(ub.x, 1.0 - ub.x, hd.x < 0.0), ub.y - v.y * shift));
+  let t = clamp(saturate(-hd.y - 0.70710677) * 3.4142134, 0.01, 0.99);
+  let on = select(0.0, 1.0, s.g >= 1.0 - t && s.b >= t);
+  return on * anisotropy / 3.14159265 * saturate((lxz.y * 0.5 + 0.5) * 4.0 - 3.0) * saturate(dot(n, v));
+}
+
+/**
+ * Aether Gazer's pupil (SimPipeline/Character/Eye, ForwardBase): unlit. The
+ * iris is a parallax-occlusion relief on the depth image (slot 0, red = height
+ * up from 1 − depth), marched in the eye's own tangent frame toward the eye of
+ * the viewer, _MinLayer..._MaxLayer layers as the view grazes; the material's
+ * picture is read where the march stops, brightened by its depth × _Intensity.
+ * A matcap (slot 2) on the normal map (slot 1, tangent normal as 0..1) scales
+ * it by (1 + matcap), and the sparkle mask (slot 3, blue / green) adds its
+ * glints, pulsing and wobbling with the clock. × level (_ProbeLightingBase).
+ */
+fn ag_eye(uv: vec2f, n: vec3f, v: vec3f, wp: vec3f, heightScale: f32, minLayer: f32, maxLayer: f32,
+          intensity: f32, mainColor: vec3f, matColor: vec3f, matPow: f32, maskScale: f32, maskSoft: f32,
+          mask2: f32, mask2Color: vec3f, mask3: f32, mask3Color: vec3f, blink: f32, blinkScale: f32,
+          scaleSpeed: f32, rotateSpeed: f32, blinkAngle: f32, level: f32) -> vec3f {
+  // the tangent frame of the mesh uvs, as the march walks them
+  let dp1 = dpdx(wp);
+  let dp2 = dpdy(wp);
+  let du1 = dpdx(uv);
+  let du2 = dpdy(uv);
+  let det = du1.x * du2.y - du2.x * du1.y;
+  let inv = select(0.0, 1.0 / det, abs(det) > 1e-12);
+  let tu = (dp1 * du2.y - dp2 * du1.y) * inv;
+  let tv = (dp2 * du1.x - dp1 * du2.x) * inv;
+  let vt = vec3f(dot(v, safe_normal(tu)), dot(v, safe_normal(tv)), dot(v, n));
+  let vz = max(abs(vt.z), 1e-3);
+  let layers = mix(ceil(maxLayer), ceil(minLayer), saturate(abs(vt.z)));
+  // against the view, both ways in these uvs: measured, the iris error 48 -> 10 of 255
+  let stp = vec3f(-vt.xy * heightScale, vz) / (layers * vz);
+  var p = vec3f(uv, 0.0) + stp;
+  var prev = vec3f(uv, 0.0);
+  var depth = 1.0 - textureSampleLevel(groupTexture0, diffuseSampler, p.xy, 0.0).r;
+  var prevDepth = 0.0;
+  for (var i = 0; i < 16; i++) {
+    if (p.z >= depth) { break; }
+    prev = p;
+    prevDepth = depth;
+    p += stp;
+    depth = 1.0 - textureSampleLevel(groupTexture0, diffuseSampler, p.xy, 0.0).r;
+  }
+  // between the last two layers, where the ray crossed the relief
+  let after = depth - p.z;
+  let before = prevDepth - prev.z;
+  let w = select(0.0, after / (after - before), abs(after - before) > 1e-6);
+  let uvP = mix(p.xy, prev.xy, w);
+  let dLast = depth;
+  var alb = textureSampleLevel(diffuseTexture, diffuseSampler, uvP, 0.0).rgb * mainColor;
+  alb += alb * dLast * intensity;
+  // the matcap, multiplied in
+  let nm = node_normal_map(textureSampleLevel(groupTexture1, diffuseSampler, uv, 0.0).rgb, 1.0, n, wp, uv);
+  let vn = (camera.view * vec4f(nm, 0.0)).xy;
+  let mc = textureSampleLevel(groupTexture2, diffuseSampler, vn * 0.5 + 0.5, 0.0).rgb * matColor * matPow;
+  var col = alb + alb * mc;
+  // the glints: the mask wobbled about the eye's centre, pulsing
+  let t = camera.time;
+  let a = sin(radians(cos(t * rotateSpeed) * blinkAngle));
+  let c = cos(a);
+  let d = uv - vec2f(0.5);
+  let uvR = select(uv, vec2f(c * d.x - a * d.y, a * d.x + c * d.y) + 0.5, blink > 0.5);
+  let m = textureSampleLevel(groupTexture3, diffuseSampler, uvR, 0.0);
+  let lo = saturate(maskScale - maskSoft);
+  let hi = saturate(maskScale + maskSoft);
+  let s1 = select(0.0, smoothstep(lo, hi, m.g), mask2 > 0.5);
+  let s2 = select(0.0, smoothstep(lo, hi, m.b), mask3 > 0.5);
+  let k = select(1.0, (sin(12.0 * t * scaleSpeed) * 0.5 + 0.7) * blinkScale, blink > 0.5);
+  col += saturate(k * s1 * mask2Color + k * s2 * mask3Color);
+  return col * level;
+}
+
+/**
+ * Aether Gazer's hair highlight, its angel ring (Uber _ANISOTROPIC_SPECULAR,
+ * _HairLightingMode 0): a band painted in the hair's uvs (the slot's image),
+ * sliding up the strands as the view climbs (_AnisotropyShift), × the ring's
+ * colour and N·V·_Anisotropy. ag_uber's hair_spec; it lays on the u factor.
+ */
+fn ag_hair_ring(slot: u32, uv: vec2f, n: vec3f, v: vec3f, color: vec3f, anisotropy: f32, shift: f32) -> vec3f {
+  let ub = vec2f(uv.x, 1.0 - uv.y);
+  let b = _ag_ramp(slot, vec2f(ub.x, ub.y - v.y * shift)).rgb;
+  return b * color * (saturate(dot(n, v)) * anisotropy);
 }
 
 fn group_tex0(uv: vec2f) -> vec4f { return textureSample(groupTexture0, diffuseSampler, uv); }

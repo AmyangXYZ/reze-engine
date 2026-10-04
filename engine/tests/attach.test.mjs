@@ -141,7 +141,9 @@ test("the pose loop runs parents first and places a child before posing it", () 
 
 test("a prop keeps physics and outlines, and is not a performer", () => {
   assert.match(engine, /!isStage && !isPlane && rbs\.length > 0/, "physics builds for a prop")
-  assert.match(engine, /if \(!inst\.isStage && \(mat\.edgeFlag & 0x10\) !== 0/, "a prop keeps its outline")
+  // Every non-stage material gets its hull; the PMX edge flag (or a look's
+  // outline) decides whether it draws — a prop is not a stage, so it keeps it.
+  assert.match(engine, /const pmxEdge = \(mat\.edgeFlag & 0x10\) !== 0 && mat\.edgeSize > 0\n\s*if \(!inst\.isStage\) \{/, "a prop keeps its outline")
   assert.match(engine, /if \(n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp \|\| !inst\.model\.visible\) return/, "a prop is not a subject")
   assert.match(engine, /if \(inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp\) continue\n      const p = inst\.model\.getAnimationProgress/, "a prop never seeds the clock")
   const hasStage = engine.slice(engine.indexOf("  hasStage(): boolean {"), engine.indexOf("  groundIsSuppressed()"))

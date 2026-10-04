@@ -30,7 +30,7 @@ export const CLOTH_ROUGH_GRAPH: ShaderGraph = {
     { id: "mix_003", type: "mix/blend" },
     { id: "hue_004", type: "hue_sat", inputs: { hue: 0.5, saturation: 0.800000011920929, value: 2.0, fac: 1.0 } },
     { id: "npr_overlay", type: "mix/overlay", inputs: { fac: 1.0 } },
-    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 18.200000762939453 } },
+    { id: "npr_emit", type: "vector_math/scale", inputs: { scale: 14.56 } },
     { id: "noise", type: "tex_noise", inputs: { scale: 17.7 } },
     { id: "noise_ramp", type: "ramp_linear", inputs: { pos0: 0.0, pos1: 1.0 } },
     { id: "bump", type: "bump", inputs: { strength: 1.0 } },

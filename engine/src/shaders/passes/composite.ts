@@ -131,7 +131,7 @@ override APPLY_GAMMA: bool = true;
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;   // bloomUpTexture mip 0 (full pyramid top)
 @group(0) @binding(2) var bloomSamp: sampler;
-@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 15>;
+@group(0) @binding(3) var<uniform> viewU: array<vec4<f32>, 16>;
 // Aux mask/alpha texture. .r = bloom mask (unused here; bloom blit uses it).
 // .g = accumulated canvas alpha (what hdr.a carried before the HDR format
 // became rg11b10ufloat). We unpremultiply HDR by this alpha for tonemap, then
@@ -153,6 +153,8 @@ override APPLY_GAMMA: bool = true;
 // viewU[9] = (grade slope.rgb, grade flags) — bit 0 the CDL grade(), bit 1 the
 //            scene's own LUT (setStageGrade) — see _rzGradeScene() below.
 // viewU[10] = (camera world position, _) — refreshed with the basis above.
+// viewU[11..14] = the cast's positions (effects; count in viewU[10].w).
+// viewU[15] = (soft curve contrast, _, _, _).
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 // The scene pass's own MSAA depth buffer, bound depth-only. NOT an extra
@@ -251,7 +253,7 @@ fn srgb_encode(x: f32) -> f32 {
  * The game's ACES branch is off in every scene measured.
  */
 fn softTransform(c: vec3f) -> vec3f {
-  let t = pow(max(vec3f(1.0) - exp(-2.5 * max(c, vec3f(0.0))), vec3f(0.0)), vec3f(1.4));
+  let t = pow(max(vec3f(1.0) - exp(-2.5 * max(c, vec3f(0.0))), vec3f(0.0)), vec3f(viewU[15].x));
   return vec3f(srgb_encode(t.r), srgb_encode(t.g), srgb_encode(t.b));
 }
 

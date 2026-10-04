@@ -29,7 +29,7 @@ export const FACE_GRAPH: ShaderGraph = {
     { id: "lit_tint", type: "hue_sat", inputs: { hue: 0.46000000834465027, saturation: 1.600000023841858, value: 1.5, fac: 1.0 } },
     { id: "toon_color", type: "mix/blend" },
     { id: "bc", type: "bright_contrast", inputs: { bright: 0.1, contrast: 0.2 } },
-    { id: "emission3", type: "vector_math/scale", inputs: { scale: 2.5 } },
+    { id: "emission3", type: "vector_math/scale", inputs: { scale: 2.0 } },
 
     // ── warm rim (toon*0.5+0.5 → cardinal ramp) ──
     { id: "warm_mul", type: "math/multiply", inputs: { b: 0.5 } },

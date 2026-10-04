@@ -79,7 +79,14 @@ import {
 } from "./shaders/lights"
 import { buildLightGrid } from "./light-grid"
 import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
-import { outlineShaderWgsl, RZ_OUTLINE_COLOR_OFFSET, RZ_OUTLINE_DISSOLVE_OFFSET, RZ_OUTLINE_WIDTH_OFFSET } from "./shaders/passes/outline"
+import {
+  outlineShaderWgsl,
+  RZ_OUTLINE_COLOR_OFFSET,
+  RZ_OUTLINE_DISSOLVE_OFFSET,
+  RZ_OUTLINE_SHADOW_OFFSET,
+  RZ_OUTLINE_TEXTURED_OFFSET,
+  RZ_OUTLINE_WIDTH_OFFSET,
+} from "./shaders/passes/outline"
 import { transparentDepthPrepassWgsl } from "./shaders/passes/depth-prepass"
 import { SELECTION_MASK_SHADER_WGSL, SELECTION_EDGE_SHADER_WGSL } from "./shaders/passes/selection"
 import { GIZMO_SHADER_WGSL } from "./shaders/passes/gizmo"
@@ -238,7 +245,7 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
       "hair", "ahoge", "bang",
     ],
   ],
-  ["body", ["肌", "皮肤", "skin"]],
+  ["body", ["肌", "皮肤", "skin", "指甲", "nail"]],
   ["metal", ["金属", "メタル", "metal", "earring", "耳环", "耳環"]],
   [
     "cloth_smooth",
@@ -284,6 +291,11 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
   ],
 ]
 
+// Whole names that are body parts — skin by another name. Whole, never
+// substrings: 手 alone is a hand, inside 手套 (gloves) or 手镯 (a bracelet) it is
+// what the hand wears; 足 is a leg, 足袋 a sock.
+const BODY_PART_NAMES = new Set(["手", "手部", "腕", "足", "脚", "腿", "爪", "hand", "hands", "arm", "arms", "leg", "legs", "body"])
+
 // Resolve a material name to a style category (override map first, then name hints), or
 // null if nothing matches — a null-resolving material stays ungrouped (neutral default).
 function resolvePreset(materialName: string, map: MaterialPresetMap | undefined): MaterialPreset | null {
@@ -293,6 +305,7 @@ function resolvePreset(materialName: string, map: MaterialPresetMap | undefined)
     }
   }
   const lower = materialName.toLowerCase()
+  if (BODY_PART_NAMES.has(lower.replace(/[\s_.\-0-9]+$/, ""))) return "body"
   for (const [preset, hints] of PRESET_NAME_HINTS) {
     for (const hint of hints) {
       if (lower.includes(hint)) return preset
@@ -642,9 +655,15 @@ export type ViewTransformOptions = {
   /** After the transform, display gamma (`pow(rgb, 1/gamma)`). */
   gamma: number
   /**
+   * The "soft" curve's power, (1 - e^(-2.5x))^contrast. Aether Gazer sets it per
+   * scene (SceneSetting._contrast): 1.4 is its common value, the character page
+   * runs 1.7. A stage brings its own; the other transforms ignore it.
+   */
+  contrast: number
+  /**
    * Which display transform the frame is formed with (composite.ts, viewTransform).
    *
-   * "soft" — Aether Gazer's own final curve, (1 - e^(-2.5x))^1.4. The default.
+   * "soft" — Aether Gazer's own final curve, (1 - e^(-2.5x))^contrast. The default.
    * "neutral" — Unity URP's Neutral, the Khronos PBR Neutral operator: colour
    *   passes through until the top fifth, which rolls off.
    * "aces" — Unity URP's ACES (RRT + ODT approximation from the Core RP).
@@ -660,6 +679,7 @@ export type ViewTransformName = "soft" | "neutral" | "aces" | "none"
 export const DEFAULT_VIEW_TRANSFORM: ViewTransformOptions = {
   exposure: 0,
   gamma: 1.0,
+  contrast: 1.4,
   transform: "soft",
 }
 
@@ -823,7 +843,9 @@ interface DrawCall {
   /** Edge-flagged materials: interleaved inverted-hull outline drawn right after
    *  this material with the outline pipeline. Shares this call's index range;
    *  own bind group (edge uniforms + diffuse texture for the alpha test). */
-  outline?: { bindGroup: GPUBindGroup }
+  /** The inverted hull: `pmx` when the PMX asked for an edge, `drawn` when it
+   *  is drawn — the PMX's, or its style group's look's outline. */
+  outline?: { bindGroup: GPUBindGroup; pmx: boolean; drawn: boolean }
   /** MODEL-SPACE AABB over this material's index range, computed at load:
    *  [minX, minY, minZ, maxX, maxY, maxZ]. Usable for culling only while the
    *  owning model is rigid (see ModelInstance.rigid) — animation moves vertices
@@ -930,6 +952,9 @@ interface ModelInstance {
    *  material buffers never reached it and a dissolved character kept her
    *  outline. Kept here so that write has somewhere to go. */
   outlineUniformBuffers: GPUBuffer[]
+  /** Each outlined material's hull block and its PMX edge (colour, size), for
+   *  a style graph's outline to take over and give back. */
+  outlineByMaterial: Map<string, { buffer: GPUBuffer; edge: Float32Array<ArrayBuffer>; picture: GPUTextureView }>
   model: Model
   /**
    * Keep simulating this model's cloth while it is HIDDEN.
@@ -2632,7 +2657,7 @@ export class Engine {
   // 15 × vec4f — see the viewU comment in composite.ts. The last one is the
   // camera's world position, which is what lets a foreground effect turn the
   // depth it is handed into a PLACE (bgWorldPos) rather than a distance.
-  private readonly compositeUniformData = new Float32Array(60)
+  private readonly compositeUniformData = new Float32Array(64)
   /** Composite background (display-space sRGB 0–1) — null = transparent canvas. */
   private backgroundColor: Vec3 | null = null
   // 360 backdrop (equirectangular skybox, sampled by view ray in composite).
@@ -3054,6 +3079,7 @@ export class Engine {
     return {
       exposure: partial?.exposure ?? d.exposure,
       gamma: partial?.gamma ?? d.gamma,
+      contrast: partial?.contrast ?? d.contrast,
       transform: partial?.transform ?? d.transform,
     }
   }
@@ -3072,7 +3098,7 @@ export class Engine {
 
   getViewTransformOptions(): ViewTransformOptions {
     const v = this.viewTransform
-    return { exposure: v.exposure, gamma: v.gamma, transform: v.transform }
+    return { exposure: v.exposure, gamma: v.gamma, contrast: v.contrast, transform: v.transform }
   }
 
   private colorGrading: ColorGradingOptions = {
@@ -3188,6 +3214,7 @@ export class Engine {
     const v = this.viewTransform
     if (patch.exposure !== undefined) v.exposure = patch.exposure
     if (patch.gamma !== undefined) v.gamma = patch.gamma
+    if (patch.contrast !== undefined) v.contrast = patch.contrast
     if (patch.transform !== undefined) v.transform = patch.transform
     if (this.device && this.compositeUniformBuffer) {
       this.writeCompositeViewUniforms()
@@ -3266,6 +3293,9 @@ export class Engine {
     u[25] = Engine.VIEW_TRANSFORM_ID[v.transform] ?? 0
     u[26] = this.canvas.width
     u[27] = this.canvas.height
+    // The soft curve's power (viewU[15].x), the scene's own (SceneSetting._contrast).
+    // Its own vec4: viewU[11..14] are the cast's positions whenever an effect runs.
+    u[60] = v.contrast
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
     // on the CPU, so the shader only ever sees slope/offset/power. Mid-gray is
     // neutral in all three; the signed distance from it is the amount.
@@ -8468,6 +8498,8 @@ export class Engine {
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
+        // the key light, for a style graph's outline colour (see outline.ts)
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
     // Outline per-instance reuses mainPerInstanceBindGroupLayout (same skinMats binding)
@@ -8476,6 +8508,7 @@ export class Engine {
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     })
 
@@ -8494,6 +8527,7 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
         { binding: 1, resource: this.materialSampler },
+        { binding: 2, resource: { buffer: this.lightUniformBuffer } },
       ],
     })
 
@@ -8507,6 +8541,7 @@ export class Engine {
       entries: [
         { binding: 0, resource: { buffer: this.mirrorCameraBuffer } },
         { binding: 1, resource: this.materialSampler },
+        { binding: 2, resource: { buffer: this.lightUniformBuffer } },
       ],
     })
 
@@ -8694,13 +8729,14 @@ export class Engine {
     // strength belong to the combine step.
     this.compositeUniformBuffer = this.device.createBuffer({
       label: "composite view uniforms",
-      // 15 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
+      // 16 × vec4f: (exposure, invGamma, _, _) · (bloom tint, intensity) ·
       // (bg rgb, mode) · camera right/up/forward basis for the 360 skybox ray ·
       // (time, _, canvas width, canvas height) for user effects · three grade
       // vectors (CDL offset+contrast, power+saturation, slope+flag) · camera
       // world position, for an effect placing itself in the scene · four
-      // character positions, for one that wants to respond to the cast.
-      size: 240,
+      // character positions, for one that wants to respond to the cast · the
+      // soft curve's contrast. Shaders that stop at the cast declare 15.
+      size: 256,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.dofUniformBuffer = this.device.createBuffer({
@@ -14894,6 +14930,7 @@ export class Engine {
       dissolve: 1,
       materialUniformBuffers: [],
       outlineUniformBuffers: [],
+      outlineByMaterial: new Map(),
       cullModelIndex: 0,
       // Seeded false: the first skin-matrix upload decides it, and until then the
       // sphere path is the safe answer (it never culls something it should not).
@@ -15535,8 +15572,12 @@ export class Engine {
       // every material — on the heaviest mesh in the scene that doubles the
       // geometry submitted per frame to draw cartoon outlines around
       // architecture, which is not the look anyone is after.
+      // Every character material gets its hull: the PMX edge flag draws it as
+      // MMD does, and a style group whose look carries an outline draws it on
+      // any material (assignDrawCallGroups sets `drawn`).
       let outline: DrawCall["outline"]
-      if (!inst.isStage && (mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0) {
+      const pmxEdge = (mat.edgeFlag & 0x10) !== 0 && mat.edgeSize > 0
+      if (!inst.isStage) {
         const materialUniformData = new Float32Array([
           mat.edgeColor[0],
           mat.edgeColor[1],
@@ -15551,25 +15592,29 @@ export class Engine {
           1,
           // The scene's width multiplier, at RZ_OUTLINE_WIDTH_OFFSET.
           this.outlineWidth,
+          // A style graph's outline, at RZ_OUTLINE_TEXTURED_OFFSET: none yet.
           0,
           // The scene's colour override, at RZ_OUTLINE_COLOR_OFFSET.
           this.outlineColor[0],
           this.outlineColor[1],
           this.outlineColor[2],
           this.outlineColor[3],
+          // The graph outline's shadow colour, at RZ_OUTLINE_SHADOW_OFFSET.
+          0,
+          0,
+          0,
+          0,
         ])
         const outlineUniformBuffer = this.createUniformBuffer(`${prefix}outline: ${mat.name}`, materialUniformData)
         inst.gpuBuffers.push(outlineUniformBuffer)
         inst.outlineUniformBuffers.push(outlineUniformBuffer)
-        const outlineBindGroup = this.device.createBindGroup({
-          label: `${prefix}outline: ${mat.name}`,
-          layout: this.outlinePerMaterialBindGroupLayout,
-          entries: [
-            { binding: 0, resource: { buffer: outlineUniformBuffer } },
-            { binding: 1, resource: textureView },
-          ],
+        inst.outlineByMaterial.set(mat.name, {
+          buffer: outlineUniformBuffer,
+          edge: materialUniformData.slice(0, 5),
+          picture: textureView,
         })
-        outline = { bindGroup: outlineBindGroup }
+        const outlineBindGroup = this.outlineBindGroup(`${prefix}outline: ${mat.name}`, outlineUniformBuffer, textureView, null)
+        outline = { bindGroup: outlineBindGroup, pmx: pmxEdge, drawn: pmxEdge }
         if (!inst.outlineVertexBuffer) {
           const data = inst.model.getOutlineVertices()
           const buf = this.device.createBuffer({
@@ -18109,8 +18154,45 @@ export class Engine {
 
   // Rebind each material draw call to its (successfully-installed) group's uniform buffer,
   // or the zero buffer when ungrouped, then re-sort by render-class draw order.
+  /** A hull's per-material group: its block, the picture, the look's tint. */
+  private outlineBindGroup(label: string, buffer: GPUBuffer, picture: GPUTextureView, tint: GPUTexture | null): GPUBindGroup {
+    return this.device.createBindGroup({
+      label,
+      layout: this.outlinePerMaterialBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer } },
+        { binding: 1, resource: picture },
+        { binding: 2, resource: (tint ?? this.fallbackMaterialTexture).createView() },
+      ],
+    })
+  }
+
   private assignDrawCallGroups(inst: ModelInstance, claimed: Map<string, string>): void {
     inst.materialToGroup.clear()
+    // The hulls: a group whose look carries an outline (ShaderGraph.outline)
+    // draws it in place of the PMX edge; the rest keep, or get back, their own.
+    for (const [name, hull] of inst.outlineByMaterial) {
+      const id = claimed.get(name)
+      const install = id ? inst.styleGroups.get(id) : undefined
+      const o = install?.group.graph.outline
+      const block = o
+        ? new Float32Array([o.color[0], o.color[1], o.color[2], 1, o.width])
+        : hull.edge
+      this.device.queue.writeBuffer(hull.buffer, 0, block)
+      this.device.queue.writeBuffer(hull.buffer, RZ_OUTLINE_TEXTURED_OFFSET, new Float32Array([o ? 1 : 0]))
+      if (o) this.device.queue.writeBuffer(hull.buffer, RZ_OUTLINE_SHADOW_OFFSET, new Float32Array([...o.shadowColor, 1]))
+      const tint = o?.tint != null ? (install?.imagesByMaterial?.[name] ?? install?.images)?.[o.tint] ?? null : null
+      for (const dc of inst.drawCalls) {
+        if (dc.materialName !== name || !dc.outline) continue
+        dc.outline.bindGroup = this.outlineBindGroup(`outline: ${name}`, hull.buffer, hull.picture, tint)
+        this.bundlesDirty = true
+        const drawn = o ? o.width > 0 : dc.outline.pmx
+        if (dc.outline.drawn !== drawn) {
+          dc.outline.drawn = drawn
+          this.bundlesDirty = true
+        }
+      }
+    }
     for (const dc of inst.drawCalls) {
       if (!dc.baseBindGroupEntries) continue // outlines/ground are never grouped
       const wantId = claimed.get(dc.materialName)
@@ -18609,7 +18691,7 @@ export class Engine {
       }
       pass.setBindGroup(2, draw.bindGroup)
       this.issueDraw(pass, draw, view.args)
-      if (draw.outline && this.outlineEnabled && view.outlines) outlined.push(draw)
+      if (draw.outline?.drawn && this.outlineEnabled && view.outlines) outlined.push(draw)
     }
     // THE HULLS AFTER THE SURFACES, as MMD draws a model's edges. A hull held
     // at the minimum width is faded, and it still writes depth: drawn between
