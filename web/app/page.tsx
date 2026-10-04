@@ -103,6 +103,17 @@ const EYES: EyeTrackingOptions = {}
 
 /** The orbit centre sits this far above her root. */
 const CAMERA_OFFSET = new Vec3(0, 11.5, 0)
+
+/** A hex colour as display-space sRGB 0–1, and as linear light (reze-design's hexToLinearVec3). */
+const srgb = (hex: string) => {
+  const n = parseInt(hex.replace("#", ""), 16)
+  return new Vec3(((n >> 16) & 0xff) / 255, ((n >> 8) & 0xff) / 255, (n & 0xff) / 255)
+}
+const linear = (hex: string) => {
+  const c = srgb(hex)
+  const f = (v: number) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4))
+  return new Vec3(f(c.x), f(c.y), f(c.z))
+}
 /** Seconds the camera takes to move from the spawn onto her once the entrance hands over. */
 const CAMERA_GLIDE = 0.4
 
@@ -711,11 +722,15 @@ export default function Home() {
     try {
       const engine = new Engine(canvasRef.current, {
         camera: { distance: 33, target: new Vec3(0, CAMERA_OFFSET.y, 0) },
-        bloom: { color: new Vec3(0.75, 0.82, 1.0) },
-        // reze-design's sun: azimuth 205°, elevation 21° (azElToDirection), strength 2.
-        sun: { strength: 2.0, direction: new Vec3(0.3946, -0.3584, 0.8462) },
-        // tailwind blue-200, display-space sRGB
-        background: new Vec3(0.749, 0.859, 0.996),
+        // reze-design's default scene, as its look reads: the magenta world at
+        // 0.66, the white sun at 0.64 from azimuth 205°, elevation 21°
+        // (azElToDirection), the game's bloom in the demo's pink, the soft view.
+        world: { color: linear("#ed6aff"), strength: 0.66 },
+        sun: { color: new Vec3(1, 1, 1), strength: 0.64, direction: new Vec3(0.3946, -0.3584, 0.8462) },
+        bloom: { enabled: true, threshold: 0.7, scatter: 0.8, intensity: 1, color: linear("#ffc9c9") },
+        view: { transform: "soft", exposure: 0 },
+        // the default scene's backdrop, display-space sRGB
+        background: srgb("#f6cfff"),
         // Double-click (desktop) / tap (touch) on her → a touch reaction. Only
         // from rest: mid-run and mid-dance taps are ignored. Tapping during a
         // reaction rolls a new one.
@@ -735,12 +750,12 @@ export default function Home() {
       // Stage first: ground up and the render loop painting before any model or
       // VMD bytes arrive — she pops in styled once ready.
       engine.addGround({
-        // tailwind blue-400 in linear light
-        diffuseColor: new Vec3(0.116, 0.384, 0.956),
-        gridLineColor: new Vec3(0.95, 0.96, 1.0),
-        gridLineOpacity: 0.5,
+        // the default scene's ground: purple at 0.48 under a light grid
+        diffuseColor: linear("#c800de"),
+        gridLineColor: linear("#fafaf9"),
+        gridLineOpacity: 0.4,
         noiseStrength: 0.02,
-        opacity: 1,
+        opacity: 0.48,
         // Kept modest: the far grid aliases into a shimmering band at horizon
         // distances. The fade starts early and ramps long so the ground melts
         // into the backdrop instead of meeting it at a visible horizon line.
