@@ -12,6 +12,11 @@
  */
 export const ASSETS = process.env.NODE_ENV === "production" ? "https://assets.reze.one/demo/reze-engine" : ""
 
+/** The motion, gzipped in the bucket (Content-Encoding: gzip, unpacked by the
+ *  browser): R2 serves a VMD as application/octet-stream, which Cloudflare
+ *  never compresses, and the 13 clips are 18.5MB raw against 3.2MB packed. */
+export const ANIMATIONS = process.env.NODE_ENV === "production" ? `${ASSETS}/animations-gz` : "/animations"
+
 /** The cast, shared by every site (reze.design reads the same Reze) rather than
  *  copied into each one's folder. `next dev` reads the same models out of
  *  `public/models/reze`.

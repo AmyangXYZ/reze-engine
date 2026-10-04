@@ -19,7 +19,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Bomb } from "lucide-react"
 import Loading from "@/components/loading"
-import { ASSETS, CAST } from "@/lib/assets"
+import { ANIMATIONS, ASSETS, CAST } from "@/lib/assets"
 
 // One playable Reze: WASD or the wheel to run, Space or the button to dance,
 // Shift or the bomb to turn into the Bomb Devil and back, double-click her for
@@ -36,8 +36,6 @@ const CAST_STYLE: MaterialPresetMap = {
   cloth_smooth: ["bozi", "choker"],
   cloth_rough: ["Rubber", "Leather"],
 }
-
-const ANIMATIONS = `${ASSETS}/animations`
 
 // Locomotion: a stand loop, a run loop, and the stop played when a run is
 // released. The run and stop carry their authored root travel; loading lifts it
