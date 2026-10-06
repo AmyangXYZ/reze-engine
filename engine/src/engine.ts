@@ -17144,28 +17144,25 @@ export class Engine {
           py += pos.y
           pz += pos.z
         }
-        px += this.cameraTargetOffset.x
-        py += this.cameraTargetOffset.y
-        pz += this.cameraTargetOffset.z
         const tau = this.cameraFollowSmoothing
+        const f = this.cameraFollowPos
         if (tau > 0 && this.cameraFollowSeeded) {
           // Exponential lag toward the bone: the handheld-camera feel. The
           // orbit pivot trails the target and eases in, never snapping.
           const k = 1 - Math.exp(-deltaTime / tau)
-          const f = this.cameraFollowPos
           f.x += (px - f.x) * k
           f.y += (py - f.y) * k
           f.z += (pz - f.z) * k
-          this.camera.target.x = f.x
-          this.camera.target.y = f.y
-          this.camera.target.z = f.z
         } else {
-          this.cameraFollowPos.setXYZ(px, py, pz)
+          f.setXYZ(px, py, pz)
           this.cameraFollowSeeded = true
-          this.camera.target.x = px
-          this.camera.target.y = py
-          this.camera.target.z = pz
         }
+        // The offset goes on AFTER the lag. A pan writes the offset (panSink),
+        // and the lag is for the bone's motion: eased with it, a pan glided
+        // on after the hand let go while an orbit stopped dead.
+        this.camera.target.x = f.x + this.cameraTargetOffset.x
+        this.camera.target.y = f.y + this.cameraTargetOffset.y
+        this.camera.target.z = f.z + this.cameraTargetOffset.z
       }
     }
 

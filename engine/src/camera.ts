@@ -74,7 +74,8 @@ export class Camera {
 
   // Camera settings
   angularSensitivity: number = 0.005
-  panSensitivity: number = 0.0002 // Sensitivity for right-click panning
+  panSensitivity: number = 0.0003 // Sensitivity for right-click panning
+  static readonly PAN_REF_RADIUS = 33
   wheelPrecision: number = 0.01
   pinchPrecision: number = 0.05
   minZ: number = 0.05
@@ -335,10 +336,13 @@ export class Camera {
   private panCamera(deltaX: number, deltaY: number) {
     const { right, up } = this.getCameraVectors()
 
-    // Calculate pan distance based on camera distance
-    // The pan amount is proportional to the camera distance (radius) for consistent feel
-    // This makes panning feel natural at all zoom levels
-    const panDistance = this.radius * this.panSensitivity
+    // Pan scales with camera distance, so a drag covers the same share of the
+    // frame at every zoom from PAN_REF_RADIUS out. Closer in it shrinks slower
+    // than the distance (power 0.7): a close-up pans a little faster across the
+    // frame — 1.4x at distance 10, 1.8x at 5 — instead of crawling.
+    const r = this.radius
+    const ref = Camera.PAN_REF_RADIUS
+    const panDistance = (r >= ref ? r : ref * Math.pow(Math.max(r, 0) / ref, 0.7)) * this.panSensitivity
 
     // Horizontal movement: drag right pans left (opposite direction)
     // Vertical movement: drag up pans up (positive up vector)
