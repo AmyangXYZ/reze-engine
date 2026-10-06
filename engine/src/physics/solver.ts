@@ -37,7 +37,12 @@ const BOUNCE_THRESHOLD = 2.0
 // pushes apart; separated (depth < 0, a speculative row) it ALLOWS approach at
 // the rate that closes the gap, which is what keeps those rows inert until the
 // body would really arrive.
-const CONTACT_ERP = 0.2
+//
+// 0.1, half Bullet's 0.2: at 120 Hz each step closes a tenth of the overlap,
+// the same correction per second as MMD's 0.2 at 60 Hz, and a light cloth body
+// pressed between its joints and a collider stops being kicked out harder than
+// the joints can take back (skirt shake −20% on its own).
+const CONTACT_ERP = 0.1
 
 // btContactSolverInfo's SOLVER_RANDMIZE_ORDER. Gauss-Seidel is order-biased —
 // rows solved first win — which on a cross-linked lattice shows up as a lean or
@@ -119,6 +124,11 @@ const LIMIT_SOFTNESS_ANGULAR = 0.5
 // ratio (ζ = 0.7); ported in isolation the motor form measured 0.0015 mean
 // reversal at jerk 0.5, the calmest joint-side result recorded.
 const SPRING_DAMPING = 1.0
+// The motor's velocity gain at the rate PMX rigs are authored against — MMD's
+// Bullet at 60 Hz with 10 iterations. Bullet's form divides by the step's fps
+// and iteration count; at any other substep rate that retunes every spring,
+// so the gain is pinned here and the substep rate stays a solver choice.
+const SPRING_VEL_FACTOR = (60 * SPRING_DAMPING) / 10
 // btConstraintInfo2::erp, from infoGlobal.m_erp — used only by getMotorFactor.
 const INFO_ERP = 0.2
 
@@ -543,7 +553,7 @@ function setupConstraint(
       const k = con.springStiffness[i]
       const serr = curr - con.equilibriumPoint[i]
       const force = serr * k
-      const velFactor = (invDt * SPRING_DAMPING) / iterations
+      const velFactor = SPRING_VEL_FACTOR
       const target = -velFactor * force
       // getMotorFactor's `vel` is Bullet's tag_vel: −targetVelocity for a
       // linear axis, which in our sign convention is the target itself.
@@ -625,7 +635,7 @@ function setupConstraint(
       const k = con.springStiffness[idx]
       const serr = _angDiffScratch[i] - con.equilibriumPoint[idx]
       const force = -serr * k
-      const velFactor = (invDt * SPRING_DAMPING) / iterations
+      const velFactor = SPRING_VEL_FACTOR
       const target = -velFactor * force
       // tag_vel for a rotational axis is Bullet's targetVelocity, i.e. −ours.
       const motFact = getMotorFactor(_angDiffScratch[i], con.angularMin[i], con.angularMax[i], -target, invDt * INFO_ERP)

@@ -1397,7 +1397,10 @@ function flipOneNormal(c: Contact): void {
 // see RigidBodyStore.getCollisionPairs. SAP / dynamic AABB tree pay off
 // above ~500 bodies; below that this flat sweep wins on cache locality.
 export function findContacts(store: RigidBodyStore, pool: ContactPool): void {
-  store.updateAabbs()
+  // Inflated by the contact margin and no more: a narrowphase only ever makes
+  // a contact within CONTACT_MARGIN, so a fatter box only bought SAT tests on
+  // pairs that could never touch — at 0.5 that was most of the collision cost.
+  store.updateAabbs(CONTACT_MARGIN + 0.01)
   const pairs = store.getCollisionPairs()
   for (let p = 0; p < pairs.length; p += 2) {
     const i = pairs[p]
