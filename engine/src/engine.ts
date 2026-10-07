@@ -967,6 +967,10 @@ interface ModelInstance {
    * change reads as a glitch rather than as a cut.
    */
   simulateWhileHidden: boolean
+  /** The host's per-model switch over the shadow map — see setModelCastShadow.
+   *  Off drops every draw from the shadow list; on hands it back to the PMX
+   *  flag on each material. */
+  castShadow: boolean
   basePath: string
   assetReader: AssetReader
   gpuBuffers: GPUBuffer[]
@@ -13482,6 +13486,27 @@ export class Engine {
     return true
   }
 
+  /**
+   * Whether one model casts a shadow at all.
+   *
+   * Off takes it out of the shadow map, the shadow the cast lays on a stage and
+   * the caster sphere the floor fits its shadow to; it still receives shadows
+   * from everything else. On defers to the PMX author's flag per material, so a
+   * material its author excluded stays excluded.
+   */
+  setModelCastShadow(modelName: string, on: boolean): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    if (inst.castShadow === on) return true
+    inst.castShadow = on
+    this.sortDrawCalls(inst)
+    return true
+  }
+
+  getModelCastShadow(modelName: string): boolean {
+    return this.modelInstances.get(modelName)?.castShadow ?? true
+  }
+
   getPhysicsFloor(): boolean {
     return this.physicsFloor
   }
@@ -13732,7 +13757,7 @@ export class Engine {
       this.cullMetaF32[f + 4] = b[3]
       this.cullMetaF32[f + 5] = b[4]
       this.cullMetaF32[f + 6] = b[5]
-      this.cullMetaU32[f + 7] = draw.castsShadow === true ? Engine.CULL_DRAW_CASTS_SHADOW : 0
+      this.cullMetaU32[f + 7] = inst.castShadow && draw.castsShadow === true ? Engine.CULL_DRAW_CASTS_SHADOW : 0
       // Everything but instanceCount is structural, so the compute never writes
       // it — one fewer store per draw per frame, and the args stay readable in a
       // capture as "this is the draw, that is whether it survived".
@@ -14889,6 +14914,7 @@ export class Engine {
       name,
       model,
       simulateWhileHidden: false,
+      castShadow: true,
       basePath,
       assetReader,
       gpuBuffers,
@@ -18265,9 +18291,9 @@ export class Engine {
     inst.drawCalls.sort(
       (a, b) => typeOrder[a.type] - typeOrder[b.type] || this.drawCallRank(inst, a) - this.drawCallRank(inst, b),
     )
-    inst.shadowDrawCalls = inst.drawCalls.filter(
-      (d) => (d.type === "opaque" || d.type === "transparent") && d.castsShadow === true,
-    )
+    inst.shadowDrawCalls = inst.castShadow
+      ? inst.drawCalls.filter((d) => (d.type === "opaque" || d.type === "transparent") && d.castsShadow === true)
+      : []
     // The sort reorders drawCalls, and a draw's position in that array is its
     // slot in every cull buffer.
     this.cullListDirty = true

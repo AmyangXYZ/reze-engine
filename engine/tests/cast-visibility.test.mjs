@@ -41,3 +41,17 @@ test("cloth keeps moving while hidden only when asked", () => {
   const setter = engine.slice(engine.indexOf("setModelPhysicsWhileHidden(modelName"))
   assert.match(setter.slice(0, 260), /inst\.simulateWhileHidden = on/, "the setter writes it")
 })
+
+test("a model's cast shadow is the host's switch over the PMX flag", () => {
+  assert.match(engine, /simulateWhileHidden: false,\n\s+castShadow: true,/, "on by default")
+  assert.match(
+    engine,
+    /inst\.shadowDrawCalls = inst\.castShadow\n\s+\? inst\.drawCalls\.filter\(\(d\) => \(d\.type === "opaque" \|\| d\.type === "transparent"\) && d\.castsShadow === true\)\n\s+: \[\]/,
+    "off empties the shadow list every pass and the caster sphere read",
+  )
+  assert.match(
+    engine,
+    /inst\.castShadow && draw\.castsShadow === true \? Engine\.CULL_DRAW_CASTS_SHADOW : 0/,
+    "the cull's shadow bit agrees with the list",
+  )
+})
