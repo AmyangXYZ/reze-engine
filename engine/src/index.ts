@@ -23,6 +23,8 @@ export {
   RENDERING_LAYER_DEFAULT,
   RENDERING_LAYER_CHARACTER,
   type ModelAttachment,
+  type SceneAovs,
+  type LightProbe,
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,
@@ -227,3 +229,5 @@ export type { EyeTrackingOptions } from "./model"
 export type { NativeStagePackage, NativeStageReader } from "./unity/stage"
 export type { NativeLook, NativeMaterialSpec, NativeTexture } from "./unity/looks"
 export type { NativeShader, NativeShaderInfo } from "./unity/host"
+export { AOV_PIXEL_FIELDS, AOV_PIXEL_STRIDE } from "./shaders/passes/aov"
+export { GROUND_MATERIAL_ID, GROUND_OBJECT_ID } from "./shaders/passes/ground"

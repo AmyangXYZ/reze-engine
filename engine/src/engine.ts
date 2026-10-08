@@ -27,6 +27,7 @@ import {
 } from "./asset-reader"
 import { SHADOW_DEPTH_SHADER_WGSL } from "./shaders/passes/shadow"
 import { ID_DEBUG_SHADER_WGSL } from "./shaders/passes/id-debug"
+import { AOV_PIXELS_WGSL, AOV_PIXEL_FIELDS, AOV_PIXEL_STRIDE, AOV_PROBE_HEAD, AOV_PROBE_STRIDE, AOV_PROBE_WGSL } from "./shaders/passes/aov"
 import { paramChanged, sampleParamTrack, type ParamKey, type ParamValue } from "./param-track"
 import {
   advanceSim,
@@ -471,6 +472,38 @@ export type ModelTransform = {
 }
 
 /** How a model rides another — MMD's 外部親 (outside parent). See setModelParent. */
+/**
+ * The frame read back as numbers (Engine.readAovs). `data` holds `stride`
+ * floats per texel, row-major from the top-left, named by `fields`; `ids` one
+ * word per texel, material id in the low 16 bits and object id in the high
+ * (Engine.getIdLegend names them; 0 is nothing). Colour is LINEAR and before
+ * `exposure` (stops) is applied.
+ */
+export type SceneAovs = {
+  width: number
+  height: number
+  stride: number
+  fields: typeof AOV_PIXEL_FIELDS
+  data: Float32Array
+  ids: Uint32Array
+  exposure: number
+}
+
+/** The light arriving at one point (Engine.probeLight). Colours are linear
+ *  light, before the surface's albedo: the sun's is its colour times strength,
+ *  unshadowed and unfaced — multiply by sunShadow and max(sunFacing, 0). */
+export type LightProbe = {
+  sunShadow: number
+  sunFacing: number
+  sun: [number, number, number]
+  ambient: [number, number, number]
+  /** Each lamp's light here, in the engine's lamp order. */
+  lamps: [number, number, number][]
+  /** How many of `lamps` are the document's (setLights, non-directional, in
+   *  order); the rest an effect emits. */
+  documentLamps: number
+}
+
 export type ModelAttachment = {
   /** Model key of the parent. */
   model: string
@@ -2279,6 +2312,11 @@ export class Engine {
   private idDebugBindGroupLayout: GPUBindGroupLayout | null = null
   private idDebugBindGroup: GPUBindGroup | null = null
   private idDebug = false
+  /** Store ids and depth for readAovs — see setAovCapture. */
+  private aovCapture = false
+  private aovPixelsPipeline: GPUComputePipeline | null = null
+  private aovProbePipeline: GPUComputePipeline | null = null
+  private aovSampler: GPUSampler | null = null
   private multisampleMaskTexture!: GPUTexture
   private maskResolveTexture!: GPUTexture
   private maskResolveView!: GPUTextureView
@@ -3423,6 +3461,189 @@ export class Engine {
   /** True when the id attachment exists on this device. */
   hasObjectIds(): boolean {
     return this.idView !== null
+  }
+
+  /**
+   * Keep the frame's ids and depth for readAovs.
+   *
+   * Both are discarded at the end of an ordinary frame (see the store ops in
+   * renderFrame); while this is on they are stored, on exactly the terms the
+   * id-debug view and a masking effect already get. Turn it on, render the
+   * frame to measure, read it, turn it off — the stores cost real bandwidth
+   * and nothing else reads them.
+   *
+   * Returns false when the device has no id attachment, in which case
+   * readAovs answers null.
+   */
+  setAovCapture(on: boolean): boolean {
+    this.aovCapture = on && this.idView !== null
+    return this.aovCapture || !on
+  }
+
+  /**
+   * What drew each id: the model's object id, and its materials' ids in the
+   * order the id attachment counts them (materials that produced a draw,
+   * 1-based). The floor is GROUND_OBJECT_ID / GROUND_MATERIAL_ID.
+   */
+  getIdLegend(): { objectId: number; model: string; materials: { id: number; name: string }[] }[] {
+    const out: { objectId: number; model: string; materials: { id: number; name: string }[] }[] = []
+    for (const [name, inst] of this.modelInstances) {
+      const materials: { id: number; name: string }[] = []
+      let id = 0
+      for (const mat of inst.model.getMaterials()) {
+        if (mat.vertexCount === 0) continue
+        materials.push({ id: ++id, name: mat.name })
+      }
+      out.push({ objectId: inst.objectId, model: name, materials })
+    }
+    return out
+  }
+
+  /**
+   * The last frame, as numbers: per texel its linear colour, what drew it, how
+   * far it is, and the light arriving there — the sun's shadow and facing, the
+   * lamps', the world's. See shaders/passes/aov.ts for what each field is and
+   * how the normal is rebuilt.
+   *
+   * Reads the frame ALREADY RENDERED, at the render size it was rendered at:
+   * call it after renderFrame with setAovCapture on, before anything renders
+   * again (a capture stops the loop for exactly this). Null when the device
+   * has no id attachment or capture was not on.
+   */
+  async readAovs(): Promise<SceneAovs | null> {
+    if (!this.aovCapture || !this.idView || !this.depthReadView || !this.camera) return null
+    const width = this.hdrResolveTexture.width
+    const height = this.hdrResolveTexture.height
+    const pipeline = this.aovPixelsPipeline ??= this.device.createComputePipeline({
+      label: "aov pixels",
+      layout: "auto",
+      compute: { module: this.device.createShaderModule({ label: "aov pixels", code: AOV_PIXELS_WGSL }), entryPoint: "pixels" },
+    })
+
+    const invVP = this.camera.getProjectionMatrix().multiply(this.camera.getViewMatrix()).inverse().values
+    const eye = this.camera.getPosition()
+    const uniform = new ArrayBuffer(64 + 16 + 16)
+    new Float32Array(uniform, 0, 16).set(invVP)
+    new Float32Array(uniform, 64, 4).set([eye.x, eye.y, eye.z, 1])
+    new Uint32Array(uniform, 80, 4).set([width, height, 0, 0])
+    const ubuf = this.device.createBuffer({ label: "aov uniforms", size: uniform.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+    this.device.queue.writeBuffer(ubuf, 0, uniform)
+
+    const texels = width * height
+    const fBytes = texels * AOV_PIXEL_STRIDE * 4
+    const idBytes = texels * 4
+    const fBuf = this.device.createBuffer({ label: "aov out", size: fBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const idBuf = this.device.createBuffer({ label: "aov ids", size: idBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const fRead = this.device.createBuffer({ label: "aov out read", size: fBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const idRead = this.device.createBuffer({ label: "aov ids read", size: idBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+
+    const bind = this.device.createBindGroup({
+      label: "aov pixels",
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        ...this.aovLightEntries(),
+        { binding: 7, resource: this.idView },
+        { binding: 8, resource: this.depthReadView },
+        { binding: 9, resource: this.hdrResolveTexture.createView() },
+        { binding: 10, resource: { buffer: ubuf } },
+        { binding: 11, resource: { buffer: fBuf } },
+        { binding: 12, resource: { buffer: idBuf } },
+      ],
+    })
+    const encoder = this.device.createCommandEncoder({ label: "aov pixels" })
+    const pass = encoder.beginComputePass({ label: "aov pixels" })
+    pass.setPipeline(pipeline)
+    pass.setBindGroup(0, bind)
+    pass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8))
+    pass.end()
+    encoder.copyBufferToBuffer(fBuf, 0, fRead, 0, fBytes)
+    encoder.copyBufferToBuffer(idBuf, 0, idRead, 0, idBytes)
+    this.device.queue.submit([encoder.finish()])
+
+    try {
+      await Promise.all([fRead.mapAsync(GPUMapMode.READ), idRead.mapAsync(GPUMapMode.READ)])
+      const f = new Float32Array(fRead.getMappedRange().slice(0))
+      const ids = new Uint32Array(idRead.getMappedRange().slice(0))
+      const exposure = this.getViewTransformOptions().exposure ?? 0
+      return { width, height, stride: AOV_PIXEL_STRIDE, fields: AOV_PIXEL_FIELDS, data: f, ids, exposure }
+    } finally {
+      for (const b of [ubuf, fBuf, idBuf, fRead, idRead]) b.destroy()
+    }
+  }
+
+  /**
+   * The light arriving at points the caller names — a face, a hand, a spot on
+   * the floor — facing the normal given: the sun's shadow, facing and colour,
+   * the world's ambient, and EACH LAMP'S share kept apart, in the order the
+   * engine holds them (the document's lamps first, as setLights got them,
+   * then any an effect emits).
+   *
+   * Reads the shadow atlas and lamp records of the last frame rendered.
+   */
+  async probeLight(points: readonly { position: { x: number; y: number; z: number }; normal: { x: number; y: number; z: number } }[]): Promise<LightProbe[]> {
+    if (points.length === 0) return []
+    const pipeline = this.aovProbePipeline ??= this.device.createComputePipeline({
+      label: "aov probe",
+      layout: "auto",
+      compute: { module: this.device.createShaderModule({ label: "aov probe", code: AOV_PROBE_WGSL }), entryPoint: "probe" },
+    })
+    const data = new Float32Array(points.length * 8)
+    points.forEach((pt, i) => data.set([pt.position.x, pt.position.y, pt.position.z, 1, pt.normal.x, pt.normal.y, pt.normal.z, 0], i * 8))
+    const inBuf = this.device.createBuffer({ label: "aov probe points", size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+    this.device.queue.writeBuffer(inBuf, 0, data)
+    const outBytes = points.length * AOV_PROBE_STRIDE * 4
+    const outBuf = this.device.createBuffer({ label: "aov probe out", size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const readBuf = this.device.createBuffer({ label: "aov probe read", size: outBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const bind = this.device.createBindGroup({
+      label: "aov probe",
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [...this.aovLightEntries(), { binding: 7, resource: { buffer: inBuf } }, { binding: 8, resource: { buffer: outBuf } }],
+    })
+    const encoder = this.device.createCommandEncoder({ label: "aov probe" })
+    const pass = encoder.beginComputePass({ label: "aov probe" })
+    pass.setPipeline(pipeline)
+    pass.setBindGroup(0, bind)
+    pass.dispatchWorkgroups(points.length)
+    pass.end()
+    encoder.copyBufferToBuffer(outBuf, 0, readBuf, 0, outBytes)
+    this.device.queue.submit([encoder.finish()])
+    try {
+      await readBuf.mapAsync(GPUMapMode.READ)
+      const f = new Float32Array(readBuf.getMappedRange().slice(0))
+      return points.map((_, i) => {
+        const o = i * AOV_PROBE_STRIDE
+        const count = Math.round(f[o + 8])
+        const lamps: [number, number, number][] = []
+        for (let l = 0; l < count; l++) {
+          const b = o + AOV_PROBE_HEAD + l * 4
+          lamps.push([f[b], f[b + 1], f[b + 2]])
+        }
+        return {
+          sunShadow: f[o],
+          sunFacing: f[o + 1],
+          sun: [f[o + 2], f[o + 3], f[o + 4]],
+          ambient: [f[o + 5], f[o + 6], f[o + 7]],
+          lamps,
+          documentLamps: Math.round(f[o + 9]),
+        }
+      })
+    } finally {
+      for (const b of [inBuf, outBuf, readBuf]) b.destroy()
+    }
+  }
+
+  /** The scene light API and the lamps, as aov.ts's prelude binds them. */
+  private aovLightEntries(): GPUBindGroupEntry[] {
+    this.aovSampler ??= this.device.createSampler({ label: "aov cookie sampler", magFilter: "linear", minFilter: "linear" })
+    return [
+      { binding: 0, resource: { buffer: this.lightUniformBuffer } },
+      { binding: 1, resource: { buffer: this.shadowLightVPBuffer } },
+      { binding: 2, resource: this.shadowAtlasView },
+      { binding: 3, resource: this.shadowComparisonSampler },
+      { binding: 4, resource: { buffer: this.lightsBuffer } },
+      { binding: 5, resource: this.cookieView },
+      { binding: 6, resource: this.aovSampler },
+    ]
   }
 
   /** The pass that draws it, built lazily so a scene that never asks for the
@@ -7098,6 +7319,12 @@ export class Engine {
    * frame. Nothing recompiles, so this is safe to drive per frame from a
    * timeline.
    */
+  /** How many effects are installed — the indices setEffectInfluence and its
+   *  siblings address are 0 up to this. */
+  getEffectCount(): number {
+    return this.effects.length
+  }
+
   setEffectInfluence(index: number, influence: number): void {
     const fx = this.effects[index]
     if (!fx) return
@@ -17246,7 +17473,7 @@ export class Engine {
     // The scattering pass is the third reader: it rejects taps across a depth
     // step and scales its width by distance, so a scene wearing a subsurface
     // look stores depth for as long as it does.
-    const depthRead = dofOn || this.effects.some((e) => e.hasForeground) || this.subsurfaceInUse()
+    const depthRead = dofOn || this.aovCapture || this.effects.some((e) => e.hasForeground) || this.subsurfaceInUse()
     this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
     if (depthRead) this.writeDepthOfFieldUniforms()
 
@@ -17268,7 +17495,7 @@ export class Engine {
     if (idAtt) {
       // The flood seeds from the id attachment, so an effect that reads only the
       // DISTANCE still needs the ids kept — it just never names them itself.
-      const idsRead = this.idDebug || this.effects.some((e) => e.readsIds || e.readsCastDistance)
+      const idsRead = this.idDebug || this.aovCapture || this.effects.some((e) => e.readsIds || e.readsCastDistance)
       idAtt.storeOp = idsRead ? "store" : "discard"
     }
 
