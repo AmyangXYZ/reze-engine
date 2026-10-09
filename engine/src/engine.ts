@@ -13783,7 +13783,7 @@ export class Engine {
       // pass entirely while it is idle. Morph changes still come through, since
       // that is the one thing a stage's controls do move. A prop idles the same
       // way while it stands on its own; hung from a hand it moves every frame.
-      const stageIdle = (inst.isStage || inst.isPlane || inst.isProp) && !attached && inst.model.isIdle()
+      const stageIdle = (inst.isStage || inst.isPlane || inst.isProp) && !attached && !inst.physics && inst.model.isIdle()
       let verticesChanged = false
       if (!stageIdle) {
         // The camera in the model's own space, for the eyes — the placement
