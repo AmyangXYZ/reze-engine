@@ -239,7 +239,7 @@ struct RzJelly {
 /**
  * Where the jelly puts an iris vertex. The iris is the part of the eye the eye
  * bones carry, so it is moved as a whole, in bind space before skinning:
- * flattened about its centre while the eye closes, bulging across as jelly does,
+ * shrunk about its centre while a lid moves, a little more down than across,
  * grown past rest as it springs back, and swelling as a turn or her motion
  * knocks it — scale only, in place, inside the white, which stays where it is. Vertices take it by
  * their weight on the eye bones (jelly[2].w, jelly[3].w), so nothing else on
@@ -259,10 +259,11 @@ fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
     if (j[2].w == j[3].w && e == 0u && distance(p.xy, j[1].xy) < distance(p.xy, j[0].xy)) { continue; }
     if (j[2].w == j[3].w && e == 1u && distance(p.xy, j[0].xy) <= distance(p.xy, j[1].xy)) { continue; }
     let st = j[4u + e];
-    // The blink's squash, as jelly gives: flattened down, it bulges across
-    // (and a stretch thins it), and the bounce both eyes share (jelly[1].w).
-    // Height is held under 1.06 so a swell cannot rise past the upper lid.
-    let k = clamp(vec2f(1.0 + 0.45 * st.x, 1.0 - st.x) + j[1].w, vec2f(0.9, 0.78), vec2f(1.1, 1.06));
+    // The squash, nearly round: it shrinks both ways, a little more down than
+    // across, so the iris keeps its circle and only leans oval; and the bounce
+    // both eyes share (jelly[1].w). Held under 1.08 so a swell cannot rise
+    // past the upper lid.
+    let k = clamp(vec2f(1.0 - 0.8 * st.x, 1.0 - st.x) + j[1].w, vec2f(0.78, 0.75), vec2f(1.08, 1.08));
     let moved = c.xy + (p.xy - c.xy) * k;
     out = vec3f(mix(p.xy, moved, w), p.z);
   }
@@ -304,10 +305,11 @@ fn rzJellyGlow(jj: RzJelly, tex: vec3f, alpha: f32, v: vec3f, l: vec3f, sun: vec
     fwd = -normalize(hm[2].xyz);
   }
   let h = normalize(l + v);
-  // Held near the middle of the iris, a little low: the top of an iris sits
-  // under the upper lid, and a glint there pokes out over it.
+  // Held in the middle and lower iris: the top of an iris sits under the upper
+  // lid, and a glint there — or its bloom halo — pokes out over it.
   var g = vec2f(dot(h, right), dot(h, up)) * 0.6;
-  g = g * min(1.0, 0.3 / max(length(g), 1e-6)) - vec2f(0.0, 0.08);
+  g = g * min(1.0, 0.25 / max(length(g), 1e-6)) - vec2f(0.0, 0.1);
+  g.y = min(g.y, 0.0);
   let aa = max(length(fwidth(jj.src)), 1e-4);
   let glint = 1.0 - smoothstep(0.16 - aa, 0.16 + aa, distance(jj.src, g));
   let second = 1.0 - smoothstep(0.07 - aa, 0.07 + aa, distance(jj.src, -0.55 * g + vec2f(0.1, -0.12)));
@@ -315,25 +317,35 @@ fn rzJellyGlow(jj: RzJelly, tex: vec3f, alpha: f32, v: vec3f, l: vec3f, sun: vec
   let key = clamp(dot(sun, vec3f(0.2126, 0.7152, 0.0722)), 0.3, 2.0);
   let lit = facing * key * (0.35 + 0.65 * shadow);
   // HDR, well past 1, so bloom takes them as the hard sparkle of a gem.
-  let glints = (glint + 0.8 * second) * lit * (2.6 + 1.6 * jj.shine);
-  let open = 1.0 - smoothstep(0.3, 0.8, jj.closure);
+  // Bright enough for bloom to catch, not so bright its halo spreads past the
+  // iris onto the lid.
+  let glints = (glint + 0.8 * second) * lit * (1.8 + 0.8 * jj.shine);
+  // Gone as the lid starts down, not only once shut: a half-closed smile puts
+  // the lid right over where the glint sits.
+  let open = 1.0 - smoothstep(0.1, 0.45, jj.closure);
   // Only where the eye's own picture is (its alpha), never on the iris's top
   // rim, and gone as the lid comes down.
-  let onEye = smoothstep(0.5, 0.9, alpha) * (1.0 - smoothstep(0.35, 0.6, jj.src.y));
+  let solid = smoothstep(0.5, 0.9, alpha);
+  let onEye = solid * (1.0 - smoothstep(0.05, 0.35, jj.src.y));
   // Light through the jelly: the light enters where the glint is and comes out
   // the far side, so the iris glows in its own colour in a crescent opposite
   // the glint — the lit-from-within look of a gem, or a jelly.
   let r = length(jj.src);
   let away = -normalize(g + vec2f(0.0, -1e-3));
   let crescent = smoothstep(0.15, 0.7, dot(jj.src, away)) * (1.0 - smoothstep(0.8, 1.0, r));
-  let through = tex * crescent * (0.9 + 0.6 * jj.shine) * lit;
+  let through = tex * crescent * (2.2 + 1.0 * jj.shine) * lit;
   // And the colour runs deeper: the iris's own hue pushed, never its greys.
   let lum = dot(tex, vec3f(0.2126, 0.7152, 0.0722));
-  let vivid = max(tex - vec3f(lum), vec3f(0.0)) * 0.7;
-  let gem = (vec3f(glints) + through + vivid) * open * onEye * jj.w;
+  let vivid = max(tex - vec3f(lum), vec3f(0.0)) * 1.2;
+  // The glass over it: a broad soft sheen across the upper iris, under the
+  // lid line, the dome of a bead catching the room.
+  let dome = (1.0 - smoothstep(0.0, 0.5, distance(jj.src * vec2f(0.8, 1.4), vec2f(0.0, 0.2)))) * 0.45 * lit;
+  // The glints keep off the iris's top; the soft light (sheen, glow through,
+  // colour) has no halo to spill, so it only needs the eye's own picture.
+  let gem = (vec3f(glints) * onEye + (vec3f(dome) + through + vivid) * solid) * open * jj.w;
   // The whole eye shines a little brighter, more while it wobbles — not just
   // the iris, so this one is not held to it (jj.w).
-  let lift = tex * (0.15 + 0.35 * jj.shine) * select(0.0, 1.0, strength > 0.0);
+  let lift = tex * (0.25 + 0.35 * jj.shine) * select(0.0, 1.0, strength > 0.0);
   return (gem + lift) * min(strength, 1.0);
 }
 

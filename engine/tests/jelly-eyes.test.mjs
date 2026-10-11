@@ -91,13 +91,13 @@ test("clampStrength: default 1, held to 0..2", () => {
   assert.equal(clampStrength(5), 2)
   assert.equal(clampStrength(0), 0)
   const model = fakeModel()
-  assert.equal(new JellyEyes(model, {}).strength, 1)
+  assert.equal(new JellyEyes(model, { idle: false }).strength, 1)
   assert.equal(new JellyEyes(model, { strength: 9 }).strength, 2)
 })
 
 test("a blink squashes as the lid moves, opening too, and settles", () => {
   const model = fakeModel()
-  const jelly = new JellyEyes(model, { strength: 1 })
+  const jelly = new JellyEyes(model, { strength: 1, idle: false })
   jelly.step(1 / 60, model)
   model.weights[0] = 1
   const closing = run(jelly, model, 0.2)
@@ -117,7 +117,7 @@ test("a blink squashes as the lid moves, opening too, and settles", () => {
 
 test("a held half-close (a smile) leaves the iris at rest", () => {
   const model = fakeModel()
-  const jelly = new JellyEyes(model, {})
+  const jelly = new JellyEyes(model, { idle: false })
   model.weights[0] = 0.26
   jelly.step(1 / 60, model)
   const trace = run(jelly, model, 2)
@@ -126,7 +126,7 @@ test("a held half-close (a smile) leaves the iris at rest", () => {
 
 test("a wink moves only its own eye", () => {
   const model = fakeModel()
-  const jelly = new JellyEyes(model, {})
+  const jelly = new JellyEyes(model, { idle: false })
   jelly.step(1 / 60, model)
   model.weights[1] = 1 // ウィンク — the left eye
   run(jelly, model, 0.1)
@@ -138,7 +138,7 @@ test("a wink moves only its own eye", () => {
 
 test("a seek (dt > 0.25 s) lands on the pose instead of springing to it", () => {
   const model = fakeModel()
-  const jelly = new JellyEyes(model, {})
+  const jelly = new JellyEyes(model, { idle: false })
   model.weights[0] = 1
   jelly.step(1 / 60, model)
   model.weights[0] = 0
@@ -158,7 +158,7 @@ test("a seek (dt > 0.25 s) lands on the pose instead of springing to it", () => 
 test("her head turning swells it in place; her eyes turning (eye tracking) does not", () => {
   const swell = (bone) => {
     const model = fakeModel()
-    const jelly = new JellyEyes(model, {})
+    const jelly = new JellyEyes(model, { idle: false })
     jelly.step(1 / 60, model)
     yaw(model.mats[bone], 0.3)
     let peak = 0
@@ -173,13 +173,53 @@ test("her head turning swells it in place; her eyes turning (eye tracking) does 
   }
   const head = swell(0)
   assert.ok(head.peak > 0.01, `a head turn should swell it, peak ${head.peak}`)
+  // It ripples, not one dip: the squash crosses back and forth several times.
+  {
+    const model = fakeModel()
+    const jelly = new JellyEyes(model, { idle: false })
+    jelly.step(1 / 60, model)
+    yaw(model.mats[0], 0.3)
+    const trace = run(jelly, model, 4)
+    let crossings = 0
+    for (let i = 1; i < trace.length; i++) if (Math.sign(trace[i]) !== Math.sign(trace[i - 1]) && trace[i] !== 0) crossings++
+    assert.ok(crossings >= 4, `a knock should ripple, crossed rest ${crossings} times`)
+  }
   assert.ok(Math.abs(head.end) < 0.005, `should settle, ended at ${head.end}`)
   assert.equal(swell(1).peak, 0, "an eye turn alone must not")
 })
 
+test("idle taps: a small bounce every few seconds, settling between, on the scene clock", () => {
+  const model = fakeModel()
+  const trace = (idle) => {
+    const jelly = new JellyEyes(model, { idle })
+    const out = []
+    for (let t = 0; t < 12; t += 1 / 60) {
+      jelly.step(1 / 60, model)
+      out.push(read(jelly).squash[0])
+    }
+    return out
+  }
+  const a = trace(true)
+  const peak = Math.max(...a.map(Math.abs))
+  assert.ok(peak > 0.02, `it should tap while nothing else moves, peak ${peak}`)
+  assert.ok(peak < 0.1, `and stay small, peak ${peak}`)
+  // Rests between taps: somewhere it has settled almost still.
+  assert.ok(a.some((x, i) => i > 60 && Math.abs(x) < 0.003), "it should settle between taps")
+  // The same clock taps the same way.
+  assert.deepEqual(trace(true), a)
+  assert.ok(trace(false).every((x) => x === 0), "idle off: nothing")
+  // Paused (no time passing) it holds still.
+  const jelly = new JellyEyes(model, {})
+  for (let i = 0; i < 200; i++) jelly.step(1 / 60, model)
+  const held = read(jelly).squash[0]
+  jelly.step(0, model)
+  jelly.step(0, model)
+  assert.ok(Math.abs(read(jelly).squash[0] - held) < 1e-9)
+})
+
 test("write(): layout, and strength scaling (0 reads as off)", () => {
   const model = fakeModel()
-  const jelly = new JellyEyes(model, { strength: 2 })
+  const jelly = new JellyEyes(model, { strength: 2, idle: false })
   jelly.step(1 / 60, model)
   model.weights[0] = 1
   run(jelly, model, 0.1)

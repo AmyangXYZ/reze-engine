@@ -3,8 +3,8 @@
 // What every working version of the effect has in common, whether it is keyed
 // by hand in MMD, a pendulum in Live2D, or a jiggle bone in Blender: an INPUT
 // (a blink, a turn), something that REMEMBERS the last frame (a spring), and a
-// cheap OUTPUT. Here the output is the iris's SCALE, in place: it flattens and
-// bulges as a lid moves (opening too), swells as her head turns or moves, and
+// cheap OUTPUT. Here the output is the iris's SCALE, in place: it shrinks and
+// springs back as a lid moves (opening too), swells as her head turns or moves, and
 // wobbles back. It never slides — tried, it read as the iris coming loose. The
 // inputs are her blinks and her head, never her eyes' own turn: eye tracking
 // turns the eyes after the camera, and the camera must not shake the jelly.
@@ -22,6 +22,9 @@ import type { Model } from "./model"
 export interface JellyEyeOptions {
   /** How much the eyes give: 0 still, 1 the intended bounce, up to 2. Default 1. */
   strength?: number
+  /** The idle taps: a small bounce every few seconds while nothing else moves them.
+   *  Default true; false leaves only what her blinks and motion set off. */
+  idle?: boolean
 }
 
 // The closing morphs, by the names MMD, VRoid and the usual converters give
@@ -32,14 +35,15 @@ const LEFT = ["ウィンク", "ウィンク２", "ｳｨﾝｸ", "ｳｨﾝｸ�
 const RIGHT = ["ウィンク右", "ウィンク２右", "ｳｨﾝｸ右", "ｳｨﾝｸ２右", "wink_R", "Wink_R", "blink_R", "Fcl_EYE_Close_R"]
 
 // The squash: how far a closed eye presses the picture, and the spring that
-// follows it — underdamped, so the eye opening overshoots into a stretch and
-// settles in two or three wobbles, the "Duang" the effect is named for.
+// follows it — lightly damped, so one knock ripples: the squash, a rebound past
+// rest, and several smaller wobbles before it settles. One dip and done read as
+// a scale, not a jelly; the ripple is the "Duang" the effect is named for.
 // Only a CHANGE of closure squashes: the eye's closure less a slow follower of
 // it, so a blink squeezes then bounces, while a held half-close (a smile)
 // leaves the iris at rest instead of squashed for as long as she smiles.
 const SQUASH_CLOSED = 0.35
-const SQUASH_HZ = 1.4
-const SQUASH_ZETA = 0.22
+const SQUASH_HZ = 1.8
+const SQUASH_ZETA = 0.08
 const CLOSURE_FOLLOW_S = 0.35
 // The lag: the picture trails the eye's turn and catches up past it. Radians of
 // lag to eye radii of offset; the head's own turn counts for a third, so a
@@ -55,7 +59,7 @@ const LAG_ZETA = 0.4
 const LAG_GAIN = 0.5
 const LAG_MAX = (3 * Math.PI) / 180
 // And never past this many iris radii, whatever the lever, at strength 1.
-const OFFSET_MAX = 0.06
+const OFFSET_MAX = 0.2
 const HEAD_SHARE = 0.35
 // The inertia: the iris has a little mass, hung on a spring from the head, so
 // her own motion — a bob, a step, a sway of the dance — leaves it behind and
@@ -65,11 +69,33 @@ const INERTIA_ZETA = 0.4
 const INERTIA_GAIN = 0.04
 // The jelly's give: the iris never moves, it swells. The lag and the inertia
 // are how hard it is being knocked (in iris radii, as if it could move); that
-// knock grows it a little and it settles in a wobble — the scale bounce on top
-// of the blink's squash. Iris scale per iris radius of knock.
-const PULSE_GAIN = 1.6
-const PULSE_HZ = 1.6
-const PULSE_ZETA = 0.24
+// knock grows it a little and it ripples back, as the squash does — the bounce on top
+// of the blink's squash. Eased, not linear: the swell is PULSE_MAX·tanh(knock /
+// PULSE_REF), so the small steady knocks of a dance still show while a jolt
+// (play from a pause: the head going from still to moving at once) cannot
+// swell it past the cap.
+const PULSE_MAX = 0.07
+const PULSE_REF = 0.006
+// And the same knock squashes it as a blink does — nearly round, on
+// the blink's spring — so her motion reads as plainly as a blink. Eased by the
+// same curve, up to MOTION_SQUASH (a blink's opening gives about 0.2).
+const MOTION_SQUASH = 0.18
+const PULSE_HZ = 2.0
+const PULSE_ZETA = 0.08
+// The idle taps: every few seconds, at uneven times, a small knock into the
+// same springs her motion drives — the iris dips, bounces and settles, then
+// rests — the way a jelly on a table is never quite still. A steady sine was
+// tried, as size (a zoom) and as wider-then-taller (queasy); a settling tap is
+// what reads as jelly. Velocity kicks, so the bounce keeps the springs' own
+// timing; the gaps come from a hash of the tap's count, so the scene clock
+// alone decides them and an export taps where the screen did.
+const IDLE_SQUASH_KICK = 0.45
+const IDLE_PULSE_KICK = 0.25
+const IDLE_GAP: [number, number] = [1.8, 3.8]
+const idleGap = (n: number): number => {
+  const x = Math.sin(n * 12.9898 + 78.233) * 43758.5453
+  return IDLE_GAP[0] + (x - Math.floor(x)) * (IDLE_GAP[1] - IDLE_GAP[0])
+}
 // Integration step, and the jump past which a delta is a seek, not time.
 const SUBSTEP = 1 / 240
 const SEEK = 0.25
@@ -123,6 +149,11 @@ const newState = (): EyeState => ({
 
 export class JellyEyes {
   strength: number
+  idle: boolean
+  // Scene time stepped so far, and the idle taps: how many, and when the next.
+  private clock = 0
+  private taps = 0
+  private nextTap = idleGap(0)
   private readonly rest: [EyeRest, EyeRest]
   private readonly state: [EyeState, EyeState] = [newState(), newState()]
   private readonly morphs: [number[], number[], number[]]
@@ -133,6 +164,7 @@ export class JellyEyes {
 
   constructor(model: Model, options: JellyEyeOptions) {
     this.strength = clampStrength(options.strength)
+    this.idle = options.idle ?? true
     const bones = model.getSkeleton().bones
     const index = (name: string) => bones.findIndex((b) => b.name === name)
     const both = index("両目")
@@ -154,6 +186,13 @@ export class JellyEyes {
     const closure = [Math.min(1, both + sum(this.morphs[1])), Math.min(1, both + sum(this.morphs[2]))]
     const head = this.headBone >= 0 ? model.getBoneWorldMatrixAt(this.headBone) : null
     const seek = this.fresh || dt > SEEK || dt < 0
+    if (dt > 0) this.clock += dt
+    let tap = false
+    if (!seek && this.idle && this.clock >= this.nextTap) {
+      tap = true
+      this.taps++
+      this.nextTap = this.clock + idleGap(this.taps)
+    }
     this.stepInertia(dt, head, seek)
     for (let e = 0; e < 2; e++) {
       const s = this.state[e]
@@ -167,7 +206,8 @@ export class JellyEyes {
       else s.settled += (s.closure - s.settled) * Math.min(1, dt / CLOSURE_FOLLOW_S)
       // Either way a lid moves squashes — opening too, which is the half of a
       // blink you can see (closing, the lid hides the iris anyway).
-      const squashTarget = SQUASH_CLOSED * Math.abs(s.closure - s.settled)
+      const knock = seek ? 0 : Math.tanh(Math.hypot(...this.offset(s, e)) / PULSE_REF)
+      const squashTarget = SQUASH_CLOSED * Math.abs(s.closure - s.settled) + MOTION_SQUASH * knock
       if (seek) {
         s.squash = squashTarget
         s.squashV = 0
@@ -178,9 +218,13 @@ export class JellyEyes {
         s.pulse = s.pulseV = 0
         continue
       }
+      if (tap) {
+        s.squashV += IDLE_SQUASH_KICK
+        s.pulseV -= IDLE_PULSE_KICK
+      }
       const steps = Math.ceil(dt / SUBSTEP)
       const h = steps > 0 ? dt / steps : 0
-      const pulseTarget = PULSE_GAIN * Math.hypot(...this.offset(s, e))
+      const pulseTarget = PULSE_MAX * knock
       for (let i = 0; i < steps; i++) {
         s.pulseV += h * spring(s.pulse - pulseTarget, s.pulseV, PULSE_HZ, PULSE_ZETA)
         s.pulse += h * s.pulseV

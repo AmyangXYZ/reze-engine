@@ -428,6 +428,11 @@ export interface MidiNote {
 /** How many character positions an effect can read (viewU[11..14]). Defined
  *  beside the shader that reads them — the layout arithmetic has to agree. */
 const MAX_EFFECT_SUBJECTS = EFFECT_SUBJECTS
+/** The frame's half height (model units) at and past which a camera follow
+ *  takes its full smoothing; closer shots follow more rigidly — see the
+ *  follow in renderWithDelta(). About a full-body shot. */
+const FOLLOW_LAG_FULL_HALF = 8
+
 /** Where a character IS, for an effect that follows them. センター carries a
  *  motion's root movement — walking, jumping — where the model transform only
  *  carries where the model was placed; 全ての親 is the fallback for a model that
@@ -3042,6 +3047,12 @@ export class Engine {
   private cameraFollowSmoothing = 0
   private cameraFollowSeeded = false
   private readonly cameraFollowPos = new Vec3(0, 0, 0)
+  // Turning with the bone (setCameraFollow's `turn`): the bone's facing as yaw
+  // and elevation, eased like the position, whose change each frame is added
+  // to the orbit — so the shot keeps its angle to her face as she turns.
+  private cameraFollowTurn = false
+  private cameraFollowYaw = 0
+  private cameraFollowPitch = 0
   private cameraTargetOffset: Vec3 = new Vec3(0, 0, 0)
 
   private lastFrameTime = performance.now()
@@ -10227,8 +10238,13 @@ export class Engine {
     this.cameraTargetOffset.z = offset?.z ?? 0
   }
 
-  /** Souls-style follow cam: orbit center tracks a model bone each frame. Shorthand for setCameraTarget(model, boneName, offset). */
-  setCameraFollow(model: Model | null, boneName?: string, offset?: Vec3, smoothing?: number): void {
+  /**
+   * Souls-style follow cam: orbit center tracks a model bone each frame.
+   * Shorthand for setCameraTarget(model, boneName, offset). With `turn`, the
+   * orbit also turns with her face (the head bone) — the camera keeps its
+   * angle to her face as she turns and nods, and a drag still orbits on top.
+   */
+  setCameraFollow(model: Model | null, boneName?: string, offset?: Vec3, smoothing?: number, turn?: boolean): void {
     // Panning sets the very thing the follow overwrites each frame, so it is
     // goes to the offset for as long as the shot is riding a bone. See Camera.panSink.
     this.camera.panSink = model !== null ? this.cameraTargetOffset : null
@@ -10244,6 +10260,7 @@ export class Engine {
     // Handheld feel: seconds for the camera to close ~63% of the gap to the
     // bone (exponential, frame-rate independent). 0 = rigid instant follow.
     this.cameraFollowSmoothing = Math.max(0, smoothing ?? 0)
+    this.cameraFollowTurn = turn ?? false
     this.cameraFollowSeeded = false
   }
 
@@ -10403,6 +10420,49 @@ export class Engine {
       // predictable cut to the scene's framing, no easing from the shot.
       this.cameraFollowSeeded = false
     }
+  }
+
+  /**
+   * The follow's turn: her FACE's direction — the head bone (頭), whatever bone
+   * the position rides, since an eye under eye tracking turns back toward the
+   * camera as the face turns and so never points anywhere new. MMD rests facing
+   * −Z, so forward is its negated third column, placed by the model's
+   * rotation (the followed bone stands in on a rig with no 頭) — as yaw and
+   * elevation, eased by the follow's own lag, and each frame's change added to
+   * the orbit (alpha turns with the yaw, beta with the elevation) and to the
+   * offset (turned about the vertical, so a framing off to her side stays at
+   * her side). Seeds without moving the camera, on the frame the follow is
+   * (re)bound — cameraFollowSeeded, cleared there, is set right after this.
+   */
+  private turnWithFollowBone(m: Model, tau: number, deltaTime: number): void {
+    const w = m.getBoneWorldMatrix("頭") ?? m.getBoneWorldMatrix(this.cameraTargetBoneName)
+    if (!w) return
+    const fwd = new Vec3(-w[8], -w[9], -w[10])
+    Quat.rotateVecInto(m.rotation, fwd, fwd)
+    const len = Math.hypot(fwd.x, fwd.y, fwd.z)
+    if (len < 1e-6) return
+    const yaw = Math.atan2(fwd.x, fwd.z)
+    const pitch = Math.asin(Math.max(-1, Math.min(1, fwd.y / len)))
+    if (!this.cameraFollowSeeded) {
+      this.cameraFollowYaw = yaw
+      this.cameraFollowPitch = pitch
+      return
+    }
+    const wrap = (a: number) => a - 2 * Math.PI * Math.round(a / (2 * Math.PI))
+    const k = tau > 0 ? 1 - Math.exp(-deltaTime / tau) : 1
+    const dYaw = wrap(yaw - this.cameraFollowYaw) * k
+    const dPitch = (pitch - this.cameraFollowPitch) * k
+    this.cameraFollowYaw = wrap(this.cameraFollowYaw + dYaw)
+    this.cameraFollowPitch += dPitch
+    const cam = this.camera
+    cam.alpha += dYaw
+    cam.beta = Math.max(0.01, Math.min(Math.PI - 0.01, cam.beta - dPitch))
+    const o = this.cameraTargetOffset
+    const c = Math.cos(dYaw)
+    const sn = Math.sin(dYaw)
+    const ox = o.x
+    o.x = ox * c + o.z * sn
+    o.z = -ox * sn + o.z * c
   }
 
   /** True while the orbit target is riding a model bone (setCameraFollow). */
@@ -13736,7 +13796,7 @@ export class Engine {
   }
 
   /**
-   * Jelly eyes: her irises flatten and bulge as her lids move, swell as her
+   * Jelly eyes: her irises shrink and spring back as her lids move, swell as her
    * head turns or moves, and wobble back, and shine like a gem — two hard
    * glints, light glowing through the iris, deeper colour. MMD's 果冻眼, on any
    * PMX and under any eye graph. Null stills them again.
@@ -13755,14 +13815,17 @@ export class Engine {
       this.device.queue.writeBuffer(inst.lightBuffer, 0, inst.objectLight)
       return true
     }
-    if (inst.jellyEyes) inst.jellyEyes.strength = clampStrength(options.strength)
+    if (inst.jellyEyes) {
+      inst.jellyEyes.strength = clampStrength(options.strength)
+      inst.jellyEyes.idle = options.idle ?? true
+    }
     else inst.jellyEyes = new JellyEyes(inst.model, options)
     return true
   }
 
   getModelJellyEyes(modelName: string): Required<JellyEyeOptions> | null {
     const jelly = this.modelInstances.get(modelName)?.jellyEyes
-    return jelly ? { strength: jelly.strength } : null
+    return jelly ? { strength: jelly.strength, idle: jelly.idle } : null
   }
 
   getModelCastShadow(modelName: string): boolean {
@@ -17439,8 +17502,16 @@ export class Engine {
           py += pos.y
           pz += pos.z
         }
-        const tau = this.cameraFollowSmoothing
+        // The lag scales with how much the shot holds. Eased, the pivot trails
+        // the bone by its speed × tau — nothing in a full-body shot, but in a
+        // close-up of her eye it is most of the frame, and the eye swims out
+        // of it as she moves. So: the full handheld lag once the frame is
+        // FOLLOW_LAG_FULL_HALF tall (half height, model units — about a
+        // full-body shot), shrinking linearly to rigid as the shot closes in.
+        const half = this.camera.radius * Math.tan(this.camera.fov / 2)
+        const tau = this.cameraFollowSmoothing * Math.min(1, half / FOLLOW_LAG_FULL_HALF)
         const f = this.cameraFollowPos
+        if (this.cameraFollowTurn) this.turnWithFollowBone(m, tau, deltaTime)
         if (tau > 0 && this.cameraFollowSeeded) {
           // Exponential lag toward the bone: the handheld-camera feel. The
           // orbit pivot trails the target and eases in, never snapping.
