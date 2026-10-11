@@ -216,8 +216,126 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 //   sh        that ambient's irradiance, folded as the world's (ibl.ts);
 //   fill.rgb  its fill (Engine.setModelFill), added after its graph times its
 //             surface colour — zero for a model that has none.
-struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f }
+//   jelly     its jelly eyes (Engine.setModelJellyEyes, jelly-eyes.ts), not
+//             lighting but per-model all the same, so it rides here:
+//               [0] left iris centre (bind space), strength — 0 is off
+//               [1] right iris centre, scale bounce (both eyes)
+//               [2] left iris half extents, closure, eye bone (−1 none)
+//               [3] the right's
+//               [4] left squash, 0, 0, shine             [5] the right's
+struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 6> }
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
+
+/** What the glints need to know about a fragment of the eye render class. */
+struct RzJelly {
+  /** Where in the iris this fragment is, in iris radii. */
+  src: vec2f,
+  /** 1 inside the iris, easing to 0 at its rim (0 everywhere when off). */
+  w: f32,
+  closure: f32,
+  shine: f32,
+};
+
+/**
+ * Where the jelly puts an iris vertex. The iris is the part of the eye the eye
+ * bones carry, so it is moved as a whole, in bind space before skinning:
+ * flattened about its centre while the eye closes, bulging across as jelly does,
+ * grown past rest as it springs back, and swelling as a turn or her motion
+ * knocks it — scale only, in place, inside the white, which stays where it is. Vertices take it by
+ * their weight on the eye bones (jelly[2].w, jelly[3].w), so nothing else on
+ * the face moves.
+ */
+fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
+  let j = objectLight.jelly;
+  var out = p;
+  for (var e = 0u; e < 2u; e++) {
+    let bone = j[2u + e].w;
+    if (bone < 0.0) { continue; }
+    let b = u32(bone);
+    let w = dot(nw, select(vec4f(0.0), vec4f(1.0), joints == vec4<u32>(b)));
+    if (w <= 0.0) { continue; }
+    let c = j[e].xyz;
+    // A rig that carries both eyes on one bone: each vertex follows its own side.
+    if (j[2].w == j[3].w && e == 0u && distance(p.xy, j[1].xy) < distance(p.xy, j[0].xy)) { continue; }
+    if (j[2].w == j[3].w && e == 1u && distance(p.xy, j[0].xy) <= distance(p.xy, j[1].xy)) { continue; }
+    let st = j[4u + e];
+    // The blink's squash, as jelly gives: flattened down, it bulges across
+    // (and a stretch thins it), and the bounce both eyes share (jelly[1].w).
+    // Height is held under 1.06 so a swell cannot rise past the upper lid.
+    let k = clamp(vec2f(1.0 + 0.45 * st.x, 1.0 - st.x) + j[1].w, vec2f(0.9, 0.78), vec2f(1.1, 1.06));
+    let moved = c.xy + (p.xy - c.xy) * k;
+    out = vec3f(mix(p.xy, moved, w), p.z);
+  }
+  return out;
+}
+
+/**
+ * The glints' frame for an eye fragment: its place in the iris in iris radii,
+ * from the bind-space position, which the jelly moved the iris with — so the
+ * glints ride the sloshing iris. Strength 0 gives w 0, which turns them off.
+ */
+fn rzJellyEye(rp: vec3f) -> RzJelly {
+  let j = objectLight.jelly;
+  let qL = (rp.xy - j[0].xy) / max(j[2].xy, vec2f(1e-4));
+  let qR = (rp.xy - j[1].xy) / max(j[3].xy, vec2f(1e-4));
+  let right = dot(qR, qR) < dot(qL, qL);
+  let a = select(qL, qR, right);
+  let st = select(j[4], j[5], right);
+  let w = (1.0 - smoothstep(0.85, 1.0, length(a))) * select(0.0, 1.0, j[0].w > 0.0);
+  return RzJelly(a, w, select(j[2].z, j[3].z, right), st.w);
+}
+
+/**
+ * The jelly shine, added after the graph: two hard glints where the light
+ * would catch a bead — placed by the half vector in the head's frame, so they
+ * hold still while the iris turns under them — and the eye brightening while
+ * it wobbles. Flat, cel discs rather than a gradient lobe; HDR, so bloom
+ * takes them. Shut eyes catch nothing.
+ */
+fn rzJellyGlow(jj: RzJelly, tex: vec3f, alpha: f32, v: vec3f, l: vec3f, sun: vec3f, shadow: f32) -> vec3f {
+  let strength = objectLight.jelly[0].w;
+  var right = vec3f(1.0, 0.0, 0.0);
+  var up = vec3f(0.0, 1.0, 0.0);
+  var fwd = vec3f(0.0, 0.0, -1.0);
+  if (material.headBoneIndex >= 0.0) {
+    let hm = skinMats[u32(material.headBoneIndex)];
+    right = normalize(hm[0].xyz);
+    up = normalize(hm[1].xyz);
+    fwd = -normalize(hm[2].xyz);
+  }
+  let h = normalize(l + v);
+  // Held near the middle of the iris, a little low: the top of an iris sits
+  // under the upper lid, and a glint there pokes out over it.
+  var g = vec2f(dot(h, right), dot(h, up)) * 0.6;
+  g = g * min(1.0, 0.3 / max(length(g), 1e-6)) - vec2f(0.0, 0.08);
+  let aa = max(length(fwidth(jj.src)), 1e-4);
+  let glint = 1.0 - smoothstep(0.16 - aa, 0.16 + aa, distance(jj.src, g));
+  let second = 1.0 - smoothstep(0.07 - aa, 0.07 + aa, distance(jj.src, -0.55 * g + vec2f(0.1, -0.12)));
+  let facing = saturate(dot(fwd, v) * 2.0);
+  let key = clamp(dot(sun, vec3f(0.2126, 0.7152, 0.0722)), 0.3, 2.0);
+  let lit = facing * key * (0.35 + 0.65 * shadow);
+  // HDR, well past 1, so bloom takes them as the hard sparkle of a gem.
+  let glints = (glint + 0.8 * second) * lit * (2.6 + 1.6 * jj.shine);
+  let open = 1.0 - smoothstep(0.3, 0.8, jj.closure);
+  // Only where the eye's own picture is (its alpha), never on the iris's top
+  // rim, and gone as the lid comes down.
+  let onEye = smoothstep(0.5, 0.9, alpha) * (1.0 - smoothstep(0.35, 0.6, jj.src.y));
+  // Light through the jelly: the light enters where the glint is and comes out
+  // the far side, so the iris glows in its own colour in a crescent opposite
+  // the glint — the lit-from-within look of a gem, or a jelly.
+  let r = length(jj.src);
+  let away = -normalize(g + vec2f(0.0, -1e-3));
+  let crescent = smoothstep(0.15, 0.7, dot(jj.src, away)) * (1.0 - smoothstep(0.8, 1.0, r));
+  let through = tex * crescent * (0.9 + 0.6 * jj.shine) * lit;
+  // And the colour runs deeper: the iris's own hue pushed, never its greys.
+  let lum = dot(tex, vec3f(0.2126, 0.7152, 0.0722));
+  let vivid = max(tex - vec3f(lum), vec3f(0.0)) * 0.7;
+  let gem = (vec3f(glints) + through + vivid) * open * onEye * jj.w;
+  // The whole eye shines a little brighter, more while it wobbles — not just
+  // the iris, so this one is not held to it (jj.w).
+  let lift = tex * (0.15 + 0.35 * jj.shine) * select(0.0, 1.0, strength > 0.0);
+  return (gem + lift) * min(strength, 1.0);
+}
 
 /** The light arriving at a surface of this object facing n: its own ambient
  *  where loaded data gave it one (a stage's probes, a character's), else the
@@ -329,10 +447,11 @@ const COMMON_VS_WGSL = /* wgsl */ `
   var output: VertexOutput;
   output.vcolor = vcolor;
   output.uv2 = uv2;
-  let pos4 = vec4f(position, 1.0);
   let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
   let invWeightSum = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
   let nw = select(vec4f(1.0, 0.0, 0.0, 0.0), weights0 * invWeightSum, weightSum > 0.0001);
+  var pos4 = vec4f(position, 1.0);
+  if (objectLight.jelly[0].w > 0.0) { pos4 = vec4f(rzJellyVertex(position, joints0, nw), 1.0); }
   var skinnedPos = vec4f(0.0);
   var skinnedNrm = vec3f(0.0);
   for (var i = 0u; i < 4u; i++) {

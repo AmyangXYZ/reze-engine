@@ -43,6 +43,7 @@ import {
   type SimClock,
 } from "./effect-schedule"
 import { parentKeySpan, type ModelParentKey } from "./parent-keys"
+import { JellyEyes, clampStrength, clearJellyEyes, type JellyEyeOptions } from "./jelly-eyes"
 import { NativeHost } from "./unity/host"
 import { NativeLooks, type NativeLook } from "./unity/looks"
 import { NativeStage, type NativeStageLights, type NativeStagePackage, type NativeStageReader } from "./unity/stage"
@@ -1004,6 +1005,9 @@ interface ModelInstance {
    *  Off drops every draw from the shadow list; on hands it back to the PMX
    *  flag on each material. */
   castShadow: boolean
+  /** Its jelly eyes' springs, or null while its eyes are still — see
+   *  setModelJellyEyes. */
+  jellyEyes: JellyEyes | null
   basePath: string
   assetReader: AssetReader
   gpuBuffers: GPUBuffer[]
@@ -8311,8 +8315,9 @@ export class Engine {
           visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
-        // The model's own light — see setModelFill and setModelSun.
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // The model's own light — see setModelFill and setModelSun. VERTEX
+        // too: jelly eyes move the iris in the vertex shader (jelly[] in it).
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     })
     // group 2: per-material (textures + material uniforms) — bound per draw call.
@@ -13730,6 +13735,36 @@ export class Engine {
     return true
   }
 
+  /**
+   * Jelly eyes: her irises flatten and bulge as her lids move, swell as her
+   * head turns or moves, and wobble back, and shine like a gem — two hard
+   * glints, light glowing through the iris, deeper colour. MMD's 果冻眼, on any
+   * PMX and under any eye graph. Null stills them again.
+   *
+   * Driven by her closing morphs (まばたき, the winks) and her head bone, never
+   * her eyes' own turn, so eye tracking following the camera leaves it still.
+   * The springs step on the scene clock, so an export bounces exactly as the
+   * screen did. The iris only scales in place (see jelly-eyes.ts).
+   */
+  setModelJellyEyes(modelName: string, options: JellyEyeOptions | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst || !this.device) return false
+    if (!options) {
+      inst.jellyEyes = null
+      clearJellyEyes(inst.objectLight)
+      this.device.queue.writeBuffer(inst.lightBuffer, 0, inst.objectLight)
+      return true
+    }
+    if (inst.jellyEyes) inst.jellyEyes.strength = clampStrength(options.strength)
+    else inst.jellyEyes = new JellyEyes(inst.model, options)
+    return true
+  }
+
+  getModelJellyEyes(modelName: string): Required<JellyEyeOptions> | null {
+    const jelly = this.modelInstances.get(modelName)?.jellyEyes
+    return jelly ? { strength: jelly.strength } : null
+  }
+
   getModelCastShadow(modelName: string): boolean {
     return this.modelInstances.get(modelName)?.castShadow ?? true
   }
@@ -13799,6 +13834,12 @@ export class Engine {
         }
         verticesChanged = inst.model.update(deltaTime, inst.isStage || inst.isPlane ? false : this.ikEnabled)
         inst.skinMatricesDirty = true
+      }
+      // After the pose, so the springs read this frame's blink and eye turn.
+      if (inst.jellyEyes) {
+        inst.jellyEyes.step(deltaTime, inst.model)
+        inst.jellyEyes.write(inst.objectLight)
+        this.device.queue.writeBuffer(inst.lightBuffer, 48 * 4, inst.objectLight, 48, 24)
       }
       animMs += performance.now() - tAnim
       // Material morphs ride the same weight change as vertex morphs but land in
@@ -15104,9 +15145,9 @@ export class Engine {
 
     // Its ObjectLight: the world's ambient, and the layers its kind draws on —
     // the cast on the character layer as well as the default one. Words:
-    // layers [0..3], ambient flag [4..7], SH [8..43], fill [44..47] — see
-    // materials/common.ts.
-    const objectLight = new Float32Array(48)
+    // layers [0..3], ambient flag [4..7], SH [8..43], fill [44..47], jelly
+    // eyes [48..71] — see materials/common.ts.
+    const objectLight = new Float32Array(72)
     new Uint32Array(objectLight.buffer)[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0
     const lightBuffer = this.device.createBuffer({
@@ -15142,6 +15183,7 @@ export class Engine {
       model,
       simulateWhileHidden: false,
       castShadow: true,
+      jellyEyes: null,
       basePath,
       assetReader,
       gpuBuffers,

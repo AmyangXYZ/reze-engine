@@ -220,6 +220,7 @@ export {
  */
 export { EFFECT_MATH_API, PARTICLE_STRUCT_WGSL } from "./shaders/passes/hosted-api"
 export type { EyeTrackingOptions } from "./model"
+export type { JellyEyeOptions } from "./jelly-eyes"
 
 /**
  * The game's own materials (src/unity): a stage package drawn by its translated

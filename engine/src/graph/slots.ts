@@ -57,6 +57,16 @@ const EYE_REAR_GATE = `
   }
 `
 
+// Eye's jelly (Engine.setModelJellyEyes): the vertex shader moves the iris
+// itself; the fragment only adds the glints, computed once the lighting context
+// exists and added in the epilogue after the graph. Off, they are zero.
+const PLAIN_SAMPLE = `  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
+`
+const EYE_JELLY_SAMPLE = `  let rz_jelly = rzJellyEye(input.restPos);
+${PLAIN_SAMPLE}`
+const EYE_JELLY_GLOW = `  let rz_jelly_glow = rzJellyGlow(rz_jelly, tex_color, tex_s.a, v, l, sun, shadow);
+`
+
 // ── Adjust-tier uniforms — fixed 16-vec4f block (256 B) shared by the single material
 // bind group layout; non-graph draws bind a zero buffer. ──
 const STYLE_UNIFORMS_WGSL = `struct StyleUniforms { p: array<vec4f, 16> };
@@ -104,8 +114,7 @@ function prelude(renderClass: RenderClass, alphaMode: AlphaMode, blend: StyleBle
   const flip =
     renderClass === "eye" ? "" : "\n  n = select(-n, n, dot(n, v) >= 0.0);"
   return `@fragment fn fs(input: VertexOutput) -> FSOut {
-  let tex_s = textureSample(diffuseTexture, diffuseSampler, input.uv);
-  // MMD alpha semantics: material alpha × texture alpha.
+${renderClass === "eye" ? EYE_JELLY_SAMPLE : PLAIN_SAMPLE}  // MMD alpha semantics: material alpha × texture alpha.
   let alpha = material.alpha * tex_s.a;
 ${discard}
 
@@ -152,7 +161,7 @@ ${gate}
   // The normal the lamps' diffuse layer is lit by, for a principled walk to
   // compute it on the way (rzLightsDiffuseOnce). n is final from here on.
   _rzLampN = n;
-
+${renderClass === "eye" ? EYE_JELLY_GLOW : ""}
 `
 }
 
@@ -205,7 +214,7 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // it is emission, not a surface colour, so nothing may ramp or shadow it. Zero
   // on every fragment of every material that is not dissolving, which is what
   // keeps this out of the way of a scene that never uses it.
-  const BURN = ` + RZ_BURN_COLOR * rz_burn`
+  const BURN = ` + RZ_BURN_COLOR * rz_burn${renderClass === "eye" ? " + rz_jelly_glow" : ""}`
   // The scene fog, last, as the game lays it over a lit surface; an
   // emission-only graph takes none (the game's effect shaders have no fog).
   // A premultiplied colour takes its fog premultiplied too: the haze a pane
