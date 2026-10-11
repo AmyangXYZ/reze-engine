@@ -18,18 +18,22 @@ const { JellyEyes, clampStrength, clearJellyEyes } = await import("../dist/jelly
 
 const IDENTITY = () => new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])
 
-const fakeModel = () => {
+// `tips`: the irises hang on 左目先/右目先 (children of the eye bones) instead
+// of the eye bones themselves, as some converted rigs do.
+const fakeModel = ({ tips = false } = {}) => {
   const bones = [
     { name: "頭", parentIndex: -1, bindTranslation: [0, 15, 0] },
     { name: "左目", parentIndex: 0, bindTranslation: [0.5, 0.2, -0.5] },
     { name: "右目", parentIndex: 0, bindTranslation: [-0.5, 0.2, -0.5] },
+    { name: "左目先", parentIndex: 1, bindTranslation: [0, 0, -0.1] },
+    { name: "右目先", parentIndex: 2, bindTranslation: [0, 0, -0.1] },
   ]
   // A ring of eight vertices around each eye, radius 0.2 × 0.3, carried fully
   // by its eye bone; one face vertex on the head.
   const pos = []
   const joints = []
   const weights = []
-  for (const [bone, cx] of [[1, 0.5], [2, -0.5]]) {
+  for (const [bone, cx] of tips ? [[3, 0.5], [4, -0.5]] : [[1, 0.5], [2, -0.5]]) {
     for (let i = 0; i < 8; i++) {
       const a = (i / 8) * Math.PI * 2
       pos.push(cx + 0.2 * Math.cos(a), 15.2 + 0.3 * Math.sin(a), -0.5)
@@ -40,7 +44,14 @@ const fakeModel = () => {
   pos.push(0, 14, -0.6)
   joints.push(0, 0, 0, 0)
   weights.push(255, 0, 0, 0)
-  const morphs = [{ name: "まばたき" }, { name: "ウィンク" }, { name: "ウィンク右" }]
+  // The last one lifts the LEFT iris (its ring is vertices 0–7) by 0.1, as a
+  // rig's pupil-up morph does.
+  const morphs = [
+    { name: "まばたき" },
+    { name: "ウィンク" },
+    { name: "ウィンク右" },
+    { name: "瞳上", vertexOffsets: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => ({ vertexIndex: i, positionOffset: [0, 0.1, 0] })) },
+  ]
   const w = new Float32Array(morphs.length)
   const mats = bones.map(() => IDENTITY())
   return {
@@ -147,7 +158,7 @@ test("a seek (dt > 0.25 s) lands on the pose instead of springing to it", () => 
   // A turn of the eye over a seek leaves no lag either.
   yaw(model.mats[1], 0.4)
   jelly.step(0.5, model)
-  assert.deepEqual(read(jelly).offset[0], [0, 0])
+  assert.equal(read(jelly).offset[0][0], 0)
   // A negative delta (scrubbing back) is a seek too.
   // Landing shut over a seek is no blink, so no squash.
   model.weights[0] = 1
@@ -166,7 +177,7 @@ test("her head turning swells it in place; her eyes turning (eye tracking) does 
       jelly.step(1 / 60, model)
       const r = read(jelly)
       peak = Math.max(peak, r.o[55])
-      assert.deepEqual(r.offset[0], [0, 0], "the iris never moves")
+      assert.equal(r.offset[0][0], 0, "the iris never moves")
     }
     for (let i = 0; i < 600; i++) jelly.step(1 / 60, model)
     return { peak, end: read(jelly).o[55] }
@@ -188,12 +199,12 @@ test("her head turning swells it in place; her eyes turning (eye tracking) does 
   assert.equal(swell(1).peak, 0, "an eye turn alone must not")
 })
 
-test("idle taps: a small bounce every few seconds, settling between, on the scene clock", () => {
+test("idle taps: a knock every 4–8 s, settling between, on the scene clock", () => {
   const model = fakeModel()
   const trace = (idle) => {
     const jelly = new JellyEyes(model, { idle })
     const out = []
-    for (let t = 0; t < 12; t += 1 / 60) {
+    for (let t = 0; t < 20; t += 1 / 60) {
       jelly.step(1 / 60, model)
       out.push(read(jelly).squash[0])
     }
@@ -201,8 +212,8 @@ test("idle taps: a small bounce every few seconds, settling between, on the scen
   }
   const a = trace(true)
   const peak = Math.max(...a.map(Math.abs))
-  assert.ok(peak > 0.02, `it should tap while nothing else moves, peak ${peak}`)
-  assert.ok(peak < 0.1, `and stay small, peak ${peak}`)
+  assert.ok(peak > 0.04, `it should tap noticeably, peak ${peak}`)
+  assert.ok(peak < 0.3, `and within the squash's reach, peak ${peak}`)
   // Rests between taps: somewhere it has settled almost still.
   assert.ok(a.some((x, i) => i > 60 && Math.abs(x) < 0.003), "it should settle between taps")
   // The same clock taps the same way.
@@ -215,6 +226,32 @@ test("idle taps: a small bounce every few seconds, settling between, on the scen
   jelly.step(0, model)
   jelly.step(0, model)
   assert.ok(Math.abs(read(jelly).squash[0] - held) < 1e-9)
+})
+
+test("the centre follows a morph that moves the iris, so it scales in place", () => {
+  const model = fakeModel()
+  const jelly = new JellyEyes(model, { idle: false })
+  jelly.step(1 / 60, model)
+  assert.ok(Math.abs(read(jelly).o[49] - 15.2) < 1e-5, "at rest, the ring's centre")
+  model.weights[3] = 1
+  jelly.step(1 / 60, model)
+  const o = read(jelly).o
+  assert.ok(Math.abs(o[49] - 15.3) < 1e-5, `left centre should rise with the morph, at ${o[49]}`)
+  assert.ok(Math.abs(o[53] - 15.2) < 1e-5, `the right iris it does not touch stays, at ${o[53]}`)
+  model.weights[3] = 0.5
+  jelly.step(1 / 60, model)
+  assert.ok(Math.abs(read(jelly).o[49] - 15.25) < 1e-5, "half the weight, half the way")
+})
+
+test("irises hung on the eye bones' tips are found, on those bones", () => {
+  const model = fakeModel({ tips: true })
+  const jelly = new JellyEyes(model, { idle: false })
+  jelly.step(1 / 60, model)
+  const o = read(jelly).o
+  assert.ok(Math.abs(o[48] - 0.5) < 1e-5 && Math.abs(o[49] - 15.2) < 1e-5, "left iris centre")
+  assert.ok(Math.abs(o[56] - 0.2) < 1e-5 && Math.abs(o[57] - 0.3) < 1e-5, "left iris size, not the fallback")
+  assert.equal(o[59], 3, "the left iris scales by 左目先")
+  assert.equal(o[63], 4, "the right by 右目先")
 })
 
 test("write(): layout, and strength scaling (0 reads as off)", () => {

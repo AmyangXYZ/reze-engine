@@ -222,7 +222,7 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 //               [1] right iris centre, scale bounce (both eyes)
 //               [2] left iris half extents, closure, eye bone (−1 none)
 //               [3] the right's
-//               [4] left squash, 0, 0, shine             [5] the right's
+//               [4] left squash, 0, clock, shine         [5] the right's
 struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 6> }
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
 
@@ -234,6 +234,8 @@ struct RzJelly {
   w: f32,
   closure: f32,
   shine: f32,
+  /** Scene seconds (wrapped), for the twinkles. */
+  clock: f32,
 };
 
 /**
@@ -283,7 +285,7 @@ fn rzJellyEye(rp: vec3f) -> RzJelly {
   let a = select(qL, qR, right);
   let st = select(j[4], j[5], right);
   let w = (1.0 - smoothstep(0.85, 1.0, length(a))) * select(0.0, 1.0, j[0].w > 0.0);
-  return RzJelly(a, w, select(j[2].z, j[3].z, right), st.w);
+  return RzJelly(a, w, select(j[2].z, j[3].z, right), st.w, j[4].z);
 }
 
 /**
@@ -311,7 +313,12 @@ fn rzJellyGlow(jj: RzJelly, tex: vec3f, alpha: f32, v: vec3f, l: vec3f, sun: vec
   g = g * min(1.0, 0.25 / max(length(g), 1e-6)) - vec2f(0.0, 0.1);
   g.y = min(g.y, 0.0);
   let aa = max(length(fwidth(jj.src)), 1e-4);
-  let glint = 1.0 - smoothstep(0.16 - aa, 0.16 + aa, distance(jj.src, g));
+  // A star, not only a disc: the disc with two thin rays through it, the
+  // anime sparkle.
+  let dg = jj.src - g;
+  let rays = max(0.0, 1.0 - abs(dg.y) / 0.018) * (1.0 - smoothstep(0.0, 0.34, abs(dg.x)))
+    + max(0.0, 1.0 - abs(dg.x) / 0.018) * (1.0 - smoothstep(0.0, 0.26, abs(dg.y)));
+  let glint = max(1.0 - smoothstep(0.13 - aa, 0.13 + aa, length(dg)), rays * 0.8);
   let second = 1.0 - smoothstep(0.07 - aa, 0.07 + aa, distance(jj.src, -0.55 * g + vec2f(0.1, -0.12)));
   let facing = saturate(dot(fwd, v) * 2.0);
   let key = clamp(dot(sun, vec3f(0.2126, 0.7152, 0.0722)), 0.3, 2.0);
@@ -331,7 +338,9 @@ fn rzJellyGlow(jj: RzJelly, tex: vec3f, alpha: f32, v: vec3f, l: vec3f, sun: vec
   // the far side, so the iris glows in its own colour in a crescent opposite
   // the glint — the lit-from-within look of a gem, or a jelly.
   let r = length(jj.src);
-  let away = -normalize(g + vec2f(0.0, -1e-3));
+  // Out the LOWER iris, always — the anime gem's bright underside — leaning
+  // away from the glint; never up, where its bloom would spill on the lid.
+  let away = normalize(vec2f(-g.x * 0.6, -1.0));
   let crescent = smoothstep(0.15, 0.7, dot(jj.src, away)) * (1.0 - smoothstep(0.8, 1.0, r));
   let through = tex * crescent * (2.2 + 1.0 * jj.shine) * lit;
   // And the colour runs deeper: the iris's own hue pushed, never its greys.
@@ -340,13 +349,43 @@ fn rzJellyGlow(jj: RzJelly, tex: vec3f, alpha: f32, v: vec3f, l: vec3f, sun: vec
   // The glass over it: a broad soft sheen across the upper iris, under the
   // lid line, the dome of a bead catching the room.
   let dome = (1.0 - smoothstep(0.0, 0.5, distance(jj.src * vec2f(0.8, 1.4), vec2f(0.0, 0.2)))) * 0.45 * lit;
-  // The glints keep off the iris's top; the soft light (sheen, glow through,
-  // colour) has no halo to spill, so it only needs the eye's own picture.
-  let gem = (vec3f(glints) * onEye + (vec3f(dome) + through + vivid) * solid) * open * jj.w;
+  // Everything that blooms keeps to the lower iris, so no halo reaches the lid.
+  let lower = 1.0 - smoothstep(-0.05, 0.3, jj.src.y);
+  // The cut: soft facets fanning across the lower iris, light split as a cut
+  // stone splits it, turning slowly.
+  let ang = atan2(jj.src.y, jj.src.x);
+  let facets = pow(0.5 + 0.5 * cos(ang * 7.0 + jj.clock * 0.35), 6.0)
+    * smoothstep(0.3, 0.75, r) * (1.0 - smoothstep(0.82, 0.97, r)) * lower;
+  // The rim: a band of its own colour just inside the iris edge, HDR, which
+  // bloom spreads into a glow around the stone.
+  let rim = smoothstep(0.7, 0.84, r) * (1.0 - smoothstep(0.86, 0.97, r)) * lower;
+  // Twinkles: three specks in the lower iris, each flashing now and then on
+  // the scene clock.
+  var twinkle = 0.0;
+  for (var i = 0; i < 3; i++) {
+    let fi = f32(i);
+    let at = vec2f(0.42 * cos(3.6 + fi * 1.1), -0.25 - 0.18 * fi + 0.1 * sin(fi * 2.3));
+    let flash = pow(max(0.0, sin(jj.clock * (1.3 + 0.37 * fi) + fi * 2.1)), 12.0);
+    twinkle += (1.0 - smoothstep(0.0, 0.05 + aa, distance(jj.src, at))) * flash;
+  }
+  let sparkle = (vec3f(glints + twinkle * 2.0) * onEye
+    + tex * facets * 2.5 * lit * solid * (1.0 + 0.6 * jj.shine));
+  // The soft light (sheen, glow through, colour) needs only the eye's picture.
+  let gem = (sparkle + (vec3f(dome) + through + vivid) * solid) * open * jj.w;
+  // The edge, which jj.w (fading out from 0.85) would hide: the glowing rim
+  // band, and a thin glossy line right at the border — light running round
+  // the stone's edge — all the way round, bright below and dim above, where a
+  // halo would reach the lid. Up to the mesh's edge and no further.
+  let on = select(0.0, 1.0, strength > 0.0) * (1.0 - smoothstep(1.0 - aa, 1.0, r));
+  let edgeLine = smoothstep(0.92, 0.955, r) * (1.0 - smoothstep(0.965, 0.995, r));
+  let edgeLit = mix(0.3, 1.0, lower) * lit * (1.0 + 0.6 * jj.shine);
+  let edge = (tex * rim * 2.0 + vec3f(rim * 0.25)) * lit * (1.0 + 0.6 * jj.shine)
+    + (vec3f(0.55) + tex * 0.8) * edgeLine * edgeLit;
+  let border = edge * solid * open * on;
   // The whole eye shines a little brighter, more while it wobbles — not just
   // the iris, so this one is not held to it (jj.w).
   let lift = tex * (0.25 + 0.35 * jj.shine) * select(0.0, 1.0, strength > 0.0);
-  return (gem + lift) * min(strength, 1.0);
+  return (gem + border + lift) * min(strength, 1.0);
 }
 
 /** The light arriving at a surface of this object facing n: its own ambient

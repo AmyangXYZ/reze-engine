@@ -22,7 +22,7 @@ import type { Model } from "./model"
 export interface JellyEyeOptions {
   /** How much the eyes give: 0 still, 1 the intended bounce, up to 2. Default 1. */
   strength?: number
-  /** The idle taps: a small bounce every few seconds while nothing else moves them.
+  /** The idle taps: a ripple every 4–8 s while nothing else moves them.
    *  Default true; false leaves only what her blinks and motion set off. */
   idle?: boolean
 }
@@ -82,16 +82,21 @@ const PULSE_REF = 0.006
 const MOTION_SQUASH = 0.18
 const PULSE_HZ = 2.0
 const PULSE_ZETA = 0.08
-// The idle taps: every few seconds, at uneven times, a small knock into the
+// The idle taps: every 4–8 s, at uneven times, a knock into the
 // same springs her motion drives — the iris dips, bounces and settles, then
 // rests — the way a jelly on a table is never quite still. A steady sine was
 // tried, as size (a zoom) and as wider-then-taller (queasy); a settling tap is
-// what reads as jelly. Velocity kicks, so the bounce keeps the springs' own
-// timing; the gaps come from a hash of the tap's count, so the scene clock
-// alone decides them and an export taps where the screen did.
-const IDLE_SQUASH_KICK = 0.45
-const IDLE_PULSE_KICK = 0.25
-const IDLE_GAP: [number, number] = [1.8, 3.8]
+// what reads as jelly. A tap is a full KNOCK, exactly what her motion gives at
+// its strongest — a gentler nudge was tried and went unnoticed — held for a
+// moment and let go, so it rings through the same springs. The gaps come from
+// a hash of the tap's count, so the scene clock alone decides them and an
+// export taps where the screen did.
+const IDLE_TAP_S = 0.12
+// How hard a tap knocks (motion's strongest is 1) and how far apart they fall:
+// a full knock every 2–4 s read as the iris zooming constantly; rarer, a touch
+// softer, each one reads as a ripple and the eye rests between.
+const IDLE_TAP = 0.6
+const IDLE_GAP: [number, number] = [4, 8]
 const idleGap = (n: number): number => {
   const x = Math.sin(n * 12.9898 + 78.233) * 43758.5453
   return IDLE_GAP[0] + (x - Math.floor(x)) * (IDLE_GAP[1] - IDLE_GAP[0])
@@ -132,6 +137,18 @@ interface EyeRest {
   // Iris centre to the eye bone's head: what a turn moves the iris by, per
   // radian.
   lever: number
+  // The vertices it was measured from (empty for a fallback), and the bone
+  // that carries them (−1 when none does).
+  verts: number[]
+  bone: number
+}
+
+// A vertex morph's pull on an iris: the mean offset it gives the iris's
+// vertices at weight 1. Morphs add linearly, so the iris's centre under any
+// mix of them is the rest centre plus these, weighted.
+interface MorphShift {
+  morph: number
+  d: [number, number, number]
 }
 
 const newState = (): EyeState => ({
@@ -154,12 +171,20 @@ export class JellyEyes {
   private clock = 0
   private taps = 0
   private nextTap = idleGap(0)
+  // The current tap's knock, 1 at the tap and fading over IDLE_TAP_S.
+  private tapKnock = 0
   private readonly rest: [EyeRest, EyeRest]
   private readonly state: [EyeState, EyeState] = [newState(), newState()]
   private readonly morphs: [number[], number[], number[]]
   private readonly eyeBones: [number, number]
   private readonly headBone: number
   private fresh = true
+  // Each iris's centre THIS frame: the rest centre carried by the morphs that
+  // move the iris (a pupil-up, a look-left) — the vertex shader scales the
+  // morphed iris, so a centre left at rest scales it about a point it has
+  // already left, and it drifts off as it shrinks and grows.
+  private readonly shifts: [MorphShift[], MorphShift[]]
+  private readonly centre: [[number, number, number], [number, number, number]]
   private readonly inertia: Inertia = { p: [0, 0, 0], v: [0, 0, 0], head: [0, 0, 0], offset: [0, 0] }
 
   constructor(model: Model, options: JellyEyeOptions) {
@@ -170,26 +195,44 @@ export class JellyEyes {
     const both = index("両目")
     const l = index("左目")
     const r = index("右目")
-    this.eyeBones = [l >= 0 ? l : both, r >= 0 ? r : both]
     this.headBone = index("頭")
     const names = model.getMorphing().morphs.map((m) => m.name)
     const find = (list: string[]) => list.map((n) => names.indexOf(n)).filter((i) => i >= 0)
     this.morphs = [find(BOTH), find(LEFT), find(RIGHT)]
     this.rest = findIrises(model, l, r, both)
+    // The bone that carries each iris, which may be under the eye bone.
+    this.eyeBones = [this.rest[0].bone, this.rest[1].bone]
+    this.shifts = [irisShifts(model, this.rest[0].verts), irisShifts(model, this.rest[1].verts)]
+    this.centre = [[...this.rest[0].centre], [...this.rest[1].centre]]
   }
 
   /** Advance both springs by dt seconds of scene time. */
   step(dt: number, model: Model): void {
     const weights = model.getEffectiveMorphWeights()
+    for (let e = 0; e < 2; e++) {
+      const c = this.centre[e]
+      const r = this.rest[e].centre
+      c[0] = r[0]
+      c[1] = r[1]
+      c[2] = r[2]
+      for (const { morph, d } of this.shifts[e]) {
+        const w = weights[morph] ?? 0
+        if (w === 0) continue
+        c[0] += d[0] * w
+        c[1] += d[1] * w
+        c[2] += d[2] * w
+      }
+    }
     const sum = (list: number[]) => list.reduce((s, i) => s + (weights[i] ?? 0), 0)
     const both = sum(this.morphs[0])
     const closure = [Math.min(1, both + sum(this.morphs[1])), Math.min(1, both + sum(this.morphs[2]))]
     const head = this.headBone >= 0 ? model.getBoneWorldMatrixAt(this.headBone) : null
     const seek = this.fresh || dt > SEEK || dt < 0
     if (dt > 0) this.clock += dt
-    let tap = false
-    if (!seek && this.idle && this.clock >= this.nextTap) {
-      tap = true
+    if (dt > 0) this.tapKnock *= Math.exp(-dt / IDLE_TAP_S)
+    if (seek) this.tapKnock = 0
+    else if (this.idle && this.clock >= this.nextTap) {
+      this.tapKnock = IDLE_TAP
       this.taps++
       this.nextTap = this.clock + idleGap(this.taps)
     }
@@ -206,7 +249,7 @@ export class JellyEyes {
       else s.settled += (s.closure - s.settled) * Math.min(1, dt / CLOSURE_FOLLOW_S)
       // Either way a lid moves squashes — opening too, which is the half of a
       // blink you can see (closing, the lid hides the iris anyway).
-      const knock = seek ? 0 : Math.tanh(Math.hypot(...this.offset(s, e)) / PULSE_REF)
+      const knock = seek ? 0 : Math.max(this.tapKnock, Math.tanh(Math.hypot(...this.offset(s, e)) / PULSE_REF))
       const squashTarget = SQUASH_CLOSED * Math.abs(s.closure - s.settled) + MOTION_SQUASH * knock
       if (seek) {
         s.squash = squashTarget
@@ -217,10 +260,6 @@ export class JellyEyes {
         s.shine = 0
         s.pulse = s.pulseV = 0
         continue
-      }
-      if (tap) {
-        s.squashV += IDLE_SQUASH_KICK
-        s.pulseV -= IDLE_PULSE_KICK
       }
       const steps = Math.ceil(dt / SUBSTEP)
       const h = steps > 0 ? dt / steps : 0
@@ -245,17 +284,18 @@ export class JellyEyes {
 
   /** Write jelly[0..5] into an ObjectLight copy (floats 48..71). */
   write(o: Float32Array): void {
-    const [L, R] = this.rest
-    o.set([L.centre[0], L.centre[1], L.centre[2], this.strength], 48)
+    const [L, R] = this.centre
+    o.set([L[0], L[1], L[2], this.strength], 48)
     // One scale bounce for both: the mean of the two eyes', so they swell together.
     const pulse = ((this.state[0].pulse + this.state[1].pulse) / 2) * this.strength
-    o.set([R.centre[0], R.centre[1], R.centre[2], pulse], 52)
+    o.set([R[0], R[1], R[2], pulse], 52)
     for (let e = 0; e < 2; e++) {
       const s = this.state[e]
       const rest = this.rest[e]
       o.set([rest.radius[0], rest.radius[1], s.closure, this.eyeBones[e]], 56 + e * 4)
-      // Offset words (65, 66) stay 0: the iris holds its place; only scale.
-      o.set([s.squash * this.strength, 0, 0, s.shine], 64 + e * 4)
+      // Word 65 stays 0 (the iris holds its place; only scale); 66 carries the
+      // scene clock for the gem's twinkles, wrapped so a float keeps it exact.
+      o.set([s.squash * this.strength, 0, this.clock % 1000, s.shine], 64 + e * 4)
     }
   }
 
@@ -356,6 +396,64 @@ function look(eye: Float32Array | null, head: Float32Array | null, out: [number,
 const dot = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 /**
+ * The iris out of everything one eye carries: grouped by material, the group
+ * whose centre is nearest the eye bone, and any other group centred on it
+ * (within its own size) — layers of the same eye. Without materials (or a
+ * bone), the set as it came.
+ */
+function irisOnly(model: Model, set: number[], bone: [number, number, number] | null): number[] {
+  const materials = model.getMaterials?.() ?? []
+  const { positions, indices } = model.getGeometry()
+  if (set.length < 3 || !bone || !materials.length || !indices.length) return set
+  const material = new Int32Array(positions.length / 3).fill(-1)
+  let start = 0
+  materials.forEach((m, i) => {
+    for (let k = start; k < start + m.vertexCount; k++) if (material[indices[k]] < 0) material[indices[k]] = i
+    start += m.vertexCount
+  })
+  const groups = new Map<number, number[]>()
+  for (const v of set) {
+    const g = groups.get(material[v])
+    if (g) g.push(v)
+    else groups.set(material[v], [v])
+  }
+  if (groups.size < 2) return set
+  const boxes = [...groups.values()].map((vs) => {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+    for (const v of vs) {
+      minX = Math.min(minX, positions[v * 3])
+      maxX = Math.max(maxX, positions[v * 3])
+      minY = Math.min(minY, positions[v * 3 + 1])
+      maxY = Math.max(maxY, positions[v * 3 + 1])
+    }
+    return { vs, x: (minX + maxX) / 2, y: (minY + maxY) / 2, size: Math.max(maxX - minX, maxY - minY) / 2 }
+  })
+  const near = boxes.reduce((a, b) => (Math.hypot(b.x - bone[0], b.y - bone[1]) < Math.hypot(a.x - bone[0], a.y - bone[1]) ? b : a))
+  return boxes.filter((b) => Math.hypot(b.x - near.x, b.y - near.y) <= near.size).flatMap((b) => b.vs)
+}
+
+/** Every vertex morph that moves this iris, with the mean offset it gives it. */
+function irisShifts(model: Model, verts: number[]): MorphShift[] {
+  if (!verts.length) return []
+  const inIris = new Set(verts)
+  const out: MorphShift[] = []
+  model.getMorphing().morphs.forEach((m, morph) => {
+    const d: [number, number, number] = [0, 0, 0]
+    for (const o of m.vertexOffsets ?? []) {
+      if (!inIris.has(o.vertexIndex)) continue
+      d[0] += o.positionOffset[0]
+      d[1] += o.positionOffset[1]
+      d[2] += o.positionOffset[2]
+    }
+    d[0] /= verts.length
+    d[1] /= verts.length
+    d[2] /= verts.length
+    if (Math.hypot(...d) > 1e-6) out.push({ morph, d })
+  })
+  return out
+}
+
+/**
  * Each iris in bind space: the vertices the eye bones carry are exactly the
  * part of the eye that turns to look — the iris and pupil — so their centroid
  * is its centre and their spread its size. A rig that carries both eyes on
@@ -380,29 +478,71 @@ function findIrises(model: Model, l: number, r: number, both: number): [EyeRest,
   const leftSign = lHead && rHead ? Math.sign(lHead[0] - rHead[0]) || 1 : 1
   const { positions } = model.getGeometry()
   const { joints, weights } = model.getSkinning()
-  const sets: [number[], number[]] = [[], []]
-  const n = positions.length / 3
-  for (let v = 0; v < n; v++) {
-    let wl = 0
-    let wr = 0
-    let wb = 0
-    for (let k = 0; k < 4; k++) {
-      const j = joints[v * 4 + k]
-      const w = weights[v * 4 + k]
-      if (j === l) wl += w
-      else if (j === r) wr += w
-      else if (j === both) wb += w
+  // Which eye each bone turns with: an eye bone, or any bone under one. Rigs
+  // differ in which carries the iris — some hang it on the eye bone itself,
+  // some on its tip (左目先/右目先), which turns with it all the same.
+  const owner = bones.map((_, i) => {
+    for (let b = i; b >= 0; b = bones[b].parentIndex) {
+      if (b === l) return 0
+      if (b === r) return 1
+      if (b === both) return 2
     }
-    if (wl >= 128) sets[0].push(v)
-    else if (wr >= 128) sets[1].push(v)
-    else if (wb >= 128) sets[Math.sign(positions[v * 3]) === leftSign ? 0 : 1].push(v)
+    return -1
+  })
+  // Per side, the vertices and how much iris weight each bone carries: the
+  // heaviest is the one the vertex shader scales by (one bone per eye).
+  //
+  // The per-eye trees first. 両目 is a fallback for rigs that carry both irises
+  // on it alone: where 左目/右目 do carry them, anything hung on 両目 is
+  // something else that turns with the eyes — an expression overlay above them
+  // (blush lines, sparkles) — and split by side it stretches each "iris" past
+  // any iris, so the size check rejects both and the eyes never move.
+  const gather = (useBoth: boolean) => {
+    const sets: [number[], number[]] = [[], []]
+    const n = positions.length / 3
+    for (let v = 0; v < n; v++) {
+      const w3 = [0, 0, 0]
+      for (let k = 0; k < 4; k++) {
+        const o = owner[joints[v * 4 + k]]
+        if (o >= 0) w3[o] += weights[v * 4 + k]
+      }
+      let side: 0 | 1
+      if (w3[0] >= 128) side = 0
+      else if (w3[1] >= 128) side = 1
+      else if (useBoth && w3[2] >= 128) side = Math.sign(positions[v * 3]) === leftSign ? 0 : 1
+      else continue
+      sets[side].push(v)
+    }
+    return sets
+  }
+  let gathered = gather(false)
+  if (gathered[0].length < 3 && gathered[1].length < 3) gathered = gather(true)
+  // Of what turns with an eye, the iris is the mesh nearest its bone, with the
+  // layers stacked on it (an eye white, a highlight sheet over the same disc).
+  // A mesh elsewhere that the eye bones also carry — an expression overlay
+  // above the eyes — is left out, or it stretches the "iris" past any iris.
+  const sets: [number[], number[]] = [irisOnly(model, gathered[0], lHead), irisOnly(model, gathered[1], rHead)]
+  const carried: [Map<number, number>, Map<number, number>] = [new Map(), new Map()]
+  for (const side of [0, 1] as const) {
+    for (const v of sets[side]) {
+      for (let k = 0; k < 4; k++) {
+        const j = joints[v * 4 + k]
+        if (owner[j] >= 0) carried[side].set(j, (carried[side].get(j) ?? 0) + weights[v * 4 + k])
+      }
+    }
+  }
+  const carrier = (side: 0 | 1): number => {
+    let best = -1
+    let most = 0
+    for (const [j, w] of carried[side]) if (w > most) [best, most] = [j, w]
+    return best
   }
   const apart = lHead && rHead ? Math.hypot(lHead[0] - rHead[0], lHead[1] - rHead[1]) : 0
   const fallbackRadius = apart > 0 ? apart * 0.22 : 0.3
-  const rest = (set: number[], bone: [number, number, number] | null, side: number): EyeRest => {
+  const rest = (set: number[], bone: [number, number, number] | null, side: number, carrierBone: number): EyeRest => {
     if (set.length < 3) {
       const c: [number, number, number] = bone ?? [side * fallbackRadius * 2, 0, 0]
-      return { centre: c, radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2 }
+      return { centre: c, radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2, verts: [], bone: -1 }
     }
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, z = 0
     for (const v of set) {
@@ -420,7 +560,7 @@ function findIrises(model: Model, l: number, r: number, both: number): [EyeRest,
     const rx = (maxX - minX) / 2
     const ry = (maxY - minY) / 2
     if (apart > 0 && (rx > apart * 0.6 || ry > apart * 0.8)) {
-      return { centre: bone ?? [side * fallbackRadius * 2, 0, 0], radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2 }
+      return { centre: bone ?? [side * fallbackRadius * 2, 0, 0], radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2, verts: [], bone: -1 }
     }
     const centre: [number, number, number] = [(minX + maxX) / 2, (minY + maxY) / 2, z / set.length]
     const radius: [number, number] = [Math.max(rx, 1e-3), Math.max(ry, 1e-3)]
@@ -428,7 +568,7 @@ function findIrises(model: Model, l: number, r: number, both: number): [EyeRest,
     // still turns its eyes visibly, so read it as a typical eyeball's.
     const r = (radius[0] + radius[1]) / 2
     const lever = Math.max(bone ? Math.hypot(centre[0] - bone[0], centre[1] - bone[1], centre[2] - bone[2]) : 0, r * 1.5)
-    return { centre, radius, lever }
+    return { centre, radius, lever, verts: set, bone: carrierBone }
   }
-  return [rest(sets[0], lHead, leftSign), rest(sets[1], rHead, -leftSign)]
+  return [rest(sets[0], lHead, leftSign, carrier(0)), rest(sets[1], rHead, -leftSign, carrier(1))]
 }
