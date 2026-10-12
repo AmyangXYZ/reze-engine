@@ -197,12 +197,22 @@ fn safe_normal2(v: vec2f) -> vec2f {
   let w = max(clipPos.w, 1e-4);
   var ndc: vec2f;
   var coverage = 1.0;
+  // The scene's width dial splits around 1×. Above it, it widens the line
+  // before the minimum, as it always has. Below it, it thins the line AFTER
+  // the minimum: a line held at the minimum is drawn that wide and faded, and
+  // it still writes depth across all of it — so a dial at 0.1× or at 0.0001×
+  // left the same 1.5 px ring for whatever drew or read depth after it, and
+  // the dial did nothing visible. Thinned past the minimum instead, the hull
+  // is genuinely sub-pixel, the multisampling covers only what it covers, and
+  // the line fades with the dial and claims depth only where it is.
+  let widen = max(material.widthScale, 1.0);
+  let thin = min(material.widthScale, 1.0);
   if (material.textured > 0.5) {
     // The game's: a view-space offset of edgeSize world units along the view
     // normal, projected, then each axis held between 1.2 px and 1.2 px ×
     // (1 + _OutlineMaxOffsetMultiplier, 1.5) of a 1920-wide frame; a line the
     // minimum had to push fades by how far it was pushed.
-    let off = viewNormal.xy * material.edgeSize * material.widthScale * outlineNormal.w;
+    let off = viewNormal.xy * material.edgeSize * widen * outlineNormal.w;
     let d1 = vec2f(off.x * camera.projection[0][0], off.y * camera.projection[1][1]) / w;
     // the minimum along the push direction (the game's dir · 2/screen · 1.2)
     let pxNdc = 2.0 / refViewport * 1.2 * safe_normal2(viewNormal.xy);
@@ -214,7 +224,7 @@ fn safe_normal2(v: vec2f) -> vec2f {
     ndc = o * select(vec2f(1.0), sign(d1), abs(d1) > vec2f(0.0));
   } else {
     let breakDepth = RZ_OUTLINE_FULL_FIGURE * camera.projection[1][1];
-    let nearNdc = viewNormal.xy * (material.edgeSize * material.widthScale * outlineNormal.w * 4.0 / refViewport);
+    let nearNdc = viewNormal.xy * (material.edgeSize * widen * outlineNormal.w * 4.0 / refViewport);
     ndc = nearNdc * (min(w, breakDepth) / w);
 
     // Antialiased minimum (the game's _OutlineAntialias): held at the minimum
@@ -228,6 +238,7 @@ fn safe_normal2(v: vec2f) -> vec2f {
       ndc = select(vec2f(0.0), ndc * (minPx / px), px > 1e-6);
     }
   }
+  ndc *= thin;
   output.normal = worldNormal;
   output.coverage = coverage;
   output.position = vec4f(clipPos.xy + ndc * w, clipPos.z, clipPos.w);
