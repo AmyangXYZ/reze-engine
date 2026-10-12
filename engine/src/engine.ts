@@ -8338,7 +8338,8 @@ export class Engine {
       label: "main per-material bind group layout",
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        // VERTEX too: jelly eyes tell a highlight layer by its materialId.
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         // StyleUniforms for compiled graph shaders (adjust-tier sliders). Hand-written
@@ -13797,9 +13798,8 @@ export class Engine {
 
   /**
    * Jelly eyes: her irises shrink and spring back as her lids move, swell as her
-   * head turns or moves, and wobble back, and shine like a gem — two hard
-   * glints, light glowing through the iris, deeper colour. MMD's 果冻眼, on any
-   * PMX and under any eye graph. Null stills them again.
+   * head turns or moves, and wobble back. MMD's 果冻眼, on any PMX and under
+   * any eye graph. Null stills them again.
    *
    * Driven by her closing morphs (まばたき, the winks) and her head bone, never
    * her eyes' own turn, so eye tracking following the camera leaves it still.
@@ -13902,7 +13902,7 @@ export class Engine {
       if (inst.jellyEyes) {
         inst.jellyEyes.step(deltaTime, inst.model)
         inst.jellyEyes.write(inst.objectLight)
-        this.device.queue.writeBuffer(inst.lightBuffer, 48 * 4, inst.objectLight, 48, 24)
+        this.device.queue.writeBuffer(inst.lightBuffer, 48 * 4, inst.objectLight, 48, 48)
       }
       animMs += performance.now() - tAnim
       // Material morphs ride the same weight change as vertex morphs but land in
@@ -15210,7 +15210,7 @@ export class Engine {
     // the cast on the character layer as well as the default one. Words:
     // layers [0..3], ambient flag [4..7], SH [8..43], fill [44..47], jelly
     // eyes [48..71] — see materials/common.ts.
-    const objectLight = new Float32Array(72)
+    const objectLight = new Float32Array(96)
     new Uint32Array(objectLight.buffer)[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0
     const lightBuffer = this.device.createBuffer({

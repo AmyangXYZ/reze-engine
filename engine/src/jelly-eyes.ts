@@ -3,19 +3,25 @@
 // What every working version of the effect has in common, whether it is keyed
 // by hand in MMD, a pendulum in Live2D, or a jiggle bone in Blender: an INPUT
 // (a blink, a turn), something that REMEMBERS the last frame (a spring), and a
-// cheap OUTPUT. Here the output is the iris's SCALE, in place: it shrinks and
-// springs back as a lid moves (opening too), swells as her head turns or moves, and
-// wobbles back. It never slides — tried, it read as the iris coming loose. The
-// inputs are her blinks and her head, never her eyes' own turn: eye tracking
-// turns the eyes after the camera, and the camera must not shake the jelly.
+// cheap OUTPUT. Here the output is the iris's shape, in place.
+//
+// The blink is the MME 果冻眼's (JellyEye V1.2.2, by 茶叶味香皂): a spring
+// driven by how FAST the lids move. The iris widens while they close and rings
+// out once they stop, kicked again at each change of pace; the lid presses it
+// flatter as it closes; a twist and a drift of a hair ride the spring. On top,
+// her head's motion and an idle tap now and then knock it, as before. A
+// highlight drawn as its own layer over the iris (a separate material, as MME
+// rigs have) follows the iris, then trembles on its own: a new random spot ten
+// times a second, no easing — the jiggle the MME is known for. The inputs are
+// her blinks and her head, never her eyes' own turn: eye tracking turns the
+// eyes after the camera, and the camera must not shake the jelly.
 //
 // The springs run on the CPU, stepped by the engine's frame delta — the same
 // exact delta renderFrame() hands an export, so a blink bounces identically on
-// screen and in the file. Their state rides in the model's ObjectLight
-// (jelly[0..5], see materials/common.ts): the vertex shader scales the iris —
-// the vertices the eye bones carry — about its centre, and the eye render class
-// adds the gem look after its graph (glints, light through the iris, deeper
-// colour), so every eye graph becomes jelly without knowing it.
+// screen and in the file. Their result rides in the model's ObjectLight
+// (jelly[0..11], see materials/common.ts): the vertex shader moves the iris —
+// the vertices the eye bones carry — about its centre, so every eye graph
+// becomes jelly without knowing it. Nothing changes its colour.
 
 import type { Model } from "./model"
 
@@ -34,17 +40,81 @@ const BOTH = ["まばたき", "笑い", "はぅ", "blink", "Blink", "eye_close",
 const LEFT = ["ウィンク", "ウィンク２", "ｳｨﾝｸ", "ｳｨﾝｸ２", "wink", "Wink", "blink_L", "Fcl_EYE_Close_L"]
 const RIGHT = ["ウィンク右", "ウィンク２右", "ｳｨﾝｸ右", "ｳｨﾝｸ２右", "wink_R", "Wink_R", "blink_R", "Fcl_EYE_Close_R"]
 
-// The squash: how far a closed eye presses the picture, and the spring that
-// follows it — lightly damped, so one knock ripples: the squash, a rebound past
-// rest, and several smaller wobbles before it settles. One dip and done read as
-// a scale, not a jelly; the ripple is the "Duang" the effect is named for.
-// Only a CHANGE of closure squashes: the eye's closure less a slow follower of
-// it, so a blink squeezes then bounces, while a held half-close (a smile)
-// leaves the iris at rest instead of squashed for as long as she smiles.
-const SQUASH_CLOSED = 0.35
+// The blink, as the MME runs it (its JellyEye_Settings.fxsub defaults). The
+// eye's closure (0..1) is differentiated twice. Its speed drives a target the
+// spring chases: CLOSE_DRIVE while closing, OPEN_DRIVE while opening, eased by
+// how fast. Every change between gaining and losing pace kicks the spring's
+// velocity. The spring is an exact under-damped step at SPRING_HZ whose
+// envelope halves every HALF_LIFE.
+const ACCEL_MIN = 0.5
+const ACCEL_FULL = 2
+const ACCEL_KICK = 0.32
+const RELEASE_KICK = 0.2
+const CLOSE_DRIVE = 0.85
+const OPEN_DRIVE = 0.2
+const DRIVE_SPEED_MIN = 0.04
+const DRIVE_SPEED_FULL = 2.5
+const DRIVE_CURVE = 0.85
+const MORPH_SPEED_LIMIT = 30
+const ACCEL_LIMIT = 240
+const MAX_STEP = 0.12
+const SPRING_HZ = 3
+const HALF_LIFE = 0.28
+const ELASTIC_S = 2
+const STOP_EPS = 0.0025
+const MIN_RELEASE = 0.12
+const SPRING_LIMIT = 1.25
+// What the spring does to the iris, per unit of it: wider far more than
+// taller, a little less on the rebound side; the lid's press, flatter by
+// SQUEEZE_Y at full closure; a twist (degrees); and a drift (iris radii: the
+// MME's model units over a typical iris of 0.1). Twist and drift take both the
+// spring's place (_POS) and its velocity (_VEL). The twist is ten and five
+// times the MME's defaults (0.2°, 0.8°): at those it stays under a degree and
+// the iris never visibly turns as it rings.
+const SCALE_GAIN: [number, number] = [0.2, 0.05]
+const REBOUND: [number, number] = [0.7, 0.8]
+const SQUEEZE_Y = 0.18
+const TWIST_POS = 2
+const TWIST_VEL = 4
+const DRIFT_POS: [number, number] = [0.008, 0.015]
+const DRIFT_VEL: [number, number] = [0.012, 0.006]
+// The highlight layer's own motion: a held random spot, re-drawn JITTER_HZ
+// times a second per axis, up to JITTER of an iris radius; and, on the spring,
+// a further sway (iris radii) and turn (degrees) of its own.
+const JITTER_HZ: [number, number] = [9, 11]
+const JITTER: [number, number] = [0.03, 0.02]
+const HL_SWAY: [number, number] = [0.03, 0.045]
+const HL_TURN = 10
+const HL_SCALE: [number, number] = [0.055, 0.045]
+const HL_SCALE_MIN = 0.85
+const HL_SCALE_MAX = 1.2
+// The roll: while a closing expression holds, the iris turns about its eye
+// bone's X axis (左目/右目, the eyeball's centre), rolling down with the lid —
+// the angle at weight 1, and simultaneous expressions add. And it comes
+// forward a little (iris radii) with the expression and with the spring, so
+// the roll does not sink it into the white. The MME rolls with the lid
+// exactly, which the lid hides; here the roll follows on a spring of the same
+// pace and decay as the blink's, so as the eye opens the iris swings up past
+// rest and wobbles back, where it can be seen.
+const ROLL: Record<string, number> = {
+  まばたき: -15, blink: -15, Blink: -15, eye_close: -15, Fcl_EYE_Close: -15, はぅ: -15, 笑い: -5,
+  ウィンク: -5, ｳｨﾝｸ: -5, wink: -5, Wink: -5, ウィンク２: -15, ｳｨﾝｸ２: -15, blink_L: -15, Fcl_EYE_Close_L: -15,
+  ウィンク右: -5, ｳｨﾝｸ右: -5, wink_R: -5, Wink_R: -5, ウィンク２右: -15, ｳｨﾝｸ２右: -15, blink_R: -15, Fcl_EYE_Close_R: -15,
+}
+const ROLL_HZ = SPRING_HZ
+const ROLL_ZETA = Math.LN2 / HALF_LIFE / (2 * Math.PI * SPRING_HZ)
+// How much of the spring's swing about the expression angle shows: the whole
+// of it carried the iris up most of its radius after a blink.
+const ROLL_SWING = 0.4
+const PUSH_EXPRESSION = 0.15
+const PUSH_ELASTIC = 0.04
+// A highlight sheet by name, for rigs that keep it on its own material.
+const HIGHLIGHT = /ハイライト|ﾊｲﾗｲﾄ|高光|highlight|hilight|(^|[^a-z])hl([^a-z]|$)/i
+const DEG = Math.PI / 180
+// The knock's squash (her motion, the idle taps): nearly round, lightly damped
+// so one knock ripples.
 const SQUASH_HZ = 1.8
 const SQUASH_ZETA = 0.08
-const CLOSURE_FOLLOW_S = 0.35
 // The lag: the picture trails the eye's turn and catches up past it. Radians of
 // lag to eye radii of offset; the head's own turn counts for a third, so a
 // sudden stop of the head wobbles the eyes without a dance keeping them
@@ -107,16 +177,25 @@ const SEEK = 0.25
 
 interface EyeState {
   closure: number
-  // The slow follower of closure; closure − settled is what squashes.
-  settled: number
+  // The MME blink: last frame's closure and its speed, the last pace trend
+  // (+1 gaining, −1 losing, 0 still), the spring's place and velocity, and
+  // the seconds since the lids last drove it.
+  prev: number
+  speed: number
+  trend: number
+  x: number
+  v: number
+  age: number
   squash: number
   squashV: number
   // Lagged look (yaw, pitch) and its velocity; the offset is lagged − actual.
   lag: [number, number]
   lagV: [number, number]
   look: [number, number]
-  shine: number
   pulse: number
+  // The roll (degrees) and its velocity, chasing the expressions' angle.
+  roll: number
+  rollV: number
   pulseV: number
 }
 
@@ -141,6 +220,8 @@ interface EyeRest {
   // that carries them (−1 when none does).
   verts: number[]
   bone: number
+  // The eye bone's head, which the roll turns about (null: no eye bone).
+  pivot: [number, number, number] | null
 }
 
 // A vertex morph's pull on an iris: the mean offset it gives the iris's
@@ -153,14 +234,20 @@ interface MorphShift {
 
 const newState = (): EyeState => ({
   closure: 0,
-  settled: 0,
+  prev: 0,
+  speed: 0,
+  trend: 0,
+  x: 0,
+  v: 0,
+  age: ELASTIC_S,
   squash: 0,
   squashV: 0,
   lag: [0, 0],
   lagV: [0, 0],
   look: [0, 0],
-  shine: 0,
   pulse: 0,
+  roll: 0,
+  rollV: 0,
   pulseV: 0,
 })
 
@@ -186,6 +273,11 @@ export class JellyEyes {
   private readonly shifts: [MorphShift[], MorphShift[]]
   private readonly centre: [[number, number, number], [number, number, number]]
   private readonly inertia: Inertia = { p: [0, 0, 0], v: [0, 0, 0], head: [0, 0, 0], offset: [0, 0] }
+  // The highlight layers' draw ids (MaterialUniforms.materialId), up to two.
+  readonly highlights: number[]
+  // Each eye's closing expressions with their roll, and the angle they set this frame (degrees).
+  private readonly rolls: [{ morph: number; deg: number }[], { morph: number; deg: number }[]]
+  private readonly roll: [number, number] = [0, 0]
 
   constructor(model: Model, options: JellyEyeOptions) {
     this.strength = clampStrength(options.strength)
@@ -199,11 +291,14 @@ export class JellyEyes {
     const names = model.getMorphing().morphs.map((m) => m.name)
     const find = (list: string[]) => list.map((n) => names.indexOf(n)).filter((i) => i >= 0)
     this.morphs = [find(BOTH), find(LEFT), find(RIGHT)]
+    const rolls = (list: string[]) => list.map((n) => ({ morph: names.indexOf(n), deg: ROLL[n] ?? 0 })).filter((r) => r.morph >= 0 && r.deg !== 0)
+    this.rolls = [rolls([...BOTH, ...LEFT]), rolls([...BOTH, ...RIGHT])]
     this.rest = findIrises(model, l, r, both)
     // The bone that carries each iris, which may be under the eye bone.
     this.eyeBones = [this.rest[0].bone, this.rest[1].bone]
     this.shifts = [irisShifts(model, this.rest[0].verts), irisShifts(model, this.rest[1].verts)]
     this.centre = [[...this.rest[0].centre], [...this.rest[1].centre]]
+    this.highlights = findHighlights(model, this.rest)
   }
 
   /** Advance both springs by dt seconds of scene time. */
@@ -226,6 +321,7 @@ export class JellyEyes {
     const sum = (list: number[]) => list.reduce((s, i) => s + (weights[i] ?? 0), 0)
     const both = sum(this.morphs[0])
     const closure = [Math.min(1, both + sum(this.morphs[1])), Math.min(1, both + sum(this.morphs[2]))]
+    for (let e = 0; e < 2; e++) this.roll[e] = this.rolls[e].reduce((a, r) => a + r.deg * Math.max(0, Math.min(1, weights[r.morph] ?? 0)), 0)
     const head = this.headBone >= 0 ? model.getBoneWorldMatrixAt(this.headBone) : null
     const seek = this.fresh || dt > SEEK || dt < 0
     if (dt > 0) this.clock += dt
@@ -245,22 +341,24 @@ export class JellyEyes {
       // Only her motion — the head turning and moving (the inertia) — and her
       // blinks do.
       look(head, null, s.look)
-      if (seek) s.settled = s.closure
-      else s.settled += (s.closure - s.settled) * Math.min(1, dt / CLOSURE_FOLLOW_S)
-      // Either way a lid moves squashes — opening too, which is the half of a
-      // blink you can see (closing, the lid hides the iris anyway).
       const knock = seek ? 0 : Math.max(this.tapKnock, Math.tanh(Math.hypot(...this.offset(s, e)) / PULSE_REF))
-      const squashTarget = SQUASH_CLOSED * Math.abs(s.closure - s.settled) + MOTION_SQUASH * knock
+      const squashTarget = MOTION_SQUASH * knock
       if (seek) {
+        // Landing on a pose is no blink: the spring rests where it lands.
+        s.prev = s.closure
+        s.speed = s.trend = s.x = s.v = 0
+        s.age = ELASTIC_S
         s.squash = squashTarget
         s.squashV = 0
         s.lag[0] = s.look[0]
         s.lag[1] = s.look[1]
         s.lagV[0] = s.lagV[1] = 0
-        s.shine = 0
         s.pulse = s.pulseV = 0
+        s.roll = this.roll[e]
+        s.rollV = 0
         continue
       }
+      blink(s, dt)
       const steps = Math.ceil(dt / SUBSTEP)
       const h = steps > 0 ? dt / steps : 0
       const pulseTarget = PULSE_MAX * knock
@@ -269,33 +367,63 @@ export class JellyEyes {
         s.pulse += h * s.pulseV
         s.squashV += h * spring(s.squash - squashTarget, s.squashV, SQUASH_HZ, SQUASH_ZETA)
         s.squash += h * s.squashV
+        s.rollV += h * spring(s.roll - this.roll[e], s.rollV, ROLL_HZ, ROLL_ZETA)
+        s.roll += h * s.rollV
         for (let k = 0; k < 2; k++) {
           s.lagV[k] += h * spring(s.lag[k] - s.look[k], s.lagV[k], LAG_HZ, LAG_ZETA)
           s.lag[k] += h * s.lagV[k]
         }
       }
-      // Shine follows the motion: bright while the jelly moves, fading as it
-      // settles, eased so a single wobble does not strobe.
-      const motion = Math.min(1, 2.5 * Math.abs(s.squash - squashTarget) + 4 * Math.hypot(...this.offset(s, e)))
-      s.shine += (motion - s.shine) * Math.min(1, dt * 12)
     }
     this.fresh = false
   }
 
-  /** Write jelly[0..5] into an ObjectLight copy (floats 48..71). */
+  /** Write jelly[0..11] into an ObjectLight copy (floats 48..95). */
   write(o: Float32Array): void {
     const [L, R] = this.centre
-    o.set([L[0], L[1], L[2], this.strength], 48)
-    // One scale bounce for both: the mean of the two eyes', so they swell together.
-    const pulse = ((this.state[0].pulse + this.state[1].pulse) / 2) * this.strength
-    o.set([R[0], R[1], R[2], pulse], 52)
+    const g = this.strength
+    o.set([L[0], L[1], L[2], g], 48)
+    // The highlight layers' draw ids, two packed in one float (exact to 4095).
+    const [a = 0, b = 0] = this.highlights
+    o.set([R[0], R[1], R[2], a + b * 4096], 52)
+    // One knock swell for both: the mean of the two eyes', so they swell together.
+    const pulse = (this.state[0].pulse + this.state[1].pulse) / 2
+    const omega = 2 * Math.PI * SPRING_HZ
+    // Strength scales every departure from rest, then the bounds hold: the
+    // swell under 1.08 tall so it cannot rise past the upper lid.
+    const by = (k: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, 1 + (k - 1) * g))
     for (let e = 0; e < 2; e++) {
       const s = this.state[e]
       const rest = this.rest[e]
+      const r = (rest.radius[0] + rest.radius[1]) / 2
+      // The MME spring's place, and its velocity in the same units.
+      const x = s.x
+      const vn = s.v / omega
+      const gain = (k: 0 | 1) => SCALE_GAIN[k] * (x >= 0 ? 1 : REBOUND[k])
+      const kx = (1 + x * gain(0)) * (1 - 0.8 * s.squash + pulse)
+      const ky = (1 + x * gain(1)) * (1 - SQUEEZE_Y * s.closure) * (1 - s.squash + pulse)
       o.set([rest.radius[0], rest.radius[1], s.closure, this.eyeBones[e]], 56 + e * 4)
-      // Word 65 stays 0 (the iris holds its place; only scale); 66 carries the
-      // scene clock for the gem's twinkles, wrapped so a float keeps it exact.
-      o.set([s.squash * this.strength, 0, this.clock % 1000, s.shine], 64 + e * 4)
+      // [4]/[5]: scale across and down, the iris's twist, the highlight's turn.
+      o.set([by(kx, 0.78, 1.25), by(ky, 0.7, 1.08), (x * TWIST_POS + vn * TWIST_VEL) * DEG * g, vn * HL_TURN * DEG * g], 64 + e * 4)
+      // [6]/[7]: the iris's drift, then the highlight's on top (bind units).
+      // The tremble is held random spots on the scene clock, so an export
+      // trembles where the screen did, and a pause holds it.
+      const tick = (hz: number, seed: number) => (this.idle ? hashSigned(Math.floor(this.clock * hz) + seed + e * 101) : 0)
+      o.set(
+        [
+          (x * DRIFT_POS[0] + vn * DRIFT_VEL[0]) * r * g,
+          (x * DRIFT_POS[1] + vn * DRIFT_VEL[1]) * r * g,
+          (vn * HL_SWAY[0] + tick(JITTER_HZ[0], 17) * JITTER[0]) * r * g,
+          (vn * HL_SWAY[1] + tick(JITTER_HZ[1], 53) * JITTER[1]) * r * g,
+        ],
+        72 + e * 4,
+      )
+      // [8]/[9]: the roll's pivot and angle; [10]/[11]: the highlight's own
+      // scale, and how far the iris comes forward (bind units).
+      const pivot = rest.pivot
+      o.set(pivot ? [pivot[0], pivot[1], pivot[2], (this.roll[e] + (s.roll - this.roll[e]) * ROLL_SWING) * DEG * g] : [0, 0, 0, 0], 80 + e * 4)
+      const hs = (k: 0 | 1) => Math.max(HL_SCALE_MIN, Math.min(HL_SCALE_MAX, 1 + x * HL_SCALE[k] * g))
+      o.set([hs(0), hs(1), (s.closure * PUSH_EXPRESSION + Math.min(Math.abs(x), SPRING_LIMIT) * PUSH_ELASTIC) * r * g, 0], 88 + e * 4)
     }
   }
 
@@ -352,9 +480,109 @@ export class JellyEyes {
   }
 }
 
-/** Zero jelly[0..5] — strength 0 is what the shader reads as off. */
+/** Zero jelly[0..11] — strength 0 is what the shader reads as off. */
 export function clearJellyEyes(o: Float32Array): void {
-  o.fill(0, 48, 72)
+  o.fill(0, 48, 96)
+}
+
+/** A held random value in −1..1 for an integer tick, as the MME hashes it. */
+function hashSigned(n: number): number {
+  const x = Math.sin(n * 12.9898 + 78.233) * 43758.5453
+  return (x - Math.floor(x)) * 2 - 1
+}
+
+/**
+ * One frame of the MME's blink spring for one eye (JellyEye_StateUpdate.fxsub,
+ * JE_ComputeNextState), from its closure this frame.
+ */
+function blink(s: EyeState, dt: number): void {
+  if (!(dt > 0)) return
+  dt = Math.min(dt, MAX_STEP)
+  const omega = 2 * Math.PI * SPRING_HZ
+  const clamp = (x: number, m: number) => Math.max(-m, Math.min(m, x))
+  const speed = clamp((s.closure - s.prev) / dt, MORPH_SPEED_LIMIT)
+  // The change of SPEED, not of signed velocity: gaining pace or losing it.
+  const accel = clamp((Math.abs(speed) - Math.abs(s.speed)) / dt, ACCEL_LIMIT)
+  const trend = accel > ACCEL_MIN ? 1 : accel < -ACCEL_MIN ? -1 : 0
+  // One run of gaining (or losing) pace is one kick.
+  const kicked = trend !== 0 && trend !== s.trend
+  let latched = trend !== 0 ? trend : s.trend
+  if (trend === 0 && Math.abs(speed) < DRIVE_SPEED_MIN && Math.abs(s.speed) < DRIVE_SPEED_MIN) latched = 0
+  // While the lids move, a target the spring chases, eased by how fast.
+  const amount = Math.max(0, Math.min(1, (Math.abs(speed) - DRIVE_SPEED_MIN) / (DRIVE_SPEED_FULL - DRIVE_SPEED_MIN))) ** DRIVE_CURVE
+  const target = amount * (speed > DRIVE_SPEED_MIN ? CLOSE_DRIVE : speed < -DRIVE_SPEED_MIN ? OPEN_DRIVE : 0)
+  const driven = Math.abs(target) > 1e-5
+  const x0 = s.x
+  let v0 = s.v
+  if (kicked) v0 += (trend > 0 ? ACCEL_KICK : -RELEASE_KICK) * Math.min(1, Math.abs(accel) / ACCEL_FULL) * omega
+  const age = driven || kicked ? 0 : Math.min(s.age + dt, ELASTIC_S)
+  let x = 0
+  let v = 0
+  if (driven || kicked || s.age < ELASTIC_S || Math.abs(x0) > STOP_EPS || Math.abs(v0) / omega > STOP_EPS) {
+    // The exact under-damped step about the target.
+    const decay = Math.LN2 / HALF_LIFE
+    const envelope = Math.exp(-decay * dt)
+    const c = Math.cos(omega * dt)
+    const sn = Math.sin(omega * dt)
+    const rel = x0 - target
+    x = target + envelope * (rel * c + ((v0 + decay * rel) * sn) / omega)
+    v = envelope * (v0 * c - ((decay * v0 + (decay * decay + omega * omega) * rel) * sn) / omega)
+  }
+  x = clamp(x, SPRING_LIMIT)
+  v = clamp(v, omega * SPRING_LIMIT * 2)
+  s.prev = s.closure
+  s.speed = speed
+  s.trend = latched
+  const settled = !driven && age >= MIN_RELEASE && Math.abs(x) <= STOP_EPS && Math.abs(v) / omega <= STOP_EPS
+  if (settled || (!driven && age >= ELASTIC_S)) {
+    s.x = s.v = 0
+    s.age = ELASTIC_S
+  } else {
+    s.x = x
+    s.v = v
+    s.age = age
+  }
+}
+
+/**
+ * The highlight layers: a material drawn over an iris — after it, on the same
+ * disc, made of vertices the eye bones carry — or one named as a highlight.
+ * As draw ids (1-based over the materials that draw, as the engine numbers
+ * MaterialUniforms.materialId), at most two. A rig whose highlight is painted
+ * into the iris has none, and only the iris moves.
+ */
+function findHighlights(model: Model, rest: [EyeRest, EyeRest]): number[] {
+  const materials = model.getMaterials?.() ?? []
+  const { positions, indices } = model.getGeometry()
+  const iris = new Set([...rest[0].verts, ...rest[1].verts])
+  if (!materials.length || !indices.length || !iris.size) return []
+  const layers: { id: number; name: string; minX: number; maxX: number; minY: number; maxY: number }[] = []
+  let start = 0
+  let id = 0
+  for (const m of materials) {
+    const count = m.vertexCount
+    if (count === 0) continue
+    id++
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+    for (let k = start; k < start + count; k++) {
+      const v = indices[k]
+      if (!iris.has(v)) continue
+      minX = Math.min(minX, positions[v * 3])
+      maxX = Math.max(maxX, positions[v * 3])
+      minY = Math.min(minY, positions[v * 3 + 1])
+      maxY = Math.max(maxY, positions[v * 3 + 1])
+    }
+    start += count
+    if (minX <= maxX) layers.push({ id, name: m.name, minX, maxX, minY, maxY })
+  }
+  const out: number[] = []
+  layers.forEach((l, i) => {
+    const cx = (l.minX + l.maxX) / 2
+    const cy = (l.minY + l.maxY) / 2
+    const over = layers.slice(0, i).some((u) => cx >= u.minX && cx <= u.maxX && cy >= u.minY && cy <= u.maxY)
+    if ((over || HIGHLIGHT.test(l.name)) && out.length < 2) out.push(l.id)
+  })
+  return out
 }
 
 export function clampStrength(s: number | undefined): number {
@@ -542,7 +770,7 @@ function findIrises(model: Model, l: number, r: number, both: number): [EyeRest,
   const rest = (set: number[], bone: [number, number, number] | null, side: number, carrierBone: number): EyeRest => {
     if (set.length < 3) {
       const c: [number, number, number] = bone ?? [side * fallbackRadius * 2, 0, 0]
-      return { centre: c, radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2, verts: [], bone: -1 }
+      return { centre: c, radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2, verts: [], bone: -1, pivot: null }
     }
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, z = 0
     for (const v of set) {
@@ -560,7 +788,7 @@ function findIrises(model: Model, l: number, r: number, both: number): [EyeRest,
     const rx = (maxX - minX) / 2
     const ry = (maxY - minY) / 2
     if (apart > 0 && (rx > apart * 0.6 || ry > apart * 0.8)) {
-      return { centre: bone ?? [side * fallbackRadius * 2, 0, 0], radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2, verts: [], bone: -1 }
+      return { centre: bone ?? [side * fallbackRadius * 2, 0, 0], radius: [fallbackRadius, fallbackRadius], lever: fallbackRadius * 2, verts: [], bone: -1, pivot: null }
     }
     const centre: [number, number, number] = [(minX + maxX) / 2, (minY + maxY) / 2, z / set.length]
     const radius: [number, number] = [Math.max(rx, 1e-3), Math.max(ry, 1e-3)]
@@ -568,7 +796,7 @@ function findIrises(model: Model, l: number, r: number, both: number): [EyeRest,
     // still turns its eyes visibly, so read it as a typical eyeball's.
     const r = (radius[0] + radius[1]) / 2
     const lever = Math.max(bone ? Math.hypot(centre[0] - bone[0], centre[1] - bone[1], centre[2] - bone[2]) : 0, r * 1.5)
-    return { centre, radius, lever, verts: set, bone: carrierBone }
+    return { centre, radius, lever, verts: set, bone: carrierBone, pivot: bone }
   }
   return [rest(sets[0], lHead, leftSign, carrier(0)), rest(sets[1], rHead, -leftSign, carrier(1))]
 }
