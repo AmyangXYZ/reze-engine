@@ -26,6 +26,73 @@ import { WORLD_AMBIENT_WGSL } from "../lights"
 //   group(1): per-model skinning
 //   group(2): per-material (diffuse texture + material uniforms)
 
+/** The jelly eyes' vertex move (jelly-eyes.ts). Every pass that places model
+ *  vertices takes it, or a pass that skips it draws the iris where it was —
+ *  the shadow map then shades half the moved iris with its own unmoved copy.
+ *  Reads `objectLight.jelly` and `material.materialId`, which the including
+ *  module declares. */
+export const JELLY_VERTEX_WGSL = /* wgsl */ `
+fn _rzJellyTurn(q: vec2f, a: f32) -> vec2f {
+  let c = cos(a);
+  let s = sin(a);
+  return vec2f(c * q.x - s * q.y, s * q.x + c * q.y);
+}
+
+/**
+ * Where the jelly puts an iris vertex. The iris is the part of the eye the eye
+ * bones carry, so it is moved as a whole, in bind space before skinning:
+ * scaled about its centre (the CPU composes the blink's spring, the lid's
+ * press and her motion's knock into one scale), turned and drifted a hair on
+ * the spring, brought forward a hair, and rolled about the eye bone with a
+ * closing expression — inside the white, which stays where it is. A highlight
+ * layer (this draw's material is one of jelly[1].w's) takes the iris's move,
+ * then its own scale, turn and tremble, before the roll. Vertices take it by their weight on the eye bones
+ * (jelly[2].w, jelly[3].w), so nothing else on the face moves.
+ */
+fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
+  let j = objectLight.jelly;
+  let ids = u32(j[1].w);
+  let mid = u32(material.materialId);
+  let hl = mid > 0u && (mid == (ids & 4095u) || mid == (ids >> 12u));
+  var out = p;
+  for (var e = 0u; e < 2u; e++) {
+    let bone = j[2u + e].w;
+    if (bone < 0.0) { continue; }
+    let b = u32(bone);
+    let w = dot(nw, select(vec4f(0.0), vec4f(1.0), joints == vec4<u32>(b)));
+    if (w <= 0.0) { continue; }
+    let c = j[e].xyz;
+    // A rig that carries both eyes on one bone: each vertex follows its own side.
+    if (j[2].w == j[3].w && e == 0u && distance(p.xy, j[1].xy) < distance(p.xy, j[0].xy)) { continue; }
+    if (j[2].w == j[3].w && e == 1u && distance(p.xy, j[0].xy) <= distance(p.xy, j[1].xy)) { continue; }
+    let t = j[4u + e];
+    let m = j[6u + e];
+    let h = j[10u + e];
+    var q = _rzJellyTurn((p.xy - c.xy) * t.xy, t.z) + m.xy;
+    // Forward is −Z (MMD faces −Z).
+    var push = h.z;
+    if (hl) {
+      // Sliding over the iris's dome on its own, a highlight sheet a hair in
+      // front of it would sink into it where the dome bulges more and the two
+      // fight for depth; so it comes forward by as far as it slid — a slope of
+      // one, steeper than the dome anywhere it draws.
+      let before = q;
+      q = _rzJellyTurn(q * h.xy, t.w) + m.zw;
+      push += length(q - before);
+    }
+    var moved = vec3f(c.xy + q, p.z - push);
+    let roll = j[8u + e];
+    if (roll.w != 0.0) {
+      let d = moved - roll.xyz;
+      let rd = _rzJellyTurn(d.yz, roll.w);
+      moved = roll.xyz + vec3f(d.x, rd.x, rd.y);
+    }
+    out = mix(p, moved, w);
+  }
+  return out;
+}
+`
+
 export const COMMON_BINDINGS_WGSL = /* wgsl */ `
 
 struct CameraUniforms {
@@ -234,66 +301,7 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12> }
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
 
-fn _rzJellyTurn(q: vec2f, a: f32) -> vec2f {
-  let c = cos(a);
-  let s = sin(a);
-  return vec2f(c * q.x - s * q.y, s * q.x + c * q.y);
-}
-
-/**
- * Where the jelly puts an iris vertex. The iris is the part of the eye the eye
- * bones carry, so it is moved as a whole, in bind space before skinning:
- * scaled about its centre (the CPU composes the blink's spring, the lid's
- * press and her motion's knock into one scale), turned and drifted a hair on
- * the spring, brought forward a hair, and rolled about the eye bone with a
- * closing expression — inside the white, which stays where it is. A highlight
- * layer (this draw's material is one of jelly[1].w's) takes the iris's move,
- * then its own scale, turn and tremble, before the roll. Vertices take it by their weight on the eye bones
- * (jelly[2].w, jelly[3].w), so nothing else on the face moves.
- */
-fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
-  let j = objectLight.jelly;
-  let ids = u32(j[1].w);
-  let mid = u32(material.materialId);
-  let hl = mid > 0u && (mid == (ids & 4095u) || mid == (ids >> 12u));
-  var out = p;
-  for (var e = 0u; e < 2u; e++) {
-    let bone = j[2u + e].w;
-    if (bone < 0.0) { continue; }
-    let b = u32(bone);
-    let w = dot(nw, select(vec4f(0.0), vec4f(1.0), joints == vec4<u32>(b)));
-    if (w <= 0.0) { continue; }
-    let c = j[e].xyz;
-    // A rig that carries both eyes on one bone: each vertex follows its own side.
-    if (j[2].w == j[3].w && e == 0u && distance(p.xy, j[1].xy) < distance(p.xy, j[0].xy)) { continue; }
-    if (j[2].w == j[3].w && e == 1u && distance(p.xy, j[0].xy) <= distance(p.xy, j[1].xy)) { continue; }
-    let t = j[4u + e];
-    let m = j[6u + e];
-    let h = j[10u + e];
-    var q = _rzJellyTurn((p.xy - c.xy) * t.xy, t.z) + m.xy;
-    // Forward is −Z (MMD faces −Z).
-    var push = h.z;
-    if (hl) {
-      // Sliding over the iris's dome on its own, a highlight sheet a hair in
-      // front of it would sink into it where the dome bulges more and the two
-      // fight for depth; so it comes forward by as far as it slid — a slope of
-      // one, steeper than the dome anywhere it draws.
-      let before = q;
-      q = _rzJellyTurn(q * h.xy, t.w) + m.zw;
-      push += length(q - before);
-    }
-    var moved = vec3f(c.xy + q, p.z - push);
-    let roll = j[8u + e];
-    if (roll.w != 0.0) {
-      let d = moved - roll.xyz;
-      let rd = _rzJellyTurn(d.yz, roll.w);
-      moved = roll.xyz + vec3f(d.x, rd.x, rd.y);
-    }
-    out = mix(p, moved, w);
-  }
-  return out;
-}
-
+${JELLY_VERTEX_WGSL}
 /** The light arriving at a surface of this object facing n: its own ambient
  *  where loaded data gave it one (a stage's probes, a character's), else the
  *  world's. The same polynomial rzWorldAmbient evaluates. */

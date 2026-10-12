@@ -354,11 +354,6 @@ type GroupInstall = {
   pipelineNoDepthWrite: GPURenderPipeline
   /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
-  /** eye render-class only: the same pipeline with its cull flipped, for the
-   *  mirror pass. The eye is the ONE material class that culls a face, and a
-   *  reflection flips winding, so in the mirror the ordinary pipeline keeps
-   *  exactly the faces it exists to discard. */
-  mirrorPipeline?: GPURenderPipeline
   uniformBuffer: GPUBuffer
   /** The group's own image maps, uploaded once per apply and owned here — the
    *  install destroys them when it is replaced, so a re-apply cannot leak. */
@@ -8512,6 +8507,8 @@ export class Engine {
         { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        // The model's ObjectLight, for its jelly eyes.
+        { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
       ],
     })
     const shadowShader = this.device.createShaderModule({
@@ -15180,32 +15177,6 @@ export class Engine {
       physics.setFloor(this.physicsFloor)
     }
 
-    // One per cascade: the shadow VERTEX shader reads a single matrix, and
-    // which one is the only thing that differs between the cascade passes.
-    const shadowBindGroups = SHADOW_CASCADES.map((_, ci) =>
-      this.device.createBindGroup({
-        label: `${name}: shadow bind, cascade ${ci}`,
-        layout: this.shadowDepthPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.shadowCascadeVPBuffers[ci] } },
-          { binding: 1, resource: { buffer: skinMatrixBuffer } },
-          { binding: 2, resource: this.materialSampler },
-        ],
-      }),
-    )
-    // …and one more past the cascades, for the cast's shadow on a stage.
-    shadowBindGroups.push(
-      this.device.createBindGroup({
-        label: `${name}: shadow bind, stage cast shadow`,
-        layout: this.shadowDepthPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.castShadowVPBuffer } },
-          { binding: 1, resource: { buffer: skinMatrixBuffer } },
-          { binding: 2, resource: this.materialSampler },
-        ],
-      }),
-    )
-
     // Its ObjectLight: the world's ambient, and the layers its kind draws on —
     // the cast on the character layer as well as the default one. Words:
     // layers [0..3], ambient flag [4..7], SH [8..43], fill [44..47], jelly
@@ -15219,6 +15190,34 @@ export class Engine {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(lightBuffer, 0, objectLight)
+
+    // One per cascade: the shadow VERTEX shader reads a single matrix, and
+    // which one is the only thing that differs between the cascade passes.
+    const shadowBindGroups = SHADOW_CASCADES.map((_, ci) =>
+      this.device.createBindGroup({
+        label: `${name}: shadow bind, cascade ${ci}`,
+        layout: this.shadowDepthPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.shadowCascadeVPBuffers[ci] } },
+          { binding: 1, resource: { buffer: skinMatrixBuffer } },
+          { binding: 2, resource: this.materialSampler },
+          { binding: 3, resource: { buffer: lightBuffer } },
+        ],
+      }),
+    )
+    // …and one more past the cascades, for the cast's shadow on a stage.
+    shadowBindGroups.push(
+      this.device.createBindGroup({
+        label: `${name}: shadow bind, stage cast shadow`,
+        layout: this.shadowDepthPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.castShadowVPBuffer } },
+          { binding: 1, resource: { buffer: skinMatrixBuffer } },
+          { binding: 2, resource: this.materialSampler },
+          { binding: 3, resource: { buffer: lightBuffer } },
+        ],
+      }),
+    )
     const mainPerInstanceBindGroup = this.perInstanceBindGroup(name, skinMatrixBuffer, lightBuffer)
 
     const pickPerInstanceBindGroup = this.device.createBindGroup({
@@ -16189,6 +16188,10 @@ export class Engine {
       // Alpha is the switch; clamp the rest so a stacked multiply cannot send a
       // colour negative and light the material from the inside.
       for (let k = 0; k < 11; k++) if (d[k] < 0) d[k] = 0
+      // Alpha also stops at 1, as in MMD. Models ship additive +1 alpha morphs
+      // (照れ on 拾星梦语) that MMD's clamp makes a no-op; let through, alpha 2
+      // blends as src*2 - dst and burns every material white.
+      if (d[3] > 1) d[3] = 1
       if (d[3] < 0.0001) inst.morphHiddenMaterials.add(target.materialName)
       let changed = false
       for (let k = 0; k < 11; k++) {
@@ -18021,10 +18024,9 @@ export class Engine {
         if (!result.ok) return
         const module = this.cachedShaderModule(result.wgsl, `style group: ${g.id} (${renderClass})`)
         await Promise.all([
-          this.createRenderClassPipeline(renderClass, module, false, true, false, blend),
-          this.createRenderClassPipeline(renderClass, module, false, false, false, blend),
-          renderClass === "hair" ? this.createRenderClassPipeline(renderClass, module, true, true, false, blend) : null,
-          renderClass === "eye" ? this.createRenderClassPipeline(renderClass, module, false, true, true, blend) : null,
+          this.createRenderClassPipeline(renderClass, module, false, true, blend),
+          this.createRenderClassPipeline(renderClass, module, false, false, blend),
+          renderClass === "hair" ? this.createRenderClassPipeline(renderClass, module, true, true, blend) : null,
         ]).catch(() => {})
       }),
     )
@@ -18401,20 +18403,17 @@ export class Engine {
     // The single-sided twins a draw of this group will ask for (sidedPipeline),
     // built with their pipelines rather than synchronously at the first draw.
     const singleSided = inst.drawCalls.some((dc) => !dc.doubleSided && group.materials.includes(dc.materialName))
-    const variant = (overEyes: boolean, depthWrite: boolean, mirrored: boolean) =>
-      this.createRenderClassPipeline(renderClass, module, overEyes, depthWrite, mirrored, blend).then(async (p) => {
-        if (singleSided && !mirrored) await this.buildSidedTwin(p, false)
+    const variant = (overEyes: boolean, depthWrite: boolean) =>
+      this.createRenderClassPipeline(renderClass, module, overEyes, depthWrite, blend).then(async (p) => {
+        if (singleSided) await this.buildSidedTwin(p, false)
         return p
       })
     const variants = Promise.all([
-      variant(false, true, false),
+      variant(false, true),
       // The depth-write-off twin: stage transparency draws with it (see
       // pipelineForDrawCall), and a future OIT path would too.
-      variant(false, false, false),
-      renderClass === "hair" ? variant(true, true, false) : undefined,
-      // Only the eye needs one: every other class culls "none", which a flipped
-      // winding leaves alone.
-      renderClass === "eye" ? variant(false, true, true) : undefined,
+      variant(false, false),
+      renderClass === "hair" ? variant(true, true) : undefined,
     ])
     // Handled below either way; this keeps a rejection off the console while
     // the diagnostics are read.
@@ -18435,9 +18434,8 @@ export class Engine {
     let pipeline: GPURenderPipeline
     let pipelineNoDepthWrite: GPURenderPipeline
     let overEyesPipeline: GPURenderPipeline | undefined
-    let mirrorPipeline: GPURenderPipeline | undefined
     try {
-      ;[pipeline, pipelineNoDepthWrite, overEyesPipeline, mirrorPipeline] = await variants
+      ;[pipeline, pipelineNoDepthWrite, overEyesPipeline] = await variants
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
       return { ok: false, diagnostics, slotMap: result.slotMap }
@@ -18467,7 +18465,6 @@ export class Engine {
       pipeline,
       pipelineNoDepthWrite,
       overEyesPipeline,
-      mirrorPipeline,
       uniformBuffer,
       images: this.uploadGroupImages(group),
       imagesByMaterial: group.imagesByMaterial
@@ -18643,29 +18640,25 @@ export class Engine {
   /**
    * Render-class pipeline state. A group's compiled graph swaps the fragment shading; the
    * render-class owns pass integration (stencil interplay, depth bias, cull). auto = plain;
-   * eye = stamp + front cull + bias; hair = stencil-test (+ the over-eyes variant).
+   * eye = stencil stamp; hair = stencil-test (+ the over-eyes variant). Cull comes from
+   * the material's double-sided flag (sidedPipeline).
    */
   private createRenderClassPipeline(
     renderClass: RenderClass,
     module: GPUShaderModule,
     overEyes: boolean,
     depthWrite = true,
-    mirrored = false,
     blend: StyleBlend = "over",
   ): Promise<GPURenderPipeline> {
     const base = {
       label: `style ${renderClass}${overEyes ? " (over eyes)" : ""}`,
       layout: this.mainPipelineLayout,
       vertex: { module, buffers: this.materialVertexBufferLayouts },
-      // The eye front-culls — the see-through-hair look is draw order plus that
-      // cull plus the stencil stamp, and it is the deployed appearance of every
-      // published scene. In the MIRROR the winding is flipped (determinant -1,
-      // reflection.ts), so the same cull keeps the back of the eyeball and
-      // discards its front. `mirrored` flips it back rather than changing what
-      // the camera sees.
-      primitive: {
-        cullMode: (renderClass === "eye" ? (mirrored ? "back" : "front") : "none") as GPUCullMode,
-      },
+      // Every class draws both sides here and takes the PMX double-sided flag
+      // from sidedPipeline, whose single-sided twin culls front (back in the
+      // mirror's flipped winding) — the eye's old fixed cull. A double-sided
+      // iris sheet keeps the faces a turn of the eye swings away.
+      primitive: { cullMode: "none" as GPUCullMode },
       multisample: { count: Engine.MULTISAMPLE_COUNT },
     }
     const plainDepth: GPUDepthStencilState = {
@@ -18956,7 +18949,6 @@ export class Engine {
     if (dc.groupId) {
       const install = inst.styleGroups.get(dc.groupId)
       if (install) {
-        if (mirrored && install.mirrorPipeline) return install.mirrorPipeline
         return stageGlass ? install.pipelineNoDepthWrite : install.pipeline
       }
     }

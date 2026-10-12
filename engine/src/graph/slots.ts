@@ -102,13 +102,14 @@ function prelude(renderClass: RenderClass, alphaMode: AlphaMode, blend: StyleBle
   // camera-averted fragments change (front surfaces have dot(n,v) > 0 and are
   // untouched), unlike a front_facing test, which PMX's clockwise winding
   // inverts. Fixes inner skirt linings (裙子白1-style flipped-normal copies)
-  // shading near-black through sheer outer layers. Eye is exempt: it FRONT-culls
-  // by design, so its visible fragments are back faces with intended normals.
+  // shading near-black through sheer outer layers. Eye is exempt: its normals
+  // shade as authored.
   const flip =
     renderClass === "eye" ? "" : "\n  n = select(-n, n, dot(n, v) >= 0.0);"
   return `@fragment fn fs(input: VertexOutput) -> FSOut {
-${PLAIN_SAMPLE}  // MMD alpha semantics: material alpha × texture alpha.
-  let alpha = material.alpha * tex_s.a;
+${PLAIN_SAMPLE}  // MMD alpha semantics: material alpha × texture alpha, capped at 1 as MMD
+  // does (a PMX can author alpha above 1; blended, it burns the material white).
+  let alpha = saturate(material.alpha * tex_s.a);
 ${discard}
 
   // ── Dissolve ──

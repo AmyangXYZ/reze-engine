@@ -27,7 +27,7 @@
 // attachment, and that answer does not exist at import time. The constant could
 // not have taken the outputs at all, which is most of why it did not have them.
 
-import { DISSOLVE_WGSL } from "../materials/common"
+import { DISSOLVE_WGSL, JELLY_VERTEX_WGSL } from "../materials/common"
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
 
 export function transparentDepthPrepassWgsl(): string {
@@ -44,13 +44,20 @@ struct MaterialUniforms {
   alpha: f32,
   _skip0: vec4f,
   _skip1: vec4f,
-  _skip2: vec3f,
+  _skip2: f32,
+  materialId: f32,
+  _skip3: f32,
   dissolve: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(2) var diffuseSampler: sampler;
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
+// The model's ObjectLight, for its jelly eyes: depth goes down where the colour
+// pass will draw the iris.
+struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12> }
+@group(1) @binding(1) var<uniform> objectLight: ObjectLight;
+${JELLY_VERTEX_WGSL}
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
 
@@ -74,10 +81,11 @@ struct VSOut {
   @location(3) joints0: vec4<u32>,
   @location(4) weights0: vec4<f32>,
 ) -> VSOut {
-  let pos4 = vec4f(position, 1.0);
   let weightSum = weights0.x + weights0.y + weights0.z + weights0.w;
   let invWeightSum = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
   let w = select(vec4f(1.0, 0.0, 0.0, 0.0), weights0 * invWeightSum, weightSum > 0.0001);
+  var pos4 = vec4f(position, 1.0);
+  if (objectLight.jelly[0].w > 0.0) { pos4 = vec4f(rzJellyVertex(position, joints0, w), 1.0); }
   var skinned = vec4f(0.0);
   for (var i = 0u; i < 4u; i++) {
     skinned += (skinMats[joints0[i]] * pos4) * w[i];

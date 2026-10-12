@@ -1,4 +1,4 @@
-import { DISSOLVE_WGSL } from "../materials/common"
+import { DISSOLVE_WGSL, JELLY_VERTEX_WGSL } from "../materials/common"
 
 // Shadow map depth pass. Skinned VS + alpha-test FS (depth-only attachment, no
 // color targets): texels where diffuse-texture alpha × material alpha fall below
@@ -21,10 +21,17 @@ struct MaterialDiffuse {
   diffuse: vec4f,
   _skip0: vec4f,
   _skip1: vec4f,
-  _skip2: vec3f,
+  _skip2: f32,
+  materialId: f32,
+  _skip3: f32,
   dissolve: f32,
 };
 @group(1) @binding(1) var<uniform> material: MaterialDiffuse;
+// The model's ObjectLight, for its jelly eyes: the map must hold the iris where
+// the colour pass draws it.
+struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12> }
+@group(0) @binding(3) var<uniform> objectLight: ObjectLight;
+${JELLY_VERTEX_WGSL}
 
 struct VSOut {
   @builtin(position) position: vec4f,
@@ -38,10 +45,11 @@ struct VSOut {
 
 @vertex fn vs(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f,
   @location(3) joints0: vec4<u32>, @location(4) weights0: vec4<f32>) -> VSOut {
-  let pos4 = vec4f(position, 1.0);
   let ws = weights0.x + weights0.y + weights0.z + weights0.w;
   let inv = select(1.0, 1.0 / ws, ws > 0.0001);
   let nw = select(vec4f(1.0,0.0,0.0,0.0), weights0 * inv, ws > 0.0001);
+  var pos4 = vec4f(position, 1.0);
+  if (objectLight.jelly[0].w > 0.0) { pos4 = vec4f(rzJellyVertex(position, joints0, nw), 1.0); }
   var sp = vec4f(0.0);
   for (var i = 0u; i < 4u; i++) { sp += (skinMats[joints0[i]] * pos4) * nw[i]; }
   var out: VSOut;

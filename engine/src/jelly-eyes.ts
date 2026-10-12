@@ -90,23 +90,23 @@ const HL_SCALE_MIN = 0.85
 const HL_SCALE_MAX = 1.2
 // The roll: while a closing expression holds, the iris turns about its eye
 // bone's X axis (左目/右目, the eyeball's centre), rolling down with the lid —
-// the angle at weight 1, and simultaneous expressions add. And it comes
-// forward a little (iris radii) with the expression and with the spring, so
-// the roll does not sink it into the white. The MME rolls with the lid
-// exactly, which the lid hides; here the roll follows on a spring of the same
-// pace and decay as the blink's, so as the eye opens the iris swings up past
-// rest and wobbles back, where it can be seen.
+// the angle at weight 1, and simultaneous expressions add. It comes forward
+// only with the spring (iris radii): pushed with the expression as well, a
+// shut eye's iris came through a lid set close in front of it (白里黑子). The MME rolls with the lid
+// exactly, which the lid hides; here the roll follows on a spring twice the
+// blink's pace with its decay, so as the eye opens the iris swings up past rest
+// and wobbles back, where it can be seen. At the blink's own pace it trailed
+// the opening lid and swung a third of an iris past centre: a jump.
 const ROLL: Record<string, number> = {
   まばたき: -15, blink: -15, Blink: -15, eye_close: -15, Fcl_EYE_Close: -15, はぅ: -15, 笑い: -5,
   ウィンク: -5, ｳｨﾝｸ: -5, wink: -5, Wink: -5, ウィンク２: -15, ｳｨﾝｸ２: -15, blink_L: -15, Fcl_EYE_Close_L: -15,
   ウィンク右: -5, ｳｨﾝｸ右: -5, wink_R: -5, Wink_R: -5, ウィンク２右: -15, ｳｨﾝｸ２右: -15, blink_R: -15, Fcl_EYE_Close_R: -15,
 }
-const ROLL_HZ = SPRING_HZ
-const ROLL_ZETA = Math.LN2 / HALF_LIFE / (2 * Math.PI * SPRING_HZ)
-// How much of the spring's swing about the expression angle shows: the whole
-// of it carried the iris up most of its radius after a blink.
-const ROLL_SWING = 0.4
-const PUSH_EXPRESSION = 0.15
+const ROLL_HZ = 6
+const ROLL_ZETA = Math.LN2 / HALF_LIFE / (2 * Math.PI * ROLL_HZ)
+// How much of the spring's swing about the expression angle shows: a
+// twenty-fifth of an iris radius past centre after a blink.
+const ROLL_SWING = 0.25
 const PUSH_ELASTIC = 0.04
 // A highlight sheet by name, for rigs that keep it on its own material.
 const HIGHLIGHT = /ハイライト|ﾊｲﾗｲﾄ|高光|highlight|hilight|(^|[^a-z])hl([^a-z]|$)/i
@@ -288,10 +288,23 @@ export class JellyEyes {
     const l = index("左目")
     const r = index("右目")
     this.headBone = index("頭")
-    const names = model.getMorphing().morphs.map((m) => m.name)
-    const find = (list: string[]) => list.map((n) => names.indexOf(n)).filter((i) => i >= 0)
+    const all = model.getMorphing().morphs
+    const names = all.map((m) => m.name)
+    // The weights read are resolved, so a group whose every target is named
+    // (Reze's まばたき is ウィンク２ + ウィンク２右) arrives through its
+    // leaves; counted as well, a blink rolled the iris twice as far.
+    const known = new Set([...BOTH, ...LEFT, ...RIGHT])
+    const resolved = (i: number) => {
+      const refs = all[i].groupReferences
+      return !!refs?.length && refs.every((r) => known.has(names[r.morphIndex]))
+    }
+    const morphIndex = (n: string) => {
+      const i = names.indexOf(n)
+      return i >= 0 && !resolved(i) ? i : -1
+    }
+    const find = (list: string[]) => list.map(morphIndex).filter((i) => i >= 0)
     this.morphs = [find(BOTH), find(LEFT), find(RIGHT)]
-    const rolls = (list: string[]) => list.map((n) => ({ morph: names.indexOf(n), deg: ROLL[n] ?? 0 })).filter((r) => r.morph >= 0 && r.deg !== 0)
+    const rolls = (list: string[]) => list.map((n) => ({ morph: morphIndex(n), deg: ROLL[n] ?? 0 })).filter((r) => r.morph >= 0 && r.deg !== 0)
     this.rolls = [rolls([...BOTH, ...LEFT]), rolls([...BOTH, ...RIGHT])]
     this.rest = findIrises(model, l, r, both)
     // The bone that carries each iris, which may be under the eye bone.
@@ -423,7 +436,7 @@ export class JellyEyes {
       const pivot = rest.pivot
       o.set(pivot ? [pivot[0], pivot[1], pivot[2], (this.roll[e] + (s.roll - this.roll[e]) * ROLL_SWING) * DEG * g] : [0, 0, 0, 0], 80 + e * 4)
       const hs = (k: 0 | 1) => Math.max(HL_SCALE_MIN, Math.min(HL_SCALE_MAX, 1 + x * HL_SCALE[k] * g))
-      o.set([hs(0), hs(1), (s.closure * PUSH_EXPRESSION + Math.min(Math.abs(x), SPRING_LIMIT) * PUSH_ELASTIC) * r * g, 0], 88 + e * 4)
+      o.set([hs(0), hs(1), Math.min(Math.abs(x), SPRING_LIMIT) * PUSH_ELASTIC * r * g, 0], 88 + e * 4)
     }
   }
 
@@ -550,6 +563,11 @@ function blink(s: EyeState, dt: number): void {
  * As draw ids (1-based over the materials that draw, as the engine numbers
  * MaterialUniforms.materialId), at most two. A rig whose highlight is painted
  * into the iris has none, and only the iris moves.
+ *
+ * A layer drawn on vertices an earlier layer already uses is a copy of that
+ * layer (白里黑子's ☆ and ❤ are star and heart irises on the iris's own
+ * vertices), so it moves with it. Slid as a highlight, a copy of the dome sits
+ * in front of the iris on one half, flipping sides with the tremble.
  */
 function findHighlights(model: Model, rest: [EyeRest, EyeRest]): number[] {
   const materials = model.getMaterials?.() ?? []
@@ -557,6 +575,7 @@ function findHighlights(model: Model, rest: [EyeRest, EyeRest]): number[] {
   const iris = new Set([...rest[0].verts, ...rest[1].verts])
   if (!materials.length || !indices.length || !iris.size) return []
   const layers: { id: number; name: string; minX: number; maxX: number; minY: number; maxY: number }[] = []
+  const used = new Set<number>()
   let start = 0
   let id = 0
   for (const m of materials) {
@@ -564,16 +583,21 @@ function findHighlights(model: Model, rest: [EyeRest, EyeRest]): number[] {
     if (count === 0) continue
     id++
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+    let copy = true
+    const mine: number[] = []
     for (let k = start; k < start + count; k++) {
       const v = indices[k]
       if (!iris.has(v)) continue
+      if (!used.has(v)) copy = false
+      mine.push(v)
       minX = Math.min(minX, positions[v * 3])
       maxX = Math.max(maxX, positions[v * 3])
       minY = Math.min(minY, positions[v * 3 + 1])
       maxY = Math.max(maxY, positions[v * 3 + 1])
     }
     start += count
-    if (minX <= maxX) layers.push({ id, name: m.name, minX, maxX, minY, maxY })
+    for (const v of mine) used.add(v)
+    if (minX <= maxX && !copy) layers.push({ id, name: m.name, minX, maxX, minY, maxY })
   }
   const out: number[] = []
   layers.forEach((l, i) => {

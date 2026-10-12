@@ -160,7 +160,7 @@ test("a closing expression rolls the iris down about its eye bone on a spring: a
   hold(3)
   r = read(jelly)
   assert.ok(Math.abs(deg(r.o, 0) + 15) < 0.05 && Math.abs(deg(r.o, 1) + 15) < 0.05, `held, blink settles at −15°: ${deg(r.o, 0)}`)
-  assert.ok(r.o[90] > 0, "and comes forward")
+  assert.ok(Math.abs(r.o[90]) < 1e-4, "and stays back once the spring settles: a shut lid sits close in front")
   close(jelly, model, 1, 1) // ウィンク adds −5° to the left only
   hold(3)
   r = read(jelly)
