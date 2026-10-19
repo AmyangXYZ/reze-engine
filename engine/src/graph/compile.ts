@@ -85,6 +85,18 @@ export function assignStyleSlots(params: ExposedParam[]): StyleSlot[] {
 
 // ─── Validation ─────────────────────────────────────────────────────
 
+/**
+ * Where a slider starts: its own default, else the literal on the socket it
+ * targets, else that socket's registry default. The compiler inlines this value
+ * and the engine writes it into the group's uniforms, so the two always agree.
+ */
+export function paramStart(graph: ShaderGraph, param: ExposedParam): SocketValue | undefined {
+  if (param.default !== undefined) return param.default
+  const node = graph.nodes.find((n) => n.id === param.target.node)
+  if (!node) return undefined
+  return node.inputs?.[param.target.socket] ?? NODE_REGISTRY[node.type]?.inputs[param.target.socket]?.default
+}
+
 export function validateGraph(graph: ShaderGraph, opts: CompileOptions = {}): Diagnostic[] {
   const d: Diagnostic[] = []
   const nodes = new Map<string, GraphNode>()
@@ -175,7 +187,7 @@ export function validateGraph(graph: ShaderGraph, opts: CompileOptions = {}): Di
     const wantKind: SockT = p.kind === "color" ? "color" : "float"
     if (input.type !== wantKind)
       d.push(err(`param "${p.id}" is ${p.kind} but socket "${key}" is ${input.type}`, p.target.node))
-    if (!literalFits(p.default, input.type)) d.push(err(`param "${p.id}" default doesn't fit ${input.type}`, p.target.node))
+    if (p.default !== undefined && !literalFits(p.default, input.type)) d.push(err(`param "${p.id}" default doesn't fit ${input.type}`, p.target.node))
   }
 
   const out = opts.previewNode ?? graph.output
@@ -314,7 +326,7 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
       return { expr: exposed.param.kind === "float" ? convert("float", wantT, raw) : convert("color", wantT, raw) }
     }
     const inputSpec = spec(node).inputs[socket]
-    const value = exposed?.param.default ?? node.inputs?.[socket] ?? inputSpec.default
+    const value = exposed ? paramStart(graph, exposed.param) : (node.inputs?.[socket] ?? inputSpec.default)
     if (value === undefined) {
       if (inputSpec.contextDefault) return { expr: inputSpec.contextDefault }
       throw new Error(`unresolved input ${key}`) // guarded by requiresLink validation

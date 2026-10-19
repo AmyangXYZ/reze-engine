@@ -177,7 +177,7 @@ import {
   probeLevelRoughness,
   skyLevelRoughness,
 } from "./shaders/passes/probe"
-import { compileGraph, type CompileOptions, type StyleSlot } from "./graph/compile"
+import { compileGraph, paramStart, type CompileOptions, type StyleSlot } from "./graph/compile"
 import type { Diagnostic, ShaderGraph } from "./graph/schema"
 import type { AlphaMode, RenderClass, StyleBlend } from "./graph/render-class"
 import type {
@@ -18601,10 +18601,13 @@ export class Engine {
       const param = group.graph.params?.find((p) => p.id === styleSlot.id)
       if (!param) continue
       const base = styleSlot.vec4Index * 4
-      if (styleSlot.kind === "float" && typeof param.default === "number") {
-        data[base + ["x", "y", "z", "w"].indexOf(styleSlot.component!)] = param.default
-      } else if (styleSlot.kind === "color" && typeof param.default !== "number") {
-        data.set(param.default.slice(0, 3), base)
+      // The value the compiler inlined: a slider with no default of its own
+      // starts from its socket's literal, and must not take the scene down.
+      const start = paramStart(group.graph, param)
+      if (styleSlot.kind === "float" && typeof start === "number") {
+        data[base + ["x", "y", "z", "w"].indexOf(styleSlot.component!)] = start
+      } else if (styleSlot.kind === "color" && Array.isArray(start)) {
+        data.set(start.slice(0, 3), base)
       }
     }
     this.device.queue.writeBuffer(buffer, 0, data)

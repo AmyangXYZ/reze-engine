@@ -5,7 +5,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { compileGraph, validateGraph } from "../dist/graph/compile.js"
+import { compileGraph, paramStart, validateGraph } from "../dist/graph/compile.js"
 import { HAIR_GRAPH } from "../dist/graph/presets/hair.js"
 import { DEFAULT_GRAPH } from "../dist/graph/presets/default.js"
 import { CLOTH_SMOOTH_GRAPH } from "../dist/graph/presets/cloth_smooth.js"
@@ -279,6 +279,17 @@ test("param defaults inline to the same WGSL as the paramless preset", () => {
   const a = compileGraph(HAIR_WITH_PARAMS, { inlineParams: true })
   const b = compileGraph(HAIR_GRAPH, { inlineParams: true })
   assert.equal(a.fsBody, b.fsBody)
+})
+
+test("a slider with no default starts from its socket's literal", () => {
+  const graph = {
+    ...HAIR_GRAPH,
+    params: [{ id: "rim", label: "Rim Power", target: { node: "rim_pow", socket: "b" }, kind: "float" }],
+  }
+  assert.deepEqual(validateGraph(graph).filter((d) => d.severity === "error"), [])
+  const rim = HAIR_GRAPH.nodes.find((n) => n.id === "rim_pow")
+  assert.equal(paramStart(graph, graph.params[0]), rim.inputs.b)
+  assert.equal(compileGraph(graph, { inlineParams: true }).fsBody, compileGraph(HAIR_GRAPH, { inlineParams: true }).fsBody)
 })
 
 test("compile is deterministic and JSON round-trip is lossless", () => {

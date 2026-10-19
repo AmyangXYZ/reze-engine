@@ -31,7 +31,9 @@ export type ExposedParam = {
   kind: "float" | "color"
   min?: number
   max?: number
-  default: SocketValue
+  /** Where the slider starts. Absent, it starts from the target socket's own
+   *  literal (else the node's registry default): see `paramStart`. */
+  default?: SocketValue
 }
 
 export type ShaderGraph = {
