@@ -223,7 +223,7 @@ export type MaterialPresetMap = Partial<Record<MaterialPreset, string[]>>
 // look, whose see-through blend made white socks glow flat or wash out. So the
 // sock words go to rough cloth ahead of the stocking words — 袜子 before the
 // bare 袜 that 丝袜 (silk stockings) still reaches.
-const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
+const PRESET_NAME_HINTS: Array<[MaterialPreset, (string | RegExp)[]]> = [
   ["cloth_rough", ["靴下", "ソックス", "ニーソ", "袜子", "短袜", "棉袜", "socks", "sock"]],
   ["stockings", ["タイツ", "ストッキング", "袜", "stocking", "tights", "pantyhose"]],
   [
@@ -236,14 +236,15 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, string[]]> = [
     "face",
     ["顔", "颜", "顏", "脸", "臉", "かお", "face", "舌", "tongue", "牙", "牙齿", "齿", "歯", "teeth", "tooth", "口腔", "口内", "mouth", "嘴", "唇", "歯茎", "gums"],
   ],
-  // Simplified 发 is listed as compounds, never bare: it also writes 发光 (glow),
-  // and hair carries a renderClass, so a chance hit puts an emissive panel in the
-  // hair pass. Same reasoning as bare 口 being omitted from face above.
+  // Simplified 发 is hair on its own (a material called 发 or 发1), but it also
+  // writes 发光 / 发亮 / 发射 (glow, shine, emit), and hair carries a renderClass,
+  // so a chance hit would put an emissive panel in the hair pass. Hence 发 not
+  // followed by those. Same reasoning as bare 口 being omitted from face above.
   [
     "hair",
     [
       "前髪", "後髪", "髪", "髮", "頭髪", "もみあげ", "アホ毛", "ヘア",
-      "头发", "前发", "后发", "长发", "短发", "发丝", "刘海", "辫", "马尾",
+      /发(?![光亮射])/, "刘海", "辫", "马尾",
       "hair", "ahoge", "bang",
     ],
   ],
@@ -310,7 +311,7 @@ function resolvePreset(materialName: string, map: MaterialPresetMap | undefined)
   if (BODY_PART_NAMES.has(lower.replace(/[\s_.\-0-9]+$/, ""))) return "body"
   for (const [preset, hints] of PRESET_NAME_HINTS) {
     for (const hint of hints) {
-      if (lower.includes(hint)) return preset
+      if (typeof hint === "string" ? lower.includes(hint) : hint.test(lower)) return preset
     }
   }
   return null
