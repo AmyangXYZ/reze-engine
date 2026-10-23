@@ -97,7 +97,7 @@ export type EffectDirectives = {
    *  as rzPoint(i) in the particle stages. Null when the file declares none. */
   points: string | null
   /**
-   * `#textures N` (1-4): the particle shading reads N pictures the HOST hands
+   * `#textures N` (1-8): the particle shading reads N pictures the HOST hands
    * over with the install (setEffects' `textures`), as rzTexture(i, uv) — uv
    * (0,0) at the image's top-left, repeating. A game's own splash or spray is a
    * picture on a card, and drawn procedurally it can only ever be a guess at
@@ -400,8 +400,8 @@ export function parseDirectives(wgsl: string): DirectiveResult {
         return
       case "textures": {
         const n = num(args[0])
-        if (n === null || !Number.isInteger(n) || n < 1 || n > 4) {
-          errors.push(`${at}: #textures takes a count from 1 to 4`)
+        if (n === null || !Number.isInteger(n) || n < 1 || n > 8) {
+          errors.push(`${at}: #textures takes a count from 1 to 8`)
           return
         }
         d.textures = n

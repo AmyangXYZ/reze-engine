@@ -22,10 +22,11 @@ import { buildSimShader } from "../dist/shaders/passes/grid.js"
 import { buildLightEmitShader } from "../dist/shaders/lights.js"
 import { anchorAliasWgsl } from "../dist/shaders/anchor-table.js"
 
-test("#textures takes a count from 1 to 4, and nothing declares none", () => {
+test("#textures takes a count from 1 to 8, and nothing declares none", () => {
   assert.equal(parseDirectives("#textures 2").directives.textures, 2)
+  assert.equal(parseDirectives("#textures 8").directives.textures, 8)
   assert.equal(parseDirectives("// no pictures").directives.textures, 0)
-  for (const bad of ["#textures 0", "#textures 5", "#textures 1.5", "#textures x", "#textures"]) {
+  for (const bad of ["#textures 0", "#textures 9", "#textures 1.5", "#textures x", "#textures"]) {
     assert.ok(parseDirectives(bad).errors.length > 0, `${bad} is an error`)
   }
 })

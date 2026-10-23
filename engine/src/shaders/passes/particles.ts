@@ -139,10 +139,10 @@ export const PARTICLE_POINTS_BINDING = 15
  *  (6, count, 0, 0), so the draw reads at byte 16. */
 export const PARTICLE_INDIRECT_BINDING = 16
 export const PARTICLE_INDIRECT_BYTES = 32
-/** `#textures`: the pictures at 17..20 and their one sampler at 21, render
+/** `#textures`: the pictures at 17..24 and their one sampler at 25, render
  *  stage only — see texture-api.ts. */
 export const PARTICLE_TEXTURE_BINDING = 17
-export const PARTICLE_TEXTURE_SAMPLER_BINDING = 21
+export const PARTICLE_TEXTURE_SAMPLER_BINDING = 25
 export const PARTICLE_INDIRECT_DRAW_OFFSET = 16
 
 /** Bytes per particle. Explicitly padded — see the struct below. */

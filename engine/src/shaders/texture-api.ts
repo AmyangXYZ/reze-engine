@@ -17,7 +17,7 @@
 // effect file compiles in every mount it has.
 
 /** How many pictures one effect can read. */
-export const MAX_EFFECT_TEXTURES = 4
+export const MAX_EFFECT_TEXTURES = 8
 
 /**
  * rzTexture / rzTextureLod. `count` is the effect's `#textures` (0 = stubs);
