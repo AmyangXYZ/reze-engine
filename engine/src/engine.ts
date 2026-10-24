@@ -2489,6 +2489,9 @@ export class Engine {
   // Safari's Metal backend won't fold pow(x, 1) to identity.
   private compositePipelineIdentity!: GPURenderPipeline
   private compositePipelineGamma!: GPURenderPipeline
+  /** The last object id handed out. 0 is "nothing drawn", and the id buffer is
+   *  16-bit, so it wraps from 65535 back to 1. */
+  private lastObjectId = 0
   private morphComputePipeline!: GPUComputePipeline
   private morphComputeBindGroupLayout!: GPUBindGroupLayout
   // ── GPU frustum cull (see shaders/passes/cull.ts) ──
@@ -15284,7 +15287,10 @@ export class Engine {
       styleGroups: new Map(),
       materialToGroup: new Map(),
       styleGroupGen: new Map(),
-      objectId: this.modelInstances.size + 1,
+      // From a counter, never from the count: size + 1 handed a model added
+      // after a removal the id of one still in the scene, and two models with
+      // one id are one model to everything that reads the id buffer.
+      objectId: (this.lastObjectId = this.lastObjectId >= 65535 ? 1 : this.lastObjectId + 1),
       dissolve: 1,
       materialUniformBuffers: [],
       outlineUniformBuffers: [],
