@@ -1312,7 +1312,7 @@ fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPa
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
   let c = rzLightColor(i) * rzLightCookie(i, toLight);
   if (ndlD > 0.0) { out.d = c * (ndlD * falloff * aim * aim); }
-  if (ndl > 0.0) { out.s = c * (bsdf_urp(n, toLight, v, ndl, roughness) * falloff * aim * aim); }
+  if (ndl > 0.0) { out.s = c * (bsdf_urp(n, toLight, v, ndl, roughness) * falloff * aim * aim * rzLightSpecular(i)); }
   return out;
 }
 
@@ -1393,7 +1393,7 @@ fn _rzAddLightOne(i: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
   let reach = rzLightColor(i) * rzLightCookie(i, toLight) * (falloff * aim * aim);
   out.d = reach * ndl;
-  out.s = reach * pow(saturate(dot(n, normalize(toLight + v))), e);
+  out.s = reach * pow(saturate(dot(n, normalize(toLight + v))), e) * rzLightSpecular(i);
   return out;
 }
 

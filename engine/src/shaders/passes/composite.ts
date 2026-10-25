@@ -12,6 +12,7 @@ import { textureApi } from "../texture-api"
 import { castDistanceApi, CAST_FIELD_DIV } from "./cast-distance"
 import { lyricsApi, lyricsTextApi } from "../lyrics-api"
 import { midiApi } from "../midi-api"
+import { VIEW_LUT_LOG2 } from "../view-lut"
 import { gridReadApi } from "./grid"
 // Composite: HDR scene + bloom → view transform (soft / neutral / aces / none) → gamma → swapchain.
 // Bloom tint/intensity applied at combine (EEVEE treats them as combine-stage params, not prefilter).
@@ -174,6 +175,9 @@ override APPLY_GAMMA: bool = true;
 // The scene's own colour grade, as a cube — see _rzStageGrade. sRGB-encoded
 // storage, so what a sample returns is already linear.
 @group(0) @binding(12) var stageGradeLut: texture_3d<f32>;
+// The view transform a stage was authored under, as its own renderer computes
+// it (Engine.setViewLut) — scene-linear through a log2 shaper to display.
+@group(0) @binding(40) var viewLut: texture_3d<f32>;
 // The cast, as data. Read through rzSubject/rzAnchor below — the LAYOUT IS NOT
 // STABLE and never will be, because it depends on what each effect declared.
 // Reading it directly is the one thing that would freeze it forever.
@@ -360,12 +364,22 @@ fn acesTransform(color: vec3f) -> vec3f {
   return _rzSrgbEncode3(clamp(rec709, vec3f(0.0), vec3f(1.0)));
 }
 
+/** A baked view transform (mode 4): the colour's log2 between
+ *  VIEW_LUT_LOG2 [lo, hi], a stop every (hi − lo)/(n − 1), looked up in the
+ *  cube the stage's renderer filled — its display values, already encoded. */
+fn _rzViewLut(c: vec3f) -> vec3f {
+  let n = f32(textureDimensions(viewLut).x);
+  let t = clamp((log2(max(c, vec3f(exp2(${VIEW_LUT_LOG2[0]})))) - ${VIEW_LUT_LOG2[0]}) / ${VIEW_LUT_LOG2[1] - VIEW_LUT_LOG2[0]}, vec3f(0.0), vec3f(1.0));
+  return textureSampleLevel(viewLut, bloomSamp, t * ((n - 1.0) / n) + 0.5 / n, 0.0).rgb;
+}
+
 /** Which display transform, chosen per frame at viewU[6].y (0 soft, 1 none,
- *  2 neutral, 3 aces). A uniform branch rather than a pipeline variant: switching
+ *  2 neutral, 3 aces, 4 a baked cube). A uniform branch rather than a pipeline variant: switching
  *  is rare, and every arm is cheap enough that specialising the pipeline would
  *  buy nothing. */
 fn viewTransform(c: vec3f) -> vec3f {
   let mode = viewU[6].y;
+  if (mode > 3.5) { return _rzViewLut(c); }
   if (mode > 2.5) { return acesTransform(c); }
   if (mode > 1.5) { return neutralTransform(c); }
   if (mode > 0.5) { return _rzSrgbEncode3(c); }
@@ -676,7 +690,7 @@ const COMPOSITE_BODY = /* wgsl */ `
         // like a sun instead of clipping at texture white. bg.x carries the
         // world STRENGTH (the colour slot is dead in equirect modes). The
         // scene's grade stays scene-only, the documented rule above.
-        var sky = max(viewTransform(bgPm * bg.x * viewU[0].x), vec3f(0.0));
+        var sky = max(viewTransform(bgPm * bg.x * exp2(viewU[0].x)), vec3f(0.0));
         if (APPLY_GAMMA) {
           sky = pow(sky, vec3f(viewU[0].y));
         }

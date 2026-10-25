@@ -145,7 +145,11 @@ ${gate}
   // game keeps the scene's shadow under a character's own key.
   let rz_key = rzMainLight();
   let l = -light.lights[rz_key].direction.xyz;
-  let sun = light.lights[rz_key].color.xyz * light.lights[rz_key].color.w;
+  // NO KEY WHERE NONE REACHES: rzMainLight falls back to the sun's slot, and
+  // a sun kept off this draw's layers — the cast's alone, beside a stage lit
+  // only by its own lamps — must not light it through the fallback.
+  let rz_keyed = (light.dirLayers[rz_key] & objectLight.layers.x) != 0u;
+  let sun = select(vec3f(0.0), light.lights[rz_key].color.xyz * light.lights[rz_key].color.w, rz_keyed);
   let shadow = sampleShadow(input.worldPos, n);
   // The ambient: this object's own where loaded data gave it one — the game
   // gives every renderer its own — else the world's flat colour or the HDRI's

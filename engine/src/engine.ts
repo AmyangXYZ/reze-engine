@@ -776,6 +776,15 @@ export type StageGradeLut = {
   data: Uint8Array
 }
 
+/** A baked view transform — see shaders/view-lut.ts. */
+export type ViewLut = {
+  /** Texels along each edge. */
+  size: number
+  /** size³ texels of 16-bit display values (0..65535), RGB, red fastest then
+   *  green then blue, over VIEW_LUT_LOG2 on each axis. */
+  data: Uint16Array
+}
+
 export type GizmoDragKind = "rotate" | "translate"
 
 export interface GizmoDragEvent {
@@ -1955,6 +1964,12 @@ export type SceneLight = {
    * along the cone the way a stage light throws a gobo. Ignored on a point.
    */
   cookie?: string
+  /**
+   * false: the lamp lights diffuse only and puts no highlight on anything — a
+   * Blender light with glossy visibility off, which a stage rig uses to fill a
+   * room without lighting up its shiny floor. Omitted or true: both.
+   */
+  specular?: boolean
 }
 
 /**
@@ -1969,6 +1984,16 @@ export const RENDERING_LAYER_CHARACTER = 1 << 30
 const ALL_LAYERS = 0xffffffff
 /** Where the directional slots' layer bits sit in the light uniform, in words. */
 const DIR_LAYERS_AT = 108
+
+/** A float as IEEE half bits — for the cubes uploaded as rgba16float. */
+function toHalf(v: number): number {
+  if (!(v > 0)) return 0
+  if (v >= 65504) return 0x7bff
+  const e = Math.floor(Math.log2(v))
+  if (e < -14) return Math.round(v / 2 ** -24) & 0x3ff
+  const m = Math.round((v / 2 ** e - 1) * 1024)
+  return m === 1024 ? ((e + 16) << 10) : ((e + 15) << 10) | m
+}
 
 export class Engine {
   private static instance: Engine | null = null
@@ -2882,6 +2907,9 @@ export class Engine {
   private stageGradeCube: StageGradeLut | null = null
   private stageGradeTexture: GPUTexture | null = null
   private stageGradeFallback!: GPUTexture
+  /** The baked view transform (setViewLut), or null for the built-in curves. */
+  private viewLutTexture: GPUTexture | null = null
+  private viewLutCube: ViewLut | null = null
   /** Bound at composite binding 7 when no effect (or a param-less one) is set. */
   private bgParamsDummyBuffer!: GPUBuffer
   private compositePipelineLayout!: GPUPipelineLayout
@@ -3203,6 +3231,48 @@ export class Engine {
     if (this.device && this.stageGradeFallback) this.uploadStageGrade()
   }
 
+  /**
+   * Show the frame through a view transform its own renderer baked — a stage
+   * exported from Blender brings its AgX (or Filmic, or a Look) as a cube, and
+   * while one is set it replaces the transform chosen in setViewTransformOptions;
+   * exposure still applies before it. null goes back to the built-in curves.
+   */
+  setViewLut(lut: ViewLut | null): void {
+    if (lut && (!Number.isInteger(lut.size) || lut.size < 2 || lut.size > 65 || lut.data.length !== lut.size ** 3 * 3)) {
+      throw new Error(`setViewLut: ${lut.data.length} values is not a ${lut.size}³ RGB cube`)
+    }
+    this.viewLutCube = lut
+    if (this.device && this.stageGradeFallback) this.uploadViewLut()
+  }
+
+  private uploadViewLut(): void {
+    const lut = this.viewLutCube
+    this.viewLutTexture?.destroy()
+    this.viewLutTexture = null
+    if (lut) {
+      const n = lut.size
+      const texels = n ** 3
+      const half = new Uint16Array(texels * 4)
+      for (let i = 0; i < texels; i++) {
+        half[i * 4] = toHalf(lut.data[i * 3] / 65535)
+        half[i * 4 + 1] = toHalf(lut.data[i * 3 + 1] / 65535)
+        half[i * 4 + 2] = toHalf(lut.data[i * 3 + 2] / 65535)
+        half[i * 4 + 3] = 0x3c00
+      }
+      const tex = this.device!.createTexture({
+        label: `view lut ${n}³`,
+        size: [n, n, n],
+        dimension: "3d",
+        format: "rgba16float",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      })
+      this.device!.queue.writeTexture({ texture: tex }, half, { bytesPerRow: n * 8, rowsPerImage: n }, [n, n, n])
+      this.viewLutTexture = tex
+    }
+    this.rebuildCompositeBindGroup()
+    if (this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+
   private uploadStageGrade(): void {
     const lut = this.stageGradeCube
     this.stageGradeTexture?.destroy()
@@ -3346,7 +3416,8 @@ export class Engine {
     // rebuilt per effect, so the compiled variant IS the flag.
     u[11] = this.backdropEquirectView ? 2 : showingWorld ? 3 : bg ? 1 : 0
     // Which display transform forms the frame (see viewTransform in composite.ts).
-    u[25] = Engine.VIEW_TRANSFORM_ID[v.transform] ?? 0
+    // A baked view transform, while one is set, stands in for the chosen one.
+    u[25] = this.viewLutTexture ? 4 : (Engine.VIEW_TRANSFORM_ID[v.transform] ?? 0)
     u[26] = this.canvas.width
     u[27] = this.canvas.height
     // The soft curve's power (viewU[15].x), the scene's own (SceneSetting._contrast).
@@ -4525,6 +4596,7 @@ export class Engine {
         { binding: 8, resource: this.depthReadView },
         { binding: 9, resource: { buffer: this.dofUniformBuffer } },
         { binding: 12, resource: (this.stageGradeTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
+        { binding: 40, resource: (this.viewLutTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
         { binding: 11, resource: { buffer: this.castBuffer } },
         { binding: 13, resource: { buffer: this.audioBuffer } },
         { binding: 19, resource: { buffer: this.midiBuffer } },
@@ -4962,6 +5034,7 @@ export class Engine {
           { binding: 32, resource: layers[3] },
           { binding: 2, resource: this.bloomSampler },
           { binding: 12, resource: (this.stageGradeTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
+          { binding: 40, resource: (this.viewLutTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
           { binding: 1, resource: bloom },
           { binding: 4, resource: this.maskResolveView },
         ],
@@ -8104,6 +8177,7 @@ export class Engine {
         // author ever wrote. Sharing the code meant sharing these.
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
+        { binding: 40, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "3d" } },
         // And the scene's COVERAGE and bloom, without which the tap cannot
         // reconstruct a pixel: the HDR target is premultiplied, so colour alone
         // reads a half-transparent ground as a dark opaque one.
@@ -8602,6 +8676,7 @@ export class Engine {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     })
     this.uploadStageGrade()
+    this.uploadViewLut()
 
     // BEFORE the bind group below, which binds it. Full size from the start:
     // every material pipeline binds this, so sizing it to the light count would
@@ -9035,6 +9110,8 @@ export class Engine {
         // The scene's own grade cube (setStageGrade) — 1×1×1 stand-in while it
         // has none, which the flag bit keeps from ever being sampled.
         { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
+        // The baked view transform (setViewLut) — the same stand-in while none.
+        { binding: 40, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: "3d" } },
         // The cast, for rzSubject/rzAnchor. Always bound so the base shader's
         // layout matches; the base shader simply never reads it.
         { binding: 11, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
@@ -11780,7 +11857,8 @@ export class Engine {
       // nothing at all — a light that vanishes because its aim was left at the
       // default is worse than one that shines everywhere.
       const len = l.aim && l.kind !== "point" ? Math.hypot(l.aim.x, l.aim.y, l.aim.z) : 0
-      this.lightsData[b + 7] = len > 0 ? 1 : 0
+      // Its type, as bits: 1 a spot, 2 diffuse only (no highlight).
+      this.lightsData[b + 7] = (len > 0 ? 1 : 0) + (l.specular === false ? 2 : 0)
       this.lightsData[b + 8] = len > 0 ? l.aim!.x / len : 0
       this.lightsData[b + 9] = len > 0 ? l.aim!.y / len : 0
       this.lightsData[b + 10] = len > 0 ? l.aim!.z / len : 0

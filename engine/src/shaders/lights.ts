@@ -26,7 +26,7 @@ import { subjectMaskApi } from "./cast-api"
 // then MAX_LIGHTS records of 16 floats — four vec4s:
 //
 //   [0..2] position, world space               [3] radius
-//   [4..6] colour PREMULTIPLIED by intensity   [7] type
+//   [4..6] colour PREMULTIPLIED by intensity   [7] type: bits, 1 spot, 2 diffuse only
 //   [8..10] aim, unit, pointing away from the light   [11] cos of the outer angle
 //   [12] cos of the inner angle
 //   [13] the rendering layers it does NOT reach (u32 bits)
@@ -300,6 +300,9 @@ fn rzLightRadius(i: u32) -> f32 { return _rzLightVec(i, 0u).w; }
 
 /** Light i's colour, already multiplied by its intensity. */
 fn rzLightColor(i: u32) -> vec3f { return _rzLightVec(i, 1u).xyz; }
+/** 0 for a lamp that lights diffuse only (type bit 2), else 1 — the weight on
+ *  its highlight. */
+fn rzLightSpecular(i: u32) -> f32 { return select(1.0, 0.0, (u32(max(_rzLightVec(i, 1u).w, 0.0)) & 2u) != 0u); }
 
 /** Where light i points, away from itself. The zero vector for a point light. */
 fn rzLightAim(i: u32) -> vec3f { return _rzLightVec(i, 2u).xyz; }

@@ -31,6 +31,7 @@ export {
   type DissolveCycle,
   type EffectParamValue,
   type EffectResult,
+  type ViewLut,
   type CullDiagnostics,
   type MidiNote,
 } from "./engine"
@@ -232,3 +233,4 @@ export type { NativeLook, NativeMaterialSpec, NativeTexture } from "./unity/look
 export type { NativeShader, NativeShaderInfo } from "./unity/host"
 export { AOV_PIXEL_FIELDS, AOV_PIXEL_STRIDE } from "./shaders/passes/aov"
 export { GROUND_MATERIAL_ID, GROUND_OBJECT_ID } from "./shaders/passes/ground"
+export { VIEW_LUT_LOG2 } from "./shaders/view-lut"
