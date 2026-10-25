@@ -2796,6 +2796,9 @@ export class Engine {
   /** The frame the current run of requests began — the cap's start. */
   private probeAskedFrame = 0
   private probeFrame = 0
+  /** Off: no capture, and every reader falls back to the sky — see
+   *  setReflectionProbe. */
+  private probeEnabled = true
   private probeCapture: {
     msTargets: GPUTexture[]
     depth: GPUTexture
@@ -11007,6 +11010,16 @@ export class Engine {
     this.probeDirty = true
   }
 
+  /** Whether the stage reflects its own capture (the default) or the sky. Off
+   *  is for a stage whose sky was measured from inside it — a Blender export's
+   *  world — where a capture lit without the lamps' shadows comes out too
+   *  bright on a shiny floor. */
+  setReflectionProbe(enabled: boolean): void {
+    if (this.probeEnabled === enabled) return
+    this.probeEnabled = enabled
+    this.captureReflectionProbe()
+  }
+
   /** The stage's world-space bounds: every stage model's material boxes
    *  through its placement. Null without a stage. */
   private stageBounds(): { min: [number, number, number]; max: [number, number, number] } | null {
@@ -11043,9 +11056,10 @@ export class Engine {
     const settled = this.probeFrame - this.probeDirtyFrame >= Engine.PROBE_SETTLE_FRAMES
     if (!settled && this.probeFrame - this.probeAskedFrame < Engine.PROBE_MAX_WAIT_FRAMES) return
     this.probeDirty = false
-    const bounds = this.stageBounds()
+    const bounds = this.probeEnabled ? this.stageBounds() : null
     if (!bounds) {
-      // No stage: the probe goes dark and every reader falls back to the sky.
+      // No stage, or the probe is off: it goes dark and every reader falls
+      // back to the sky.
       this.probeData.fill(0)
       this.device.queue.writeBuffer(this.probeUniformBuffer, 0, this.probeData)
       return
