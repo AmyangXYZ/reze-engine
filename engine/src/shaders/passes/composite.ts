@@ -155,7 +155,8 @@ override APPLY_GAMMA: bool = true;
 //            scene's own LUT (setStageGrade) — see _rzGradeScene() below.
 // viewU[10] = (camera world position, _) — refreshed with the basis above.
 // viewU[11..14] = the cast's positions (effects; count in viewU[10].w).
-// viewU[15] = (soft curve contrast, _, _, _).
+// viewU[15] = (soft curve contrast, pixel filter weights for offsets 0, ±1, ±2)
+//            — 1, 0, 0 is no filter; see rzPixelFiltered.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 // The scene pass's own MSAA depth buffer, bound depth-only. NOT an extra
@@ -209,6 +210,25 @@ override APPLY_GAMMA: bool = true;
  *  a TS template literal and one ends it mid-shader.) */
 fn rzFieldMerge(top: vec4f, bot: vec4f) -> vec4f {
   return vec4f(top.rgb + bot.rgb * (1.0 - top.a), top.a + bot.a * (1.0 - top.a));
+}
+
+/** The scene's premultiplied HDR light and coverage through the pixel filter
+ *  (Engine.setPixelFilter): separable weights viewU[15].yzw over offsets 0,
+ *  ±1, ±2, the coverage filtered alongside so the sky still composites under
+ *  it. Only called while a filter is on. */
+fn rzPixelFiltered(coord: vec2<i32>) -> vec4f {
+  let sz = vec2<i32>(textureDimensions(hdrTex)) - vec2<i32>(1);
+  let w = array<f32, 3>(viewU[15].y, viewU[15].z, viewU[15].w);
+  let r = select(1, 2, w[2] > 0.0);
+  var acc = vec4f(0.0);
+  for (var dy = -r; dy <= r; dy++) {
+    for (var dx = -r; dx <= r; dx++) {
+      let p = clamp(coord + vec2<i32>(dx, dy), vec2<i32>(0), sz);
+      let k = w[abs(dx)] * w[abs(dy)];
+      acc += vec4f(textureLoad(hdrTex, p, 0).rgb, textureLoad(maskTex, p, 0).g) * k;
+    }
+  }
+  return acc;
 }
 
 fn linearDepth(coord: vec2<i32>) -> f32 {
@@ -573,8 +593,14 @@ const COMPOSITE_BODY = /* wgsl */ `
 
 @fragment fn fs(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
   let coord = vec2<i32>(fragCoord.xy);
-  let hdr = textureLoad(hdrTex, coord, 0);
-  let alpha = textureLoad(maskTex, coord, 0).g;
+  var hdr = textureLoad(hdrTex, coord, 0);
+  var alpha = textureLoad(maskTex, coord, 0).g;
+  // A renderer's pixel filter, while one is set (viewU[15].y < 1).
+  if (viewU[15].y < 0.99999) {
+    let f = rzPixelFiltered(coord);
+    hdr = vec4f(f.rgb, hdr.a);
+    alpha = f.a;
+  }
   let a = max(alpha, 1e-6);
   let straight = hdr.rgb / a;
   let fullSz = vec2f(textureDimensions(hdrTex));
@@ -639,6 +665,9 @@ const COMPOSITE_BODY = /* wgsl */ `
 
   let exposed = sceneStraight * exp2(viewU[0].x);
   var disp = max(viewTransform(exposed), vec3f(0.0));
+  // The scene as formed before any grade: what the sky's light-first
+  // composite below measures itself against.
+  var formed = disp;
   // Grade the SCENE only, before the display gamma. Deliberately not applied to
   // the background: it keeps a picked background color exactly as picked, and —
   // load-bearing — leaves green-screen mode's key color unshifted so chroma
@@ -648,6 +677,7 @@ const COMPOSITE_BODY = /* wgsl */ `
   }
   if (APPLY_GAMMA) {
     disp = pow(disp, vec3f(viewU[0].y));
+    formed = pow(formed, vec3f(viewU[0].y));
   }
   // ── Film grain, on the SCENE ONLY ─────────────────────────────────────────
   //
@@ -670,6 +700,11 @@ const COMPOSITE_BODY = /* wgsl */ `
   let bg = viewU[2];
   var bgA = select(0.0, 1.0, bg.w > 0.5);
   var bgPm = bg.rgb * bgA;  // premultiplied accumulator
+  // Mode 3's sky as LIGHT (scene-linear, exposed) and as formed, for the
+  // light-first composite after the layers below.
+  var skyLin = vec3f(0.0);
+  var skyFormed = vec3f(0.0);
+  var skyIsLight = false;
   // This pixel's world-space view ray, rebuilt from the camera basis — what the
   // equirect samples by, and what both effect mounts navigate by. The dome sits
   // at infinity (no parallax): PhotoDome-style, display-only. Hoisted out of the
@@ -690,11 +725,14 @@ const COMPOSITE_BODY = /* wgsl */ `
         // like a sun instead of clipping at texture white. bg.x carries the
         // world STRENGTH (the colour slot is dead in equirect modes). The
         // scene's grade stays scene-only, the documented rule above.
-        var sky = max(viewTransform(bgPm * bg.x * exp2(viewU[0].x)), vec3f(0.0));
+        skyLin = bgPm * bg.x * exp2(viewU[0].x);
+        var sky = max(viewTransform(skyLin), vec3f(0.0));
         if (APPLY_GAMMA) {
           sky = pow(sky, vec3f(viewU[0].y));
         }
         bgPm = sky;
+        skyFormed = sky;
+        skyIsLight = true;
       }
     }
     BACKGROUND_CALL
@@ -703,6 +741,23 @@ const COMPOSITE_BODY = /* wgsl */ `
   // expression, because the foreground mount composites onto it.
   var outRgb = disp * sceneAlpha + bgPm * (1.0 - sceneAlpha);
   var outA = sceneAlpha + bgA * (1.0 - sceneAlpha);
+  // OVER A SKY OF LIGHT, LIGHT FIRST. Mode 3's sky is radiance, so where the
+  // scene only partly covers it — an antialiased edge, an ember smaller than a
+  // pixel, a glow the pixel filter spread — the film sees the two lights
+  // summed, as a renderer's camera does: the scene's light plus the sky's
+  // through what the scene leaves uncovered, then formed. Formed apart and
+  // mixed after, as the display-space composite above does, a thin edge at
+  // twenty times white is clipped to white first and then faded by its
+  // coverage to a grey dot. The difference is added on top of the layered
+  // frame, so the background effects drawn over the sky and the scene's grade
+  // stay as they were; with neither it is the summed light exactly.
+  if (skyIsLight && sceneAlpha < 0.99999) {
+    var summed = max(viewTransform(exposed * sceneAlpha + skyLin * (1.0 - sceneAlpha)), vec3f(0.0));
+    if (APPLY_GAMMA) {
+      summed = pow(summed, vec3f(viewU[0].y));
+    }
+    outRgb += summed - (formed * sceneAlpha + skyFormed * (1.0 - sceneAlpha));
+  }
   // Ribbons are NOT read here any more: they draw inside the scene pass, so
   // they are already in disp — tone mapped, and bloomed, which they never
   // were while this line existed. Sampling them here as well would draw them

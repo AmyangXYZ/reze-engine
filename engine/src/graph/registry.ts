@@ -734,12 +734,15 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
       occlusion: F(1),
       emission: C([0, 0, 0]),
       alpha: F(1),
+      /** 1: the lamps' and sun's highlights rise toward white at grazing
+       *  (Schlick), as Blender's Principled; 0 is URP's fixed reflectance. */
+      fresnel: F(0),
       normal: { type: "vector", contextDefault: "n" },
     },
     outputs: { color: "color", alpha: "float" },
     outputSelect: { color: ".rgb", alpha: ".a" },
     emit: (a) =>
-      `urp_lit(${a.base_color}, ${a.metallic}, ${a.smoothness}, ${a.specular}, ${a.occlusion}, ${a.emission}, ${a.alpha}, ` +
+      `urp_lit(${a.base_color}, ${a.metallic}, ${a.smoothness}, ${a.specular}, ${a.occlusion}, ${a.emission}, ${a.alpha}, ${a.fresnel}, ` +
       `${a.normal}, l, v, sun, amb, shadow, input.worldPos, true)`,
     takesLight: true,
   },

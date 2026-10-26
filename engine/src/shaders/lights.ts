@@ -23,7 +23,7 @@ import { subjectMaskApi } from "./cast-api"
 //   [4..6] grid origin (f32)    [7] 1 / cell edge (f32)
 //   [8..10] grid dims (u32)     [12..19] the OUTSIDE mask (u32 bits)
 //
-// then MAX_LIGHTS records of 16 floats — four vec4s:
+// then MAX_LIGHTS records of 20 floats — five vec4s:
 //
 //   [0..2] position, world space               [3] radius
 //   [4..6] colour PREMULTIPLIED by intensity   [7] type: bits, 1 spot, 2 diffuse only
@@ -32,6 +32,8 @@ import { subjectMaskApi } from "./cast-api"
 //   [13] the rendering layers it does NOT reach (u32 bits)
 //   [14] its bulb: the distance inside which the inverse square is held flat
 //        (0 = RZ_LAMP_NEAR)                    [15] its cookie: layer + 1, 0 none
+//   [16..18] a TUBE's half-axis, world space: the lamp is the segment
+//        position ± this, (0,0,0) for a point           [19] unused
 //
 // then the grid: LIGHT_MASK_WORDS words of lamp bits per cell.
 //
@@ -64,7 +66,7 @@ import { textureApi } from "./texture-api"
  *  outside mask, five vec4s — see the layout above. */
 export const LIGHT_HEADER = 20
 /** Floats per light — see the layout above. */
-export const LIGHT_STRIDE = 16
+export const LIGHT_STRIDE = 20
 /**
  * The cap. The loop below runs per fragment over the lights a scene HAS, so
  * this bounds the worst case rather than the ordinary one, and the buffer is
@@ -252,6 +254,10 @@ fn lightEmitMain(@builtin(global_invocation_id) gid: vec3u) {
   _rzLightsOut[b + 13u] = 0.0;
   _rzLightsOut[b + 14u] = select(0.0, max(l.near, 0.0), finite && l.near == l.near);
   _rzLightsOut[b + 15u] = 0.0;
+  _rzLightsOut[b + 16u] = 0.0;
+  _rzLightsOut[b + 17u] = 0.0;
+  _rzLightsOut[b + 18u] = 0.0;
+  _rzLightsOut[b + 19u] = 0.0;
 }
 `
 }
@@ -335,6 +341,68 @@ fn rzLightCookie(i: u32, toLight: vec3f) -> vec3f {
  *  a soft sphere, which a single global bulb cannot spell. */
 fn rzLightNear(i: u32) -> f32 { let r = _rzLightVec(i, 3u).z; return select(RZ_LAMP_NEAR, r, r > 0.0); }
 
+/** A tube lamp's half-axis: the lamp is the segment rzLightPos ± this. The
+ *  zero vector for a point or a spot, which is every lamp but a tube. */
+fn rzLightTube(i: u32) -> vec3f { return _rzLightVec(i, 4u).xyz; }
+
+/**
+ * A TUBE: a glowing strip, a neon line — light along a segment, not from a
+ * point. A row of points stood in for one puts a dot of highlight per point on
+ * a glossy wall where the strip's reflection is a band, and lights the panel
+ * beside the strip as if from half a metre away.
+ *
+ * Its irradiance is the segment's, its total intensity spread along it, per
+ * unit of that intensity (far off it is n·l/d², the point lamp's):
+ *
+ * - WITH AN AIM, a glowing strip facing it — Lambertian, cos θₑ at every
+ *   point of it. Since the aim is square to the segment, cos θₑ/r is hₑ/r²
+ *   all along it (hₑ the height of p over the strip's plane), and the
+ *   integral of hₑ·n·(x − p)/r⁴ along it is closed: with t along the axis
+ *   and D the distance off it, ∫(A + B·t)/(D² + t²)² dt =
+ *   A·(t/(2D²(D² + t²)) + atan(t/D)/(2D³)) − B/(2(D² + t²)). Exact for a
+ *   thin strip (within 0.4% of the integral over a 2 × 0.1 m face); a spot
+ *   cone's fit to the cosine gave a quarter too much 30° off its axis.
+ * - Without one, a line glowing every way (Picott's, as Karis gives it):
+ *   (n·L0/|L0| + n·L1/|L1|) / (|L0||L1| + L0·L1), the ends L0 and L1 from p;
+ *   beside a long line at h it is 2/(h·length).
+ *
+ * The bulb floors D (2·bulb² the Picott denominator), as max(d², bulb²)
+ * floors a point. Clamped at zero: both assume the whole segment above p's
+ * horizon.
+ */
+fn _rzTubeIrradiance(p: vec3f, n: vec3f, c: vec3f, h: vec3f, aim: vec3f, bulb: f32) -> f32 {
+  if (dot(aim, aim) > 0.5) {
+    let len = length(h);
+    let u = h / max(len, 1e-6);
+    let w = c - p;
+    let wu = dot(w, u);
+    let wp = w - u * wu;
+    let he = -dot(aim, w);
+    if (he <= 0.0) { return 0.0; }
+    let D2 = max(dot(wp, wp), bulb * bulb);
+    let D = sqrt(D2);
+    let A = dot(n, wp);
+    let B = dot(n, u);
+    let t1 = wu + len;
+    let t0 = wu - len;
+    let f1 = A * (t1 / (2.0 * D2 * (D2 + t1 * t1)) + atan(t1 / D) / (2.0 * D2 * D)) - B / (2.0 * (D2 + t1 * t1));
+    let f0 = A * (t0 / (2.0 * D2 * (D2 + t0 * t0)) + atan(t0 / D) / (2.0 * D2 * D)) - B / (2.0 * (D2 + t0 * t0));
+    return max(he * (f1 - f0) / max(2.0 * len, 1e-6), 0.0);
+  }
+  let L0 = c - h - p;
+  let L1 = c + h - p;
+  let l0 = max(length(L0), 1e-4);
+  let l1 = max(length(L1), 1e-4);
+  let e = (dot(n, L0) / l0 + dot(n, L1) / l1) / max(l0 * l1 + dot(L0, L1), 2.0 * bulb * bulb);
+  return max(e, 0.0);
+}
+
+/** The point of a tube nearest p: where its reach, cone and cookie are read. */
+fn _rzTubeNearest(p: vec3f, c: vec3f, h: vec3f) -> vec3f {
+  let t = clamp(dot(p - c, h) / max(dot(h, h), 1e-8), -1.0, 1.0);
+  return c + h * t;
+}
+
 /** The cosines a spot fades between: x its outer edge, y its inner one. A point
  *  light stores (-1, -1), which saturates the cone term to 1. */
 fn rzLightCone(i: u32) -> vec2f { return vec2f(_rzLightVec(i, 2u).w, _rzLightVec(i, 3u).x); }
@@ -379,8 +447,23 @@ fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   let dist = length(d);
   // Out of reach before anything else is computed. The grid is conservative —
   // a cell's bit means the lamp CAN reach part of it — so this still runs.
-  if (dist >= pr.w) { return vec3f(0.0); }
+  // a tube's reach is from its segment: past it by its half-length
+  let h = rzLightTube(i);
+  if (dist >= pr.w + length(h)) { return vec3f(0.0); }
   let toLight = d / max(dist, 1e-4);
+  // A tube (see _rzTubeIrradiance): its reach from the point of it nearest
+  // p, its light the segment's whole — an aimed one's cosine included, so it
+  // takes no cone and no cookie.
+  if (dot(h, h) > 0.0) {
+    let q = _rzTubeNearest(p, pr.xyz, h);
+    let qd = length(q - p);
+    if (qd >= pr.w) { return vec3f(0.0); }
+    let qt = clamp(qd / max(pr.w, 1e-4), 0.0, 1.0);
+    let qt2 = qt * qt;
+    let qw = 1.0 - qt2 * qt2;
+    let e = _rzTubeIrradiance(p, n, pr.xyz, h, rzLightAim(i), rzLightNear(i));
+    return rzLightColor(i) * (e * qw * qw);
+  }
   // Facing the light, and nothing behind it. No wrap or half-lambert: this
   // layer adds light, and a wrapped term would lift the shadow side, which is
   // the ramp's business and not this one's.

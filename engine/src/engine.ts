@@ -491,6 +491,19 @@ export type SceneAovs = {
   exposure: number
 }
 
+/** The shape of a renderer's pixel filter (Engine.setPixelFilter): Cycles'
+ *  default Blackman-Harris, or its box. */
+export type PixelFilterType = "blackman-harris" | "box"
+
+/** A local reflection probe (Engine.setReflectionProbe): where it is captured
+ *  from and the box it projects onto, world space (PMX units). A surface
+ *  outside the box reflects the sky. */
+export type ReflectionProbeRegion = {
+  center: readonly [number, number, number] | readonly number[]
+  min: readonly [number, number, number] | readonly number[]
+  max: readonly [number, number, number] | readonly number[]
+}
+
 /** The light arriving at one point (Engine.probeLight). Colours are linear
  *  light, before the surface's albedo: the sun's is its colour times strength,
  *  unshadowed and unfaced — multiply by sunShadow and max(sunFacing, 0). */
@@ -1086,6 +1099,8 @@ interface ModelInstance {
    *  hiddenMaterials so a morph switching a part off never clobbers the user's
    *  own visibility toggle, and vice versa. */
   morphHiddenMaterials: Set<string>
+  /** Materials the reflection probe leaves out (setMaterialInProbe). */
+  probeHiddenMaterials: Set<string>
   /** Material-morph targets, or null when the model has no type-8 morphs. */
   materialMorphTargets: MaterialMorphTarget[] | null
   /** The same targets by PMX material index, so a named offset is one lookup. */
@@ -1970,6 +1985,16 @@ export type SceneLight = {
    * room without lighting up its shiny floor. Omitted or true: both.
    */
   specular?: boolean
+  /**
+   * A TUBE: the lamp is the segment position ± this half-axis (engine units)
+   * rather than a point — a neon strip, a glowing line. Its light is the
+   * segment's and its highlight a band along it; `near` is the tube's radius,
+   * `radius` its reach from the segment. With an `aim` (square to the tube)
+   * it is a glowing strip facing that way, Lambertian — the cosine exact, so
+   * `angle`, `innerAngle` and `cookie` are not read; without one it glows every
+   * way. Omitted or zero: a point (or spot).
+   */
+  tube?: XYZ
 }
 
 /**
@@ -2799,6 +2824,9 @@ export class Engine {
   /** Off: no capture, and every reader falls back to the sky — see
    *  setReflectionProbe. */
   private probeEnabled = true
+  /** A local probe's capture point and box, world space — see
+   *  setReflectionProbe. Null: the stage's middle and bounds. */
+  private probeRegion: ReflectionProbeRegion | null = null
   private probeCapture: {
     msTargets: GPUTexture[]
     depth: GPUTexture
@@ -3339,6 +3367,58 @@ export class Engine {
     return this.grain
   }
 
+  /** The pixel filter: its width in pixels (0 off) and the 1D weights of
+   *  offsets 0, ±1, ±2 it comes to — see setPixelFilter. */
+  private pixelFilter = { width: 0, type: "blackman-harris" as PixelFilterType, weights: [1, 0, 0] as [number, number, number] }
+
+  /**
+   * A renderer's pixel filter, over the rendered scene: how Cycles builds a
+   * pixel from the light around it rather than from its own square alone.
+   * Off (width 0) the engine's pixels are their own box, which is what it has
+   * always drawn.
+   *
+   * Cycles samples each pixel through a Blackman-Harris window twice the
+   * filter width across (1.5 px by default, so 3 px), or a box that width
+   * across. It is invisible on ordinary surfaces and decides what a thing
+   * smaller than a pixel and far brighter than white looks like: a 3 cm ember
+   * glowing at twenty times white spreads into the pixels around it and reads
+   * as a coloured square, and a neon edge gets its coloured fringe. The engine
+   * resolves its samples to a box first, so the filter here is that window
+   * integrated over each neighbour's square — the nearest staircase to it —
+   * applied to the scene's HDR light before the view transform, coverage
+   * alongside, so the sky behind it composites as before. Up to 2.5 px wide
+   * (5×5 taps), one more pass of reads in the composite, none when off.
+   */
+  setPixelFilter(width: number, type: PixelFilterType = "blackman-harris"): void {
+    const w = Number.isFinite(width) ? Math.min(Math.max(width, 0), 2.5) : 0
+    // The window's full span in pixels and its shape over u in 0..1.
+    const span = type === "box" ? w : w * 2
+    const shape = (u: number) =>
+      type === "box"
+        ? 1
+        : 0.35875 - 0.48829 * Math.cos(2 * Math.PI * u) + 0.14128 * Math.cos(4 * Math.PI * u) - 0.01168 * Math.cos(6 * Math.PI * u)
+    const weights: [number, number, number] = [1, 0, 0]
+    if (span > 1e-3) {
+      // Each offset's square, [d − ½, d + ½], integrated over the window.
+      const n = 64
+      for (let d = 0; d < 3; d++) {
+        let sum = 0
+        for (let i = 0; i < n; i++) {
+          const x = d - 0.5 + (i + 0.5) / n
+          if (Math.abs(x) < span / 2) sum += shape(x / span + 0.5) / n
+        }
+        weights[d] = sum
+      }
+      const total = weights[0] + 2 * weights[1] + 2 * weights[2]
+      for (let d = 0; d < 3; d++) weights[d] /= total
+    }
+    this.pixelFilter = { width: w, type, weights }
+    if (this.device && this.compositeUniformBuffer) this.writeCompositeViewUniforms()
+  }
+  getPixelFilter(): Readonly<{ width: number; type: PixelFilterType }> {
+    return { width: this.pixelFilter.width, type: this.pixelFilter.type }
+  }
+
   setViewTransformOptions(patch: Partial<ViewTransformOptions>): void {
     const v = this.viewTransform
     if (patch.exposure !== undefined) v.exposure = patch.exposure
@@ -3426,6 +3506,11 @@ export class Engine {
     // The soft curve's power (viewU[15].x), the scene's own (SceneSetting._contrast).
     // Its own vec4: viewU[11..14] are the cast's positions whenever an effect runs.
     u[60] = v.contrast
+    // The pixel filter's 1D weights for offsets 0, ±1, ±2 (viewU[15].yzw);
+    // 1, 0, 0 is off — see setPixelFilter.
+    u[61] = this.pixelFilter.weights[0]
+    u[62] = this.pixelFilter.weights[1]
+    u[63] = this.pixelFilter.weights[2]
     // ── Grade (viewU[7..9]) ── The UI's three tonal COLORS map to ASC CDL here,
     // on the CPU, so the shader only ever sees slope/offset/power. Mid-gray is
     // neutral in all three; the signed distance from it is the amount.
@@ -11013,10 +11098,19 @@ export class Engine {
   /** Whether the stage reflects its own capture (the default) or the sky. Off
    *  is for a stage whose sky was measured from inside it — a Blender export's
    *  world — where a capture lit without the lamps' shadows comes out too
-   *  bright on a shiny floor. */
-  setReflectionProbe(enabled: boolean): void {
-    if (this.probeEnabled === enabled) return
+   *  bright on a shiny floor.
+   *
+   *  With a region the probe is LOCAL, as a room's box probe is in Unity:
+   *  captured from region.center, box-projected onto region.min..max, and a
+   *  surface outside that box reflects the sky — a tunnel's glossy walls
+   *  mirror its neon while the floor around it keeps the world. Null: the
+   *  stage's middle and bounds, every surface. */
+  setReflectionProbe(enabled: boolean, region: ReflectionProbeRegion | null = null): void {
+    const same = (a: ReflectionProbeRegion | null, b: ReflectionProbeRegion | null) =>
+      a === b || (!!a && !!b && [0, 1, 2].every((k) => a.center[k] === b.center[k] && a.min[k] === b.min[k] && a.max[k] === b.max[k]))
+    if (this.probeEnabled === enabled && same(this.probeRegion, region)) return
     this.probeEnabled = enabled
+    this.probeRegion = region && [region.center, region.min, region.max].every((v) => v.length >= 3 && v.every(Number.isFinite)) ? region : null
     this.captureReflectionProbe()
   }
 
@@ -11056,7 +11150,8 @@ export class Engine {
     const settled = this.probeFrame - this.probeDirtyFrame >= Engine.PROBE_SETTLE_FRAMES
     if (!settled && this.probeFrame - this.probeAskedFrame < Engine.PROBE_MAX_WAIT_FRAMES) return
     this.probeDirty = false
-    const bounds = this.probeEnabled ? this.stageBounds() : null
+    const region = this.probeRegion
+    const bounds = !this.probeEnabled ? null : region ? { min: region.min, max: region.max } : this.stageBounds()
     if (!bounds) {
       // No stage, or the probe is off: it goes dark and every reader falls
       // back to the sky.
@@ -11065,7 +11160,7 @@ export class Engine {
       return
     }
     try {
-      this.renderProbe(bounds)
+      this.renderProbe(bounds, region?.center ?? null)
     } catch (e) {
       console.warn("[reze-engine] reflection probe capture failed:", e)
     }
@@ -11193,19 +11288,25 @@ export class Engine {
    * the MMD convention, else their bottom) — where a game puts the probe of a
    * room the player stands in. The box it projects onto is the bounds.
    *
+   * A LOCAL probe (setReflectionProbe's region) is captured from the point
+   * it names and projects onto its own box; a surface outside that box
+   * reflects the sky, as Unity's box probes fall back to the skybox past
+   * their bounds.
+   *
    * WHAT: the stage alone, in its own looks, lit by the scene's sun, lamps
    * and sky as they stand. The cast is not in it (a baked probe never holds
    * the characters), nor are effects.
    */
-  private renderProbe(bounds: { min: [number, number, number]; max: [number, number, number] }): void {
+  private renderProbe(
+    bounds: { min: readonly number[]; max: readonly number[] },
+    at: readonly number[] | null,
+  ): void {
     const cap = this.ensureProbeCapture()
     const { min, max } = bounds
     const floor = min[1] <= 0 && max[1] >= 0 ? 0 : min[1]
-    const eye: [number, number, number] = [
-      (min[0] + max[0]) * 0.5,
-      Math.min(floor + 12, (min[1] + max[1]) * 0.5),
-      (min[2] + max[2]) * 0.5,
-    ]
+    const eye: [number, number, number] = at
+      ? [at[0], at[1], at[2]]
+      : [(min[0] + max[0]) * 0.5, Math.min(floor + 12, (min[1] + max[1]) * 0.5), (min[2] + max[2]) * 0.5]
     const span = Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2])
     const near = 0.25
     const far = Math.max(span * 2, 100)
@@ -11328,7 +11429,8 @@ export class Engine {
       for (let f = 0; f < 6; f++) run(face(this.probeTexture, m, f), cap.filterPipeline, cap.filterGroups[m * 6 + f])
     this.device.queue.submit([encoder.finish()])
 
-    this.probeData.set([eye[0], eye[1], eye[2], 1, min[0], min[1], min[2], 1, max[0], max[1], max[2], 0])
+    // boxMax.w: 1 for a local probe, whose outside reflects the sky.
+    this.probeData.set([eye[0], eye[1], eye[2], 1, min[0], min[1], min[2], 1, max[0], max[1], max[2], at ? 1 : 0])
     this.device.queue.writeBuffer(this.probeUniformBuffer, 0, this.probeData)
   }
 
@@ -11891,6 +11993,12 @@ export class Engine {
       // rewrites the lamps when it lands).
       const cookie = l.cookie !== undefined ? this.cookieLayers.get(l.cookie) : undefined
       this.lightsData[b + 15] = cookie !== undefined ? cookie + 1 : 0
+      // A tube's half-axis; zero for a point (a non-finite one is a point too)
+      const tube = l.tube && [l.tube.x, l.tube.y, l.tube.z].every(Number.isFinite) && l.kind !== "directional" ? l.tube : null
+      this.lightsData[b + 16] = tube ? tube.x : 0
+      this.lightsData[b + 17] = tube ? tube.y : 0
+      this.lightsData[b + 18] = tube ? tube.z : 0
+      this.lightsData[b + 19] = 0
     }
     // The grid, from the records as STORED — normalised aim, clamped reach, the
     // cosines in f32 — so it indexes exactly what the shader will evaluate.
@@ -11898,7 +12006,10 @@ export class Engine {
       list.map((_, i) => {
         const b = LIGHT_HEADER + i * LIGHT_STRIDE
         const d = this.lightsData
-        return { x: d[b], y: d[b + 1], z: d[b + 2], radius: d[b + 3], ax: d[b + 8], ay: d[b + 9], az: d[b + 10], cosOuter: d[b + 11] }
+        // a tube reaches its radius from any point of its segment: past the
+        // middle by its half-length, and a cone is no bound along it
+        const half = Math.hypot(d[b + 16], d[b + 17], d[b + 18])
+        return { x: d[b], y: d[b + 1], z: d[b + 2], radius: d[b + 3] + half, ax: d[b + 8], ay: d[b + 9], az: d[b + 10], cosOuter: half > 0 ? -1 : d[b + 11] }
       }),
     )
     this.lightHeader.set(grid.origin, 4)
@@ -13702,6 +13813,20 @@ export class Engine {
     else inst.hiddenMaterials.add(materialName)
   }
 
+  /**
+   * Whether the reflection probe captures a material. Off for a glowing strip
+   * whose light a TUBE LAMP already carries (SceneLight.tube): the lamp draws
+   * its reflection in every glossy surface, exactly, and the probe's picture
+   * of the same strip would put it there a second time. Re-captures the probe.
+   */
+  setMaterialInProbe(modelName: string, materialName: string, inProbe: boolean): void {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst || inst.probeHiddenMaterials.has(materialName) === !inProbe) return
+    if (inProbe) inst.probeHiddenMaterials.delete(materialName)
+    else inst.probeHiddenMaterials.add(materialName)
+    this.captureReflectionProbe()
+  }
+
   toggleMaterialVisible(modelName: string, materialName: string): void {
     const inst = this.modelInstances.get(modelName)
     if (!inst) return
@@ -15371,6 +15496,7 @@ export class Engine {
       skinMatricesDirty: true,
       hiddenMaterials: new Set(),
       morphHiddenMaterials: new Set(),
+      probeHiddenMaterials: new Set(),
       materialMorphTargets: null,
       materialMorphByIndex: null,
       physics,
@@ -19135,6 +19261,7 @@ export class Engine {
       if (only && (only === "hair") !== this.isHairDraw(inst, draw)) continue
       // The probe draws directly, past the cull: honour the switches it holds.
       if (view.args === "probe" && !this.shouldRenderDrawCall(inst, draw)) continue
+      if (view.args === "probe" && inst.probeHiddenMaterials.has(draw.materialName)) continue
       if (!bound) {
         pass.setBindGroup(0, view.perFrame)
         pass.setBindGroup(1, inst.mainPerInstanceBindGroup)

@@ -25,6 +25,8 @@ export {
   type ModelAttachment,
   type SceneAovs,
   type LightProbe,
+  type ReflectionProbeRegion,
+  type PixelFilterType,
   type GizmoDragEvent,
   type GizmoDragCallback,
   type GizmoDragKind,

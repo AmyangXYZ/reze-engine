@@ -241,7 +241,8 @@ struct LightVP { viewProj: array<mat4x4f, ${SHADOW_CASCADES.length}>, };
 
 /** The stage's reflection probe (Engine.captureReflectionProbe): where it was
  *  captured (xyz) and its strength (w); the box it projects onto, min with the
- *  on-flag in w, then max. Off (boxMin.w 0) the sky stands in. */
+ *  on-flag in w, then max with the local flag in w (1: outside the box the
+ *  sky stands in). Off (boxMin.w 0) the sky stands in everywhere. */
 struct ProbeUniforms {
   center: vec4f,
   boxMin: vec4f,

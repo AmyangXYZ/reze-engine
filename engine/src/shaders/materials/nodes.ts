@@ -1290,15 +1290,147 @@ fn pmx_sphere_map(base: vec3f, strength: f32, N: vec3f) -> vec3f {
 // (_rzLampN, not the mapped N) and in the order rzLightsDiffuse sums it, so the
 // epilogue's rzLightsDiffuseOnce is that function's exact answer without a
 // second pass over the grid. See lights.ts.
-struct _RzLampPair { d: vec3f, s: vec3f };
+//
+// Each highlight also comes out as Blender's Principled draws it (.p, and .q
+// weighted by its rise toward grazing, _rzGrazing), for a closure that asks
+// for it (urp_lit's fresnel): its reflectance is then f0·p + (1 − f0)·q per
+// lamp. URP's own
+// lobe is not that with a Fresnel added — its V·F shortcut,
+// 1/(max(0.1, L·H²)(4a + 2)), already rises at grazing, and Schlick on top of
+// it counted the rise twice (a third too bright in a glossy floor's
+// reflection of a strip).
+struct _RzLampPair { d: vec3f, s: vec3f, p: vec3f, q: vec3f };
+var<private> _rzLampPrincipled: vec3f = vec3f(0.0);
+var<private> _rzLampPrincipledGrazing: vec3f = vec3f(0.0);
+
+/**
+ * How far a Principled surface's reflectance rises from f0 toward 1 at this
+ * pair of directions: the EXACT Fresnel of a dielectric at Principled's
+ * default IOR 1.5 (f0 0.04), as Cycles evaluates it, put as
+ * (F(L·H) − 0.04)/0.96 so f0 + (1 − f0)·this is that Fresnel. Schlick's
+ * (1 − L·H)⁵ is a sixth low from 45° to 65°, a few percent high past 80°. For a metal (f0 its
+ * colour) it stands in for Cycles' F82 tint, close where (1 − f0) is small.
+ */
+fn _rzGrazing(l: vec3f, v: vec3f) -> f32 {
+  let c = clamp(dot(l, normalize(l + v)), 1e-4, 1.0);
+  let g = sqrt(1.25 + c * c);            // n² − 1 + c², n = 1.5
+  let a = (g - c) / (g + c);
+  let b = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
+  let f = 0.5 * a * a * (1.0 + b * b);
+  return saturate((f - 0.04) / 0.96);
+}
+
+/**
+ * Cycles' microfacet lobe without its Fresnel: GGX's D and Smith's
+ * height-correlated visibility, α = roughness², times π for this engine's
+ * light units (LIGHT UNITS — URP's lobe carries the same π). Returns
+ * π·D·V; the caller multiplies by N·L (or a tube's irradiance) and the
+ * reflectance.
+ */
+fn _rzGgxSmith(N: vec3f, L: vec3f, V: vec3f, roughness: f32) -> f32 {
+  let a = max(roughness * roughness, 6.1035156e-5);
+  let a2 = a * a;
+  let H = normalize(L + V);
+  let NH = saturate(dot(N, H));
+  let NL = saturate(dot(N, L));
+  let NV = max(dot(N, V), 1e-4);
+  let d = NH * NH * (a2 - 1.0) + 1.0;
+  let vis = 0.5 / max(NL * sqrt(NV * NV * (1.0 - a2) + a2) + NV * sqrt(NL * NL * (1.0 - a2) + a2), 1e-5);
+  return a2 / max(d * d, 1e-8) * vis;
+}
+
+/** One point of a tube's highlight, per unit of its length: (URP's lobe,
+ *  Principled's, Principled's grazing part), each × the strip's cosine there
+ *  (1 for a tube glowing every way), the surface's and 1/r². */
+fn _rzTubeSample(x: vec3f, p: vec3f, n: vec3f, v: vec3f, roughness: f32, facing: f32, aim: vec3f, bulb: f32) -> vec3f {
+  let d = x - p;
+  let rr = max(length(d), 1e-4);
+  let l = d / rr;
+  let ce = select(1.0, max(-dot(aim, l), 0.0), facing > 0.5);
+  let cr = max(dot(n, l), 0.0);
+  if (ce <= 0.0 || cr <= 0.0) { return vec3f(0.0); }
+  let k = ce / max(rr * rr, bulb * bulb);
+  let pp = _rzGgxSmith(n, l, v, roughness) * cr * k;
+  return vec3f(bsdf_urp(n, l, v, cr, roughness) * k, pp, pp * _rzGrazing(l, v));
+}
+
+/**
+ * A tube's diffuse and highlight (see _rzTubeIrradiance in lights.ts).
+ *
+ * THE HIGHLIGHT IS INTEGRATED ALONG IT: the lobe at each point of the strip,
+ * with its cosine, the surface's and 1/r², by Gauss-Legendre over three pieces
+ * split around where the reflected ray passes nearest the segment — 4 points
+ * across the lobe's window there, 2 on either side. The window's half-width
+ * is the lobe's own at that distance, 0.85·α·d/sin (the ray's angle to the
+ * tube), plus the bulb. Against the exact integral over a 2 × 0.1 m strip
+ * from twelve views it is within 5% at roughness 0.35 and 7% at 0.6 (a
+ * quarter low at 0.15, where the lobe is narrower than the strip is wide).
+ * Karis's representative point, the lobe's peak times the whole strip's
+ * light, was 0.2 to 2 times it across one floor.
+ */
+fn _rzTubeOne(i: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32, c: vec3f, h: vec3f, reach: f32) -> _RzLampPair {
+  var out = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  let q = _rzTubeNearest(p, c, h);
+  let qd = length(q - p);
+  if (qd >= reach) { return out; }
+  let t = clamp(qd / max(reach, 1e-4), 0.0, 1.0);
+  let t2 = t * t;
+  let window = 1.0 - t2 * t2;
+  let bulb = rzLightNear(i);
+  let aim = rzLightAim(i);
+  let facing = select(0.0, 1.0, dot(aim, aim) > 0.5);
+  let col = rzLightColor(i) * (window * window);
+  out.d = col * _rzTubeIrradiance(p, _rzLampN, c, h, aim, bulb);
+  if (rzLightSpecular(i) <= 0.0 || _rzTubeIrradiance(p, n, c, h, aim, bulb) <= 0.0) { return out; }
+  let r = reflect(-v, n);
+  let L0 = c - h - p;
+  let Ld = 2.0 * h;
+  let lenD = max(length(Ld), 1e-6);
+  let rLd = dot(r, Ld);
+  let s0 = clamp((dot(r, L0) * rLd - dot(L0, Ld)) / max(dot(Ld, Ld) - rLd * rLd, 1e-8), 0.0, 1.0);
+  let dr = length(L0 + Ld * s0);
+  let sinT = sqrt(max(1.0 - (rLd / lenD) * (rLd / lenD), 1e-4));
+  let a = max(roughness * roughness, 6.1035156e-5);
+  let w = min(0.85 * a * dr / (lenD * sinT) + bulb / lenD, 1.0);
+  let lo = max(s0 - w, 0.0);
+  let hi = min(s0 + w, 1.0);
+  let base = c - h;
+  var acc = vec3f(0.0);
+  // the two side pieces, 2 points each (±1/√3, weight 1)
+  let g2 = 0.5773503;
+  if (lo > 1e-6) {
+    let m = lo * 0.5;
+    acc = acc + (_rzTubeSample(base + Ld * (m - m * g2), p, n, v, roughness, facing, aim, bulb)
+               + _rzTubeSample(base + Ld * (m + m * g2), p, n, v, roughness, facing, aim, bulb)) * m;
+  }
+  if (hi < 1.0 - 1e-6) {
+    let m = (1.0 - hi) * 0.5;
+    let mid = hi + m;
+    acc = acc + (_rzTubeSample(base + Ld * (mid - m * g2), p, n, v, roughness, facing, aim, bulb)
+               + _rzTubeSample(base + Ld * (mid + m * g2), p, n, v, roughness, facing, aim, bulb)) * m;
+  }
+  // the lobe's window, 4 points
+  let m = (hi - lo) * 0.5;
+  let mid = lo + m;
+  acc = acc + (_rzTubeSample(base + Ld * (mid - m * 0.8611363), p, n, v, roughness, facing, aim, bulb) * 0.3478548
+             + _rzTubeSample(base + Ld * (mid - m * 0.3399810), p, n, v, roughness, facing, aim, bulb) * 0.6521452
+             + _rzTubeSample(base + Ld * (mid + m * 0.3399810), p, n, v, roughness, facing, aim, bulb) * 0.6521452
+             + _rzTubeSample(base + Ld * (mid + m * 0.8611363), p, n, v, roughness, facing, aim, bulb) * 0.3478548) * m;
+  out.s = col * acc.x;
+  out.p = col * acc.y;
+  out.q = col * acc.z;
+  return out;
+}
 
 fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPair {
-  var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  var out = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
   if (!_rzLightReaches(i)) { return out; }
   let pr = _rzLightVec(i, 0u);
   let d = pr.xyz - p;
   let dist = length(d);
-  if (dist >= pr.w) { return out; }
+  let h = rzLightTube(i);
+  if (dist >= pr.w + length(h)) { return out; }
+  if (dot(h, h) > 0.0) { return _rzTubeOne(i, p, n, v, roughness, pr.xyz, h, pr.w); }
   let toLight = d / max(dist, 1e-4);
   let ndlD = max(dot(_rzLampN, toLight), 0.0);
   let ndl = dot(n, toLight);
@@ -1312,12 +1444,17 @@ fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPa
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
   let c = rzLightColor(i) * rzLightCookie(i, toLight);
   if (ndlD > 0.0) { out.d = c * (ndlD * falloff * aim * aim); }
-  if (ndl > 0.0) { out.s = c * (bsdf_urp(n, toLight, v, ndl, roughness) * falloff * aim * aim * rzLightSpecular(i)); }
+  if (ndl > 0.0) {
+    let k = falloff * aim * aim * rzLightSpecular(i);
+    out.s = c * (bsdf_urp(n, toLight, v, ndl, roughness) * k);
+    out.p = c * (_rzGgxSmith(n, toLight, v, roughness) * ndl * k);
+    out.q = out.p * _rzGrazing(toLight, v);
+  }
   return out;
 }
 
 fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPair {
-  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
   var bits = bits0;
   loop {
     if (bits == 0u) { break; }
@@ -1326,6 +1463,8 @@ fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f
     let one = _rzLampOne(i, p, n, v, roughness);
     acc.d = acc.d + one.d;
     acc.s = acc.s + one.s;
+    acc.p = acc.p + one.p;
+    acc.q = acc.q + one.q;
   }
   return acc;
 }
@@ -1333,6 +1472,8 @@ fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f
 fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
   var d = vec3f(0.0);
   var s = vec3f(0.0);
+  var pr = vec3f(0.0);
+  var q = vec3f(0.0);
   let count = rzLightCount();
   let docs = _rzLightDocCount();
   if (docs > 0u) {
@@ -1347,12 +1488,18 @@ fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
     let w7 = _rzLampWord(m.hi.w, 224u, p, n, v, roughness);
     d = d + w0.d + w1.d + w2.d + w3.d + w4.d + w5.d + w6.d + w7.d;
     s = s + w0.s + w1.s + w2.s + w3.s + w4.s + w5.s + w6.s + w7.s;
+    pr = pr + w0.p + w1.p + w2.p + w3.p + w4.p + w5.p + w6.p + w7.p;
+    q = q + w0.q + w1.q + w2.q + w3.q + w4.q + w5.q + w6.q + w7.q;
   }
   for (var i = docs; i < count; i = i + 1u) {
     let one = _rzLampOne(i, p, n, v, roughness);
     d = d + one.d;
     s = s + one.s;
+    pr = pr + one.p;
+    q = q + one.q;
   }
+  _rzLampPrincipled = pr;
+  _rzLampPrincipledGrazing = q;
   // The first closure's walk speaks for the fragment; a second principled in
   // the same graph shares p and the prelude normal, so its answer is the same.
   if (!_rzLampDiffuseSet) {
@@ -1375,10 +1522,14 @@ fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
 // behind the surface gets neither term, as the game's step(N·L ≥ 0) has it.
 
 fn _rzAddLightOne(i: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
-  var out = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  var out = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
   if (!_rzLightReaches(i)) { return out; }
   let pr = _rzLightVec(i, 0u);
-  let d = pr.xyz - p;
+  // a tube is met at its nearest point here: a graph's Blinn-Phong glint has
+  // no representative-point form
+  let tube = rzLightTube(i);
+  let at = select(pr.xyz, _rzTubeNearest(p, pr.xyz, tube), dot(tube, tube) > 0.0);
+  let d = at - p;
   let dist = length(d);
   if (dist >= pr.w) { return out; }
   let toLight = d / max(dist, 1e-4);
@@ -1398,7 +1549,7 @@ fn _rzAddLightOne(i: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
 }
 
 fn _rzAddLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
-  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
   var bits = bits0;
   loop {
     if (bits == 0u) { break; }
@@ -1412,7 +1563,7 @@ fn _rzAddLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) 
 }
 
 fn rz_additional_lights(p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
-  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0));
+  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
   let count = rzLightCount();
   let docs = _rzLightDocCount();
   if (docs > 0u) {
@@ -1472,7 +1623,8 @@ fn rz_box_project(d: vec3f, p: vec3f, bmin: vec3f, bmax: vec3f, c: vec3f) -> vec
 /**
  * The scene's reflection: the stage's own reflection probe where the engine
  * captured one (Engine reflection probe — rendered from the stage's middle,
- * GGX-prefiltered, box-projected to the stage's bounds), else the world's sky.
+ * GGX-prefiltered, box-projected to the stage's bounds, or a local probe's own
+ * point and box, outside which the sky stands in), else the world's sky.
  *
  * ROUGHNESS PICKS THE MIP ON UNITY'S CURVE, r·(1.7 − 0.7r)·6 on a cube of
  * seven levels (64² down to 1²) — URP's PerceptualRoughnessToMipmapLevel with
@@ -1481,6 +1633,9 @@ fn rz_box_project(d: vec3f, p: vec3f, bmin: vec3f, bmax: vec3f, c: vec3f) -> vec
 fn rzProbeSpecular(dir: vec3f, wp: vec3f, roughness: f32) -> vec3f {
   let r = clamp(roughness, 0.0, 1.0);
   if (probe.boxMin.w < 0.5) { return rzWorldSpecularLod(dir, r, 1.0); }
+  // A local probe (boxMax.w 1) holds only its box: past it, the sky.
+  let outside = any(wp <= probe.boxMin.xyz) || any(wp >= probe.boxMax.xyz);
+  if (probe.boxMax.w > 0.5 && outside) { return rzWorldSpecularLod(dir, r, 1.0); }
   let levels = f32(textureNumLevels(probeCube) - 1u);
   let lod = min(r * (1.7 - 0.7 * r) * 6.0, levels);
   let d = rz_box_project(normalize(dir), wp, probe.boxMin.xyz, probe.boxMax.xyz, probe.center.xyz);
@@ -1507,9 +1662,15 @@ fn rzProbeSpecular(dir: vec3f, wp: vec3f, roughness: f32) -> vec3f {
  * shaded here by THIS surface's albedo and the epilogue adds none; as a layer
  * of a larger look it leaves them to the epilogue. The cast's shadow on a
  * stage multiplies the lit part.
+ *
+ * fresnel 1 draws the direct highlights as Blender's Principled does: GGX
+ * with Smith's visibility and Fresnel's reflectance (_rzGrazing),
+ * per light — a dark dielectric seen at a grazing angle mirrors a lamp several
+ * times as strongly as head on. 0 (the default, every Unity stage) is URP's
+ * lobe and reflectance, term for term; between them it mixes.
  */
 fn urp_lit(base: vec3f, metallic: f32, smoothness: f32, spec: f32, occlusion: f32, emission: vec3f, alpha: f32,
-           N: vec3f, L: vec3f, V: vec3f, sun_rgb: vec3f, amb_rgb: vec3f, shadow: f32, wp: vec3f,
+           fresnel: f32, N: vec3f, L: vec3f, V: vec3f, sun_rgb: vec3f, amb_rgb: vec3f, shadow: f32, wp: vec3f,
            surface: bool) -> vec4f {
   let m = clamp(metallic, 0.0, 1.0);
   let sm = clamp(smoothness, 0.0, 1.0);
@@ -1530,8 +1691,16 @@ fn urp_lit(base: vec3f, metallic: f32, smoothness: f32, spec: f32, occlusion: f3
     _rzLampDiffuseTaken = true;
   }
   let ao = clamp(occlusion, 0.0, 1.0);
-  let direct = diffuse * (sun_rgb * (NL * shadow) + lampDiff)
-             + specular * (bsdf_urp(N, L, V, NL, r) * sun_rgb * shadow + lampSpec);
+  let urpSpec = specular * (bsdf_urp(N, L, V, NL, r) * sun_rgb * shadow + lampSpec);
+  var directSpec = urpSpec;
+  let fz = clamp(fresnel, 0.0, 1.0);
+  if (fz > 0.0) {
+    let sunP = _rzGgxSmith(N, L, V, r) * NL * sun_rgb * shadow;
+    let principled = specular * (sunP + _rzLampPrincipled)
+                   + (vec3f(1.0) - specular) * (sunP * _rzGrazing(L, V) + _rzLampPrincipledGrazing);
+    directSpec = mix(urpSpec, principled, fz);
+  }
+  let direct = diffuse * (sun_rgb * (NL * shadow) + lampDiff) + directSpec;
   let indirect = diffuse * amb_rgb * ao
                + rzProbeSpecular(reflect(-V, N), wp, r) * ao * urp_env_brdf(specular, r, sm, reflectivity, NV);
   var lit = direct + indirect;
