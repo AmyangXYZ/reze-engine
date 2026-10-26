@@ -18466,23 +18466,18 @@ export class Engine {
     return true
   }
 
-  /** The model at one cast slot — the subject rzSubject(index) reads. */
-  private castSubjectName(index: number, subjects: readonly string[] | null = null): string | null {
+  /** The models an effect's rzSubject(i) reads, in its own index order: the
+   *  ones it is aimed at, or the whole cast when it is aimed at nobody. */
+  private castSubjectNames(subjects: readonly string[] | null = null): string[] {
+    const names: string[] = []
     let n = 0
-    let local = 0
-    let found: string | null = null
     this.forEachInstance((inst) => {
-      if (found !== null || n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible)
-        return
+      if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
       n++
-      // The effect's OWN index, which is what its shaders count in: an effect
-      // aimed at the third dancer finds her at 0, so a #dissolve on it takes HER
-      // apart rather than whoever stands at the head of the cast.
       if (subjects && !subjects.includes(inst.name)) return
-      if (local === index) found = inst.name
-      local++
+      names.push(inst.name)
     })
-    return found
+    return names
   }
 
   /** One effect's four durations: its dials where it declares them, the
@@ -18507,8 +18502,8 @@ export class Engine {
    *
    * Two things ask for one. A cycle set on a model (setModelDissolveCycle) runs
    * on the scene clock and repeats, as it always has. An effect declaring
-   * `#dissolve` takes ITS OWN subject 0 apart on its own terms — the first model
-   * it is aimed at, the head of the cast when it is aimed at nobody in
+   * `#dissolve` takes every one of ITS subjects apart on its own terms — the
+   * models it is aimed at, the whole cast when it is aimed at nobody in
    * particular: scheduled, the cycle on each clip's clock with her whole between
    * clips; unscheduled, the same repeating cycle as before. Where both ask, the more dissolved wins — two
    * answers about one body, and half a body is not one of them.
@@ -18521,14 +18516,15 @@ export class Engine {
     for (const fx of this.effects) {
       if (!fx.dissolve) continue
       const cycle = dissolveCycleOf(this.dissolveTimingsOf(fx, fx.dissolve))
-      const subject = this.castSubjectName(0, fx.subjects)
-      if (!cycle || !subject) continue
+      if (!cycle) continue
+      let v: number
       if (fx.window && fx.window.length > 0) {
         transport ??= this.transportTime()
-        put(subject, scheduledDissolve(fx.window, cycle, transport))
+        v = scheduledDissolve(fx.window, cycle, transport)
       } else {
-        put(subject, sampleDissolveCycle(cycle, this.sceneClock))
+        v = sampleDissolveCycle(cycle, this.sceneClock)
       }
+      for (const subject of this.castSubjectNames(fx.subjects)) put(subject, v)
     }
     for (const name of this.dissolveTouched) if (!want.has(name)) this.setModelDissolve(name, 1)
     this.dissolveTouched = new Set(want.keys())
