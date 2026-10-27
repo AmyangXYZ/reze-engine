@@ -204,6 +204,12 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   // shadows, and under a hard step flip whole regions at once. After the graph
   // it lifts her evenly and leaves every shadow where it is.
   const LIT = takesLight ? ` + (rzLightsDiffuseOnce(input.worldPos, n) + objectLight.fill.rgb) * albedo` : ""
+  // The cast's shadow on a stage the sun cannot reach under its roof
+  // (rzRoofedCastShadow), over everything the surface took — the lamps
+  // included, since they are what light a closed room. Zero off a stage.
+  const CAST = takesLight
+    ? `  out.color = vec4f(out.color.rgb * mix(vec3f(1.0), light.castShadow.rgb, rzRoofedCastShadow(input.worldPos) * light.castShadow.w), out.color.a);\n`
+    : ""
 
   const ALBEDO = `  let albedo = tex_color;
 `
@@ -244,13 +250,13 @@ ${ID_WRITE}  return out;
 
   var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
-${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
+${CAST}${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `${ALBEDO}  var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
-${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
+${CAST}${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
 }

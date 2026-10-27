@@ -11709,15 +11709,15 @@ export class Engine {
   }
 
   /**
-   * The cast's shadow on a stage, as a game on SimPipeline lays its ground
-   * shadow: the characters drawn into a map of their own from `direction` (the
-   * way TO the light, this engine's axes), and every Unity-mode stage surface
-   * multiplied toward `color` (linear) by amount × how much of the cast stands
-   * in the way. Its darkness is independent of the sun's — X340's is dim
-   * moonlight, which left a kneeling figure no shadow at all — and without a
-   * `direction` it falls along the sun, so it agrees with every other shadow on
-   * the stage. Only stage materials read it; a scene
-   * without a stage is untouched. Null turns it off.
+   * The cast's shadow on a stage the sun cannot reach: the characters drawn
+   * into a map of their own from `direction` (the way TO the light, this
+   * engine's axes), and every graph-drawn stage surface multiplied toward
+   * `color` (linear) by amount × how much of the cast stands in the way —
+   * where the stage roofs her from the sun (rzRoofedCastShadow). Under open
+   * sky the sun's own map lays her shadow and this adds nothing; under a
+   * ceiling, where the lamps cast none, it is the only shadow she has. Without
+   * a `direction` it falls along the sun. A scene without a stage is
+   * untouched. Null turns it off.
    */
   setStageCastShadow(opts: StageCastShadow | null): void {
     this.castShadow = opts
@@ -15418,11 +15418,14 @@ export class Engine {
 
     // Its ObjectLight: the world's ambient, and the layers its kind draws on —
     // the cast on the character layer as well as the default one. Words:
-    // layers [0..3], ambient flag [4..7], SH [8..43], fill [44..47], jelly
-    // eyes [48..71] — see materials/common.ts.
+    // layers [0..3] (y: a stage, which takes the cast's shadow —
+    // rzRoofedCastShadow), ambient flag [4..7], SH [8..43], fill [44..47],
+    // jelly eyes [48..71] — see materials/common.ts.
     const objectLight = new Float32Array(96)
-    new Uint32Array(objectLight.buffer)[0] =
+    const objectLayers = new Uint32Array(objectLight.buffer)
+    objectLayers[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0
+    objectLayers[1] = isStage ? 1 : 0
     const lightBuffer = this.device.createBuffer({
       label: `${name}: object light`,
       size: objectLight.byteLength,

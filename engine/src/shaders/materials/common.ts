@@ -390,6 +390,42 @@ fn sampleShadow(worldPos: vec3f, n: vec3f) -> f32 {
   return mix(1.0, _rzSunTaps(a), castAmt);
 }
 
+/**
+ * The cast's shadow on a stage surface where the stage ROOFS the cast from the
+ * sun, 0–1 — setStageCastShadow on a graph-drawn stage (a GLB's). Under open
+ * sky the sun's own map already lays the cast's shadow, and laying this one too
+ * doubled it; under a ceiling the sun reaches neither the floor nor her, the
+ * lamps cast nothing, and she stood on the floor with no shadow at all. So
+ * per pixel: find the point of the cast that throws this shadow (the cast
+ * map's nearest depth, walked back toward the light along the map's z row),
+ * step off her toward the light, and ask the sun's map whether it reaches
+ * there. Lit: the sun shadow has it, answer 0. Shadowed: this is the only
+ * shadow she gets. Zero on everything that is not a stage (objectLight
+ * layers.y).
+ */
+fn rzRoofedCastShadow(wp: vec3f) -> f32 {
+  if (light.castShadow.w <= 0.0 || objectLight.layers.y == 0u) { return 0.0; }
+  let cover = _rzCastShadow(wp);
+  if (cover <= 0.0) { return 0.0; }
+  let ndc = (light.castVP * vec4f(wp, 1.0)).xyz;
+  let size = vec2i(textureDimensions(castShadowMap));
+  let px = vec2i(vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(size));
+  // The nearest of her over the filter's footprint: a penumbra texel's own
+  // depth may be the cleared 1.
+  var occ = 1.0;
+  for (var y = -2; y <= 2; y += 2) {
+    for (var x = -2; x <= 2; x += 2) {
+      occ = min(occ, textureLoad(castShadowMap, clamp(px + vec2i(x, y), vec2i(0), size - 1), 0));
+    }
+  }
+  if (occ >= ndc.z) { return 0.0; }
+  // Orthographic: depth grows away from the light at |g| per unit.
+  let g = vec3f(light.castVP[0].z, light.castVP[1].z, light.castVP[2].z);
+  let k = length(g);
+  let q = wp - (g / k) * ((ndc.z - occ) / k + 0.5);
+  return cover * (1.0 - rzSunOcclusion(q, vec3f(0.0)));
+}
+
 `;
 
 // ─── Skinning vertex shader ─────────────────────────────────────────

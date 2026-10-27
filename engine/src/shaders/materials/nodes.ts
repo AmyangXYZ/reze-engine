@@ -1703,8 +1703,7 @@ fn urp_lit(base: vec3f, metallic: f32, smoothness: f32, spec: f32, occlusion: f3
   let direct = diffuse * (sun_rgb * (NL * shadow) + lampDiff) + directSpec;
   let indirect = diffuse * amb_rgb * ao
                + rzProbeSpecular(reflect(-V, N), wp, r) * ao * urp_env_brdf(specular, r, sm, reflectivity, NV);
-  var lit = direct + indirect;
-  lit = lit * mix(vec3f(1.0), light.castShadow.rgb, _rzCastShadow(wp) * light.castShadow.w);
+  let lit = direct + indirect;
   return vec4f(lit + max(emission, vec3f(0.0)), a * oneMinusReflectivity + reflectivity);
 }
 
