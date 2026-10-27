@@ -773,6 +773,9 @@ export const DEFAULT_COLOR_GRADING: ColorGradingOptions = {
   saturation: 1,
 }
 
+/** Added to every stated audio time — see setAudioTime. Seconds. */
+const AUDIO_TIME_NUDGE = 1e-3
+
 /** The cast's shadow on a stage — see Engine.setStageCastShadow. */
 export type StageCastShadow = {
   /** The way TO the light, this engine's axes. Omitted, it is the sun's, read
@@ -2923,7 +2926,8 @@ export class Engine {
    * with no visible difference.
    */
   private anchorTable: AnchorTable = EMPTY_ANCHOR_TABLE
-  private castLastMs = 0
+  /** The scene clock at the last cast upload — what anchor velocities divide by. */
+  private castLastScene = 0
   /** Recent path per trailed anchor, keyed "model\0slot". Newest first, so the
    *  shader's index 0 is now — written by unshifting rather than by tracking a
    *  head, because 64 is short and the alternative is an index the GPU side
@@ -10889,7 +10893,14 @@ export class Engine {
    */
   setAudioTime(seconds: number, playing = true): void {
     if (this.audioBuffer === this.audioFallbackBuffer) return
-    this.audioTimeScratch[0] = seconds
+    // Nudged a millisecond off the analysis frames' edges. An export states
+    // exact frame times, i/60, and in f32 i/60 ÷ 1/60 lands a hair either side
+    // of i: the frame an effect read flipped at random, so a hop on the beat
+    // stalled a frame, jumped two, and now and then restarted — the beat
+    // effects judder in a 60 fps export and never in the editor, whose clock
+    // never sits on an edge. A millisecond is far past f32's error at any song
+    // length and far under anything heard.
+    this.audioTimeScratch[0] = seconds + AUDIO_TIME_NUDGE
     this.audioTimeScratch[1] = playing ? 1 : 0
     this.device.queue.writeBuffer(this.audioBuffer, 12, this.audioTimeScratch)
   }
@@ -19817,7 +19828,7 @@ export class Engine {
             ? CAST_TRAIL_BASE + (lastTrail * MAX_EFFECT_SUBJECTS + MAX_EFFECT_SUBJECTS) * TRAIL_SAMPLES
             : CAST_SUBJECT_VEC4S + scene.length * MAX_EFFECT_SUBJECTS * 3
         this.device.queue.writeBuffer(this.castBuffer, 0, this.castData, 0, used * 4)
-        this.castLastMs = performance.now()
+        this.castLastScene = this.sceneClock
       }
     }
   }
@@ -19963,8 +19974,12 @@ export class Engine {
     const anchors = this.anchorTable.entries
     if (anchors.length === 0) return
     let prev = this.anchorPrev.get(inst.name)
-    const dtMs = Math.max(1, performance.now() - this.castLastMs)
-    const invDt = 1000 / dtMs
+    // On the scene clock, not the wall's: an export takes as long per frame as
+    // the encoder does, and a velocity over wall time came out a fraction of
+    // the real one and different every frame. A frame that moved no time (a
+    // paused redraw) has none.
+    const dt = this.sceneClock - this.castLastScene
+    const invDt = dt > 1e-6 ? 1 / dt : 0
     if (!prev || prev.length !== anchors.length * 3) {
       prev = new Float32Array(anchors.length * 3).fill(NaN)
       this.anchorPrev.set(inst.name, prev)
