@@ -49,7 +49,7 @@ const particlesSrc = read("../src/shaders/passes/particles.ts")
  *  here is about count, order and blend rather than which float it is. */
 const FORMATS = { hdr: "rgba16float", aux: "rg8unorm" }
 
-const CLASSES = ["material", "material-additive", "material-premultiplied", "ground", "mirror", "outline", "particle", "particle-additive", "trail", "trail-over", "depth-prepass"]
+const CLASSES = ["material", "material-additive", "material-premultiplied", "material-multiply", "ground", "mirror", "outline", "particle", "particle-additive", "trail", "trail-over", "depth-prepass"]
 
 /** Classes whose shaders write an id, and so declare a third fragment output. */
 const WRITES_ID = ["material", "ground"]
@@ -497,6 +497,19 @@ test("the ground and particles blend premultiplied, and only because they premul
     const [c] = sceneTargets(cls, FORMATS)
     assert.equal(c.blend.color.srcFactor, "src-alpha", `${cls} writes straight colour and must be premultiplied by the blend`)
   }
+})
+
+test("a multiplying material filters the colour and leaves the aux as it was", () => {
+  // An eye shadow darkens the iris it lies on, so the colour is the frame
+  // scaled by what the fragment writes, and alpha — the frame's coverage — is
+  // not the shade's to change. The fragment fades its own multiplier by its
+  // coverage (mix(1, colour, alpha)), which is why the blend reads no alpha.
+  const [color, aux] = sceneTargets("material-multiply", FORMATS)
+  assert.deepEqual(color.blend.color, { srcFactor: "dst", dstFactor: "zero", operation: "add" })
+  assert.deepEqual(color.blend.alpha, { srcFactor: "zero", dstFactor: "one", operation: "add" })
+  // The eye under it keeps its bloom mask and its coverage.
+  assert.deepEqual(aux.blend.color, { srcFactor: "zero", dstFactor: "one", operation: "add" })
+  assert.deepEqual(aux.blend.alpha, { srcFactor: "zero", dstFactor: "one", operation: "add" })
 })
 
 // ── The scene pass's bundle rule ──

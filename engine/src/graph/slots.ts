@@ -221,6 +221,23 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
   const FOG = takesLight
     ? `  out.color = vec4f(mix(mix(out.color.rgb, light.fog[0].rgb${fogOver}, input.fog.x), light.fog[2].rgb${fogOver}, input.fog.y), out.color.a);\n`
     : ""
+  // MULTIPLY WRITES A FILTER, NOT A COLOUR. What it darkens was lit already —
+  // the iris under an eye shadow took the sun and its own glow — so the shade
+  // takes no light of its own: lit, a light-grey shadow came out brighter than
+  // the eye and multiplied it WHITER. The multiplier is the surface's own
+  // colour, its texture times the PMX diffuse as every look's base is, or what
+  // an emission-only graph paints, which is already a colour no light reaches.
+  // Faded by coverage here (the blend reads no alpha), capped at 1 so it can
+  // only darken, and with no lamps, burn or fog — all three are light. The aux
+  // is kept by the blend, so the mask written is never stored.
+  if (blend === "multiply") {
+    const filter = takesLight ? "tex_color * material.diffuseColor" : "final_color"
+    return `  var out: FSOut;
+  out.color = vec4f(mix(vec3f(1.0), saturate(${filter}), ${alphaBase}), ${alphaBase});
+  out.mask = vec4f(0.0);
+${ID_WRITE}  return out;
+`
+  }
   if (renderClass === "hair") {
     return `${ALBEDO}  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }

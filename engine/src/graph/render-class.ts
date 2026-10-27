@@ -14,9 +14,11 @@ export type AlphaMode = "opaque" | "hashed"
 /** How a group's colour meets the frame. "over" is the ordinary alpha blend;
  *  "additive" adds its light and never reads alpha; "premultiplied" takes a
  *  colour already weighted by its own coverage (One, OneMinusSrcAlpha) — a
- *  game's glass, whose reflection must not fade with its transparency. See
- *  StyleGroup.blend. */
-export type StyleBlend = "over" | "additive" | "premultiplied"
+ *  game's glass, whose reflection must not fade with its transparency;
+ *  "multiply" filters what is already there by the surface's colour
+ *  (DstColor Zero) — a game's eye shadow, a tint over the iris that can only
+ *  darken it. See StyleGroup.blend. */
+export type StyleBlend = "over" | "additive" | "premultiplied" | "multiply"
 
 /** Descriptive manifest for hosts (reze-design) so the render-class picker is data-driven
  *  instead of hardcoding strings. The effect implementations stay engine-side; this only

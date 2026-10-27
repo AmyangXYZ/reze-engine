@@ -104,6 +104,14 @@ type SceneRenderClass =
    *  express. Out of WRITES_ID for the mirror's reason: a window is not what a
    *  click on the figure behind it means. */
   | "material-premultiplied"
+  /** A material that FILTERS what is behind it — a game's eye shadow (Blend
+   *  DstColor Zero): a soft band over the top of the iris whose colour is a
+   *  multiplier, so the eye under it darkens and never lightens. Laid over, its
+   *  light grey at partial alpha veils the iris white instead. The aux and the
+   *  coverage are left as they were — a shade is not a surface, and the eye
+   *  under it keeps its bloom — and out of WRITES_ID for the mirror's reason:
+   *  a click there means the eye. */
+  | "material-multiply"
   /** Particles and ribbons in their default, non-additive mode. */
   | "particle"
   /** Particles declaring `#blend additive` — LIGHT rather than matter, so
@@ -163,6 +171,20 @@ const PREMULTIPLIED_OVER: GPUBlendState = {
   alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
 }
 
+/** The destination scaled by the source colour; alpha is not touched. The
+ *  fragment writes its multiplier already faded by its own coverage
+ *  (mix(1, colour, alpha)), so the blend reads no alpha. */
+const MULTIPLY_KEEP_ALPHA: GPUBlendState = {
+  color: { srcFactor: "dst", dstFactor: "zero", operation: "add" },
+  alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+}
+
+/** Leaves the attachment exactly as it was. */
+const KEEP: GPUBlendState = {
+  color: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+  alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+}
+
 /** Additive, premultiplied by the fragment's alpha as it writes. */
 const ADD_PREMULTIPLIED: GPUBlendState = {
   color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
@@ -199,6 +221,8 @@ const BLENDS: Record<Exclude<SceneRenderClass, "depth-prepass">, [GPUBlendState,
   // The colour premultiplied by the graph (game_pbr's glass); the aux is
   // written straight, as every material's is.
   "material-premultiplied": [PREMULTIPLIED_OVER, ALPHA_OVER],
+  // A shade over what is drawn: the colour filtered, the aux untouched.
+  "material-multiply": [MULTIPLY_KEEP_ALPHA, KEEP],
   // PREMULTIPLIED, like the ground and for the same reason: what a mirror
   // writes is a sample of the HDR target, and that target already holds colour
   // premultiplied by its own alpha. Handed to the src-alpha blend it would be

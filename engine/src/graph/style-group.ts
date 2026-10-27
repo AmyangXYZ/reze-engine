@@ -30,8 +30,26 @@ export type StyleGroup = {
    * nebula and a starfield on cylinders round the scene, their alpha 0 across
    * the whole image because additive blending does not look at it. Laid over,
    * they are invisible.
+   *
+   * "multiply" is a FILTER: the frame behind is scaled by the surface's own
+   * colour, faded by its alpha, and nothing is added — see `blendByMaterial`
+   * for the eye shadow it exists for.
    */
   blend?: StyleBlend
+  /**
+   * `blend`, but PER MATERIAL — for a member that meets the frame unlike the
+   * rest of its group.
+   *
+   * An eye shadow (目影) is an EYE part: it sits on the iris, stamps the same
+   * stencil the see-through hair reads, and draws in the eye's order. What sets
+   * it apart is only how it lands — the game multiplies it, a soft grey band
+   * that darkens the top of the iris, where laid over it veils the eye white.
+   * Keyed here it stays in the eye's group, shading on the eye's graph, and
+   * draws through a pipeline of its own blend.
+   *
+   * A material with no entry takes `blend`.
+   */
+  blendByMaterial?: Record<string, StyleBlend>
   /**
    * Extra image maps for this group's shading, up to four.
    *

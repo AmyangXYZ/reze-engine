@@ -561,3 +561,18 @@ test("a colour literal still cannot sit on a float socket", () => {
   assert.equal(r.ok, false)
   assert.ok(r.diagnostics.some((d) => d.message.includes("doesn't fit float socket")))
 })
+
+test("a multiplying member writes its own colour as a filter, unlit", () => {
+  // The eye graph lights its base and adds 1.5x of it as glow. Multiplied
+  // through that, a light-grey eye shadow came out above 1 and lightened the
+  // iris; the filter is the surface colour, faded by coverage, capped at 1.
+  const r = compileGraph(EYE_GRAPH, { renderClass: "eye", alphaMode: "opaque", blend: "multiply" })
+  assert.ok(r.ok, JSON.stringify(r.diagnostics))
+  const tail = r.wgsl.slice(r.wgsl.indexOf("let final_color"))
+  assert.match(tail, /out\.color = vec4f\(mix\(vec3f\(1\.0\), saturate\(tex_color \* material\.diffuseColor\), alpha\), alpha\);/)
+  // No light of its own: no lamps, no dissolve glow, no fog.
+  assert.doesNotMatch(tail, /rzLightsDiffuseOnce|RZ_BURN_COLOR|light\.fog/)
+  // The same graph laid over keeps every one of them.
+  const over = compileGraph(EYE_GRAPH, { renderClass: "eye", alphaMode: "opaque", blend: "over" })
+  assert.match(over.wgsl.slice(over.wgsl.indexOf("let final_color")), /rzLightsDiffuseOnce/)
+})

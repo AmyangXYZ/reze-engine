@@ -294,6 +294,17 @@ const PRESET_NAME_HINTS: Array<[MaterialPreset, (string | RegExp)[]]> = [
   ],
 ]
 
+// The eye parts the game MULTIPLIES over the iris rather than lays over it: an
+// eye shadow, a soft light-grey band at partial alpha whose job is to darken the
+// top of the eye. They stay eye parts — the stencil, the order and the graph are
+// the eye's — and take blend "multiply" per material (blendByMaterial).
+const EYE_SHADOW_HINTS = ["目影", "眼影", "eyeshadow", "eye_shadow", "eye shadow"]
+
+function isEyeShadow(materialName: string): boolean {
+  const lower = materialName.toLowerCase()
+  return EYE_SHADOW_HINTS.some((hint) => lower.includes(hint))
+}
+
 // Whole names that are body parts — skin by another name. Whole, never
 // substrings: 手 alone is a hand, inside 手套 (gloves) or 手镯 (a bracelet) it is
 // what the hand wears; 足 is a leg, 足袋 a sock.
@@ -355,6 +366,9 @@ type GroupInstall = {
   pipelineNoDepthWrite: GPURenderPipeline
   /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
+  /** The same three for each blend a member keys apart from the group's
+   *  (StyleGroup.blendByMaterial) — an eye shadow multiplying in the eye group. */
+  byBlend: Partial<Record<StyleBlend, Pick<GroupInstall, "pipeline" | "pipelineNoDepthWrite" | "overEyesPipeline">>>
   uniformBuffer: GPUBuffer
   /** The group's own image maps, uploaded once per apply and owned here — the
    *  install destroys them when it is replaced, so a re-apply cannot leak. */
@@ -2083,6 +2097,9 @@ export class Engine {
   /** A group blending "premultiplied" — see scene-contract's
    *  material-premultiplied. */
   private sceneTargetsPremultiplied!: GPUColorTargetState[]
+  /** A group or member blending "multiply" — see scene-contract's
+   *  material-multiply. */
+  private sceneTargetsMultiply!: GPUColorTargetState[]
   /** The scene pass's attachment formats, settled at init once the device has
    *  said which HDR format it will blend. Every scene-pass pipeline asks
    *  scene-contract for its targets against these. */
@@ -8431,6 +8448,7 @@ export class Engine {
     // blend: "additive". See scene-contract's material-additive.
     this.sceneTargetsAdditive = sceneTargetsFor("material-additive", this.sceneFormats)
     this.sceneTargetsPremultiplied = sceneTargetsFor("material-premultiplied", this.sceneFormats)
+    this.sceneTargetsMultiply = sceneTargetsFor("material-multiply", this.sceneFormats)
     this.fullVertexBufferLayouts = fullVertexBuffers
     // Slot 3 stays empty: the outline hull binds its own stream there between
     // two material draws, and a material reading slot 3 would pick it up.
@@ -18149,6 +18167,7 @@ export class Engine {
     for (const [preset, materials] of buckets) {
       const info = PRESET_GROUP_INFO[preset]
       if (!info) continue
+      const shadows = preset === "eye" ? materials.filter(isEyeShadow) : []
       groups.push({
         id: preset,
         label: info.graph.name,
@@ -18156,6 +18175,7 @@ export class Engine {
         graph: info.graph,
         renderClass: info.renderClass,
         alphaMode: info.alphaMode,
+        ...(shadows.length ? { blendByMaterial: Object.fromEntries(shadows.map((m) => [m, "multiply" as const])) } : {}),
       })
     }
     return this.applyStyleGroups(modelName, groups)
@@ -18239,20 +18259,26 @@ export class Engine {
       groups.map(async (g) => {
         const renderClass = g.renderClass ?? "auto"
         const alphaMode = g.alphaMode ?? "opaque"
-        const blend = g.blend ?? "over"
-        let result: ReturnType<typeof compileGraph>
-        try {
-          result = compileGraph(g.graph, { renderClass, alphaMode, blend })
-        } catch {
-          return
-        }
-        if (!result.ok) return
-        const module = this.cachedShaderModule(result.wgsl, `style group: ${g.id} (${renderClass})`)
-        await Promise.all([
-          this.createRenderClassPipeline(renderClass, module, false, true, blend),
-          this.createRenderClassPipeline(renderClass, module, false, false, blend),
-          renderClass === "hair" ? this.createRenderClassPipeline(renderClass, module, true, true, blend) : null,
-        ]).catch(() => {})
+        const groupBlend = g.blend ?? "over"
+        // Every blend its members draw with, as the install compiles them.
+        const blends = new Set([groupBlend, ...g.materials.map((m) => g.blendByMaterial?.[m] ?? groupBlend)])
+        await Promise.all(
+          [...blends].map(async (blend) => {
+            let result: ReturnType<typeof compileGraph>
+            try {
+              result = compileGraph(g.graph, { renderClass, alphaMode, blend })
+            } catch {
+              return
+            }
+            if (!result.ok) return
+            const module = this.cachedShaderModule(result.wgsl, `style group: ${g.id} (${renderClass}${blend === groupBlend ? "" : `, ${blend}`})`)
+            await Promise.all([
+              this.createRenderClassPipeline(renderClass, module, false, true, blend),
+              this.createRenderClassPipeline(renderClass, module, false, false, blend),
+              renderClass === "hair" ? this.createRenderClassPipeline(renderClass, module, true, true, blend) : null,
+            ]).catch(() => {})
+          }),
+        )
       }),
     )
   }
@@ -18592,14 +18618,23 @@ export class Engine {
     // arrive twice — once as the model lands and again once its sidecar has
     // decoded — and without this the second apply refreshed the definition and
     // silently kept the empty slots from the first.
+    // The blends its members draw with: the group's own first, then any a
+    // member keys for itself (blendByMaterial) — one compile each, the graph and
+    // its slots the same in all of them.
+    const groupBlend = group.blend ?? "over"
+    const blends = [
+      groupBlend,
+      ...new Set(group.materials.map((m) => group.blendByMaterial?.[m] ?? groupBlend).filter((b) => b !== groupBlend)),
+    ]
     const signature = JSON.stringify({
       g: group.graph,
       rc: renderClass,
       am: alphaMode,
-      bl: group.blend ?? "over",
+      bl: groupBlend,
       o: opts?.previewNode ?? null,
       im: group.images?.length ?? 0,
       ibm: Object.keys(group.imagesByMaterial ?? {}).sort(),
+      bls: blends,
     })
     const existing = inst.styleGroups.get(group.id)
     if (existing && existing.signature === signature) {
@@ -18607,56 +18642,71 @@ export class Engine {
       return { ok: true, diagnostics: [], slotMap: existing.slotMap }
     }
 
-    const result = compileGraph(group.graph, { ...opts, renderClass, alphaMode, blend: group.blend ?? "over" })
-    if (!result.ok) return { ok: false, diagnostics: result.diagnostics, slotMap: result.slotMap }
+    const compiled = blends.map((b) => compileGraph(group.graph, { ...opts, renderClass, alphaMode, blend: b }))
+    const result = compiled[0]
+    const failed = compiled.find((r) => !r.ok)
+    if (failed) return { ok: false, diagnostics: failed.diagnostics, slotMap: failed.slotMap }
 
     const generation = (inst.styleGroupGen.get(group.id) ?? 0) + 1
     inst.styleGroupGen.set(group.id, generation)
 
-    this.device.pushErrorScope("validation")
-    const module = this.cachedShaderModule(result.wgsl, `style group: ${group.id} (${renderClass})`)
-    const scopePromise = this.device.popErrorScope()
-    // EVERY VARIANT AT ONCE, and the module's diagnostics read beside them
-    // rather than first: the compiles run in parallel in the GPU process, and
-    // awaiting each in turn (and the diagnostics before any) made a group cost
-    // the sum of its pipelines instead of the longest.
-    const blend = group.blend ?? "over"
     // The single-sided twins a draw of this group will ask for (sidedPipeline),
     // built with their pipelines rather than synchronously at the first draw.
     const singleSided = inst.drawCalls.some((dc) => !dc.doubleSided && group.materials.includes(dc.materialName))
-    const variant = (overEyes: boolean, depthWrite: boolean) =>
-      this.createRenderClassPipeline(renderClass, module, overEyes, depthWrite, blend).then(async (p) => {
-        if (singleSided) await this.buildSidedTwin(p, false)
-        return p
-      })
-    const variants = Promise.all([
-      variant(false, true),
-      // The depth-write-off twin: stage transparency draws with it (see
-      // pipelineForDrawCall), and a future OIT path would too.
-      variant(false, false),
-      renderClass === "hair" ? variant(true, true) : undefined,
-    ])
-    // Handled below either way; this keeps a rejection off the console while
-    // the diagnostics are read.
-    variants.catch(() => {})
-    const [info, scopeError] = await Promise.all([module.getCompilationInfo(), scopePromise])
+    // EVERY VARIANT AT ONCE, and the module's diagnostics read beside them
+    // rather than first: the compiles run in parallel in the GPU process, and
+    // awaiting each in turn (and the diagnostics before any) made a group cost
+    // the sum of its pipelines instead of the longest. One module per blend,
+    // each with its variants.
+    const builds = compiled.map((r, i) => {
+      const blend = blends[i]
+      this.device.pushErrorScope("validation")
+      const module = this.cachedShaderModule(r.wgsl, `style group: ${group.id} (${renderClass}${blend === blends[0] ? "" : `, ${blend}`})`)
+      const scopePromise = this.device.popErrorScope()
+      const variant = (overEyes: boolean, depthWrite: boolean) =>
+        this.createRenderClassPipeline(renderClass, module, overEyes, depthWrite, blend).then(async (p) => {
+          if (singleSided) await this.buildSidedTwin(p, false)
+          return p
+        })
+      const variants = Promise.all([
+        variant(false, true),
+        // The depth-write-off twin: stage transparency draws with it (see
+        // pipelineForDrawCall), and a future OIT path would too.
+        variant(false, false),
+        renderClass === "hair" ? variant(true, true) : undefined,
+      ])
+      // Handled below either way; this keeps a rejection off the console while
+      // the diagnostics are read.
+      variants.catch(() => {})
+      return { wgsl: r.wgsl, module, scopePromise, variants }
+    })
     const diagnostics = [...result.diagnostics]
-    for (const msg of info.messages) {
-      if (msg.type !== "error") continue
-      diagnostics.push({ severity: "error", nodeId: nodeIdForWgslLine(result.wgsl, msg.lineNum), message: `WGSL: ${msg.message}` })
+    let scopeError: GPUError | null = null
+    for (const build of builds) {
+      const [info, error] = await Promise.all([build.module.getCompilationInfo(), build.scopePromise])
+      scopeError ??= error
+      for (const msg of info.messages) {
+        if (msg.type !== "error") continue
+        diagnostics.push({ severity: "error", nodeId: nodeIdForWgslLine(build.wgsl, msg.lineNum), message: `WGSL: ${msg.message}` })
+      }
     }
     if (diagnostics.some((d) => d.severity === "error") || scopeError) {
       if (scopeError && !diagnostics.some((d) => d.severity === "error"))
         diagnostics.push({ severity: "error", message: `WGSL: ${scopeError.message}` })
-      this.forgetShaderModule(result.wgsl)
+      for (const build of builds) this.forgetShaderModule(build.wgsl)
       return { ok: false, diagnostics, slotMap: result.slotMap }
     }
 
     let pipeline: GPURenderPipeline
     let pipelineNoDepthWrite: GPURenderPipeline
     let overEyesPipeline: GPURenderPipeline | undefined
+    const byBlend: GroupInstall["byBlend"] = {}
     try {
-      ;[pipeline, pipelineNoDepthWrite, overEyesPipeline] = await variants
+      const sets = await Promise.all(builds.map((build) => build.variants))
+      ;[pipeline, pipelineNoDepthWrite, overEyesPipeline] = sets[0]
+      sets.slice(1).forEach(([p, noDepth, overEyes], i) => {
+        byBlend[blends[i + 1]] = { pipeline: p, pipelineNoDepthWrite: noDepth, overEyesPipeline: overEyes }
+      })
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
       return { ok: false, diagnostics, slotMap: result.slotMap }
@@ -18686,6 +18736,7 @@ export class Engine {
       pipeline,
       pipelineNoDepthWrite,
       overEyesPipeline,
+      byBlend,
       uniformBuffer,
       images: this.uploadGroupImages(group),
       imagesByMaterial: group.imagesByMaterial
@@ -18938,7 +18989,9 @@ export class Engine {
             ? this.sceneTargetsAdditive
             : blend === "premultiplied"
               ? this.sceneTargetsPremultiplied
-              : this.sceneTargets,
+              : blend === "multiply"
+                ? this.sceneTargetsMultiply
+                : this.sceneTargets,
       },
       depthStencil,
     }
@@ -19173,7 +19226,8 @@ export class Engine {
     if (dc.groupId) {
       const install = inst.styleGroups.get(dc.groupId)
       if (install) {
-        return stageGlass ? install.pipelineNoDepthWrite : install.pipeline
+        const own = this.memberPipelines(install, dc)
+        return stageGlass ? own.pipelineNoDepthWrite : own.pipeline
       }
     }
     return stageGlass ? this.neutralPipelineNoDepthWrite : this.neutralPipeline
@@ -19600,7 +19654,14 @@ export class Engine {
   private overEyesPipelineFor(inst: ModelInstance, dc: DrawCall): GPURenderPipeline | null {
     if (!dc.groupId) return null
     const install = inst.styleGroups.get(dc.groupId)
-    return install?.renderClass === "hair" ? (install.overEyesPipeline ?? null) : null
+    return install?.renderClass === "hair" ? (this.memberPipelines(install, dc).overEyesPipeline ?? null) : null
+  }
+
+  /** A member's pipelines: those of the blend it keys for itself, else the
+   *  group's (StyleGroup.blendByMaterial). */
+  private memberPipelines(install: GroupInstall, dc: DrawCall): Pick<GroupInstall, "pipeline" | "pipelineNoDepthWrite" | "overEyesPipeline"> {
+    const blend = install.group.blendByMaterial?.[dc.materialName]
+    return (blend && install.byBlend[blend]) || install
   }
 
   private updateCameraUniforms() {
