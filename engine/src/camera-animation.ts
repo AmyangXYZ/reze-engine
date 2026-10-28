@@ -86,6 +86,10 @@ export class CameraAnimation {
     }
     const a = frames[lo]
     const b = frames[hi]
+    // Keys one frame apart are a cut: MMD never draws between them, so the
+    // earlier key holds until the later one's frame. A time meant as that frame
+    // can land a hair under it (11/30 * 30), and still cuts.
+    if (b.frame - a.frame === 1) return this.pose(frame < b.frame - 1e-4 ? a : b)
     const span = b.frame - a.frame
     const localT = span > 0 ? (frame - a.frame) / span : 0
     // The incoming interpolation curve is stored on the segment's end keyframe (b).
