@@ -93,6 +93,11 @@ fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
 }
 `
 
+/** A model's ObjectLight as WGSL declares it (see the layout below). One copy
+ *  for every pass that binds it, so their layouts cannot drift. */
+export const OBJECT_LIGHT_STRUCT_WGSL =
+  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: vec4f }"
+
 export const COMMON_BINDINGS_WGSL = /* wgsl */ `
 
 struct CameraUniforms {
@@ -299,7 +304,10 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 //               [9] the right's
 //               [10] left highlight scale x, y, forward push (bind units), 0
 //               [11] the right's
-struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12> }
+//   bloom.x   1 while it feeds the bloom, 0 when it is left out
+//             (Engine.setModelBloom): the bloom mask its surfaces and
+//             outlines write.
+${OBJECT_LIGHT_STRUCT_WGSL}
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
 
 ${JELLY_VERTEX_WGSL}

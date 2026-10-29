@@ -1068,7 +1068,7 @@ interface ModelInstance {
   shadowDrawCalls: DrawCall[]
   shadowBindGroups: GPUBindGroup[]
   mainPerInstanceBindGroup: GPUBindGroup
-  /** Its ObjectLight — rendering layers, its own ambient, its fill — and the CPU copy it
+  /** Its ObjectLight — rendering layers, its own ambient, its fill, its bloom — and the CPU copy it
    *  is written from. Every model has one: its layers decide its lights. */
   lightBuffer: GPUBuffer
   objectLight: Float32Array<ArrayBuffer>
@@ -12666,6 +12666,20 @@ export class Engine {
     return true
   }
 
+  /**
+   * Whether one model feeds the bloom. Off, its surfaces and outlines write 0
+   * to the bloom mask, as the ground does: its own bright pixels stop glowing,
+   * while a glow from behind it still spreads across it. A model drawn by the
+   * game's own shaders (src/unity) writes its own mask and takes none of this.
+   */
+  setModelBloom(name: string, on: boolean): boolean {
+    const inst = this.modelInstances.get(name)
+    if (!inst || !this.device) return false
+    inst.objectLight[96] = on ? 1 : 0
+    this.device.queue.writeBuffer(inst.lightBuffer, 96 * 4, inst.objectLight, 96, 4)
+    return true
+  }
+
   /** The per-model group: its skinning matrices and its ObjectLight. */
   private perInstanceBindGroup(name: string, skinMatrixBuffer: GPUBuffer, light: GPUBuffer): GPUBindGroup {
     return this.device.createBindGroup({
@@ -15431,8 +15445,9 @@ export class Engine {
     // the cast on the character layer as well as the default one. Words:
     // layers [0..3] (y: a stage, which takes the cast's shadow —
     // rzRoofedCastShadow), ambient flag [4..7], SH [8..43], fill [44..47],
-    // jelly eyes [48..71] — see materials/common.ts.
-    const objectLight = new Float32Array(96)
+    // jelly eyes [48..95], bloom [96..99] — see materials/common.ts.
+    const objectLight = new Float32Array(100)
+    objectLight[96] = 1
     const objectLayers = new Uint32Array(objectLight.buffer)
     objectLayers[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0
@@ -19347,7 +19362,8 @@ export class Engine {
     // shoe's sole's hull cut the upper behind it, and the floor showed through
     // as pale lines along the seam. After every surface of this phase it only
     // ever blends over finished ones. Same index ranges; own pipeline and
-    // groups 0/2 — group 1 (skinMats) is layout-identical and stays bound.
+    // groups 0/2 — group 1 (skinMats, ObjectLight) is layout-identical and
+    // stays bound.
     if (outlined.length) {
       const mirrored = view.args === "mirror"
       pass.setPipeline(mirrored ? this.outlineMirrorPipeline : this.outlinePipeline)

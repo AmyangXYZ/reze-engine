@@ -17,7 +17,7 @@
 // a string baked at import cannot know what the device said.
 
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
-import { DISSOLVE_WGSL } from "../materials/common"
+import { DISSOLVE_WGSL, OBJECT_LIGHT_STRUCT_WGSL } from "../materials/common"
 
 /**
  * Where `dissolve` sits in the outline's own uniform, in bytes.
@@ -89,6 +89,8 @@ struct OutlineLights { ambientColor: vec4f, lights: array<OutlineLight, 4>, };
 @group(0) @binding(1) var edgeSampler: sampler;
 @group(0) @binding(2) var<uniform> light: OutlineLights;
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
+${OBJECT_LIGHT_STRUCT_WGSL}
+@group(1) @binding(1) var<uniform> objectLight: ObjectLight;
 @group(2) @binding(0) var<uniform> material: MaterialUniforms;
 @group(2) @binding(1) var diffuseTexture: texture_2d<f32>;
 /** A look's outline tint (ShaderGraph.outline.tint): one of its images, white
@@ -288,7 +290,7 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
     rgb = tex.rgb * tint * mix(material.shadowColor.rgb, rgb, lit);
   }
   out.color = vec4f(rgb, material.edgeColor.a * texA * input.coverage);
-  out.mask = vec4f(1.0, 1.0, 0.0, out.color.a);
+  out.mask = vec4f(objectLight.bloom.x, 1.0, 0.0, out.color.a);
 ${sceneIdPadWgsl("out")}  return out;
 }
 `

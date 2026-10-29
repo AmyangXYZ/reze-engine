@@ -1,4 +1,4 @@
-import { DISSOLVE_WGSL, JELLY_VERTEX_WGSL } from "../materials/common"
+import { DISSOLVE_WGSL, JELLY_VERTEX_WGSL, OBJECT_LIGHT_STRUCT_WGSL } from "../materials/common"
 
 // Shadow map depth pass. Skinned VS + alpha-test FS (depth-only attachment, no
 // color targets): texels where diffuse-texture alpha × material alpha fall below
@@ -29,7 +29,7 @@ struct MaterialDiffuse {
 @group(1) @binding(1) var<uniform> material: MaterialDiffuse;
 // The model's ObjectLight, for its jelly eyes: the map must hold the iris where
 // the colour pass draws it.
-struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12> }
+${OBJECT_LIGHT_STRUCT_WGSL}
 @group(0) @binding(3) var<uniform> objectLight: ObjectLight;
 ${JELLY_VERTEX_WGSL}
 

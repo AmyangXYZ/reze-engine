@@ -250,13 +250,13 @@ ${ID_WRITE}  return out;
 
   var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
-${CAST}${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
+${CAST}${FOG}  out.mask = vec4f(objectLight.bloom.x, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `${ALBEDO}  var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
-${CAST}${FOG}  out.mask = vec4f(1.0, 1.0, _rzSubsurface, out.color.a);
+${CAST}${FOG}  out.mask = vec4f(objectLight.bloom.x, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
 }
