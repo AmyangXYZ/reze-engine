@@ -5,7 +5,7 @@
 // leaves the box where it was.
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { SHADOW_CASCADES, NEAR_REACH, buildShadowCascades, cascadeSlices, fitShadowVP, sliceCorners } from "../dist/shadow-cascades.js"
+import { SHADOW_CASCADES, NEAR_REACH, buildShadowCascades, cascadeSlices, cascadeSpheres, fitShadowVP, sliceCorners } from "../dist/shadow-cascades.js"
 
 /** A camera looking down +Z from 60 units back, a little above the floor. */
 function view(overrides = {}) {
@@ -104,6 +104,50 @@ test("the near slice reaches past the point of interest and the far slice ends a
   assert.ok(far[1] > 300 && far[1] < 320, `the far slice ends where the room does: ${far[1]}`)
   const alone = cascadeSlices(v, DANCER).at(-1)
   assert.ok(alone[1] < 70, `a dancer alone keeps a short frustum: ${alone[1]}`)
+})
+
+test("the inner cascade sits on the cast on a wide shot", () => {
+  const free = view()
+  const onCast = view({ subject: { x: 0, y: 10, z: 60, radius: 11 } })
+  const spheres = cascadeSpheres(onCast, ROOM)
+  assert.equal(spheres[0].radius, 12, "the radius rounds up to its step")
+  assert.equal(spheres[0].center.z, 60)
+  assert.ok(spheres[0].radius < cascadeSpheres(free, ROOM)[0].radius / 3)
+  for (let i = 1; i < spheres.length; i++) {
+    assert.equal(spheres[i].radius, cascadeSpheres(free, ROOM)[i].radius, `cascade ${i} stays on the view`)
+  }
+})
+
+test("the cast's tile is the same size from any distance", () => {
+  for (const focus of [5, 8, 20, 60, 200]) {
+    const subject = { x: 0, y: 10, z: focus - 60, radius: 11 }
+    assert.equal(cascadeSpheres(view({ focus, subject }), ROOM)[0].radius, 12, `focus ${focus}`)
+  }
+})
+
+test("the head takes the first tile and the figure the second, from any distance", () => {
+  for (const focus of [5, 20, 60, 200]) {
+    const subject = { x: 0, y: 10, z: focus - 60, radius: 11 }
+    const head = { x: 0, y: 18, z: focus - 60, radius: 3 }
+    const spheres = cascadeSpheres(view({ focus, subject, head }), ROOM)
+    assert.equal(spheres[0].radius, 3, `focus ${focus}`)
+    assert.equal(spheres[1].radius, 12, `focus ${focus}`)
+    assert.ok(spheres[2].radius < spheres[3].radius, "the view's cascades still nest")
+    const near = cascadeSpheres(view({ focus }), ROOM)[0]
+    assert.ok(spheres[2].radius >= near.radius, "and hold the near slice")
+  }
+})
+
+test("two heads far apart leave the figure the first tile", () => {
+  const subject = { x: 0, y: 10, z: 0, radius: 15 }
+  const spheres = cascadeSpheres(view({ subject, head: { x: 0, y: 18, z: 0, radius: 16 } }), ROOM)
+  assert.equal(spheres[0].radius, 16)
+  assert.ok(spheres[1].radius > 16)
+})
+
+test("a cast out of frame gets no tile", () => {
+  const away = cascadeSpheres(view({ subject: { x: 900, y: 10, z: 60, radius: 11 } }), ROOM)[0]
+  assert.equal(away.radius, cascadeSpheres(view(), ROOM)[0].radius)
 })
 
 test("the snap holds: a sub-texel camera move does not change the matrix", () => {

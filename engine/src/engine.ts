@@ -198,6 +198,29 @@ import { METAL_GRAPH } from "./graph/presets/metal"
 import { CLOTH_SMOOTH_GRAPH } from "./graph/presets/cloth_smooth"
 import { CLOTH_ROUGH_GRAPH } from "./graph/presets/cloth_rough"
 
+/** Grow sphere `s` (x, y, z, radius; radius 0 = empty) to hold another: the
+ *  standard union, keeping the larger if one contains the other, else growing
+ *  along the line between the centres. */
+function growSphere(s: Float32Array, x: number, y: number, z: number, rad: number): void {
+  if (rad <= 0) return
+  const r = s[3]
+  const d = Math.hypot(x - s[0], y - s[1], z - s[2])
+  if (r > 0 && d + rad <= r) return
+  if (r <= 0 || d + r <= rad) {
+    s[0] = x
+    s[1] = y
+    s[2] = z
+    s[3] = rad
+    return
+  }
+  const nr = (d + r + rad) * 0.5
+  const t = (nr - r) / d
+  s[0] += (x - s[0]) * t
+  s[1] += (y - s[1]) * t
+  s[2] += (z - s[2]) * t
+  s[3] = nr
+}
+
 // Material preset dispatch. Consumers supply a MaterialPresetMap assigning material names
 // to presets; unmapped materials fall back to "default" (Principled BSDF).
 export type MaterialPreset =
@@ -456,6 +479,9 @@ const MAX_EFFECT_ANCHORS = EFFECT_ANCHORS
 
 /** Only for the bounding sphere's height. */
 const HEAD_BONE = "頭"
+/** Around the head bone in model units: the face, the hair over it and the
+ *  neck it shadows, on a figure about 20 tall. */
+const SHADOW_HEAD_RADIUS = 3
 /** Scratch for the per-frame camera-to-model-space hand-off to the eyes. */
 const _gazeScratch = new Vec3(0, 0, 0)
 
@@ -14545,6 +14571,7 @@ export class Engine {
     }
     if (this.cullModelBuffer) this.device.queue.writeBuffer(this.cullModelBuffer, 0, data.buffer as ArrayBuffer)
     this.updateCasterSphere(data)
+    this.updateShadowSubject(data)
     this.updateShadowSceneBounds(data, flags)
   }
 
@@ -14643,12 +14670,7 @@ export class Engine {
    */
   private updateCasterSphere(data: Float32Array): void {
     const out = this.casterSphere
-    out[3] = 0
-    let cx = 0
-    let cy = 0
-    let cz = 0
-    let r = 0
-    let any = false
+    out.fill(0)
     for (let i = 0; i < this.cullModels.length; i++) {
       const inst = this.cullModels[i]
       if (!inst.model.visible || inst.shadowDrawCalls.length === 0) continue
@@ -14658,44 +14680,44 @@ export class Engine {
         return
       }
       const o = i * Engine.CULL_MODEL_FLOATS + 16
-      const x = data[o]
-      const y = data[o + 1]
-      const z = data[o + 2]
-      const rad = data[o + 3]
-      if (rad <= 0) continue
-      if (!any) {
-        cx = x
-        cy = y
-        cz = z
-        r = rad
-        any = true
-        continue
-      }
-      // Union of two spheres, the standard construction: if one already contains
-      // the other keep it, else grow along the line between the centres.
-      const dx = x - cx
-      const dy = y - cy
-      const dz = z - cz
-      const d = Math.hypot(dx, dy, dz)
-      if (d + rad <= r) continue
-      if (d + r <= rad) {
-        cx = x
-        cy = y
-        cz = z
-        r = rad
-        continue
-      }
-      const nr = (d + r + rad) * 0.5
-      const t = (nr - r) / d
-      cx += dx * t
-      cy += dy * t
-      cz += dz * t
-      r = nr
+      growSphere(out, data[o], data[o + 1], data[o + 2], data[o + 3])
     }
-    out[0] = cx
-    out[1] = cy
-    out[2] = cz
-    out[3] = any ? r : 0
+  }
+
+  /** The cast's sphere and the sphere around its heads, stage and cards aside:
+   *  what the first shadow cascades sit on (shadow-cascades.ts). */
+  private updateShadowSubject(data: Float32Array): void {
+    const out = this.shadowSubjectSphere
+    const heads = this.shadowHeadSphere
+    out.fill(0)
+    heads.fill(0)
+    for (let i = 0; i < this.cullModels.length; i++) {
+      const inst = this.cullModels[i]
+      if (!inst.model.visible || inst.rigid || inst.isStage || inst.isPlane || inst.isProp || inst.shadowDrawCalls.length === 0) continue
+      const o = i * Engine.CULL_MODEL_FLOATS + 16
+      growSphere(out, data[o], data[o + 1], data[o + 2], data[o + 3])
+      const m = inst.model
+      const w = m.getBoneWorldMatrix(HEAD_BONE)
+      if (!w) continue
+      // Model space → world, as the cull's spheres compose it.
+      const c = cullScratchVec
+      c.setXYZ(w[12] * m.scale, w[13] * m.scale, w[14] * m.scale)
+      Quat.rotateVecInto(m.rotation, c, c)
+      growSphere(heads, c.x + m.position.x, c.y + m.position.y, c.z + m.position.z, SHADOW_HEAD_RADIUS * m.scale)
+    }
+    const { subject, head } = this.shadowView
+    if (subject) {
+      subject.x = out[0]
+      subject.y = out[1]
+      subject.z = out[2]
+      subject.radius = out[3]
+    }
+    if (head) {
+      head.x = heads[0]
+      head.y = heads[1]
+      head.z = heads[2]
+      head.radius = heads[3]
+    }
   }
 
   /** Every shadow caster in one sphere: (x, y, z, radius). radius 0 = nothing
@@ -14703,6 +14725,8 @@ export class Engine {
   /** A card's own texture, by model key — see setPlaneFrame. */
   private planeTextures = new Map<string, GPUTexture>()
   private casterSphere = new Float32Array(4)
+  private shadowSubjectSphere = new Float32Array(4)
+  private shadowHeadSphere = new Float32Array(4)
 
   /** The ground's uniform block, kept so the caster sphere can be refreshed in
    *  it every frame rather than rebuilding the buffer (addGround allocates). */
@@ -16005,6 +16029,8 @@ export class Engine {
     near: 1,
     far: 100,
     focus: 10,
+    subject: { x: 0, y: 0, z: 0, radius: 0 },
+    head: { x: 0, y: 0, z: 0, radius: 0 },
   }
 
   private updateShadowLightVP() {

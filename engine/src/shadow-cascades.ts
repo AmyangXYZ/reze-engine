@@ -23,6 +23,16 @@ import { Mat4, Vec3 } from "./math"
  * plane and the outermost is the whole frustum, and all take the same depth
  * range.
  * tests/shadow-cascades.test.mjs pins it.
+ *
+ * The exception is the cast. While any of it is in the near slice, the first
+ * cascades leave the view and sit on it, the head's tile and then the whole
+ * figure's, so her shadow holds one detail from any distance. A shadow edge is
+ * known to half a texel whatever filters it, and a cel band prints that as a
+ * comb of teeth a texel across, so the face takes the finest tile. These two
+ * stand outside the invariant harmlessly: the view cascades after them nest as
+ * ever and hold the near slice, so the rest of the frame only drops a step, and
+ * a caster lies under its receiver along the light, so nothing the cull rejects
+ * can land on her.
  */
 export type ShadowCascade = {
   /** Texels per side of this cascade's tile — sets the snap quantum. */
@@ -52,6 +62,11 @@ export const SHADOW_CASCADES: readonly ShadowCascade[] = [0, 1, 2, 3].map((i) =>
  *  outer cascades carry the rest of the room. */
 export const NEAR_REACH = 20
 
+/** The cast's radius rounds up to this, in world units. The radius sets the
+ *  texel, so following it exactly would swim every shadow edge with her arms. */
+const SUBJECT_RADIUS_STEP = 2
+const HEAD_RADIUS_STEP = 0.5
+
 /** The view the cascades are fitted to: the camera's eye and basis (world
  *  space, left-handed, +Z forward as the projection is), its vertical field of
  *  view, aspect and clip planes, and how far away the thing it looks at is. */
@@ -66,7 +81,13 @@ export type ShadowView = {
   far: number
   /** Distance from the eye to the camera target, along the view. */
   focus: number
+  /** The sphere around the posed cast; radius 0 with nobody on stage. */
+  subject?: ShadowSphere
+  /** The sphere around the cast's heads; radius 0 with no head bone. */
+  head?: ShadowSphere
 }
+
+export type ShadowSphere = { x: number; y: number; z: number; radius: number }
 
 /** World-space box around everything drawn, or null for an empty scene. */
 export type ShadowBounds = { min: [number, number, number]; max: [number, number, number] } | null
@@ -133,6 +154,29 @@ function sliceSphere(view: ShadowView, n: number, f: number): { center: Vec3; ra
   return { center, radius }
 }
 
+type Sphere = { center: Vec3; radius: number }
+
+const stepped = (s: ShadowSphere, step: number): Sphere => ({
+  center: new Vec3(s.x, s.y, s.z),
+  radius: Math.ceil(s.radius / step) * step,
+})
+
+/** The sphere each cascade fits, inner to outer: the view's slices, unless any
+ *  of the cast is in the near one. Then the head and the figure go first, and
+ *  the view keeps what is left. */
+function cascadeFits(view: ShadowView, bounds: ShadowBounds): Sphere[] {
+  const slices = cascadeSlices(view, bounds)
+  const spheres = slices.map(([n, f]) => sliceSphere(view, n, f))
+  const s = view.subject
+  if (!s || s.radius <= 0) return spheres
+  const body = stepped(s, SUBJECT_RADIUS_STEP)
+  const near = spheres[0]
+  if (Math.hypot(s.x - near.center.x, s.y - near.center.y, s.z - near.center.z) >= near.radius + body.radius) return spheres
+  const h = view.head
+  const head = h && h.radius > 0 ? stepped(h, HEAD_RADIUS_STEP) : null
+  return head && head.radius < body.radius ? [head, body, spheres[1], spheres[3]] : [body, spheres[1], spheres[2], spheres[3]]
+}
+
 /** The eight corners of a slice, for tests and for the fit's own checks. */
 export function sliceCorners(view: ShadowView, n: number, f: number): XYZ[] {
   const out: XYZ[] = []
@@ -152,7 +196,7 @@ export function sliceCorners(view: ShadowView, n: number, f: number): XYZ[] {
 
 /**
  * One cascade's view-projection: an orthographic box around the slice's
- * sphere, snapped to the map's texel grid in the light's right/up plane so a
+ * sphere (the slice's own unless `sphere` is given), snapped to the map's texel grid in the light's right/up plane so a
  * moving camera doesn't shimmer its shadow edges, and reaching along the light
  * from the nearest thing in the scene to the farthest, so everything that
  * could cast into the slice does.
@@ -167,6 +211,7 @@ export function fitShadowVP(
   cascade: ShadowCascade,
   out: Float32Array,
   offset: number,
+  sphere = sliceSphere(view, slice[0], slice[1]),
 ): Float32Array {
   const dir = new Vec3(sunDirection.x, sunDirection.y, sunDirection.z)
   dir.normalize()
@@ -174,7 +219,7 @@ export function fitShadowVP(
   const right = Vec3.crossInto(up, dir, new Vec3(0, 0, 0)).normalize()
   const upv = Vec3.crossInto(dir, right, new Vec3(0, 0, 0))
 
-  const { center, radius } = sliceSphere(view, slice[0], slice[1])
+  const { center, radius } = sphere
   // A texel of the map, in world units; the radius is rounded up onto the
   // grid too, so the box's size does not drift with the fov by fractions.
   const texel = Math.max((2 * radius) / cascade.mapSize, 1e-4)
@@ -214,12 +259,13 @@ export function fitShadowVP(
 /** Every cascade's bounding sphere (centre, radius), inner to outer — the
  *  split spheres a game shader picks its cascade by (_CascadeShadowSplitSpheres). */
 export function cascadeSpheres(view: ShadowView, bounds: ShadowBounds): { center: Vec3; radius: number }[] {
-  return cascadeSlices(view, bounds).map(([n, f]) => sliceSphere(view, n, f))
+  return cascadeFits(view, bounds)
 }
 
 /** Every cascade's view-projection in a row, inner to outer. */
 export function buildShadowCascades(view: ShadowView, sunDirection: XYZ, bounds: ShadowBounds, out: Float32Array): Float32Array {
   const slices = cascadeSlices(view, bounds)
-  for (let i = 0; i < SHADOW_CASCADES.length; i++) fitShadowVP(view, slices[i], sunDirection, bounds, SHADOW_CASCADES[i], out, i * 16)
+  const fits = cascadeFits(view, bounds)
+  for (let i = 0; i < SHADOW_CASCADES.length; i++) fitShadowVP(view, slices[i], sunDirection, bounds, SHADOW_CASCADES[i], out, i * 16, fits[i])
   return out
 }
