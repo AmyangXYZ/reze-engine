@@ -111,6 +111,13 @@ type ParticleSource = {
    *  stretched particle stretches along its velocity projected into it. `id`
    *  is the particle's slot, so the axes can come from its emitter. */
   orient?: boolean
+  /** The effect defines `particleCorner(p: Particle, id: u32, corner: u32) ->
+   *  vec3f`: where each corner of the quad stands in world space, 0 and 1 along
+   *  the bottom, 2 and 3 along the top, replacing the card entirely. Corners 2
+   *  and 3 at one point make a true triangle with uv as its barycentrics, so a
+   *  pool can draw a mesh: the positions are read in the vertex stage, after
+   *  the step, where every corner of a frame sees the same state of the pool. */
+  corner?: boolean
   /** The effect defines `particleCount() -> u32`: how many of the pool are
    *  live this frame, as a function of its dials. The step is dispatched and
    *  the quads drawn for that many slots and no more, through indirect
@@ -411,8 +418,10 @@ ${src.orient ? `  // the author's own plane (particleOrient): a card on a surfac
       r = vec2f(d.y, -d.x) * cp.x + d * (cp.y * p.stretch);
     }
   }
-  let world = p.pos + (right * r.x + up * r.y) * p.size;
-  out.clip = cam.proj * cam.view * vec4f(world, 1.0);
+${/\bfn\s+particleCorner\s*\(/.test(src.wgsl) ? `  let corners = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u);
+  let world = particleCorner(p, ii, corners[vi]);
+` : `  let world = p.pos + (right * r.x + up * r.y) * p.size;
+`}  out.clip = cam.proj * cam.view * vec4f(world, 1.0);
   return out;
 }
 
