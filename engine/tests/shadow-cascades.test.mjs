@@ -5,7 +5,7 @@
 // leaves the box where it was.
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { SHADOW_CASCADES, NEAR_REACH, buildShadowCascades, cascadeSlices, cascadeSpheres, fitShadowVP, sliceCorners } from "../dist/shadow-cascades.js"
+import { SHADOW_CASCADES, NEAR_REACH, buildShadowCascades, castCascades, cascadeSlices, cascadeSpheres, fitShadowVP, sliceCorners } from "../dist/shadow-cascades.js"
 
 /** A camera looking down +Z from 60 units back, a little above the floor. */
 function view(overrides = {}) {
@@ -143,6 +143,15 @@ test("two heads far apart leave the figure the first tile", () => {
   const spheres = cascadeSpheres(view({ subject, head: { x: 0, y: 18, z: 0, radius: 16 } }), ROOM)
   assert.equal(spheres[0].radius, 16)
   assert.ok(spheres[1].radius > 16)
+})
+
+test("the tiles on the cast are counted, since a stageless scene draws only those and the next", () => {
+  const subject = { x: 0, y: 10, z: 0, radius: 11 }
+  const head = { x: 0, y: 18, z: 0, radius: 3 }
+  assert.equal(castCascades(view(), ROOM), 0)
+  assert.equal(castCascades(view({ subject }), ROOM), 1)
+  assert.equal(castCascades(view({ subject, head }), ROOM), 2)
+  assert.equal(castCascades(view({ subject: { ...subject, x: 900 }, head }), ROOM), 0)
 })
 
 test("a cast out of frame gets no tile", () => {

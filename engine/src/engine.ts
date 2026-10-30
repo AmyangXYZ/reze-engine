@@ -50,7 +50,7 @@ import { NativeStage, type NativeStageLights, type NativeStagePackage, type Nati
 import { gameDir, unityFrameGlobals } from "./unity/globals"
 import { outlineMaxOffsetMultiplier, towardMatrix } from "./unity/character"
 import { sameValue, type NativeValue } from "./unity/host"
-import { SHADOW_ATLAS_SIZE, SHADOW_CASCADES, buildShadowCascades, cascadeSpheres, type ShadowBounds, type ShadowView } from "./shadow-cascades"
+import { SHADOW_ATLAS_SIZE, SHADOW_CASCADES, buildShadowCascades, cascadeSpheres, castCascades, type ShadowBounds, type ShadowView } from "./shadow-cascades"
 import { REFLECTION_DEBUG_WGSL, buildMirrorCamera, planeFromPointNormal } from "./reflection"
 import {
   MIRROR_DOWNSAMPLE_WGSL,
@@ -17949,14 +17949,15 @@ export class Engine {
     if (hasModels || this.nativeStage || this.shadowMapPopulated) {
       // The outer cascades are the STAGE's, and each costs a pass over the whole
       // cast. A scene with no stage has no set piece out there: every caster
-      // sits inside the inner cascade, which follows the camera target, and
-      // the outer tiles' only readers are ground pixels beyond it, where
-      // nothing is casting. So without a stage only the inner tile is drawn;
-      // the others keep the far plane cascade 0's pass cleared the whole atlas
-      // to, which compares as "no occluder" — the correct answer there.
+      // sits inside the cascades on the cast or the first of the view's after
+      // them, which holds a prop beside her, and the outer tiles' only readers
+      // are ground pixels beyond it, where nothing is casting. So without a
+      // stage only those are drawn; the others keep the far plane cascade 0's
+      // pass cleared the whole atlas to, which compares as "no occluder" — the
+      // correct answer there.
       const stage = this.hasStage()
-      for (let ci = 0; ci < SHADOW_CASCADES.length; ci++) {
-        if (ci > 0 && !stage) continue
+      const lastCascade = stage ? SHADOW_CASCADES.length - 1 : castCascades(this.shadowView, this.shadowSceneBounds)
+      for (let ci = 0; ci <= lastCascade; ci++) {
         const c = SHADOW_CASCADES[ci]
         const sp = encoder.beginRenderPass({
           // One timestamp pair exists for "shadow"; the inner cascade wears it.

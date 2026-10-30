@@ -161,20 +161,28 @@ const stepped = (s: ShadowSphere, step: number): Sphere => ({
   radius: Math.ceil(s.radius / step) * step,
 })
 
+/** How many cascades sit on the cast: none with nobody in the near slice, the
+ *  figure's alone, or the head's and the figure's. */
+export function castCascades(view: ShadowView, bounds: ShadowBounds): 0 | 1 | 2 {
+  const s = view.subject
+  if (!s || s.radius <= 0) return 0
+  const [n, f] = cascadeSlices(view, bounds)[0]
+  const near = sliceSphere(view, n, f)
+  const body = stepped(s, SUBJECT_RADIUS_STEP)
+  if (Math.hypot(s.x - near.center.x, s.y - near.center.y, s.z - near.center.z) >= near.radius + body.radius) return 0
+  const h = view.head
+  return h && h.radius > 0 && stepped(h, HEAD_RADIUS_STEP).radius < body.radius ? 2 : 1
+}
+
 /** The sphere each cascade fits, inner to outer: the view's slices, unless any
  *  of the cast is in the near one. Then the head and the figure go first, and
  *  the view keeps what is left. */
 function cascadeFits(view: ShadowView, bounds: ShadowBounds): Sphere[] {
-  const slices = cascadeSlices(view, bounds)
-  const spheres = slices.map(([n, f]) => sliceSphere(view, n, f))
-  const s = view.subject
-  if (!s || s.radius <= 0) return spheres
-  const body = stepped(s, SUBJECT_RADIUS_STEP)
-  const near = spheres[0]
-  if (Math.hypot(s.x - near.center.x, s.y - near.center.y, s.z - near.center.z) >= near.radius + body.radius) return spheres
-  const h = view.head
-  const head = h && h.radius > 0 ? stepped(h, HEAD_RADIUS_STEP) : null
-  return head && head.radius < body.radius ? [head, body, spheres[1], spheres[3]] : [body, spheres[1], spheres[2], spheres[3]]
+  const spheres = cascadeSlices(view, bounds).map(([n, f]) => sliceSphere(view, n, f))
+  const onCast = castCascades(view, bounds)
+  if (onCast === 0) return spheres
+  const body = stepped(view.subject!, SUBJECT_RADIUS_STEP)
+  return onCast === 2 ? [stepped(view.head!, HEAD_RADIUS_STEP), body, spheres[1], spheres[3]] : [body, spheres[1], spheres[2], spheres[3]]
 }
 
 /** The eight corners of a slice, for tests and for the fit's own checks. */
