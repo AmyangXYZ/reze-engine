@@ -70,12 +70,22 @@ fn viewPos(c: vec2i, d: f32) -> vec3f {
 
 fn skin(c: vec2i) -> f32 { return textureLoad(maskTex, c, 0).b; }
 
+// A colour a blur may take in: every channel finite. Read off the exponent bits, because a
+// fast-math compiler may fold x != x away. Without this one NaN or Inf beside the skin, from
+// any material on any GPU, spreads along the X pass and then the Y pass into bars and blocks
+// across the face: a tap weighted 0 still multiplies to NaN.
+fn finite3(c: vec3f) -> bool {
+  let e = bitcast<vec3u>(c) & vec3u(0x7f800000u);
+  return all(e != vec3u(0x7f800000u));
+}
+
 fn blur(fragPos: vec4f) -> vec4f {
   let c = vec2i(fragPos.xy);
   let amount = skin(c) * 4.0;
   let dir = sssU[0].xy;
   let uv = (vec2f(c) + 0.5) / sssU[1].zw;
-  let centre = textureLoad(srcTex, c, 0);
+  let raw = textureLoad(srcTex, c, 0);
+  let centre = vec4f(select(vec3f(0.0), raw.rgb, finite3(raw.rgb)), raw.a);
 
   // ray-mmd, verbatim: six offsets, and the skin variances per channel.
   // A var, not a const: a const array cannot be indexed by the loop counter.
@@ -112,11 +122,14 @@ fn blur(fragPos: vec4f) -> vec4f {
       let tc = texel(select(uv - o, uv + o, side == 0));
       // Skin only: ray-mmd zeroes a non-skin pixel's depth so the depth term
       // rejects it; the mask says the same thing directly.
-      let isSkin = select(0.0, 1.0, skin(tc) > 0.004);
-      let dd = (linearDepth(tc) - d) * 1000.0 * SSSS_SCALE;
-      let w = exp(-(offsets[i] * offsets[i] + dd * dd) / profileVar) * isSkin;
-      weightSum += w;
-      colour += w * textureLoad(srcTex, tc, 0).rgb;
+      // A tap is taken in or left out, never weighted to zero: 0 times a NaN is a NaN.
+      let tap = textureLoad(srcTex, tc, 0).rgb;
+      if (skin(tc) > 0.004 && finite3(tap)) {
+        let dd = (linearDepth(tc) - d) * 1000.0 * SSSS_SCALE;
+        let w = exp(-(offsets[i] * offsets[i] + dd * dd) / profileVar);
+        weightSum += w;
+        colour += w * tap;
+      }
     }
   }
   return vec4f(colour / weightSum, centre.a);
