@@ -131,3 +131,16 @@ test("the install says whether aiming means anything", () => {
   assert.match(engine, /readsCast: \/\\brz\(\?:Subject\|SubjectCount\|SubjectId\|Anchor\|Trail\|TrailCount\|CastDistance\)\\s\*\\\(\/\.test\(wgsl\) \|\|\n\s+anchors\.length > 0,/)
   assert.match(engine, /readsCast: built\.instance\.readsCast,/, "reported off the instance, not a second parse")
 })
+
+test("the cast is numbered in the host's order, not the load order", () => {
+  // Models load in parallel and a replaced one is added again at the end, so
+  // load order put the host's second row at subject 0. Both places that number
+  // the cast walk the host's order; nothing else may assign a slot.
+  assert.match(engine, /setCastOrder\(names: readonly string\[\]\): void/)
+  const walks = engine.match(/this\.forEachInCastOrder\(\(inst\) => \{\n\s*if \(n >= MAX_EFFECT_SUBJECTS/g) ?? []
+  assert.equal(walks.length, 2, "castSubjectNames and the slot walk")
+  assert.doesNotMatch(engine, /this\.forEachInstance\(\(inst\) => \{\n\s*if \(n >= MAX_EFFECT_SUBJECTS/, "a slot walk in load order")
+  // Names the host left out still join the cast, after the ones it ordered.
+  const body = engine.slice(engine.indexOf("private forEachInCastOrder("), engine.indexOf("private forEachInCastOrder(") + 600)
+  assert.match(body, /for \(const inst of this\.modelInstances\.values\(\)\) if \(!seen\.has\(inst\.name\)\) fn\(inst\)/)
+})

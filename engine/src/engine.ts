@@ -14142,6 +14142,35 @@ export class Engine {
     for (const inst of this.modelInstances.values()) fn(inst)
   }
 
+  /** The host's order for the cast (setCastOrder): who is subject 0, 1, ... */
+  private castOrder: string[] = []
+
+  /**
+   * The order the cast is numbered in: rzSubject(0) is the first of these on
+   * stage, and an effect dial that picks a character by number counts in it.
+   *
+   * Without it the cast is numbered in the order models finished LOADING, which
+   * is not an order anyone chose: models load in parallel, and one replaced by
+   * a new file is added again at the end. So the host's second row could be
+   * subject 0, and an effect aimed at "the first character" picked another.
+   * Names the order leaves out, or that are not loaded, follow in load order.
+   */
+  setCastOrder(names: readonly string[]): void {
+    this.castOrder = [...names]
+  }
+
+  /** Every instance, the cast order's first and the rest in load order. */
+  private forEachInCastOrder(fn: (inst: ModelInstance) => void): void {
+    const seen = new Set<string>()
+    for (const name of this.castOrder) {
+      const inst = this.modelInstances.get(name)
+      if (!inst || seen.has(name)) continue
+      seen.add(name)
+      fn(inst)
+    }
+    for (const inst of this.modelInstances.values()) if (!seen.has(inst.name)) fn(inst)
+  }
+
   // CPU frame-time breakdown (EMA-smoothed into getStats): where a frame's
   // milliseconds actually go — animation/IK/blending vs physics vs everything
   // else on the render thread. The first question of any perf report.
@@ -18553,7 +18582,7 @@ export class Engine {
   private castSubjectNames(subjects: readonly string[] | null = null): string[] {
     const names: string[] = []
     let n = 0
-    this.forEachInstance((inst) => {
+    this.forEachInCastOrder((inst) => {
       if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
       n++
       if (subjects && !subjects.includes(inst.name)) return
@@ -19816,7 +19845,7 @@ export class Engine {
       // seeded on one. The cast is who is ON STAGE.
       let n = 0
       this.castSlotOf.clear()
-      this.forEachInstance((inst) => {
+      this.forEachInCastOrder((inst) => {
         if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
         const m = inst.model
         // WHO IS IN WHICH SLOT, recorded here because here is where it is
