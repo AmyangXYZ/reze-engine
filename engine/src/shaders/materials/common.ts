@@ -352,6 +352,15 @@ fn rzMainLight() -> u32 {
 // (opposing bone rotations at 50/50 weights) — normalize(0) is 0/0 = NaN,
 // which poisons the whole shading stack and flashes through bloom. Fall
 // back to up for degenerate normals instead.
+// A fragment's colour as it may leave the material: every channel finite. A NaN
+// or Inf from any graph on any GPU is one pixel here, written as nothing; let
+// through, it blooms into a block and the skin blur smears it into bars. Read
+// off the exponent bits, which fast math cannot fold away.
+fn rz_finite(c: vec4f) -> vec4f {
+  let e = bitcast<vec4u>(c) & vec4u(0x7f800000u);
+  return select(vec4f(0.0), c, e != vec4u(0x7f800000u));
+}
+
 fn safe_normal(nIn: vec3f) -> vec3f {
   let l2 = dot(nIn, nIn);
   if (l2 < 1e-12) { return vec3f(0.0, 1.0, 0.0); }

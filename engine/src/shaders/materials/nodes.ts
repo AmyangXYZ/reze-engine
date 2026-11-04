@@ -480,7 +480,7 @@ fn ag_uber(slot: u32, base: vec3f, metallic: f32, roughness: f32, occlusion: f32
   let pr = clamp(roughness, 0.0, 1.0);
   let r = max(pr * pr, 0.0078125);
   let a2 = r * r;
-  let h = normalize(v + l);
+  let h = safe_normal(v + l);
   let ndl = saturate(dot(n, l));
   let ndv = saturate(dot(v, n));
   let ndh = saturate(dot(n, h));
@@ -1239,7 +1239,7 @@ fn normal_map(strength: f32, map_color: vec3f, normal: vec3f, tangent: vec3f, bi
 fn bsdf_urp(N: vec3f, L: vec3f, V: vec3f, NL: f32, roughness: f32) -> f32 {
   let a = max(roughness * roughness, 6.1035156e-5);
   let a2 = a * a;
-  let H = normalize(L + V);
+  let H = safe_normal(L + V);
   let NH = max(dot(N, H), 0.0);
   let LH = max(dot(L, H), 0.0);
   let d = NH * NH * (a2 - 1.0) + 1.00001;
@@ -1312,7 +1312,7 @@ var<private> _rzLampPrincipledGrazing: vec3f = vec3f(0.0);
  * colour) it stands in for Cycles' F82 tint, close where (1 − f0) is small.
  */
 fn _rzGrazing(l: vec3f, v: vec3f) -> f32 {
-  let c = clamp(dot(l, normalize(l + v)), 1e-4, 1.0);
+  let c = clamp(dot(l, safe_normal(l + v)), 1e-4, 1.0);
   let g = sqrt(1.25 + c * c);            // n² − 1 + c², n = 1.5
   let a = (g - c) / (g + c);
   let b = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
@@ -1330,10 +1330,10 @@ fn _rzGrazing(l: vec3f, v: vec3f) -> f32 {
 fn _rzGgxSmith(N: vec3f, L: vec3f, V: vec3f, roughness: f32) -> f32 {
   let a = max(roughness * roughness, 6.1035156e-5);
   let a2 = a * a;
-  let H = normalize(L + V);
+  let H = safe_normal(L + V);
   let NH = saturate(dot(N, H));
   let NL = saturate(dot(N, L));
-  let NV = max(dot(N, V), 1e-4);
+  let NV = clamp(dot(N, V), 1e-4, 1.0);
   let d = NH * NH * (a2 - 1.0) + 1.0;
   let vis = 0.5 / max(NL * sqrt(NV * NV * (1.0 - a2) + a2) + NV * sqrt(NL * NL * (1.0 - a2) + a2), 1e-5);
   return a2 / max(d * d, 1e-8) * vis;
@@ -1544,7 +1544,7 @@ fn _rzAddLightOne(i: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
   let aim = clamp((dot(-toLight, rzLightAim(i)) - cone.x) / max(cone.y - cone.x, 1e-4), 0.0, 1.0);
   let reach = rzLightColor(i) * rzLightCookie(i, toLight) * (falloff * aim * aim);
   out.d = reach * ndl;
-  out.s = reach * pow(saturate(dot(n, normalize(toLight + v))), e) * rzLightSpecular(i);
+  out.s = reach * pow(saturate(dot(n, safe_normal(toLight + v))), e) * rzLightSpecular(i);
   return out;
 }
 
@@ -1600,7 +1600,7 @@ fn rz_additional_lights(p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
 fn urp_env_brdf(f0: vec3f, roughness: f32, smoothness: f32, reflectivity: f32, NV: f32) -> vec3f {
   let a = max(roughness * roughness, 0.0078125);
   let grazing = saturate(smoothness + reflectivity);
-  let f = pow(1.0 - NV, 4.0);
+  let f = pow(saturate(1.0 - NV), 4.0);
   return (1.0 / (a * a + 1.0)) * mix(f0, vec3f(grazing), f);
 }
 
@@ -1677,7 +1677,7 @@ fn urp_lit(base: vec3f, metallic: f32, smoothness: f32, spec: f32, occlusion: f3
   let r = 1.0 - sm;
   let a = clamp(alpha, 0.0, 1.0);
   let NL = saturate(dot(N, L));
-  let NV = max(dot(N, V), 1e-4);
+  let NV = clamp(dot(N, V), 1e-4, 1.0);
   let f = 0.08 * clamp(spec, 0.0, 1.0);
   let oneMinusReflectivity = (1.0 - f) * (1.0 - m);
   let reflectivity = 1.0 - oneMinusReflectivity;

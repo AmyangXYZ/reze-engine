@@ -132,7 +132,7 @@ ${sceneIdPadWgsl("out")}
              + pow(max(dot(n, normalize(l2 + v)), 0.0), 20.0) * 0.7;
     let diff = max(dot(n, l1), 0.0) * 0.55 + max(dot(n, l2), 0.0) * 0.25;
     // The grazing rim is what makes a metal edge read as an edge.
-    let fres = pow(1.0 - abs(dot(n, v)), 4.0);
+    let fres = pow(saturate(1.0 - abs(dot(n, v))), 4.0);
     // A METAL TINTS ITS OWN HIGHLIGHT. White specular on a gold frame reads as
     // cream plastic; carrying the frame's colour into the highlight and the rim
     // is what separates gold from a yellow-painted thing.
