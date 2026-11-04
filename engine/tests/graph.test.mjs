@@ -36,7 +36,7 @@ const HAIR_BODY_INLINE = [
   "  let n_mix_003 = mix_blend(n_bevel_clamp, n_bc, n_hs_002); // @node:mix_003",
   "  let n_mix_shader_002 = mix_blend(n_rim_pow, n_mix_003, vec3f(0.1673291176557541)); // @node:mix_shader_002",
   "  let n_npr_add = n_mix_shader_002 + vec3f(n_gate_scale); // @node:npr_add",
-  "  let n_principled = urp_lit(n_bc, 0.0, 0.4523, 1.0, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+  "  let n_principled = urp_lit(n_bc, 0.0, 0.4523, 1.0, 1.0, vec3f(0.0), 1.0, 0.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
   "  let n_mix_shader_001 = mix_blend(0.2, n_npr_add, n_principled.rgb); // @node:mix_shader_001",
   "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
 ].join("\n")
@@ -49,7 +49,7 @@ test("default graph: MMD-correct neutral base (texture × material diffuse → L
     r.fsBody,
     [
       "  let n_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:base",
-      "  let n_principled = urp_lit(n_base, 0.0, 0.2929, 0.5, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, true); // @node:principled",
+      "  let n_principled = urp_lit(n_base, 0.0, 0.2929, 0.5, 1.0, vec3f(0.0), 1.0, 0.0, n, l, v, sun, amb, shadow, input.worldPos, true); // @node:principled",
       "  let final_color = n_principled.rgb; // @node:principled",
     ].join("\n"),
   )
@@ -77,7 +77,7 @@ test("cloth_smooth graph matches the hand-written shader (snapshot)", () => {
       "  let n_npr_overlay = mix_overlay(1.0, n_mix_003, n_hue_004); // @node:npr_overlay",
       "  let n_npr_emit = vector_scale(n_npr_overlay, 14.56); // @node:npr_emit",
       "  let n_principled_base = hue_sat_id(1.0, 0.800000011920929, 1.0, n_tex_base); // @node:principled_base",
-      "  let n_principled = urp_lit(n_principled_base, 0.0, 0.2929, 0.8, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+      "  let n_principled = urp_lit(n_principled_base, 0.0, 0.2929, 0.8, 1.0, vec3f(0.0), 1.0, 0.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
       "  let n_mix_shader_001 = mix_blend(0.8999999761581421, n_npr_emit, n_principled.rgb); // @node:mix_shader_001",
       "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
     ].join("\n"),
@@ -106,7 +106,7 @@ test("metal graph matches the hand-written shader (snapshot)", () => {
       "  let n_voro = tex_voronoi_color(n_voro_cross, 4.3); // @node:voro",
       "  let n_voro_ramp = ramp_linear(color_to_value(n_voro), 0.0, vec4f(0.0, 0.0, 0.0, 1.0), 1.0, vec4f(1.0, 1.0, 1.0, 1.0)); // @node:voro_ramp",
       "  let n_albedo = mix_blend(n_voro_ramp.r, vec3f(n_voro_ramp.r), n_hue_006); // @node:albedo",
-      "  let n_principled = urp_lit(n_albedo, 1.0, 0.4523, 1.0, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+      "  let n_principled = urp_lit(n_albedo, 1.0, 0.4523, 1.0, 1.0, vec3f(0.0), 1.0, 0.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
       "  let n_mix_shader_001 = mix_blend(0.6967, n_npr_emit, n_principled.rgb); // @node:mix_shader_001",
       "  let final_color = n_mix_shader_001; // @node:mix_shader_001",
     ].join("\n"),
@@ -121,7 +121,7 @@ test("cloth_rough graph matches the hand-written shader (key terms)", () => {
   assert.ok(r.fsBody.includes("let n_bump = bump_lh(1.0, n_noise_ramp.r, n, input.worldPos);"))
   assert.ok(
     r.fsBody.includes(
-      "urp_lit(n_principled_base, 0.0, 0.0, 0.25, 1.0, vec3f(0.0), 1.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
+      "urp_lit(n_principled_base, 0.0, 0.0, 0.25, 1.0, vec3f(0.0), 1.0, 0.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
     ),
   )
   assert.ok(r.fsBody.includes("mix_blend(0.8999999761581421, n_npr_emit, n_principled.rgb)"))
@@ -143,7 +143,7 @@ test("body graph matches the hand-written shader (key terms)", () => {
     "let n_warm_emit = vector_scale(n_warm_ramp.rgb, 0.30000001192092896);",
     "let n_rim2_mix = mix_blend(n_rim2_ramp.r, n_emission3, vec3f(1.0, 0.4303792119026184, 0.3315804898738861));",
     "let n_npr_stack = vector_add(n_npr_add1, n_warm_emit);",
-    "urp_lit(n_principled_base, 0.0, 0.4523, 0.5, 1.0, vec3f(0.0), 1.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
+    "urp_lit(n_principled_base, 0.0, 0.4523, 0.5, 1.0, vec3f(0.0), 1.0, 0.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
     "let n_p_sum = vector_add(n_principled.rgb, n_p_emit);",
     "let n_mix_shader_001 = mix_blend(0.5, n_npr_stack, n_p_sum);",
   ]
@@ -160,7 +160,7 @@ test("stockings graph: radiance in graph, hashed alpha from alphaMode", () => {
     "let n_mix_001 = mix_blend(0.5, vec3f(1.0), vec3f(n_ramp_face.r));",
     "let n_mask = mix_lighten(0.5, n_mix_001, vec3f(n_ramp_002.r));",
     "let n_emission_hs = hue_sat_id(1.0, 5.0, 1.0, n_tex_base);",
-    "urp_lit(n_tex_base, 0.1, 0.2929, 1.0, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false)",
+    "urp_lit(n_tex_base, 0.1, 0.2929, 1.0, 1.0, vec3f(0.0), 1.0, 0.0, n, l, v, sun, amb, shadow, input.worldPos, false)",
     "mix_blend(color_to_value(n_mask), n_emission_hs, n_principled.rgb)",
   ]
   for (const line of expect) assert.ok(r.fsBody.includes(line), `missing: ${line}`)
@@ -191,7 +191,7 @@ test("eye graph: Lit + emission, rear-gate from renderClass", () => {
       "  let n_eye_str = math_multiply(n_eye_lvl, 1.5); // @node:eye_str",
       "  let n_tex_base = mix_multiply(1.0, tex_color, material.diffuseColor); // @node:tex_base",
       "  let n_emission = vector_scale(n_tex_base, n_eye_str); // @node:emission",
-      "  let n_principled = urp_lit(n_tex_base, 0.0, 0.2929, 0.5, 1.0, vec3f(0.0), 1.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
+      "  let n_principled = urp_lit(n_tex_base, 0.0, 0.2929, 0.5, 1.0, vec3f(0.0), 1.0, 0.0, n, l, v, sun, amb, shadow, input.worldPos, false); // @node:principled",
       "  let n_add = vector_add(n_principled.rgb, n_emission); // @node:add",
       "  let final_color = n_add; // @node:add",
     ].join("\n"),
@@ -225,7 +225,7 @@ test("face graph matches the hand-written shader (key terms)", () => {
     "let n_noise = tex_noise_d2(n_map, 1.0);",
     "let n_bump = bump_lh(0.324644535779953, n_noise_ramp.r, n, input.worldPos);",
     "let n_principled_base = mix_blend(n_noise_ramp.r, n_bc, vec3f(0.6832, 0.1947, 0.1373));",
-    "urp_lit(n_principled_base, 0.0, 0.4523, 0.5, 1.0, vec3f(0.0), 1.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
+    "urp_lit(n_principled_base, 0.0, 0.4523, 0.5, 1.0, vec3f(0.0), 1.0, 0.0, n_bump, l, v, sun, amb, shadow, input.worldPos, false)",
     "let n_p_sum = vector_add(n_principled.rgb, n_p_emit);",
     "let n_mix_shader_001 = mix_blend(0.5, n_npr_stack, n_p_sum);",
   ]

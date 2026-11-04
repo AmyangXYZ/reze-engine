@@ -385,11 +385,12 @@ test("the cap clears a game stage's rig", () => {
   // A Unity stage arrives with a lamp per fixture: a resort brought 33, a lit
   // interior brings past a hundred. The loop runs over the scene's count, so
   // this bounds the buffer and the worst case rather than the ordinary one, and
-  // the buffer is storage — 256 records is 16 KiB, URP's Forward+ budget.
+  // the buffer is storage — 256 records of 20 floats (a tube's segment is the
+  // fifth vec4) is 20 KiB.
   assert.ok(MAX_LIGHTS >= 256, `MAX_LIGHTS is ${MAX_LIGHTS}`)
   // Header, 256 records, and 32k cells of eight words — about a megabyte,
   // bound once to every material.
-  assert.equal(LIGHTS_FLOATS * 4, (20 + 256 * 16 + 32768 * 8) * 4)
+  assert.equal(LIGHTS_FLOATS * 4, (20 + 256 * 20 + 32768 * 8) * 4)
 })
 
 test("the record holds a spot's aim and cone where the writer puts them", () => {
@@ -399,7 +400,7 @@ test("the record holds a spot's aim and cone where the writer puts them", () => 
   assert.match(wgsl, /fn rzLightAim\(i: u32\) -> vec3f \{ return _rzLightVec\(i, 2u\)\.xyz; \}/)
   assert.match(wgsl, /fn rzLightCone\(i: u32\) -> vec2f \{ return vec2f\(_rzLightVec\(i, 2u\)\.w, _rzLightVec\(i, 3u\)\.x\); \}/)
   const body = wgsl.slice(wgsl.indexOf("fn _rzLightOne"))
-  assert.match(body, /if \(dist >= pr\.w\) \{ return vec3f\(0\.0\); \}/, "out of reach is skipped before the rest")
+  assert.match(body, /if \(dist >= pr\.w \+ length\(h\)\) \{ return vec3f\(0\.0\); \}/, "out of reach is skipped before the rest")
   assert.match(body, /aim \* aim/, "the cone edge is squared like the falloff")
 })
 

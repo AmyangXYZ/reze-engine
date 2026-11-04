@@ -80,7 +80,7 @@ import {
   hasLightEmit,
 } from "./shaders/lights"
 import { buildLightGrid } from "./light-grid"
-import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE } from "./shaders/passes/ground"
+import { groundShaderWgsl, GROUND_NOISE_BAKE_WGSL, GROUND_NOISE_SIZE, GROUND_OBJECT_ID } from "./shaders/passes/ground"
 import {
   outlineShaderWgsl,
   RZ_OUTLINE_COLOR_OFFSET,
@@ -15579,7 +15579,7 @@ export class Engine {
       // From a counter, never from the count: size + 1 handed a model added
       // after a removal the id of one still in the scene, and two models with
       // one id are one model to everything that reads the id buffer.
-      objectId: (this.lastObjectId = this.lastObjectId >= 65535 ? 1 : this.lastObjectId + 1),
+      objectId: (this.lastObjectId = this.lastObjectId >= GROUND_OBJECT_ID - 1 ? 1 : this.lastObjectId + 1),
       dissolve: 1,
       materialUniformBuffers: [],
       outlineUniformBuffers: [],

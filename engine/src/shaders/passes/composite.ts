@@ -156,7 +156,7 @@ override APPLY_GAMMA: bool = true;
 // viewU[10] = (camera world position, _) — refreshed with the basis above.
 // viewU[11..14] = the cast's positions (effects; count in viewU[10].w).
 // viewU[15] = (soft curve contrast, pixel filter weights for offsets 0, ±1, ±2)
-//            — 1, 0, 0 is no filter; see rzPixelFiltered.
+//            — 1, 0, 0 is no filter; see _rzPixelFiltered.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
 @group(0) @binding(6) var bgEquirect: texture_2d<f32>;
 // The scene pass's own MSAA depth buffer, bound depth-only. NOT an extra
@@ -216,7 +216,7 @@ fn rzFieldMerge(top: vec4f, bot: vec4f) -> vec4f {
  *  (Engine.setPixelFilter): separable weights viewU[15].yzw over offsets 0,
  *  ±1, ±2, the coverage filtered alongside so the sky still composites under
  *  it. Only called while a filter is on. */
-fn rzPixelFiltered(coord: vec2<i32>) -> vec4f {
+fn _rzPixelFiltered(coord: vec2<i32>) -> vec4f {
   let sz = vec2<i32>(textureDimensions(hdrTex)) - vec2<i32>(1);
   let w = array<f32, 3>(viewU[15].y, viewU[15].z, viewU[15].w);
   let r = select(1, 2, w[2] > 0.0);
@@ -597,7 +597,7 @@ const COMPOSITE_BODY = /* wgsl */ `
   var alpha = textureLoad(maskTex, coord, 0).g;
   // A renderer's pixel filter, while one is set (viewU[15].y < 1).
   if (viewU[15].y < 0.99999) {
-    let f = rzPixelFiltered(coord);
+    let f = _rzPixelFiltered(coord);
     hdr = vec4f(f.rgb, hdr.a);
     alpha = f.a;
   }

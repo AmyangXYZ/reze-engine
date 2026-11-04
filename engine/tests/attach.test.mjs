@@ -135,7 +135,7 @@ test("the pose loop runs parents first and places a child before posing it", () 
   const place = loop.indexOf("this.placeAttached(inst)")
   const pose = loop.indexOf("inst.model.update(deltaTime")
   assert.ok(place > 0 && place < pose, "an attached model is placed BEFORE its pose pass")
-  assert.match(loop, /&& !attached && inst\.model\.isIdle\(\)/, "an attached prop never takes the idle skip")
+  assert.match(loop, /&& !attached && !inst\.physics && inst\.model\.isIdle\(\)/, "an attached prop never takes the idle skip")
   assert.match(loop, /inst\.isStage \|\| inst\.isPlane \? false : this\.ikEnabled/, "a prop keeps IK — its own clip may drive chains")
 })
 

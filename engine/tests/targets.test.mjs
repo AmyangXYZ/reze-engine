@@ -287,7 +287,13 @@ test("the ground's ids collide with no model's", () => {
   assert.match(groundSrc, /GROUND_OBJECT_ID = 0xffff/)
   // Minted ONCE, on the instance. The pick pass and the id attachment have to
   // name the same object by the same number, and this used to be derived twice.
-  assert.match(engine, /objectId: this\.modelInstances\.size \+ 1/, "model ids are 1-based — 0 stays 'nothing'")
+  // From a counter, so an id never repeats after a removal; 1-based, so 0 stays
+  // 'nothing', and wrapping one short of the floor's, so no model is ever 0xffff.
+  assert.match(
+    engine,
+    /objectId: \(this\.lastObjectId = this\.lastObjectId >= GROUND_OBJECT_ID - 1 \? 1 : this\.lastObjectId \+ 1\)/,
+    "model ids run 1 .. GROUND_OBJECT_ID - 1",
+  )
   assert.match(engine, /const modelId = inst\.objectId/, "the pick path must READ the id, not re-derive it")
 })
 

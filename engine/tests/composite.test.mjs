@@ -50,10 +50,10 @@ const ALLOWED = new Set([
   "RZ_TRAIL_SLOTS",
 ])
 
-// Comments are prose and name things that don't exist in this file (engine-side
+// Comments, line and block, are prose and name things that don't exist in this file (engine-side
 // constants, the placeholders themselves) — scan the code the GPU sees.
 const leftovers = (src) =>
-  [...(src.replace(/\/\/[^\n]*/g, "").match(PLACEHOLDER) ?? [])].filter((w) => !ALLOWED.has(w))
+  [...(src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "").match(PLACEHOLDER) ?? [])].filter((w) => !ALLOWED.has(w))
 
 test("every variant consumes every placeholder", () => {
   assert.deepEqual(leftovers(COMPOSITE_SHADER_WGSL), [], "base pass")
