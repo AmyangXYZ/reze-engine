@@ -36,11 +36,9 @@ ${JELLY_VERTEX_WGSL}
 struct VSOut {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
-  /** Bind-pose position, for the dissolve test — object space, as everywhere. */
+  /** Bind-pose position, for the dissolve test — object space, as everywhere.
+   *  A flake that is gone must stop casting. */
   @location(1) restPos: vec3f,
-  /** The triangle's own threshold, flat — see the material VertexOutput. A
-   *  face that is gone must stop casting, and stop as a whole face. */
-  @location(2) @interpolate(flat) faceT: f32,
 };
 
 @vertex fn vs(@location(0) position: vec3f, @location(1) normal: vec3f, @location(2) uv: vec2f,
@@ -56,7 +54,6 @@ struct VSOut {
   out.position = lp.viewProj * vec4f(sp.xyz, 1.0);
   out.uv = uv;
   out.restPos = position;
-  out.faceT = rz_dissolve_threshold(position);
   return out;
 }
 
@@ -66,6 +63,6 @@ struct VSOut {
   // The dissolve, run as the colour pass runs it. A flake that is gone stops
   // casting: without this she leaves a whole shadow standing on the floor while
   // her body is in the air.
-  if (material.dissolve < 0.9995 && in.faceT > material.dissolve) { discard; }
+  if (material.dissolve < 0.9995 && rz_dissolve_threshold(in.restPos) > material.dissolve) { discard; }
 }
 `

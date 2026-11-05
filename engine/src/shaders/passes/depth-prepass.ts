@@ -69,9 +69,6 @@ struct VSOut {
   // The bind-pose position, carried for one reason: the dissolve test below has
   // to be the SAME test the colour pass runs, and that one is in object space.
   @location(1) restPos: vec3f,
-  /** The triangle's own threshold, flat — see the material VertexOutput. This
-   *  pass must throw away exactly the faces the colour pass does. */
-  @location(2) @interpolate(flat) faceT: f32,
 };
 
 @vertex fn vs(
@@ -94,7 +91,6 @@ struct VSOut {
   o.position = camera.projection * camera.view * vec4f(skinned.xyz, 1.0);
   o.uv = uv;
   o.restPos = position;
-  o.faceT = rz_dissolve_threshold(position);
   return o;
 }
 
@@ -121,7 +117,7 @@ override CUTOFF: f32 = 0.5;
   // the colour pass throws away would punch holes that occlude the floor behind
   // her: you would see sky through her, which is the failure this line exists
   // to prevent.
-  if (material.dissolve < 0.9995 && in.faceT > material.dissolve) { discard; }
+  if (material.dissolve < 0.9995 && rz_dissolve_threshold(in.restPos) > material.dissolve) { discard; }
   var out: PrepassOut;
   out.color = vec4f(0.0);
   out.mask = vec4f(0.0);

@@ -126,7 +126,12 @@ ${discard}
   // as burning away rather than as a stencil moving over her.
   var rz_burn = 0.0;
   if (material.dissolve < 0.9995) {
-    let rz_t = input.faceT;
+    // PER FRAGMENT, from the bind-pose position: the pieces are the noise's,
+    // grit inside clumps, never the mesh's triangles, so a large face comes
+    // apart as finely as a small one. The prepass, the shadow map and the
+    // outline hull run the same function on the same interpolated input, so
+    // every pass agrees about which flakes are gone.
+    let rz_t = rz_dissolve_threshold(input.restPos);
     if (rz_t > material.dissolve) { discard; }
     // Put OUT as the last of her goes. Near zero the front is wider than what
     // is left of the surface, so every surviving fragment sits inside it and

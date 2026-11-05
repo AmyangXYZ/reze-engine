@@ -191,18 +191,6 @@ struct VertexOutput {
   // At rest skinMats are identity so restPos == worldPos, which is why existing noise-
   // scale constants stay valid without retuning.
   @location(3) restPos: vec3f,
-  /**
-   * This TRIANGLE's dissolve threshold.
-   *
-   * FLAT, so every fragment of a face shares the provoking vertex's value and
-   * the face goes as a unit — the mesh comes apart in triangles that light and
-   * leave in turn, rather than in a scatter that crosses them. Computed in the
-   * vertex stage from the bind-pose attribute, which is what lets the depth
-   * prepass, the shadow map and the outline hull reach the same number for the
-   * same face: one function, one input, one provoking vertex, one answer. They
-   * must agree — a pass that disagrees punches holes through her.
-   */
-  @location(4) @interpolate(flat) faceT: f32,
   /** The scene fog's two amounts, computed PER VERTEX as the game does — see
    *  Engine.setSceneFog — and interpolated across the face. */
   @location(5) fog: vec2f,
@@ -484,7 +472,6 @@ const COMMON_VS_WGSL = /* wgsl */ `
   output.uv = uv;
   output.worldPos = skinnedPos.xyz;
   output.restPos = position;
-  output.faceT = rz_dissolve_threshold(position);
   let viewZ = (camera.view * vec4f(skinnedPos.xyz, 1.0)).z;
   output.fog = vec2f(
     _rzFogAmount(viewZ, skinnedPos.y, light.fog[0], light.fog[1]),

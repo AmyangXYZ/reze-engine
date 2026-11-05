@@ -104,9 +104,6 @@ struct VertexOutput {
    *  the depth prepass measure against, so all three agree about which flakes
    *  are gone. */
   @location(1) restPos: vec3f,
-  /** The triangle's own threshold, flat — see the material VertexOutput. The
-   *  hull traces the body's faces, so it has to lose the same ones. */
-  @location(2) @interpolate(flat) faceT: f32,
   /** How much of a pixel-wide line this one really is (1 = all of it): a line
    *  held at the minimum width fades by what it was short. */
   @location(3) coverage: f32,
@@ -246,7 +243,6 @@ fn safe_normal2(v: vec2f) -> vec2f {
   output.position = vec4f(clipPos.xy + ndc * w, clipPos.z, clipPos.w);
   output.uv = uv;
   output.restPos = position;
-  output.faceT = rz_dissolve_threshold(position);
   return output;
 }
 
@@ -272,7 +268,7 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
   // The same test the colour pass and the depth prepass run, against the same
   // bind-pose position — three passes, one rule, or they disagree about which
   // pieces are still there.
-  if (material.dissolve < 0.9995 && input.faceT > material.dissolve) { discard; }
+  if (material.dissolve < 0.9995 && rz_dissolve_threshold(input.restPos) > material.dissolve) { discard; }
   let tex = textureSample(diffuseTexture, edgeSampler, input.uv);
   let texA = tex.a;
   if (texA < 0.05) {
