@@ -110,6 +110,15 @@ const ROLL_ZETA = Math.LN2 / HALF_LIFE / (2 * Math.PI * ROLL_HZ)
 // How much of the spring's swing about the expression angle shows: a
 // twenty-fifth of an iris radius past centre after a blink.
 const ROLL_SWING = 0.25
+// How long a held expression takes to stop pressing and rolling the iris, in
+// seconds: the press and the roll answer the CHANGE of the lids, as the MME's
+// spring does, never where they sit. A smile or a はぅ held through a chorus
+// once kept the iris a fifth shorter and rolled down for as long as it held —
+// on a squint that leaves the eyes open, the irises sank to the bottom of the
+// eyes — and leftover weights of a few hundredths, summed, kept a neutral face
+// pressed for good. A blink's own close is far quicker than this, so it still
+// presses and rolls in full.
+const HOLD_S = 0.3
 const PUSH_ELASTIC = 0.04
 // A highlight sheet by name, for rigs that keep it on its own material.
 const HIGHLIGHT = /ハイライト|ﾊｲﾗｲﾄ|高光|highlight|hilight|(^|[^a-z])hl([^a-z]|$)/i
@@ -199,6 +208,10 @@ interface EyeState {
   // The roll (degrees) and its velocity, chasing the expressions' angle.
   roll: number
   rollV: number
+  // Where the lids and the expressions' angle have been HELD: followers HOLD_S
+  // behind them. The press and the roll are what is left past them.
+  closureHeld: number
+  rollHeld: number
   pulseV: number
 }
 
@@ -237,6 +250,8 @@ interface MorphShift {
 
 const newState = (): EyeState => ({
   closure: 0,
+  closureHeld: 0,
+  rollHeld: 0,
   prev: 0,
   speed: 0,
   trend: 0,
@@ -373,11 +388,18 @@ export class JellyEyes {
         s.lag[1] = s.look[1]
         s.lagV[0] = s.lagV[1] = 0
         s.pulse = s.pulseV = 0
-        s.roll = this.roll[e]
+        s.closureHeld = s.closure
+        s.rollHeld = this.roll[e]
+        s.roll = 0
         s.rollV = 0
         continue
       }
       blink(s, dt)
+      if (dt > 0) {
+        const k = 1 - Math.exp(-dt / HOLD_S)
+        s.closureHeld += (s.closure - s.closureHeld) * k
+        s.rollHeld += (this.roll[e] - s.rollHeld) * k
+      }
       const steps = Math.ceil(dt / SUBSTEP)
       const h = steps > 0 ? dt / steps : 0
       const pulseTarget = PULSE_MAX * knock
@@ -386,7 +408,7 @@ export class JellyEyes {
         s.pulse += h * s.pulseV
         s.squashV += h * spring(s.squash - squashTarget, s.squashV, SQUASH_HZ, SQUASH_ZETA)
         s.squash += h * s.squashV
-        s.rollV += h * spring(s.roll - this.roll[e], s.rollV, ROLL_HZ, ROLL_ZETA)
+        s.rollV += h * spring(s.roll - pressedRoll(this.roll[e], s.rollHeld), s.rollV, ROLL_HZ, ROLL_ZETA)
         s.roll += h * s.rollV
         for (let k = 0; k < 2; k++) {
           s.lagV[k] += h * spring(s.lag[k] - s.look[k], s.lagV[k], LAG_HZ, LAG_ZETA)
@@ -420,7 +442,7 @@ export class JellyEyes {
       const vn = s.v / omega
       const gain = (k: 0 | 1) => SCALE_GAIN[k] * (x >= 0 ? 1 : REBOUND[k])
       const kx = (1 + x * gain(0)) * (1 - 0.8 * s.squash + pulse)
-      const ky = (1 + x * gain(1)) * (1 - SQUEEZE_Y * s.closure) * (1 - s.squash + pulse)
+      const ky = (1 + x * gain(1)) * (1 - SQUEEZE_Y * Math.max(0, s.closure - s.closureHeld)) * (1 - s.squash + pulse)
       o.set([rest.radius[0], rest.radius[1], s.closure, this.eyeBones[e]], 56 + e * 4)
       // [4]/[5]: scale across and down, the iris's twist, the highlight's turn.
       o.set([by(kx, 0.78, 1.25), by(ky, 0.7, 1.08), (x * TWIST_POS + vn * TWIST_VEL) * DEG * g, vn * HL_TURN * DEG * g], 64 + e * 4)
@@ -440,7 +462,7 @@ export class JellyEyes {
       // [8]/[9]: the roll's pivot and angle; [10]/[11]: the highlight's own
       // scale, and how far the iris comes forward (bind units).
       const pivot = rest.pivot
-      o.set(pivot ? [pivot[0], pivot[1], pivot[2], (this.roll[e] + (s.roll - this.roll[e]) * ROLL_SWING) * DEG * g] : [0, 0, 0, 0], 80 + e * 4)
+      o.set(pivot ? [pivot[0], pivot[1], pivot[2], (pressedRoll(this.roll[e], s.rollHeld) + (s.roll - pressedRoll(this.roll[e], s.rollHeld)) * ROLL_SWING) * DEG * g] : [0, 0, 0, 0], 80 + e * 4)
       const hs = (k: 0 | 1) => Math.max(HL_SCALE_MIN, Math.min(HL_SCALE_MAX, 1 + x * HL_SCALE[k] * g))
       o.set([hs(0), hs(1), Math.min(Math.abs(x), SPRING_LIMIT) * PUSH_ELASTIC * r * g, 0], 88 + e * 4)
     }
@@ -497,6 +519,12 @@ export class JellyEyes {
     m.offset[0] = cap((dot(u, right) / Math.hypot(...right) / size) * INERTIA_GAIN)
     m.offset[1] = cap((dot(u, up) / Math.hypot(...up) / size) * INERTIA_GAIN)
   }
+}
+
+/** The part of an expression's roll past where it has been held: the full
+ *  angle while it arrives, nothing once it stays, nothing as it leaves. */
+function pressedRoll(angle: number, held: number): number {
+  return Math.sign(angle) * Math.max(0, Math.abs(angle) - Math.abs(held))
 }
 
 /** Zero jelly[0..11] — strength 0 is what the shader reads as off. */

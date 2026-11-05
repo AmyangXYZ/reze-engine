@@ -243,40 +243,30 @@ test("every pass that draws the body honours the dissolve", () => {
   // It looked like the model would not dissolve, and it only happened to models
   // whose materials carry MMD's edge flag — which is what made it read as
   // "some models are broken" rather than as one pass missing a line.
-  // The threshold is per TRIANGLE: computed in the vertex stage and passed
-  // FLAT, so every fragment of a face shares the provoking vertex's value and
-  // the face goes as a unit.
-  //
-  // That moves what these four have to agree about. It is no longer "run the
-  // same expression on restPos" but "derive the same flat value from the same
-  // bind-pose attribute" — a pass that computed it per fragment instead would
-  // disagree with the others about which FACES are gone, and the model would
-  // write depth where it no longer draws. So the derivation is pinned here as
-  // well as the comparison: the comparison alone would pass for a pass that
-  // filled its own slot from something else.
+  // The threshold is per FRAGMENT, from the interpolated bind-pose position, so
+  // the pieces are the noise's and never the mesh's triangles. What the four
+  // agree about is "the same function on the same input": each fills restPos
+  // from the raw position attribute and tests rz_dissolve_threshold of it. A
+  // pass that derived its threshold from anything else would disagree about
+  // which flakes are gone, and depth would be written where nothing draws.
   const passes = ["outline", "depth-prepass", "shadow"]
   for (const name of passes) {
     const src = readFileSync(new URL(`../src/shaders/passes/${name}.ts`, import.meta.url), "utf8")
     assert.match(
       src,
-      /material\.dissolve < 0\.9995 && in(put)?\.faceT > material\.dissolve/,
+      /material\.dissolve < 0\.9995 && rz_dissolve_threshold\(in(put)?\.restPos\) > material\.dissolve/,
       `${name} must run the same dissolve test`,
     )
-    assert.match(src, /@interpolate\(flat\) faceT: f32/, `${name} must carry the threshold FLAT`)
-    assert.match(
-      src,
-      /\.faceT = rz_dissolve_threshold\(position\)/,
-      `${name} must derive it from the bind-pose attribute`,
-    )
+    assert.match(src, /\.restPos = position;/, `${name} must carry the bind-pose attribute`)
+    assert.doesNotMatch(src, /faceT/, `${name} must not carry a per-face threshold`)
   }
   // And the colour pass, which reaches it through the graph prologue.
   const slots = readFileSync(new URL("../src/graph/slots.ts", import.meta.url), "utf8")
   assert.match(slots, /if \(rz_t > material\.dissolve\) \{ discard; \}/)
-  assert.match(slots, /let rz_t = input\.faceT;/)
-  // The colour pass's own flat slot lives on the shared material VertexOutput.
+  assert.match(slots, /let rz_t = rz_dissolve_threshold\(input\.restPos\);/)
   const common = readFileSync(new URL("../src/shaders/materials/common.ts", import.meta.url), "utf8")
-  assert.match(common, /@interpolate\(flat\) faceT: f32/)
-  assert.match(common, /output\.faceT = rz_dissolve_threshold\(position\)/)
+  assert.match(common, /output\.restPos = position;/)
+  assert.doesNotMatch(common, /faceT/)
 })
 
 test("the outline's struct describes the buffer that is actually bound", () => {

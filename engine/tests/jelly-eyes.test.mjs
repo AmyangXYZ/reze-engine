@@ -146,50 +146,74 @@ test("a blink widens the iris as the lids close, rings out after, and settles", 
   assert.ok(Math.abs(end.squash[0] - end.squash[1]) < 1e-6)
 })
 
-test("a closing expression rolls the iris down about its eye bone on a spring: angles add, it swings past rest on opening", () => {
+test("a closing expression rolls the iris down about its eye bone as the lids move, and lets go while it holds", () => {
   const model = fakeModel()
   const jelly = new JellyEyes(model, { idle: false })
   jelly.step(1 / 60, model)
   const deg = (o, e) => (o[83 + e * 4] * 180) / Math.PI
-  const hold = (s) => { for (let t = 0; t < s; t += 1 / 60) jelly.step(1 / 60, model) }
+  const run = (s, trace) => {
+    for (let t = 0; t < s; t += 1 / 60) {
+      jelly.step(1 / 60, model)
+      trace?.push([deg(read(jelly).o, 0), deg(read(jelly).o, 1)])
+    }
+  }
   let r = read(jelly)
   assert.equal(deg(r.o, 0), 0)
   // The pivot is the eye bone's head: 左目 at (0.5, 15.2, −0.5).
   assert.deepEqual([...r.o.subarray(80, 83)].map((x) => +x.toFixed(5)), [0.5, 15.2, -0.5])
+  // Closing: it rolls down while the lids move.
+  const closing = []
   close(jelly, model, 0, 1) // まばたき
-  hold(3)
+  run(0.25, closing)
+  const deepest = Math.min(...closing.map(([l]) => l))
+  assert.ok(deepest < -5, `closing rolls it down: deepest ${deepest}`)
+  // Held: it lets go, back to rest, and stays back.
+  run(3)
   r = read(jelly)
-  assert.ok(Math.abs(deg(r.o, 0) + 15) < 0.05 && Math.abs(deg(r.o, 1) + 15) < 0.05, `held, blink settles at −15°: ${deg(r.o, 0)}`)
+  assert.ok(Math.abs(deg(r.o, 0)) < 0.05 && Math.abs(deg(r.o, 1)) < 0.05, `held, it rests: ${deg(r.o, 0)}`)
   assert.ok(Math.abs(r.o[90]) < 1e-4, "and stays back once the spring settles: a shut lid sits close in front")
-  close(jelly, model, 1, 1) // ウィンク adds −5° to the left only
-  hold(3)
+  // Angles add, per eye: ウィンク on top rolls the left only, then lets go.
+  const adding = []
+  close(jelly, model, 1, 1)
+  run(0.25, adding)
+  const left = Math.min(...adding.map(([l]) => l))
+  const right = Math.min(...adding.map(([, rr]) => rr))
+  assert.ok(left < -1 && Math.abs(right) < 0.05, `the wink rolls its own eye: left ${left}, right ${right}`)
+  run(3)
   r = read(jelly)
-  assert.ok(Math.abs(deg(r.o, 0) + 20) < 0.05 && Math.abs(deg(r.o, 1) + 15) < 0.05)
-  // Opening, it swings up past rest, back and forth, and settles.
+  assert.ok(Math.abs(deg(r.o, 0)) < 0.05, `and lets go: ${deg(r.o, 0)}`)
+  // A quick blink, closed and open again before it holds: down, then up past
+  // rest on the spring as it opens, a wobble, and settled.
   model.weights[1] = 0
   close(jelly, model, 0, 0)
+  run(3)
   const trace = []
-  for (let t = 0; t < 4; t += 1 / 60) {
-    jelly.step(1 / 60, model)
-    trace.push(deg(read(jelly).o, 0))
-  }
-  assert.ok(Math.max(...trace) > 3, `it should swing up past rest, peak ${Math.max(...trace)}`)
-  let crossings = 0
-  for (let i = 1; i < trace.length; i++) if (Math.sign(trace[i]) !== Math.sign(trace[i - 1]) && trace[i] !== 0) crossings++
-  assert.ok(crossings >= 3, `it should wobble, crossed rest ${crossings} times`)
-  assert.ok(Math.abs(trace.at(-1)) < 0.05, `and settle, ended at ${trace.at(-1)}`)
+  close(jelly, model, 0, 1)
+  run(0.05, trace)
+  close(jelly, model, 0, 0)
+  run(4, trace)
+  const angles = trace.map(([l]) => l)
+  assert.ok(Math.min(...angles) < -3, `a quick blink rolls it down: ${Math.min(...angles)}`)
+  assert.ok(Math.max(...angles) > 0.3, `and it swings up past rest as it opens: peak ${Math.max(...angles)}`)
+  assert.ok(Math.abs(angles.at(-1)) < 0.05, `and settles, ended at ${angles.at(-1)}`)
 })
 
-test("a held half-close (a smile) presses the iris flatter and holds still", () => {
+test("a held half-close (a smile) presses the iris as it closes, then lets go and holds still", () => {
   const model = fakeModel()
   const jelly = new JellyEyes(model, { idle: false })
-  model.weights[0] = 0.26
   jelly.step(1 / 60, model)
-  for (let i = 0; i < 120; i++) jelly.step(1 / 60, model)
+  close(jelly, model, 0, 0.26)
+  let lowest = read(jelly).scale[0][1]
+  for (let i = 0; i < 18; i++) {
+    jelly.step(1 / 60, model)
+    lowest = Math.min(lowest, read(jelly).scale[0][1])
+  }
+  assert.ok(lowest < 0.99, `pressed as it closes, lowest y ${lowest}`)
+  for (let i = 0; i < 240; i++) jelly.step(1 / 60, model)
   const a = read(jelly)
   jelly.step(1 / 60, model)
   const b = read(jelly)
-  assert.ok(Math.abs(a.scale[0][1] - (1 - 0.18 * 0.26)) < 1e-6, `the lid's press, y ${a.scale[0][1]}`)
+  assert.ok(Math.abs(a.scale[0][1] - 1) < 1e-3, `held, the press lets go: y ${a.scale[0][1]}`)
   assert.equal(a.scale[0][0], 1)
   assert.deepEqual(a.scale, b.scale, "held, not moving")
 })
