@@ -337,10 +337,23 @@ export class Model {
     return this._scale
   }
 
-  /** Whether this model renders. Hidden models skip the main, shadow, and pick passes;
-   *  physics keeps running so they resume consistently. */
+  /** Whether the HOST shows this model — what setVisible last said. A playing
+   *  motion can hide her on top of this (see `drawn`), and never writes here,
+   *  so the host's own switch reads back exactly as it set it. */
   get visible(): boolean {
     return this._visible
+  }
+
+  /** Whether this model renders this frame: the host shows her and the motion
+   *  has not hidden her. Hidden models skip the main, shadow and pick passes;
+   *  physics keeps running so they resume consistently. */
+  get drawn(): boolean {
+    return this._visible && !this.motionHidden
+  }
+
+  /** Whether the playing motion has her hidden right now (VMD's 表示 flag). */
+  get hiddenByMotion(): boolean {
+    return this.motionHidden
   }
 
   setPosition(position: Vec3): void {
@@ -459,6 +472,8 @@ export class Model {
   private _rotation: Quat = Quat.identity()
   private _scale: number = 1
   private _visible: boolean = true
+  /** The playing clip's display flag at the current frame — see `drawn`. */
+  private motionHidden = false
   private rootMatrixValues: Float32Array = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
   private rootMatrixDirty: boolean = false
   private rootIsIdentity: boolean = true
@@ -2041,6 +2056,11 @@ export class Model {
         }
         for (const track of ikTracks.values()) track.sort((a, b) => a.frame - b.frame)
         clip.ikTracks = ikTracks
+        // The same records carry the model's 表示 flag. Kept only when some
+        // record hides her: a motion that never does plays exactly as before.
+        if (ikFrames.some((r) => !r.visible)) {
+          clip.visibility = ikFrames.map((r) => ({ frame: r.frame, visible: r.visible }))
+        }
       }
       this.animationState.loadAnimation(name, clip)
     })
@@ -2317,6 +2337,8 @@ export class Model {
     this.crossfade = null
     this.oneShot = null
     this.animationState.clear()
+    // No clip, no motion to hide her: a cleared clip must not leave her gone.
+    this.motionHidden = false
   }
 
   // Seek by absolute timeline seconds, not frame index.
@@ -2376,6 +2398,7 @@ export class Model {
   /** Step the IK state to `frame`. VMD IK keys are steps: a state holds until
    *  the next one changes it, so this is a lookup, not an interpolation. */
   private applyIkFromClip(clip: AnimationClip, frame: number): void {
+    this.applyVisibilityFromClip(clip, frame)
     if (!clip.ikTracks || clip.ikTracks.size === 0) {
       if (this.ikDisabled.size > 0) this.ikDisabled.clear()
       return
@@ -2388,6 +2411,15 @@ export class Model {
       for (let i = 1; i < keys.length && keys[i].frame <= frame; i++) state = keys[i].enabled
       if (!state) this.ikDisabled.add(index)
     }
+  }
+
+  /** Step the motion's display flag to `frame`. Before its first key she is
+   *  shown — MMD's own reading of a motion that starts hidden later. */
+  private applyVisibilityFromClip(clip: AnimationClip, frame: number): void {
+    const keys = clip.visibility
+    let shown = true
+    if (keys) for (let i = 0; i < keys.length && keys[i].frame <= frame; i++) shown = keys[i].visible
+    this.motionHidden = !shown
   }
 
   /** Sample one bone track at `frame` into outRot + outVmdTrans. The translation is
@@ -2871,6 +2903,7 @@ export class Model {
         this.applyCrossfade(deltaTime)
       } else {
         const clip = this.animationState.getCurrentClip()
+        if (clip === null) this.motionHidden = false
         if (clip !== null) {
           this.applyPoseFromClip(clip, this.animationState.getCurrentFrame())
           if (evWatch !== null && evWatch === this.animationState.getCurrentAnimation()) {

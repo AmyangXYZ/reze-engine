@@ -131,6 +131,7 @@ export type {
   BlendEntry,
   BoneKeyframe,
   IkKeyframe,
+  VisibilityKeyframe,
   MorphKeyframe,
   BoneInterpolation,
   ControlPoint,

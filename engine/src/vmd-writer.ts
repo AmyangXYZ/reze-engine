@@ -94,6 +94,17 @@ export class VMDWriter {
         else ikByFrame.set(key.frame, [{ boneName, enabled: key.enabled }])
       }
     }
+    // The model's display flag rides in the same records. A moment it changes
+    // with no IK switch beside it still needs a record of its own, and every
+    // record states the flag as it stands then — one written as "shown" would
+    // bring her back mid-hide on the way in.
+    const visibility = wantBones ? clip.visibility : undefined
+    if (visibility) for (const key of visibility) if (!ikByFrame.has(key.frame)) ikByFrame.set(key.frame, [])
+    const shownAt = (frame: number): boolean => {
+      let shown = true
+      if (visibility) for (let i = 0; i < visibility.length && visibility[i].frame <= frame; i++) shown = visibility[i].visible
+      return shown
+    }
     const ikFrames = [...ikByFrame.entries()].sort((a, b) => a[0] - b[0])
     let ikSize = 0
     for (const [, states] of ikFrames) ikSize += 4 + 1 + 4 + states.length * (IK_NAME_SIZE + 1)
@@ -188,7 +199,7 @@ export class VMDWriter {
       for (const [frame, states] of ikFrames) {
         view.setUint32(offset, frame, true)
         offset += 4
-        view.setUint8(offset, 1) // model visible
+        view.setUint8(offset, shownAt(frame) ? 1 : 0) // model visible
         offset += 1
         view.setUint32(offset, states.length, true)
         offset += 4

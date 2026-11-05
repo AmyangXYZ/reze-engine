@@ -39,7 +39,17 @@ export interface AnimationClip {
   /** Per-chain IK state over time. Absent means "leave IK as the host set it" —
    *  which is what every clip built before this existed will do. */
   ikTracks?: Map<string, IkKeyframe[]>
+  /** When the motion shows and hides the model — the 表示 flag of VMD's
+   *  IK/display block, which motions use to make a character vanish for a
+   *  stretch. Steps, like IK. Absent means the motion never hides her. */
+  visibility?: VisibilityKeyframe[]
   frameCount: number // last keyframe frame index
+}
+
+/** One moment a motion shows or hides its model. Holds until the next one. */
+export interface VisibilityKeyframe {
+  frame: number
+  visible: boolean
 }
 
 export interface AnimationPlayOptions {
@@ -114,6 +124,7 @@ export class AnimationState {
       boneTracks: clip.boneTracks,
       morphTracks: clip.morphTracks,
       ikTracks: clip.ikTracks,
+      visibility: clip.visibility,
       frameCount: clip.frameCount,
     })
   }
@@ -139,6 +150,7 @@ export class AnimationState {
       boneTracks: clip?.boneTracks ?? new Map(),
       morphTracks,
       ikTracks: clip?.ikTracks,
+      visibility: clip?.visibility,
       frameCount: Math.max(clip?.frameCount ?? 0, frameCount),
     })
   }

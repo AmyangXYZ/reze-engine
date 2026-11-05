@@ -4964,7 +4964,7 @@ export class Engine {
   private writeCastSeedProps(): void {
     let n = 0
     this.forEachInstance((inst) => {
-      if (inst.isProp && inst.model.visible) n++
+      if (inst.isProp && inst.model.drawn) n++
     })
     let data = this.castSeedPropData
     let changed = data[0] !== n
@@ -4985,7 +4985,7 @@ export class Engine {
     data[0] = n
     let i = 1
     this.forEachInstance((inst) => {
-      if (!inst.isProp || !inst.model.visible) return
+      if (!inst.isProp || !inst.model.drawn) return
       if (data[i] !== inst.objectId) changed = true
       data[i++] = inst.objectId
     })
@@ -6761,7 +6761,7 @@ export class Engine {
     let n = 0
     for (const inst of this.modelInstances.values()) {
       const m = inst.model
-      if (!m.visible) continue
+      if (!m.drawn) continue
       let byPrefix = this.pointBones.get(m)
       if (!byPrefix) this.pointBones.set(m, (byPrefix = new Map()))
       let bones = byPrefix.get(points.prefix)
@@ -7720,7 +7720,7 @@ export class Engine {
     for (const inst of this.modelInstances.values()) {
       // Neither a stage nor a plane is a performer, so neither is a subject an
       // effect can follow.
-      if (!inst.model.visible || inst.isStage || inst.isPlane || inst.isProp) continue
+      if (!inst.model.drawn || inst.isStage || inst.isPlane || inst.isProp) continue
       const model = inst.model
       const matrices = model.getWorldMatrices()
       if (matrices.length === 0) continue
@@ -11177,7 +11177,7 @@ export class Engine {
     const p = new Vec3(0, 0, 0)
     let any = false
     for (const inst of this.modelInstances.values()) {
-      if (!inst.isStage || !inst.model.visible) continue
+      if (!inst.isStage || !inst.model.drawn) continue
       const m = inst.model
       for (const draw of inst.drawCalls) {
         const b = draw.bounds
@@ -11417,12 +11417,12 @@ export class Engine {
       })
       pass.setStencilReference(Engine.STENCIL_EYE_VALUE)
       for (const inst of this.modelInstances.values()) {
-        if (!inst.isStage || !inst.model.visible) continue
+        if (!inst.isStage || !inst.model.drawn) continue
         this.setModelDrawState(pass, inst)
         this.drawMaterials(pass, inst, "opaque", view)
       }
       for (const inst of this.modelInstances.values()) {
-        if (!inst.isStage || !inst.model.visible) continue
+        if (!inst.isStage || !inst.model.drawn) continue
         this.setModelDrawState(pass, inst)
         this.drawMaterials(pass, inst, "transparent", view)
       }
@@ -11773,7 +11773,7 @@ export class Engine {
     if (opts && stage) {
       let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
       for (const inst of this.modelInstances.values()) {
-        if (inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) continue
+        if (inst.isStage || inst.isPlane || inst.isProp || !inst.model.drawn) continue
         const s = this.castSphereScratch
         this.writeCullSphere(inst, s, 0)
         if (!(s[3] < 1e6)) continue
@@ -14583,7 +14583,7 @@ export class Engine {
     for (let i = 0; i < this.cullModels.length; i++) {
       const inst = this.cullModels[i]
       const o = i * Engine.CULL_MODEL_FLOATS
-      let f = inst.model.visible ? Engine.CULL_MODEL_VISIBLE : 0
+      let f = inst.model.drawn ? Engine.CULL_MODEL_VISIBLE : 0
       if (inst.rigid) {
         data.set(inst.rigidXform, o)
         f |= Engine.CULL_MODEL_RIGID
@@ -14702,7 +14702,7 @@ export class Engine {
     out.fill(0)
     for (let i = 0; i < this.cullModels.length; i++) {
       const inst = this.cullModels[i]
-      if (!inst.model.visible || inst.shadowDrawCalls.length === 0) continue
+      if (!inst.model.drawn || inst.shadowDrawCalls.length === 0) continue
       if (inst.rigid) {
         // No sphere to read. Bail out of the whole optimisation.
         out[3] = -1
@@ -14722,7 +14722,7 @@ export class Engine {
     heads.fill(0)
     for (let i = 0; i < this.cullModels.length; i++) {
       const inst = this.cullModels[i]
-      if (!inst.model.visible || inst.rigid || inst.isStage || inst.isPlane || inst.isProp || inst.shadowDrawCalls.length === 0) continue
+      if (!inst.model.drawn || inst.rigid || inst.isStage || inst.isPlane || inst.isProp || inst.shadowDrawCalls.length === 0) continue
       const o = i * Engine.CULL_MODEL_FLOATS + 16
       growSphere(out, data[o], data[o + 1], data[o + 2], data[o + 3])
       const m = inst.model
@@ -15293,7 +15293,7 @@ export class Engine {
       report.models.push({
         name: inst.name,
         rigid: inst.rigid,
-        visible: inst.model.visible,
+        visible: inst.model.drawn,
         draws: inst.drawCalls.length,
         cameraVisible: 0,
         shadowVisible: 0,
@@ -17685,7 +17685,7 @@ export class Engine {
     pass.setBindGroup(0, this.pickPerFrameBindGroup)
 
     this.forEachInstance((inst) => {
-      if (!inst.model.visible) return // hidden models aren't pickable
+      if (!inst.model.drawn) return // hidden models aren't pickable
       pass.setVertexBuffer(0, inst.vertexBuffer)
       pass.setVertexBuffer(1, inst.jointsBuffer)
       pass.setVertexBuffer(2, inst.weightsBuffer)
@@ -18583,7 +18583,7 @@ export class Engine {
     const names: string[] = []
     let n = 0
     this.forEachInCastOrder((inst) => {
-      if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
+      if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.drawn) return
       n++
       if (subjects && !subjects.includes(inst.name)) return
       names.push(inst.name)
@@ -19846,7 +19846,7 @@ export class Engine {
       let n = 0
       this.castSlotOf.clear()
       this.forEachInCastOrder((inst) => {
-        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.visible) return
+        if (n >= MAX_EFFECT_SUBJECTS || inst.isStage || inst.isPlane || inst.isProp || !inst.model.drawn) return
         const m = inst.model
         // WHO IS IN WHICH SLOT, recorded here because here is where it is
         // decided. An effect is aimed by model name, and a name only becomes a
@@ -20263,7 +20263,8 @@ export class Engine {
         skinMatrixBuffer: inst.skinMatrixBuffer,
         indexBuffer: inst.indexBuffer,
         draws,
-        hidden: (m) => inst.hiddenMaterials.has(m) || inst.morphHiddenMaterials.has(m),
+        // A hidden model hides every material, whoever hid it (setVisible or the motion).
+        hidden: (m) => !inst.model.drawn || inst.hiddenMaterials.has(m) || inst.morphHiddenMaterials.has(m),
         headSkin: () => (head >= 0 ? inst.model.getSkinMatrices().subarray(head * 16, head * 16 + 16) : null),
         headRest,
         layers: new Uint32Array(inst.objectLight.buffer)[0],

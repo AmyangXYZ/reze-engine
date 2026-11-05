@@ -20,7 +20,7 @@ test("the cast is who is on stage", () => {
   // The subject write and the name lookup must agree, or an effect draws off one
   // body while the dissolve takes another apart.
   const writes = engine.match(
-    /if \([^)]*n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp \|\| !inst\.model\.visible\)/g,
+    /if \([^)]*n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp \|\| !inst\.model\.drawn\)/g,
   ) ?? []
   assert.equal(writes.length, 2, "both the cast write and castSubjectName skip hidden models")
   assert.doesNotMatch(

@@ -144,7 +144,7 @@ test("a prop keeps physics and outlines, and is not a performer", () => {
   // Every non-stage material gets its hull; the PMX edge flag (or a look's
   // outline) decides whether it draws — a prop is not a stage, so it keeps it.
   assert.match(engine, /const pmxEdge = \(mat\.edgeFlag & 0x10\) !== 0 && mat\.edgeSize > 0\n\s*if \(!inst\.isStage\) \{/, "a prop keeps its outline")
-  assert.match(engine, /if \(n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp \|\| !inst\.model\.visible\) return/, "a prop is not a subject")
+  assert.match(engine, /if \(n >= MAX_EFFECT_SUBJECTS \|\| inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp \|\| !inst\.model\.drawn\) return/, "a prop is not a subject")
   assert.match(engine, /if \(inst\.isStage \|\| inst\.isPlane \|\| inst\.isProp\) continue\n      const p = inst\.model\.getAnimationProgress/, "a prop never seeds the clock")
   const hasStage = engine.slice(engine.indexOf("  hasStage(): boolean {"), engine.indexOf("  groundIsSuppressed()"))
   assert.doesNotMatch(hasStage, /isProp/, "a prop leaves the floor alone")
@@ -157,7 +157,7 @@ test("a prop is part of the cast's silhouette", () => {
   assert.match(seed, /@binding\(2\) var<storage, read> _rzSeedProps: array<u32>/, "the seed pass reads the prop ids")
   assert.match(seed, /if \(rzSeeds\(o, n\)\) \{ covered \+= 1\.0; \}/, "a prop's samples count as coverage")
   const write = engine.slice(engine.indexOf("  private writeCastSeedProps(): void {"), engine.indexOf("  private encodeCastDistance("))
-  assert.match(write, /inst\.isProp && inst\.model\.visible/, "every visible prop seeds")
+  assert.match(write, /inst\.isProp && inst\.model\.drawn/, "every visible prop seeds")
   assert.match(write, /data\[i\+\+\] = inst\.objectId/, "by the id its pixels carry")
   // Before the seed pass, which is now one per target set — the props seed every
   // one of them, because a prop belongs to whoever is holding it and the engine
