@@ -14105,6 +14105,7 @@ export class Engine {
     if (inst.jellyEyes) {
       inst.jellyEyes.strength = clampStrength(options.strength)
       inst.jellyEyes.idle = options.idle ?? true
+      inst.jellyEyes.motion = options.motion ?? true
     }
     else inst.jellyEyes = new JellyEyes(inst.model, options)
     return true
@@ -14112,7 +14113,7 @@ export class Engine {
 
   getModelJellyEyes(modelName: string): Required<JellyEyeOptions> | null {
     const jelly = this.modelInstances.get(modelName)?.jellyEyes
-    return jelly ? { strength: jelly.strength, idle: jelly.idle } : null
+    return jelly ? { strength: jelly.strength, idle: jelly.idle, motion: jelly.motion } : null
   }
 
   getModelCastShadow(modelName: string): boolean {

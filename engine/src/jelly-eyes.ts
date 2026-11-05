@@ -31,6 +31,9 @@ export interface JellyEyeOptions {
   /** The idle taps: a ripple every 4–8 s while nothing else moves them.
    *  Default true; false leaves only what her blinks and motion set off. */
   idle?: boolean
+  /** Whether her head's motion knocks them: a turn, a bob, a step. Default
+   *  true; false leaves only her blinks and the idle taps. */
+  motion?: boolean
 }
 
 // The closing morphs, by the names MMD, VRoid and the usual converters give
@@ -254,6 +257,7 @@ const newState = (): EyeState => ({
 export class JellyEyes {
   strength: number
   idle: boolean
+  motion: boolean
   // Scene time stepped so far, and the idle taps: how many, and when the next.
   private clock = 0
   private taps = 0
@@ -282,6 +286,7 @@ export class JellyEyes {
   constructor(model: Model, options: JellyEyeOptions) {
     this.strength = clampStrength(options.strength)
     this.idle = options.idle ?? true
+    this.motion = options.motion ?? true
     const bones = model.getSkeleton().bones
     const index = (name: string) => bones.findIndex((b) => b.name === name)
     const both = index("両目")
@@ -354,7 +359,8 @@ export class JellyEyes {
       // Only her motion — the head turning and moving (the inertia) — and her
       // blinks do.
       look(head, null, s.look)
-      const knock = seek ? 0 : Math.max(this.tapKnock, Math.tanh(Math.hypot(...this.offset(s, e)) / PULSE_REF))
+      const moved = this.motion ? Math.tanh(Math.hypot(...this.offset(s, e)) / PULSE_REF) : 0
+      const knock = seek ? 0 : Math.max(this.tapKnock, moved)
       const squashTarget = MOTION_SQUASH * knock
       if (seek) {
         // Landing on a pose is no blink: the spring rests where it lands.
