@@ -709,6 +709,9 @@ export type DepthOfFieldOptions = {
    *  dancer stays sharp without anyone touching a slider. "manual" uses
    *  focusDistance/focusRange as given. */
   focusMode: "auto" | "manual"
+  /** The character auto focus tracks, by model name. Null, or a name that is
+   *  not a visible character, falls back to the first visible character. */
+  focusModel: string | null
   /** Camera-space distance to the focus plane (MMD units). */
   focusDistance: number
   /** Depth band that stays perfectly sharp, centered on focusDistance. In auto
@@ -727,6 +730,7 @@ export type DepthOfFieldOptions = {
 export const DEFAULT_DEPTH_OF_FIELD_OPTIONS: DepthOfFieldOptions = {
   enabled: false,
   focusMode: "auto",
+  focusModel: null,
   focusDistance: 25,
   focusRange: 2,
   aperture: 1,
@@ -7711,13 +7715,16 @@ export class Engine {
     return { ...this.depthOfField }
   }
 
-  /** Auto-focus target: the camera-space depth span of the first visible
-   *  character's bones. Focus sits at the span's midpoint; the range covers the
-   *  span plus a margin for what bones don't reach (shoes, hair, cloth). */
+  /** Auto-focus target: the camera-space depth span of the chosen character's
+   *  bones (focusModel), else the first visible character's. Focus sits at the
+   *  span's midpoint; the range covers the span plus a margin for what bones
+   *  don't reach (shoes, hair, cloth). */
   private getModelBodyFocus(): { distance: number; range: number } | null {
     if (!this.camera) return null
     const view = this.camera.getViewMatrix().values
-    for (const inst of this.modelInstances.values()) {
+    const chosen = this.depthOfField.focusModel ? this.modelInstances.get(this.depthOfField.focusModel) : undefined
+    const order = chosen ? [chosen, ...this.modelInstances.values()] : this.modelInstances.values()
+    for (const inst of order) {
       // Neither a stage nor a plane is a performer, so neither is a subject an
       // effect can follow.
       if (!inst.model.drawn || inst.isStage || inst.isPlane || inst.isProp) continue
@@ -11880,6 +11887,9 @@ export class Engine {
     gridLineWidth?: number
     gridLineOpacity?: number
     gridLineColor?: Vec3
+    /** What the grid draws: "lines" (default), or "dots", one on every
+     *  crossing the lines would draw. Same spacing, colour and opacity. */
+    gridPattern?: "lines" | "dots"
     noiseStrength?: number
     /** Whole-ground opacity, 0–1 (multiplies the radial edge fade). Default 1. */
     opacity?: number
@@ -11920,6 +11930,7 @@ export class Engine {
       gridLineWidth: 0.012,
       gridLineOpacity: 0.4,
       gridLineColor: new Vec3(0.85, 0.85, 0.85),
+      gridPattern: "lines" as "lines" | "dots",
       noiseStrength: 0.05,
       opacity: 1.0,
       mirror: false,
@@ -15866,6 +15877,7 @@ export class Engine {
     gridLineWidth: number
     gridLineOpacity: number
     gridLineColor: Vec3
+    gridPattern: "lines" | "dots"
     noiseStrength: number
     opacity: number
     mirror: boolean
@@ -15882,6 +15894,7 @@ export class Engine {
       gridLineWidth,
       gridLineOpacity,
       gridLineColor,
+      gridPattern,
       noiseStrength,
       opacity,
       mirror,
@@ -15901,6 +15914,8 @@ export class Engine {
     gb[3] = fadeStart
     gb[4] = fadeEnd
     gb[5] = shadowStrength
+    // gb[6] — the grid's pattern, 0 lines and 1 dots. Was padding.
+    gb[6] = gridPattern === "dots" ? 1 : 0
     gb[7] = gridSpacing
     gb[8] = gridLineWidth
     gb[9] = gridLineOpacity

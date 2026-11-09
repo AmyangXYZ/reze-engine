@@ -93,7 +93,7 @@ struct Light { direction: vec4f, color: vec4f, };
 struct LightUniforms { ambientColor: vec4f, lights: array<Light, 4>, sh: array<vec4f, 9>, };
 struct GroundShadowMat {
   diffuseColor: vec3f, fadeStart: f32,
-  fadeEnd: f32, shadowStrength: f32, _pad6: f32, gridSpacing: f32,
+  fadeEnd: f32, shadowStrength: f32, gridPattern: f32, gridSpacing: f32,
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, mirror: f32,
   mirrorBlur: f32, _pad17: f32, shadowSoftness: f32, groundY: f32,
@@ -293,10 +293,18 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
   // Grid lines — anti-aliased via screen-space derivatives
   let gridFrac = abs(fract(gp - 0.5) - 0.5);
   let halfLine = material.gridLineWidth * 0.5;
-  let gridLine = 1.0 - min(
+  let lines = 1.0 - min(
     smoothstep(halfLine - gridDeriv.x, halfLine + gridDeriv.x, gridFrac.x),
     smoothstep(halfLine - gridDeriv.y, halfLine + gridDeriv.y, gridFrac.y)
   );
+  // Dots: one round dot on every crossing the lines would draw, its radius
+  // four line widths so the two patterns weigh about the same on the floor.
+  // Anti-aliased by the same derivative, so a far dot fades rather than
+  // shimmers.
+  let dotR = material.gridLineWidth * 4.0;
+  let dotAa = max(gridDeriv.x, gridDeriv.y);
+  let dots = 1.0 - smoothstep(dotR - dotAa, dotR + dotAa, length(gridFrac));
+  let gridLine = select(lines, dots, material.gridPattern > 0.5);
   let sun = rzWorldAmbient(n) + light.lights[0].color.xyz * light.lights[0].color.w * max(dot(n, -light.lights[0].direction.xyz), 0.0);
   // The positional layer reaches the floor too. A stage light that lit the
   // cast and not the ground under her would read as a sticker, which is the
@@ -341,8 +349,12 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
       // reconstruct the reflected image point along the ray from the MIRRORED
       // eye through this fragment. Mirroring across the floor's own plane is a
       // sign flip on y about that height (the forward vector is a direction, so
-      // it flips alone), and the image point's depth below the plane IS the
-      // reflected object's height above it.
+      // it flips alone). From the MIRRORED eye that ray lands on the object
+      // itself, ABOVE the plane — the pass drew view × R, which is the real
+      // object seen from the mirrored camera — so its height is y − floor.
+      // (It read floor − y, the image point's depth below the plane, which is
+      // never positive from this eye: every texel took level 0 and the dial
+      // did nothing.)
       let dims = vec2f(textureDimensions(mirrorDepth));
       let texel = clamp(vec2i(muv * dims), vec2i(0), vec2i(dims) - vec2i(1));
       let z = textureLoad(mirrorDepth, texel, 0);
@@ -353,7 +365,7 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
       let toFrag = i.worldPos - eyeM;
       let dir = toFrag * inverseSqrt(max(dot(toFrag, toFrag), 1e-8));
       let t = viewZ / max(dot(dir, fwdM), 1e-4);
-      let height = max(material.groundY - (eyeM.y + dir.y * t), 0.0);
+      let height = max((eyeM.y + dir.y * t) - material.groundY, 0.0);
       // Full softness by BLUR_SPAN units above the floor — about a character's
       // height. The hardware clamps the level, so the nominal 5.0 needs no
       // knowledge of the real chain length, and blur 0 reads exactly level 0.
@@ -364,7 +376,11 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
     // Still under the received shadow: a polished floor in shade shows a dim
     // reflection, and a mirror that ignored the shadow would glow in it.
     reflShadowed = refl.rgb * (1.0 - dark * 0.65);
-    reflA = textureSampleLevel(mirrorMask, linearSampler, muv, 0.0).g;
+    // THE SAME LEVEL as the colour (the placed mirror's rule, mirror.ts): the
+    // colour is premultiplied by this coverage, so the two are one quantity in
+    // two textures. Coverage read sharp under a blurred colour is a reflection
+    // that darkens as the dial comes up, from the first level that spreads.
+    reflA = textureSampleLevel(mirrorMask, linearSampler, muv, lod).g;
   }
   // THREE LAYERS, composited premultiplied, bottom to top: the shadow the
   // catcher receives, the ground surface, and the grid.
@@ -374,7 +390,16 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
   // with it — you could not have a bare grid over a photo, which is most of
   // what a grid is for. It is its own layer now: the ground plane keeps an
   // alpha, and the grid is simply on or off.
-  let surfA = edgeFade * material.opacity;
+  // FRESNEL over the reflection. A real polished floor is mostly its own
+  // colour looking straight down and nearly a mirror toward the horizon
+  // (Schlick's falloff, (1 - cos)^5), so where the mirror has something to
+  // show, the surface thins as the view grazes. Opacity is therefore the
+  // floor's coverage LOOKING STRAIGHT DOWN. Where nothing reflected, and with
+  // the mirror off, the surface is untouched: the far floor does not dissolve
+  // into an empty target.
+  let viewCos = clamp(dot(n, normalize(camera.viewPos - i.worldPos)), 0.0, 1.0);
+  let fresnel = pow(1.0 - viewCos, 5.0);
+  let surfA = edgeFade * material.opacity * (1.0 - fresnel * material.mirror * reflA);
   let gridA = gridLine * material.gridLineOpacity * edgeFade;
   // The mirror covers only what it actually REFLECTS. The backdrop no longer
   // rides in the reflection target — it clears transparent — so the floor keeps
@@ -392,7 +417,11 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
   // ground surface, grid. Each with its own coverage, none scaling another —
   // ground opacity REVEALS the mirror rather than the mirror carrying a
   // strength of its own.
-  var pm = reflShadowed * mirrA;
+  // reflShadowed is ALREADY premultiplied by its coverage (reflA): the HDR
+  // target stores colour weighted by its own alpha. So the layer's colour takes
+  // the mirror's switch and the fade, not reflA a second time — that squared
+  // coverage dimmed every edge, and every pixel once the blur spread it.
+  var pm = reflShadowed * material.mirror * edgeFade;
   var cov = mirrA;
   // Shadow catcher over the reflection-or-nothing: black, it covers.
   pm = pm * (1.0 - catchA);

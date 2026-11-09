@@ -62,8 +62,10 @@ test("the shader reflects across the floor's plane, not across zero", () => {
   // and still flips alone.
   assert.match(ground, /let eyeM = vec3f\(camera\.viewPos\.x, 2\.0 \* material\.groundY - camera\.viewPos\.y, camera\.viewPos\.z\);/)
   assert.match(ground, /let fwdM = vec3f\(fwd\.x, -fwd\.y, fwd\.z\);/)
-  // Height above the plane, measured from the plane.
-  assert.match(ground, /let height = max\(material\.groundY - \(eyeM\.y \+ dir\.y \* t\), 0\.0\);/)
+  // Height above the plane, measured from the plane. From the MIRRORED eye the
+  // ray lands on the object itself, above the plane, so it is y - floor; the
+  // other order is never positive and left every texel at level 0.
+  assert.match(ground, /let height = max\(\(eyeM\.y \+ dir\.y \* t\) - material\.groundY, 0\.0\);/)
 })
 
 test("the floor's height reaches the uniform the shader reads", () => {
