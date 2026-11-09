@@ -96,7 +96,7 @@ struct GroundShadowMat {
   fadeEnd: f32, shadowStrength: f32, gridPattern: f32, gridSpacing: f32,
   gridLineWidth: f32, gridLineOpacity: f32, noiseStrength: f32, opacity: f32,
   gridLineColor: vec3f, mirror: f32,
-  mirrorBlur: f32, _pad17: f32, shadowSoftness: f32, groundY: f32,
+  mirrorBlur: f32, mirrorReflectivity: f32, shadowSoftness: f32, groundY: f32,
   // Every shadow caster in one sphere, refreshed per frame. w = radius; 0 means
   // nothing casts, negative means "do not use this" (a rigid caster has no
   // sphere, so a scene with a stage keeps the taps). See rzShadowPossible.
@@ -390,47 +390,46 @@ ${pcfWgsl("shadowAtlas", "suv", `${1 / SHADOW_ATLAS_SIZE}`, "compareZ", "acc", "
   // with it — you could not have a bare grid over a photo, which is most of
   // what a grid is for. It is its own layer now: the ground plane keeps an
   // alpha, and the grid is simply on or off.
-  // FRESNEL over the reflection. A real polished floor is mostly its own
-  // colour looking straight down and nearly a mirror toward the horizon
-  // (Schlick's falloff, (1 - cos)^5), so where the mirror has something to
-  // show, the surface thins as the view grazes. Opacity is therefore the
-  // floor's coverage LOOKING STRAIGHT DOWN. Where nothing reflected, and with
-  // the mirror off, the surface is untouched: the far floor does not dissolve
-  // into an empty target.
+  // REFLECTION IS NOT TRANSPARENCY. A solid glossy floor reflects: its colour
+  // and its reflection ADD, in a share set by the material and the angle, and
+  // how see-through the floor is has nothing to do with it. So the two are two
+  // dials. Opacity is the surface's coverage, for compositing over a photo or a
+  // key. Reflectivity is Schlick's F0, the share reflected looking straight
+  // down; Fresnel takes it toward 1 as the view grazes, (1 - cos)^5. 1 is a true
+  // mirror at every angle.
   let viewCos = clamp(dot(n, normalize(camera.viewPos - i.worldPos)), 0.0, 1.0);
-  let fresnel = pow(1.0 - viewCos, 5.0);
-  let surfA = edgeFade * material.opacity * (1.0 - fresnel * material.mirror * reflA);
+  let f0 = clamp(material.mirrorReflectivity, 0.0, 1.0);
+  let fresnel = f0 + (1.0 - f0) * pow(1.0 - viewCos, 5.0);
+  let surfA = edgeFade * material.opacity;
   let gridA = gridLine * material.gridLineOpacity * edgeFade;
-  // The mirror covers only what it actually REFLECTS. The backdrop no longer
-  // rides in the reflection target — it clears transparent — so the floor keeps
-  // its own colour everywhere the cast is not standing, which is the difference
-  // between an MMD stage floor and a mirror of the sky.
-  let mirrA = material.mirror * edgeFade * reflA;
+  // The mirror covers only what it actually REFLECTS. The backdrop does not
+  // ride in the reflection target (it clears transparent), so the floor keeps
+  // its own colour everywhere the cast is not standing: an MMD stage floor,
+  // not a mirror of the sky.
+  let mirrA = material.mirror * edgeFade * reflA * fresnel;
   // As opacity drops the received shadow becomes a translucent dark layer
   // (Blender's Shadow Catcher), so models still feel grounded on a photo or a
-  // 360 backdrop. Colourless by construction: it darkens by covering. The
-  // MIRROR subsumes it: the reflection already carries the received shadow,
-  // and a catcher stacked on top would darken the same shadow twice.
-  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity) * (1.0 - mirrA);
+  // 360 backdrop. Colourless by construction: it darkens by covering. Where the
+  // reflection lies over it, the reflection's own shadow shows instead.
+  let catchA = dark * 0.65 * edgeFade * (1.0 - material.opacity);
 
-  // FOUR LAYERS, premultiplied, bottom to top: reflection, received shadow,
-  // ground surface, grid. Each with its own coverage, none scaling another —
-  // ground opacity REVEALS the mirror rather than the mirror carrying a
-  // strength of its own.
-  // reflShadowed is ALREADY premultiplied by its coverage (reflA): the HDR
-  // target stores colour weighted by its own alpha. So the layer's colour takes
-  // the mirror's switch and the fade, not reflA a second time — that squared
-  // coverage dimmed every edge, and every pixel once the blur spread it.
-  var pm = reflShadowed * material.mirror * edgeFade;
-  var cov = mirrA;
-  // Shadow catcher over the reflection-or-nothing: black, it covers.
-  pm = pm * (1.0 - catchA);
-  cov = catchA + cov * (1.0 - catchA);
+  // FOUR LAYERS, premultiplied, bottom to top: received shadow, ground
+  // surface, reflection, grid. The reflection over the surface is the energy
+  // split itself: what the floor reflects it does not diffuse, so the surface
+  // under it keeps (1 - F) of itself, and a floor at opacity 0 still mirrors,
+  // the way glass does.
+  var pm = vec3f(0.0);
+  var cov = catchA;
   // Surface over shadow.
   pm = baseColor * surfA + pm * (1.0 - surfA);
   cov = surfA + cov * (1.0 - surfA);
-  // Grid over surface. Unshadowed, as it has always been — a painted line reads
-  // as paint, and darkening it was never what the mix did either.
+  // Reflection over the surface. reflShadowed is ALREADY premultiplied by its
+  // coverage (reflA): the HDR target stores colour weighted by its own alpha,
+  // so it takes the switch, the fade and Fresnel, never reflA a second time.
+  pm = reflShadowed * (material.mirror * edgeFade * fresnel) + pm * (1.0 - mirrA);
+  cov = mirrA + cov * (1.0 - mirrA);
+  // Grid over everything. Unshadowed, as it has always been: a painted line
+  // reads as paint.
   pm = material.gridLineColor * gridA + pm * (1.0 - gridA);
   cov = gridA + cov * (1.0 - gridA);
 

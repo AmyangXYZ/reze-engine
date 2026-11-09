@@ -11900,6 +11900,11 @@ export class Engine {
     /** Mirror softness, 0–1: 0 a polished mirror, 1 the softest blur level,
      *  scaled by how far the reflected geometry sits behind the surface. */
     mirrorBlur?: number
+    /** How much the mirror reflects looking straight down, 0–1 (Schlick's F0);
+     *  Fresnel takes it toward 1 as the view grazes. 1 (default) is a true
+     *  mirror. Independent of `opacity`, which is only how see-through the
+     *  floor is: the reflection lies OVER the floor's colour. */
+    mirrorReflectivity?: number
     /** How soft the received shadow's edge is, 0–1. 0 (default) is the sharp
      *  kernel this has always used, to the bit; 1 spreads the taps fourteen
      *  times as wide, which is the edge an overcast sky throws.
@@ -11935,6 +11940,7 @@ export class Engine {
       opacity: 1.0,
       mirror: false,
       mirrorBlur: 0,
+      mirrorReflectivity: 1,
       shadowSoftness: 0,
       ...options,
     }
@@ -15882,6 +15888,7 @@ export class Engine {
     opacity: number
     mirror: boolean
     mirrorBlur: number
+    mirrorReflectivity: number
     shadowSoftness: number
   }) {
     const {
@@ -15899,6 +15906,7 @@ export class Engine {
       opacity,
       mirror,
       mirrorBlur,
+      mirrorReflectivity,
       shadowSoftness,
     } = opts
     // Shadow map is already created in setupPipelines()
@@ -15928,6 +15936,8 @@ export class Engine {
     this.groundMirror = gb[15]
     gb[16] = Math.min(Math.max(mirrorBlur, 0), 1)
     this.groundMirrorBlur = gb[16]
+    // gb[17] — reflectivity, the mirror's F0. Was padding.
+    gb[17] = Math.min(Math.max(mirrorReflectivity, 0), 1)
     // gb[18] — shadow edge softness. Was padding; the shader reads it as the
     // Vogel disk's radius, and 0 takes the sharp nine-tap path unchanged.
     gb[18] = Math.min(Math.max(shadowSoftness, 0), 1)
