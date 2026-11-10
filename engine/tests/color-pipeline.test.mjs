@@ -311,7 +311,7 @@ test("the outline's struct describes the buffer that is actually bound", () => {
   )
   // Written through the shared constant, never a literal — the two ends cannot
   // drift if only one of them names the number.
-  assert.match(engine, /writeBuffer\(buffer, RZ_OUTLINE_DISSOLVE_OFFSET, one\)/)
+  assert.match(engine, /writeBuffer\(hull\.buffer, RZ_OUTLINE_DISSOLVE_OFFSET, one\)/)
   assert.match(engine, /writeBuffer\(buffer, RZ_OUTLINE_WIDTH_OFFSET, one\)/)
   assert.match(engine, /writeBuffer\(buffer, RZ_OUTLINE_COLOR_OFFSET, data\)/)
   assert.match(engine, /inst\.outlineUniformBuffers\.push\(outlineUniformBuffer\)/)

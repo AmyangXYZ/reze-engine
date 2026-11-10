@@ -110,6 +110,7 @@ export {
   DIRECTIVE_NOTE,
   type EffectDirectives,
   type EffectParamDecl,
+  type EffectParamOption,
 } from "./shaders/directives"
 export {
   Model,

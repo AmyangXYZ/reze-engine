@@ -52,15 +52,34 @@
  */
 export type EffectAnchor = { bone: string; trail: boolean; along?: number; step?: number }
 
-/** A knob an effect exposes, for a host to build a control from. */
+/** One choice of an `enum` dial: its id, and a Chinese label after a `|`. */
+export type EffectParamOption = { id: string; labelZh?: string }
+
+/**
+ * A knob an effect exposes, for a host to build a control from.
+ *
+ * `bool` and `enum` are one f32 in the shader like `float`: a switch reads 0 or
+ * 1, a choice reads its option's index. They differ only in the control a host
+ * draws — a switch, a list — which is the whole reason to declare them: a
+ * slider from 0 to 3 that means "rain, dots, circuit, grid" is a dial nobody
+ * can read.
+ *
+ * `label`/`labelZh` come from a note written `— English | 中文`. A note without
+ * the `|` is only a note, as it always was.
+ */
 export type EffectParamDecl = {
   name: string
-  kind: "float" | "color" | "vec3"
-  /** Numbers for float/vec3; `#rrggbb` for a colour, which the host converts. */
+  kind: "float" | "color" | "vec3" | "bool" | "enum"
+  /** Numbers for float/vec3, 0 or 1 for bool, the option's index for enum;
+   *  `#rrggbb` for a colour, which the host converts. */
   value: number | [number, number, number] | string
   /** float only, and only when the author gave a range. */
   min?: number
   max?: number
+  /** enum only: the choices, in index order. */
+  options?: EffectParamOption[]
+  label?: string
+  labelZh?: string
 }
 
 export type EffectDirectives = {
@@ -196,6 +215,22 @@ const LINE = DIRECTIVE_LINE
  */
 export const DIRECTIVE_NOTE = /(?:^|\s)(?:—|--|\/\/|#)\s/
 
+/** The note after the arguments, or "" — see DIRECTIVE_NOTE. */
+function noteOf(rest: string): string {
+  const m = DIRECTIVE_NOTE.exec(rest)
+  return m ? rest.slice(m.index + m[0].length).trim() : ""
+}
+
+/** A dial's labels from its note, when the note is written `English | 中文`. */
+function labelsOf(rest: string): { label?: string; labelZh?: string } {
+  const note = noteOf(rest)
+  const bar = note.indexOf("|")
+  if (bar < 0) return {}
+  const label = note.slice(0, bar).trim()
+  const labelZh = note.slice(bar + 1).trim()
+  return { ...(label ? { label } : {}), ...(labelZh ? { labelZh } : {}) }
+}
+
 function argsOf(rest: string): string[] {
   // `^` as well as `\s`: the tag's own trailing space is eaten by LINE, so a
   // note can begin at the very first character — which is what
@@ -304,12 +339,46 @@ export function parseDirectives(wgsl: string): DirectiveResult {
           errors.push(`${at}: #param needs a WGSL identifier for a name`)
           return
         }
+        const labels = labelsOf(m[2])
+        if (kind === "bool") {
+          const v = rest[0]?.toLowerCase()
+          const on = v === "true" || v === "1" || v === "on"
+          const off = v === "false" || v === "0" || v === "off"
+          if (rest.length !== 1 || (!on && !off)) {
+            errors.push(`${at}: #param bool ${name} needs a default, true or false`)
+            return
+          }
+          d.params.push({ name, kind: "bool", value: on ? 1 : 0, ...labels })
+          return
+        }
+        if (kind === "enum") {
+          // Each choice is `id` or `id|中文`; a leading `*` marks the default,
+          // else the first is.
+          const options: EffectParamOption[] = []
+          let value = 0
+          for (const raw of rest) {
+            const star = raw.startsWith("*")
+            const [id, zh] = (star ? raw.slice(1) : raw).split("|")
+            if (!id) {
+              errors.push(`${at}: #param enum ${name} has an empty choice`)
+              return
+            }
+            if (star) value = options.length
+            options.push({ id, ...(zh ? { labelZh: zh } : {}) })
+          }
+          if (options.length < 2) {
+            errors.push(`${at}: #param enum ${name} needs at least two choices, like "rain|数字雨 dots|点阵"`)
+            return
+          }
+          d.params.push({ name, kind: "enum", value, options, ...labels })
+          return
+        }
         if (kind === "color") {
           if (!/^#[0-9a-fA-F]{6}$/.test(rest[0] ?? "")) {
             errors.push(`${at}: #param color ${name} needs a default like #3b82f6`)
             return
           }
-          d.params.push({ name, kind: "color", value: rest[0] })
+          d.params.push({ name, kind: "color", value: rest[0], ...labels })
           return
         }
         if (kind === "vec3") {
@@ -318,7 +387,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
             errors.push(`${at}: #param vec3 ${name} needs three numbers`)
             return
           }
-          d.params.push({ name, kind: "vec3", value: v as [number, number, number] })
+          d.params.push({ name, kind: "vec3", value: v as [number, number, number], ...labels })
           return
         }
         if (kind === "float") {
@@ -335,10 +404,10 @@ export function parseDirectives(wgsl: string): DirectiveResult {
             errors.push(`${at}: #param float ${name} takes both a min and a max, or neither`)
             return
           }
-          d.params.push({ name, kind: "float", value: v, ...(lo !== null && hi !== null ? { min: lo, max: hi } : {}) })
+          d.params.push({ name, kind: "float", value: v, ...(lo !== null && hi !== null ? { min: lo, max: hi } : {}), ...labels })
           return
         }
-        errors.push(`${at}: #param kind must be float, color or vec3`)
+        errors.push(`${at}: #param kind must be float, color, vec3, bool or enum`)
         return
       }
       case "halfres":

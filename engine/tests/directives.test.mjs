@@ -54,7 +54,7 @@ test("wrong arity is named, with its line", () => {
     ["#param float D 1 0\n", /both a min and a max/],
     ["#param color C red\n", /like #3b82f6/],
     ["#param vec3 W 0 1\n", /three numbers/],
-    ["#param bool B 1\n", /float, color or vec3/],
+    ["#param int B 1\n", /float, color, vec3, bool or enum/],
   ]) {
     const r = parseDirectives(src)
     assert.equal(r.errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
@@ -195,4 +195,27 @@ test("ribbons stay additive unless the file says #blend over", () => {
   const d = ok("#blend over\n")
   assert.equal(d.trailBlend, "over")
   assert.equal(d.particleBlend, "alpha")
+})
+
+test("a switch and a list are dials too, one f32 each", () => {
+  // A switch reads 0 or 1; a list reads its choice's index, the starred one
+  // first, else the first. Both stay plain numbers in the shader.
+  const d = ok("#param bool RING true — angel ring | 天使环\n#param enum PATTERN rain|数字雨 *dots|点阵 grid\n")
+  assert.deepEqual(d.params[0], { name: "RING", kind: "bool", value: 1, label: "angel ring", labelZh: "天使环" })
+  assert.equal(d.params[1].kind, "enum")
+  assert.equal(d.params[1].value, 1)
+  assert.deepEqual(d.params[1].options, [{ id: "rain", labelZh: "数字雨" }, { id: "dots", labelZh: "点阵" }, { id: "grid" }])
+  assert.equal(ok("#param bool OFF false\n").params[0].value, 0)
+  for (const src of ["#param bool A\n", "#param bool A maybe\n", "#param enum B only\n"]) {
+    assert.equal(parseDirectives(src).errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
+  }
+})
+
+test("a note is a label only when it is written English | 中文", () => {
+  // Shipped effects carry long notes on their dials; those stay notes.
+  const plain = ok("#param float WIDTH 3 1 30 — line thickness, pixels of a 1440-line frame\n").params[0]
+  assert.equal(plain.label, undefined)
+  const both = ok("#param float SPEED 1 0 4 — speed | 速度\n").params[0]
+  assert.equal(both.label, "speed")
+  assert.equal(both.labelZh, "速度")
 })

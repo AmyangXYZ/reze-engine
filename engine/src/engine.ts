@@ -1049,6 +1049,17 @@ interface ModelInstance {
    *  writes ONE float into each of them and needs no other reason to hold a
    *  block: the whole 16-float copy exists only for materials that morph. */
   materialUniformBuffers: GPUBuffer[]
+  /** The material each of `materialUniformBuffers` belongs to, by index. Names,
+   *  not PMX indices: a material with no faces draws nothing and has no buffer,
+   *  so the two lists do not line up with the PMX's own. */
+  materialNames: string[]
+  /** How much of each named material is still there, as setMaterialDissolve
+   *  last asked. Absent = whole. A material wears the lower of this and the
+   *  model's own `dissolve`. */
+  materialDissolve: Map<string, number>
+  /** What each material buffer was last written, so a frame that changes
+   *  nothing writes nothing. */
+  dissolveWritten: number[]
   /** The outline hulls' own uniforms, for the materials that have them.
    *
    *  A SEPARATE LIST because they are a separate buffer: the hull pass binds 32
@@ -5662,7 +5673,7 @@ export class Engine {
       // KIND comes from the declaration, never from the runtime type of the
       // value: a caller handing a number to a colour must not silently turn a
       // vec3f field into an f32 and shift every field after it.
-      const isVec = p.kind !== "float"
+      const isVec = p.kind === "color" || p.kind === "vec3"
       const align = isVec ? 16 : 4
       const offset = Math.ceil(cursor / align) * align
       layout.set(p.name, { offset: offset / 4, comps: isVec ? 3 : 1 })
@@ -15629,6 +15640,9 @@ export class Engine {
       objectId: (this.lastObjectId = this.lastObjectId >= GROUND_OBJECT_ID - 1 ? 1 : this.lastObjectId + 1),
       dissolve: 1,
       materialUniformBuffers: [],
+      materialNames: [],
+      materialDissolve: new Map(),
+      dissolveWritten: [],
       outlineUniformBuffers: [],
       outlineByMaterial: new Map(),
       cullModelIndex: 0,
@@ -16243,6 +16257,8 @@ export class Engine {
       )
       inst.gpuBuffers.push(materialUniformBuffer)
       inst.materialUniformBuffers.push(materialUniformBuffer)
+      inst.materialNames.push(mat.name)
+      inst.dissolveWritten.push(1)
       if (morphedMaterials.has(pmxMaterialIndex)) {
         const base = this.materialUniformData(mat, sphereMode, headBoneIndex, materialId, modelId)
         morphTargets.push({
@@ -18540,31 +18556,75 @@ export class Engine {
     const v = Math.min(1, Math.max(0, value))
     if (inst.dissolve === v) return true
     inst.dissolve = v
-    // Offset 60: the sixteenth float of MaterialUniforms. One four-byte write
-    // per material rather than the whole block — the block only exists as a
-    // copy for materials that morph.
-    const one = new Float32Array([v])
-    for (const buffer of inst.materialUniformBuffers) {
-      this.device.queue.writeBuffer(buffer, 60, one)
+    this.writeDissolve(inst)
+    return true
+  }
+
+  /**
+   * Take some of one model's MATERIALS apart: the stockings, the jacket, a hat
+   * — by material name, 1 whole, 0 gone. The same dissolve the whole model
+   * comes apart by (setModelDissolve), with the same burning front, honoured by
+   * the colour pass, the depth prepass, the shadow map and the outline; it is
+   * only narrowed to the materials named. Each replaces the last set: a name
+   * left out is whole again, and null makes them all whole.
+   *
+   * A material wears the lower of this and the model's own dissolve, so a
+   * model coming apart takes these with it.
+   */
+  setMaterialDissolve(modelName: string, values: Readonly<Record<string, number>> | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    const next = new Map<string, number>()
+    if (values) {
+      for (const [name, value] of Object.entries(values)) {
+        const v = Math.min(1, Math.max(0, Number.isFinite(value) ? value : 1))
+        if (v < 1) next.set(name, v)
+      }
     }
-    // And the hulls, which bind their own 32 bytes of edge data rather than the
-    // material block — so this is a different buffer at a different offset, and
-    // missing it left a dissolved character standing in her own outline.
-    for (const buffer of inst.outlineUniformBuffers) {
-      this.device.queue.writeBuffer(buffer, RZ_OUTLINE_DISSOLVE_OFFSET, one)
+    inst.materialDissolve = next
+    this.writeDissolve(inst)
+    return true
+  }
+
+  /** What setMaterialDissolve last set for one material, 1 when whole. */
+  getMaterialDissolve(modelName: string, materialName: string): number {
+    return this.modelInstances.get(modelName)?.materialDissolve.get(materialName) ?? 1
+  }
+
+  /**
+   * Each material's dissolve into its buffers: the lower of the model's and its
+   * own. Only buffers whose value moved are written.
+   *
+   * Offset 60 is the sixteenth float of MaterialUniforms, which the colour pass,
+   * the depth prepass and the shadow map all bind. The hulls bind their own 32
+   * bytes of edge data, so they are a different buffer at a different offset —
+   * missing them left a dissolved character standing in her own outline.
+   */
+  private writeDissolve(inst: ModelInstance): void {
+    const one = new Float32Array(1)
+    let moved = false
+    for (let i = 0; i < inst.materialNames.length; i++) {
+      const name = inst.materialNames[i]
+      const v = Math.min(inst.dissolve, inst.materialDissolve.get(name) ?? 1)
+      if (inst.dissolveWritten[i] === v) continue
+      inst.dissolveWritten[i] = v
+      moved = true
+      one[0] = v
+      this.device.queue.writeBuffer(inst.materialUniformBuffers[i], 60, one)
+      const hull = inst.outlineByMaterial.get(name)
+      if (hull) this.device.queue.writeBuffer(hull.buffer, RZ_OUTLINE_DISSOLVE_OFFSET, one)
     }
     // The morph path rebuilds a material's block from its `base` copy and
     // uploads it whole, which would put the old value straight back. Patching
     // `base` is what keeps a face that is morphing while she dissolves from
     // coming back solid for those frames; `last` is cleared so the next
     // comparison genuinely re-uploads rather than deciding nothing moved.
-    if (inst.materialMorphTargets) {
+    if (moved && inst.materialMorphTargets) {
       for (const t of inst.materialMorphTargets) {
-        t.base[15] = v
+        t.base[15] = Math.min(inst.dissolve, inst.materialDissolve.get(t.materialName) ?? 1)
         t.last[15] = Number.NaN
       }
     }
-    return true
   }
 
   /**
