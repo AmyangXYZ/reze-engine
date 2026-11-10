@@ -127,7 +127,7 @@ test("an unscheduled effect keeps what a caller set", () => {
   const src = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
   const from = src.indexOf("private evaluateEffectSchedules")
   const fn = src.slice(from, src.indexOf("\n  }", from))
-  assert.match(fn, /if \(!fx\.window \|\| fx\.window\.length === 0\) \{\s*fx\.weight = fx\.influence\s*continue/)
+  assert.match(fn, /if \(!fx\.window \|\| fx\.window\.length === 0\) \{\s*fx\.weight = level\s*continue/)
 })
 
 import { readFileSync } from "node:fs"
@@ -206,7 +206,7 @@ test("strips are evaluated against the TRANSPORT, never engine uptime", () => {
   const from = src.indexOf("private evaluateEffectSchedules")
   const fn = src.slice(from, src.indexOf("\n  }", from))
   assert.match(fn, /const transport = this\.transportTime\(\)/)
-  assert.match(fn, /effectState\(fx\.window, fx\.influence, transport\)/)
+  assert.match(fn, /effectState\(fx\.window, level, transport\)/)
   // The epoch is still expressed against sceneClock, deliberately: the mounts
   // integrate on a smooth monotonic clock, and what changes is the VALUE handed
   // to them, not the clock they run on.

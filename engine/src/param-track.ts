@@ -1,3 +1,5 @@
+import { bezierInterpolate } from "./animation"
+
 /**
  * A material parameter over time.
  *
@@ -26,10 +28,20 @@
 /** A parameter value: a scalar, or a vector for the vec3 params. */
 export type ParamValue = number | [number, number, number]
 
+/** How the way INTO a key runs: straight, eased in and out, or held at the
+ *  previous key's value and stepped on arrival. Absent is linear. */
+export type ParamEase = "linear" | "ease" | "hold"
+
 export type ParamKey = {
   /** Seconds on the SCENE clock — the same clock an export steps. */
   t: number
   v: ParamValue
+  /** The segment from the previous key to this one — VMD's rule, where a key
+   *  carries the curve that arrives at it. */
+  e?: ParamEase
+  /** That segment as a bezier — x1, y1, x2, y2 in 0..1, VMD's own curve — in
+   *  place of `e` when it is not a hold. */
+  b?: [number, number, number, number]
 }
 
 const lerp = (a: number, b: number, k: number): number => a + (b - a) * k
@@ -65,7 +77,15 @@ export function sampleParamTrack(keys: ParamKey[], t: number): ParamValue | null
   // Two keys at the same instant are a STEP, and the later one wins. Dividing
   // by the zero span would be a NaN written into a uniform every frame.
   if (span <= 0) return b.v
-  const k = (t - a.t) / span
+  if (b.e === "hold") return a.v
+  const u = (t - a.t) / span
+  // Smoothstep: no jump in speed at either key, which is what makes a dial
+  // that eases between two values read as a move rather than as a ramp.
+  const k = b.b
+    ? bezierInterpolate(b.b[0], b.b[2], b.b[1], b.b[3], u)
+    : b.e === "ease"
+      ? u * u * (3 - 2 * u)
+      : u
   if (typeof a.v === "number" && typeof b.v === "number") return lerp(a.v, b.v, k)
   // Mixed scalar and vector keys are an authoring mistake, not something to
   // guess at: hold the segment's start rather than inventing a conversion.

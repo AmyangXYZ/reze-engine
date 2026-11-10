@@ -54,7 +54,7 @@ test("wrong arity is named, with its line", () => {
     ["#param float D 1 0\n", /both a min and a max/],
     ["#param color C red\n", /like #3b82f6/],
     ["#param vec3 W 0 1\n", /three numbers/],
-    ["#param int B 1\n", /float, color, vec3, bool or enum/],
+    ["#param list B 1\n", /float, int, color, vec3, point, bone, bool or enum/],
   ]) {
     const r = parseDirectives(src)
     assert.equal(r.errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
@@ -218,4 +218,14 @@ test("a note is a label only when it is written English | 中文", () => {
   const both = ok("#param float SPEED 1 0 4 — speed | 速度\n").params[0]
   assert.equal(both.label, "speed")
   assert.equal(both.labelZh, "速度")
+})
+
+test("a whole number, a place and a bone are dials too", () => {
+  const d = ok("#param int COUNT 6 1 12 — chains | 链条数\n#param point AT 0 10 -2\n#param bone FROM 右手首\n").params
+  assert.deepEqual(d[0], { name: "COUNT", kind: "int", value: 6, min: 1, max: 12, label: "chains", labelZh: "链条数" })
+  assert.deepEqual(d[1], { name: "AT", kind: "point", value: [0, 10, -2] })
+  assert.deepEqual(d[2], { name: "FROM", kind: "bone", value: "右手首" })
+  for (const src of ["#param int N 1.5\n", "#param int N 2 1\n", "#param point P 0 1\n", "#param bone B\n", "#param bone B 左 右\n"]) {
+    assert.equal(parseDirectives(src).errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
+  }
 })

@@ -128,3 +128,36 @@ test("a track that failed to write tries again", () => {
   const body = engine.slice(at, engine.indexOf("\n  }", at))
   assert.match(body, /if \(this\.setStyleParam\([^)]*\)\) track\.last = v/, "last must be recorded only on a successful write")
 })
+
+test("a key's ease shapes the way into it; hold steps", () => {
+  // Hold: the previous value until this key, then this one.
+  const held = [{ t: 0, v: 0 }, { t: 2, v: 10, e: "hold" }]
+  assert.equal(sampleParamTrack(held, 1.99), 0)
+  assert.equal(sampleParamTrack(held, 2), 10)
+  // Ease: smoothstep — the middle is still the middle, the ends move slower.
+  const eased = [{ t: 0, v: 0 }, { t: 2, v: 10, e: "ease" }]
+  assert.equal(sampleParamTrack(eased, 1), 5)
+  assert.ok(sampleParamTrack(eased, 0.5) < 2.5, "slower than linear leaving the first key")
+  // Absent is linear, as every material track was written.
+  assert.equal(sampleParamTrack([K(0, 0), K(2, 10)], 0.5), 2.5)
+})
+
+test("a key's bezier shapes the way into it, as a VMD curve does", () => {
+  // A straight bezier is linear; an ease-in holds back early.
+  const straight = [{ t: 0, v: 0 }, { t: 1, v: 10, b: [0.25, 0.25, 0.75, 0.75] }]
+  assert.ok(Math.abs(sampleParamTrack(straight, 0.5) - 5) < 0.05)
+  const easeIn = [{ t: 0, v: 0 }, { t: 1, v: 10, b: [0.5, 0, 1, 1] }]
+  assert.ok(sampleParamTrack(easeIn, 0.25) < 2.5)
+  // A hold wins over a curve on the same key.
+  assert.equal(sampleParamTrack([{ t: 0, v: 0 }, { t: 1, v: 10, e: "hold", b: [0.5, 0, 1, 1] }], 0.9), 0)
+})
+
+test("an effect's keyed influence is the level its strips ramp toward", () => {
+  // A fade is keys on the influence, sampled on the transport: the schedule
+  // must read the track's level, with and without strips, never the plain one.
+  const at = engine.indexOf("private evaluateEffectSchedules()")
+  const body = engine.slice(at, engine.indexOf("\n  }\n", at))
+  assert.match(body, /sampleParamTrack\(fx\.influenceTrack, transport\)/)
+  assert.match(body, /fx\.weight = level/)
+  assert.match(body, /effectState\(fx\.window, level, transport\)/)
+})

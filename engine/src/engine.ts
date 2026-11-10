@@ -611,7 +611,31 @@ type SunOptions = {
 /** An effect param: number → f32, vector-like → vec3f (see setEffect).
  *  Structural {x,y,z} rather than the Vec3 class so JSON-derived values (a
  *  shared scene document's params) pass straight in. */
-export type EffectParamValue = number | { x: number; y: number; z: number }
+export type EffectParamValue = number | { x: number; y: number; z: number } | EffectPointValue | EffectBoneValue
+
+/** A `point` dial: a world position, or — with `model` — an offset from where
+ *  that character stands, so the point travels with her. */
+export type EffectPointValue = { x: number; y: number; z: number; model?: string | null }
+
+/** A `bone` dial: a bone by name, on `model`, or on the effect's first
+ *  character when it names none. */
+export type EffectBoneValue = { bone: string; model?: string | null }
+
+/** One key of a dial's track. `time` is seconds on the transport — the clock an
+ *  effect's strips run on. `ease` shapes the way to the NEXT key; switches,
+ *  lists and bones always hold, whatever it says. */
+export type EffectParamKey = {
+  time: number
+  value: EffectParamValue
+  ease?: "linear" | "ease" | "hold"
+  /** The way INTO this key from the previous one, as a bezier — x1, y1, x2, y2
+   *  in 0..1, the curve a VMD key carries. `ease` is that segment too.
+   *  Ignored by a hold, and by dials that always hold. */
+  curve?: [number, number, number, number]
+}
+
+const isBoneValue = (v: EffectParamValue | undefined): v is EffectBoneValue =>
+  typeof v === "object" && v !== null && "bone" in v
 
 /** A vector by shape rather than by class — Vec3 satisfies it, and so does a
  *  JSON object out of a scene document or a literal typed into a console. */
@@ -1633,7 +1657,8 @@ const TEXTURE_EXTENSION_GUESSES = [".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dd
  * darken every authored colour by the transfer curve twice.
  */
 function paramValue(p: EffectParamDecl, given: EffectParamValue | undefined): EffectParamValue {
-  if (given !== undefined) return given
+  if (p.kind === "bone") return isBoneValue(given) ? given : { bone: typeof p.value === "string" ? p.value : "", model: null }
+  if (given !== undefined) return p.kind === "int" && typeof given === "number" ? Math.round(given) : given
   if (p.kind === "color" && typeof p.value === "string") {
     const n = parseInt(p.value.slice(1), 16)
     return { x: ((n >> 16) & 255) / 255, y: ((n >> 8) & 255) / 255, z: (n & 255) / 255 }
@@ -1864,6 +1889,12 @@ interface EffectInstance {
   paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
   paramsBuffer: GPUBuffer | null
   paramsData: Float32Array<ArrayBuffer>
+  /** The dials the engine resolves every frame rather than once: each bone
+   *  dial's bone and character, and each point dial set to follow one. */
+  paramBindings: Map<string, EffectBoneValue | EffectPointValue>
+  /** Dials driven by keys, by name — see setEffectParamTrack. Bone keys index
+   *  `bones`, since the sampler carries numbers. */
+  paramTracks: Map<string, { keys: ParamKey[]; bones: EffectBoneValue[]; last: ParamValue | null }>
   /** This effect IS a mirror — see the `#mirror` directive. Draws no shader;
    *  the engine reads its dials and folds the scene through the plane. */
   hasMirror: boolean
@@ -1930,6 +1961,9 @@ interface EffectInstance {
    * permanently half-strength effect and a scheduled one are the same dial.
    */
   influence: number
+  /** `influence` over time, keyed on the transport — a fade is two keys.
+   *  Null holds `influence`. */
+  influenceTrack: ParamKey[] | null
   /** Its strips, in scene seconds — a LANE, so one effect can fire more than
    *  once. Null or empty = on for the whole scene, which is what applying an
    *  effect does until someone places it. */
@@ -5673,7 +5707,19 @@ export class Engine {
       // KIND comes from the declaration, never from the runtime type of the
       // value: a caller handing a number to a colour must not silently turn a
       // vec3f field into an f32 and shift every field after it.
-      const isVec = p.kind === "color" || p.kind === "vec3"
+      if (p.kind === "bone") {
+        // Three fields the engine fills each frame — where the bone is, the way
+        // it points, and whether this rig has it — read through rzBone_NAME().
+        for (const [field, vec] of [[p.name, true], [`${p.name}__fwd`, true], [`${p.name}__ok`, false]] as const) {
+          const align = vec ? 16 : 4
+          const offset = Math.ceil(cursor / align) * align
+          layout.set(field, { offset: offset / 4, comps: vec ? 3 : 1 })
+          fields.push(`  ${field}: ${vec ? "vec3f" : "f32"},`)
+          cursor = offset + (vec ? 12 : 4)
+        }
+        continue
+      }
+      const isVec = p.kind === "color" || p.kind === "vec3" || p.kind === "point"
       const align = isVec ? 16 : 4
       const offset = Math.ceil(cursor / align) * align
       layout.set(p.name, { offset: offset / 4, comps: isVec ? 3 : 1 })
@@ -5681,15 +5727,35 @@ export class Engine {
       cursor = offset + (isVec ? 12 : 4)
     }
     const paramsData = new Float32Array(Math.max(4, Math.ceil(cursor / 16) * 4))
+    const paramBindings = new Map<string, EffectBoneValue | EffectPointValue>()
     for (const [name, value] of entries) {
       const slot = layout.get(name)!
+      // A bone, and a point that follows someone, are resolved every frame;
+      // their fields start empty and the first evaluation fills them.
+      if (isBoneValue(value)) {
+        paramBindings.set(name, value)
+        continue
+      }
       if (typeof value === "number") paramsData[slot.offset] = value
       else {
+        if ("model" in value && value.model) paramBindings.set(name, value)
         paramsData[slot.offset] = value.x
         paramsData[slot.offset + 1] = value.y
         paramsData[slot.offset + 2] = value.z
       }
     }
+    // rzBone_NAME() for each bone dial: its own struct rather than RzAnchor, so
+    // the accessor stands in every module a params block is spliced into.
+    const bones = d.params.filter((p) => p.kind === "bone")
+    const boneWgsl = bones.length
+      ? "struct RzBoneParam { pos: vec3f, fwd: vec3f, valid: bool, }\n" +
+        bones
+          .map(
+            (p) =>
+              `fn rzBone_${p.name}() -> RzBoneParam { return RzBoneParam(params.${p.name}, params.${p.name}__fwd, params.${p.name}__ok > 0.5); }\n`,
+          )
+          .join("")
+      : ""
     /**
      * The params block, at whatever binding the pass asking has free.
      *
@@ -5700,7 +5766,7 @@ export class Engine {
      */
     const paramsWgsl = (binding: number) =>
       entries.length
-        ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(${binding}) var<uniform> params: EffectParams;\n`
+        ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(${binding}) var<uniform> params: EffectParams;\n${boneWgsl}`
         : ""
     const paramsDecl = paramsWgsl(EFFECT_PARAMS_BINDING)
 
@@ -5906,6 +5972,8 @@ export class Engine {
         paramLayout: layout,
         paramsBuffer,
         paramsData,
+        paramBindings,
+        paramTracks: new Map(),
         hasMirror: d.mirror,
         stepped: d.stepped,
         hasBackground,
@@ -5937,6 +6005,7 @@ export class Engine {
         // scheduling it is something a caller does afterwards, and an install
         // that silently began at zero would look like a compile that failed.
         influence: 1,
+        influenceTrack: null,
         window: null,
         weight: 1,
         sim: { start: null, time: null },
@@ -7525,15 +7594,158 @@ export class Engine {
   setEffectParam(index: number, name: string, value: EffectParamValue): void {
     const fx = this.effects[index]
     if (!fx || !fx.paramsBuffer) return
+    // A keyed dial is its track's: the frame writes it only when the sampled
+    // value changes, so a plain value written over it would stick until then.
+    if (fx.paramTracks.has(name)) return
+    if (this.writeEffectParam(fx, name, value)) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+    // A bone, or a point that now follows someone, lands on the next frame's
+    // evaluation; resolving it now as well means a paused scene shows it too.
+    if (fx.paramBindings.has(name)) this.evaluateEffectParams()
+  }
+
+  /** One dial into the instance's block, by its declared kind. Returns whether
+   *  the block changed — a bone changes only its binding, which the frame's
+   *  evaluation writes. */
+  private writeEffectParam(fx: EffectInstance, name: string, value: EffectParamValue): boolean {
+    const decl = fx.paramDecls.find((p) => p.name === name)
     const slot = fx.paramLayout.get(name)
-    if (!slot) return
-    if (typeof value === "number") fx.paramsData[slot.offset] = value
-    else {
-      fx.paramsData[slot.offset] = value.x
-      fx.paramsData[slot.offset + 1] = value.y
-      fx.paramsData[slot.offset + 2] = value.z
+    if (!decl || !slot) return false
+    if (decl.kind === "bone") {
+      if (isBoneValue(value)) fx.paramBindings.set(name, value)
+      return false
     }
-    this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+    if (isBoneValue(value)) return false
+    if (typeof value === "number") {
+      fx.paramsData[slot.offset] = decl.kind === "int" ? Math.round(value) : value
+      return true
+    }
+    if (decl.kind === "point" && "model" in value && value.model) fx.paramBindings.set(name, value)
+    else fx.paramBindings.delete(name)
+    fx.paramsData[slot.offset] = value.x
+    fx.paramsData[slot.offset + 1] = value.y
+    fx.paramsData[slot.offset + 2] = value.z
+    return true
+  }
+
+  /**
+   * Drive one dial from keys on the transport — the clock the effect's strips
+   * run on, so a key at a clip's start lands at the clip's start in the editor,
+   * a scrub and an export alike. Null, or no keys, gives the dial back to
+   * setEffectParam.
+   *
+   * Numbers, whole numbers, colours, vectors and points travel between keys,
+   * straight or eased; switches, lists and bones hold until the next key. A
+   * track lives on the instance, so an install builds fresh ones and the host
+   * pushes its tracks again, as it does a schedule.
+   */
+  setEffectParamTrack(index: number, name: string, keys: readonly EffectParamKey[] | null): boolean {
+    const fx = this.effects[index]
+    const decl = fx?.paramDecls.find((p) => p.name === name)
+    if (!fx || !decl) return false
+    if (!keys || keys.length === 0) {
+      fx.paramTracks.delete(name)
+      return true
+    }
+    const holds = decl.kind === "bool" || decl.kind === "enum" || decl.kind === "bone"
+    const bones: EffectBoneValue[] = []
+    const sorted = [...keys].sort((a, b) => a.time - b.time)
+    const track: ParamKey[] = []
+    for (const k of sorted) {
+      let v: ParamValue
+      if (decl.kind === "bone") {
+        if (!isBoneValue(k.value)) continue
+        v = bones.push(k.value) - 1
+      } else if (typeof k.value === "number") v = k.value
+      else if (isBoneValue(k.value)) continue
+      else v = [k.value.x, k.value.y, k.value.z]
+      track.push({
+        t: k.time,
+        v,
+        e: holds ? "hold" : (k.ease ?? "linear"),
+        ...(!holds && k.curve && k.ease !== "hold" ? { b: k.curve } : {}),
+      })
+    }
+    fx.paramTracks.set(name, { keys: track, bones, last: null })
+    this.evaluateEffectParams()
+    return true
+  }
+
+  /**
+   * Every effect's keyed dials at this transport time, then every bone and
+   * followed point where it stands now — once a frame, after the schedules, so
+   * each mount reads this frame's values. One upload per effect, and only for
+   * one whose block moved.
+   */
+  private evaluateEffectParams(): void {
+    let transport: number | null = null
+    for (const fx of this.effects) {
+      if (!fx.paramsBuffer) continue
+      let dirty = false
+      for (const [name, track] of fx.paramTracks) {
+        transport ??= this.transportTime()
+        const v = sampleParamTrack(track.keys, transport)
+        if (v === null || !paramChanged(v, track.last)) continue
+        track.last = v
+        const decl = fx.paramDecls.find((p) => p.name === name)
+        if (decl?.kind === "bone") {
+          const bone = typeof v === "number" ? track.bones[v] : undefined
+          if (bone) fx.paramBindings.set(name, bone)
+        } else if (typeof v === "number") {
+          dirty = this.writeEffectParam(fx, name, v) || dirty
+        } else {
+          const held = fx.paramBindings.get(name)
+          const model = held && !isBoneValue(held) ? held.model : undefined
+          dirty = this.writeEffectParam(fx, name, { x: v[0], y: v[1], z: v[2], ...(model ? { model } : {}) }) || dirty
+        }
+      }
+      if (fx.paramBindings.size) dirty = this.resolveParamBindings(fx) || dirty
+      if (dirty) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+    }
+  }
+
+  /** Bones and followed points into the block, where they stand this frame. */
+  private resolveParamBindings(fx: EffectInstance): boolean {
+    const d = fx.paramsData
+    let moved = false
+    const put = (offset: number, x: number, y: number, z: number) => {
+      if (d[offset] === x && d[offset + 1] === y && d[offset + 2] === z) return
+      d[offset] = x
+      d[offset + 1] = y
+      d[offset + 2] = z
+      moved = true
+    }
+    const first = () => this.castSubjectNames(fx.subjects)[0] ?? null
+    for (const [name, value] of fx.paramBindings) {
+      const slot = fx.paramLayout.get(name)
+      if (!slot) continue
+      const inst = this.modelInstances.get((value.model ?? first()) ?? "")
+      if (isBoneValue(value)) {
+        const fwdSlot = fx.paramLayout.get(`${name}__fwd`)
+        const okSlot = fx.paramLayout.get(`${name}__ok`)
+        const pos = inst?.model.getBoneWorldPosition(value.bone) ?? null
+        const ok = pos ? 1 : 0
+        if (okSlot && d[okSlot.offset] !== ok) {
+          d[okSlot.offset] = ok
+          moved = true
+        }
+        if (!inst || !pos) continue
+        const m = inst.model
+        // Model space into the world, as the cast's own anchors go.
+        pos.setXYZ(pos.x * m.scale, pos.y * m.scale, pos.z * m.scale)
+        Quat.rotateVecInto(m.rotation, pos, pos)
+        put(slot.offset, pos.x + m.position.x, pos.y + m.position.y, pos.z + m.position.z)
+        const fwd = m.getBoneWorldForward(value.bone)
+        if (fwd && fwdSlot) {
+          Quat.rotateVecInto(m.rotation, fwd, fwd)
+          put(fwdSlot.offset, fwd.x, fwd.y, fwd.z)
+        }
+      } else if (inst) {
+        // A followed point: the offset from where she stands.
+        const m = inst.model
+        put(slot.offset, m.position.x + value.x, m.position.y + value.y, m.position.z + value.z)
+      }
+    }
+    return moved
   }
 
   /**
@@ -7569,6 +7781,28 @@ export class Engine {
     // it while an additive particle would happily keep getting brighter, so the
     // same number would mean two things.
     fx.influence = Math.min(1, Math.max(0, influence))
+  }
+
+  /**
+   * Influence from keys on the transport, the way a dial is keyed: a fade in is
+   * a key at 0 and a key at 1, eased by its curve. Null or no keys gives it
+   * back to setEffectInfluence. It shapes the level the strips ramp toward.
+   */
+  setEffectInfluenceTrack(index: number, keys: readonly EffectParamKey[] | null): void {
+    const fx = this.effects[index]
+    if (!fx) return
+    const track: ParamKey[] = []
+    for (const k of keys ?? []) {
+      if (typeof k.value !== "number") continue
+      track.push({
+        t: k.time,
+        v: k.value,
+        ...(k.ease ? { e: k.ease } : {}),
+        ...(k.curve && k.ease !== "hold" ? { b: k.curve } : {}),
+      })
+    }
+    track.sort((a, b) => a.t - b.t)
+    fx.influenceTrack = track.length ? track : null
   }
 
   getEffectInfluence(index: number): number {
@@ -7659,11 +7893,13 @@ export class Engine {
     const transport = this.transportTime()
     for (const fx of this.effects) {
       fx.simReset = false
+      const keyed = fx.influenceTrack ? sampleParamTrack(fx.influenceTrack, transport) : null
+      const level = typeof keyed === "number" ? Math.min(1, Math.max(0, keyed)) : fx.influence
       if (!fx.window || fx.window.length === 0) {
-        fx.weight = fx.influence
+        fx.weight = level
         continue
       }
-      const at = effectState(fx.window, fx.influence, transport)
+      const at = effectState(fx.window, level, transport)
       fx.weight = at.weight
       // The particles and the grid carry state from frame to frame, so they get
       // more than a clock: a restart on entering a window or going back in one,
@@ -18087,6 +18323,9 @@ export class Engine {
     // caller so that playback, the export loop and a warm-up pass cannot
     // disagree about when an effect is alive — none of them has to remember it.
     this.evaluateEffectSchedules()
+    // The dials' keys and the bones and points they follow, on this frame —
+    // after the schedules, before anything reads an effect's block.
+    this.evaluateEffectParams()
     this.stepSim(encoder, deltaTime)
     this.stepParticles(encoder, deltaTime)
     // Before the scene pass, which READS the slots this writes. Same buffer,

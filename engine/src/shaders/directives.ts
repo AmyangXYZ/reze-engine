@@ -69,11 +69,12 @@ export type EffectParamOption = { id: string; labelZh?: string }
  */
 export type EffectParamDecl = {
   name: string
-  kind: "float" | "color" | "vec3" | "bool" | "enum"
-  /** Numbers for float/vec3, 0 or 1 for bool, the option's index for enum;
-   *  `#rrggbb` for a colour, which the host converts. */
+  kind: "float" | "color" | "vec3" | "bool" | "enum" | "int" | "point" | "bone"
+  /** Numbers for float/vec3/int/point, 0 or 1 for bool, the option's index for
+   *  enum, a bone's NAME for bone; `#rrggbb` for a colour, which the host
+   *  converts. */
   value: number | [number, number, number] | string
-  /** float only, and only when the author gave a range. */
+  /** float and int only, and only when the author gave a range. */
   min?: number
   max?: number
   /** enum only: the choices, in index order. */
@@ -351,6 +352,45 @@ export function parseDirectives(wgsl: string): DirectiveResult {
           d.params.push({ name, kind: "bool", value: on ? 1 : 0, ...labels })
           return
         }
+        if (kind === "int") {
+          // A count: strands, rows, petals. One f32 in the shader like a
+          // slider, but whole — the host steps it and a key never lands between.
+          const v = num(rest[0])
+          if (v === null || !Number.isInteger(v)) {
+            errors.push(`${at}: #param int ${name} needs a whole-number default`)
+            return
+          }
+          const lo = num(rest[1])
+          const hi = num(rest[2])
+          if ((rest[1] !== undefined) !== (rest[2] !== undefined) || (rest[1] !== undefined && (lo === null || hi === null))) {
+            errors.push(`${at}: #param int ${name} takes both a min and a max, or neither`)
+            return
+          }
+          d.params.push({ name, kind: "int", value: v, ...(lo !== null && hi !== null ? { min: lo, max: hi } : {}), ...labels })
+          return
+        }
+        if (kind === "point") {
+          // A place in the world, in world units — set by dragging it in the
+          // scene, and able to follow a character. One vec3f in the shader.
+          const v = rest.slice(0, 3).map(num)
+          if (rest.length !== 3 || v.some((x) => x === null)) {
+            errors.push(`${at}: #param point ${name} needs three numbers, a position like "0 10 0"`)
+            return
+          }
+          d.params.push({ name, kind: "point", value: v as [number, number, number], ...labels })
+          return
+        }
+        if (kind === "bone") {
+          // A bone of a character, picked by the host: read as rzBone_NAME(),
+          // a position, a forward and whether that rig has it. The default is
+          // the bone's name; whose bone it is, the host decides.
+          if (rest.length !== 1) {
+            errors.push(`${at}: #param bone ${name} needs one bone name, like 右手首`)
+            return
+          }
+          d.params.push({ name, kind: "bone", value: rest[0], ...labels })
+          return
+        }
         if (kind === "enum") {
           // Each choice is `id` or `id|中文`; a leading `*` marks the default,
           // else the first is.
@@ -407,7 +447,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
           d.params.push({ name, kind: "float", value: v, ...(lo !== null && hi !== null ? { min: lo, max: hi } : {}), ...labels })
           return
         }
-        errors.push(`${at}: #param kind must be float, color, vec3, bool or enum`)
+        errors.push(`${at}: #param kind must be float, int, color, vec3, point, bone, bool or enum`)
         return
       }
       case "halfres":
