@@ -260,10 +260,13 @@ export interface Morphing {
 
 // CSR inversion of vertex-morph offsets for the GPU compute pass (built once at load).
 interface MorphComputeData {
-  basePositions: Float32Array // vertexCount * 3
+  /** vertexCount * 5: each vertex's rest position (xyz) and UV (uv). */
+  base: Float32Array
   rowStart: Uint32Array // vertexCount + 1 (prefix offsets into the entry arrays)
   colMorph: Uint32Array // entryCount (morph index per entry)
-  colOffset: Float32Array // entryCount * 3 (xyz offset per entry)
+  /** entryCount * 5: a position offset (xyz) and a UV offset (uv) per entry —
+   *  a vertex morph's carries no UV, a UV morph's no position. */
+  colOffset: Float32Array
   morphCount: number
   vertexCount: number
   entryCount: number
@@ -1027,7 +1030,9 @@ export class Model {
 
   /** A PMX additional UV channel (1–4) as loaded, four floats a vertex — or
    *  null when the file has fewer. Its morphs (types 4–7) are in getMorphing(),
-   *  with uvOffsets; the engine applies neither, a native look reads both. */
+   *  with uvOffsets; the engine applies neither, a native look reads both. The
+   *  base UV's own morphs (type 3) the engine does apply, with the vertex
+   *  morphs. */
   getAdditionalUv(channel: number): Float32Array | null {
     return this.additionalUvs[channel - 1] ?? null
   }
@@ -1826,6 +1831,25 @@ export class Model {
       }
     }
 
+    // UV morphs: the base UV moved, the same way a vertex morph moves the
+    // position, into the same touched range.
+    for (let morphIdx = 0; morphIdx < morphCount; morphIdx++) {
+      const effectiveWeight = effectiveWeights[morphIdx]
+      if (effectiveWeight < 0.0001) continue
+      const morph = this.morphing.morphs[morphIdx]
+      if (morph.type !== 3 || !morph.uvOffsets) continue
+      for (const o of morph.uvOffsets) {
+        const vIdx = o.vertexIndex
+        if (vIdx < 0 || vIdx >= vertexCount) continue
+        if (Math.abs(o.offset[0]) < 0.0001 && Math.abs(o.offset[1]) < 0.0001) continue
+        const vertexIdx = vIdx * VERTEX_STRIDE
+        this.vertexData[vertexIdx + 6] += o.offset[0] * effectiveWeight
+        this.vertexData[vertexIdx + 7] += o.offset[1] * effectiveWeight
+        if (curMinVert < 0 || vIdx < curMinVert) curMinVert = vIdx
+        if (vIdx > curMaxVert) curMaxVert = vIdx
+      }
+    }
+
     let dirtyMin = curMinVert
     let dirtyMax = curMaxVert
     if (this.morphPrevMaxVert >= 0) {
@@ -1879,12 +1903,16 @@ export class Model {
       (Math.abs(o.positionOffset[0]) >= EPS ||
         Math.abs(o.positionOffset[1]) >= EPS ||
         Math.abs(o.positionOffset[2]) >= EPS)
+    // A UV morph (type 3) moves the base UV: a scrolling or spinning texture,
+    // a pattern swapped by sliding to another part of the sheet.
+    const isLiveUv = (o: UvMorphOffset): boolean =>
+      o.vertexIndex >= 0 && o.vertexIndex < V && (Math.abs(o.offset[0]) >= EPS || Math.abs(o.offset[1]) >= EPS)
 
     const counts = new Uint32Array(V)
     for (let m = 0; m < M; m++) {
       const morph = morphs[m]
-      if (morph.type !== 1) continue
-      for (const o of morph.vertexOffsets) if (isLive(o)) counts[o.vertexIndex]++
+      if (morph.type === 1) for (const o of morph.vertexOffsets) if (isLive(o)) counts[o.vertexIndex]++
+      if (morph.type === 3) for (const o of morph.uvOffsets ?? []) if (isLiveUv(o)) counts[o.vertexIndex]++
     }
 
     const rowStart = new Uint32Array(V + 1)
@@ -1898,31 +1926,43 @@ export class Model {
     if (E === 0) return null
 
     const colMorph = new Uint32Array(E)
-    const colOffset = new Float32Array(E * 3)
+    const colOffset = new Float32Array(E * 5)
     const fill = new Uint32Array(V)
     for (let m = 0; m < M; m++) {
       const morph = morphs[m]
-      if (morph.type !== 1) continue
-      for (const o of morph.vertexOffsets) {
-        if (!isLive(o)) continue
-        const v = o.vertexIndex
-        const p = rowStart[v] + fill[v]++
-        colMorph[p] = m
-        colOffset[p * 3] = o.positionOffset[0]
-        colOffset[p * 3 + 1] = o.positionOffset[1]
-        colOffset[p * 3 + 2] = o.positionOffset[2]
+      if (morph.type === 1) {
+        for (const o of morph.vertexOffsets) {
+          if (!isLive(o)) continue
+          const v = o.vertexIndex
+          const p = rowStart[v] + fill[v]++
+          colMorph[p] = m
+          colOffset[p * 5] = o.positionOffset[0]
+          colOffset[p * 5 + 1] = o.positionOffset[1]
+          colOffset[p * 5 + 2] = o.positionOffset[2]
+        }
+      } else if (morph.type === 3) {
+        for (const o of morph.uvOffsets ?? []) {
+          if (!isLiveUv(o)) continue
+          const v = o.vertexIndex
+          const p = rowStart[v] + fill[v]++
+          colMorph[p] = m
+          colOffset[p * 5 + 3] = o.offset[0]
+          colOffset[p * 5 + 4] = o.offset[1]
+        }
       }
     }
 
-    const basePositions = new Float32Array(V * 3)
+    const base = new Float32Array(V * 5)
     for (let v = 0; v < V; v++) {
       const vi = v * VERTEX_STRIDE
-      basePositions[v * 3] = this.baseVertexData[vi]
-      basePositions[v * 3 + 1] = this.baseVertexData[vi + 1]
-      basePositions[v * 3 + 2] = this.baseVertexData[vi + 2]
+      base[v * 5] = this.baseVertexData[vi]
+      base[v * 5 + 1] = this.baseVertexData[vi + 1]
+      base[v * 5 + 2] = this.baseVertexData[vi + 2]
+      base[v * 5 + 3] = this.baseVertexData[vi + 6]
+      base[v * 5 + 4] = this.baseVertexData[vi + 7]
     }
 
-    return { basePositions, rowStart, colMorph, colOffset, morphCount: M, vertexCount: V, entryCount: E }
+    return { base, rowStart, colMorph, colOffset, morphCount: M, vertexCount: V, entryCount: E }
   }
 
   // Consume the pending morph vertex-upload range for the engine. Returns null when a

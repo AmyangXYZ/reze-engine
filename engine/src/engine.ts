@@ -9534,7 +9534,7 @@ export class Engine {
     )
 
     // GPU vertex-morph compute pipeline (shared by all models; per-model bind groups).
-    // Bindings: 0-4 read-only storage (base pos, CSR rowStart/colMorph/colOffset, weights),
+    // Bindings: 0-4 read-only storage (base pos+uv, CSR rowStart/colMorph/colOffset, weights),
     // 5 read-write storage (vertex buffer), 6 uniform (params).
     const roStorage = { type: "read-only-storage" as const }
     this.morphComputeBindGroupLayout = this.device.createBindGroupLayout({
@@ -13735,7 +13735,8 @@ export class Engine {
       scratch[1] = position[1]
       scratch[2] = position[2]
       this.device.queue.writeBuffer(inst.vertexBuffer, index * 32, scratch)
-      if (inst.gpuMorph) this.device.queue.writeBuffer(inst.gpuMorph.baseBuf, index * 12, scratch)
+      // The compute base is five floats a vertex (xyz uv): the position is its first three.
+      if (inst.gpuMorph) this.device.queue.writeBuffer(inst.gpuMorph.baseBuf, index * 20, scratch)
     }
   }
 
@@ -15960,7 +15961,7 @@ export class Engine {
       return buf
     }
 
-    const baseBuf = mkStorage("basePositions", data.basePositions)
+    const baseBuf = mkStorage("base", data.base)
     const rowBuf = mkStorage("rowStart", data.rowStart)
     const colMorphBuf = mkStorage("colMorph", data.colMorph)
     const colOffsetBuf = mkStorage("colOffset", data.colOffset)
