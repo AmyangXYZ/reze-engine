@@ -103,12 +103,12 @@ test("the engine restarts and steps scheduled simulations from advanceSim", () =
   assert.match(evaluate, /fx\.simStep = sim\.step/)
 
   const particles = slice("private stepParticles", "private renderParticles")
-  assert.match(particles, /if \(scheduled && !e\.simReset && e\.simStep === 0\) continue/)
+  assert.match(particles, /if \(scheduled && !e\.simReset && e\.simStep === 0 && !e\.simNudge\) continue/)
   assert.match(particles, /if \(e\.simReset\) encoder\.clearBuffer\(p\.buffer\)/)
   assert.match(particles, /p\.data\[1\] = scheduled \? e\.simStep : Math\.min\(0\.1, Math\.max\(0, deltaTime\)\)/)
 
   const grid = slice("private stepSim(", "getEffectMounts()")
-  assert.match(grid, /if \(scheduled && !e\.simReset && e\.simStep === 0\) continue/)
+  assert.match(grid, /if \(scheduled && !e\.simReset && e\.simStep === 0 && !e\.simNudge\) continue/)
   assert.match(grid, /loadOp: "clear"/)
   assert.match(grid, /grid\.frame = 0/)
   assert.match(grid, /grid\.data\[1\] = scheduled \? e\.simStep : Math\.min\(0\.1, Math\.max\(0, deltaTime\)\)/)

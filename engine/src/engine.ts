@@ -2018,6 +2018,12 @@ interface EffectInstance {
   /** The cast its pool and grid were last stepped against — subject mask and
    *  count. A scheduled effect held still re-seeds when this moves. */
   seededCast: number
+  /** A dial changed since the last frame. A pool or grid held still steps once
+   *  at dt 0 for it, so a count, a size or anything else the step reads shows
+   *  on a paused frame rather than on play. */
+  paramsTouched: boolean
+  /** This frame's: step once at dt 0 although held (paramsTouched, taken). */
+  simNudge: boolean
   /**
    * The four durations this effect's `#dissolve` takes the cast apart over, as
    * its source wrote them. Null unless it declared one. A dial of the same name
@@ -6072,6 +6078,8 @@ export class Engine {
         simStep: 0,
         simReset: false,
         seededCast: -1,
+        paramsTouched: false,
+        simNudge: false,
         dissolve: d.dissolve ? dissolveConstants(authored) : null,
         ground: d.ground ? { color: new Vec3(...d.ground.color), noise: d.ground.noise } : null,
         // Its OWN resolution, no longer the scene's: an effect that never asked
@@ -6854,8 +6862,9 @@ export class Engine {
       const scheduled = e.window !== null
       // A scheduled pool that has not moved holds still: a paused transport, or
       // a time outside every window. A dispatch at dt 0 would still run the
-      // author's step, and not every step is a function of dt.
-      if (scheduled && !e.simReset && e.simStep === 0) continue
+      // author's step, and not every step is a function of dt — so it runs
+      // only when a dial moved, which is when the step's answer changed.
+      if (scheduled && !e.simReset && e.simStep === 0 && !e.simNudge) continue
       // Entering its window, or going back in it: the pool starts empty, and
       // every slot spawns on this dispatch from the effect's own local time.
       if (e.simReset) encoder.clearBuffer(p.buffer)
@@ -7613,7 +7622,7 @@ export class Engine {
     if (!grid) continue
     const scheduled = e.window !== null
     // Held still like the particles, for the same reason.
-    if (scheduled && !e.simReset && e.simStep === 0) continue
+    if (scheduled && !e.simReset && e.simStep === 0 && !e.simNudge) continue
     if (e.simReset) {
       // Back to how install left it: both textures empty and frame 0 again,
       // the frame an effect seeds its grid on.
@@ -7670,7 +7679,10 @@ export class Engine {
     // A keyed dial is its track's: the frame writes it only when the sampled
     // value changes, so a plain value written over it would stick until then.
     if (fx.paramTracks.has(name)) return
-    if (this.writeEffectParam(fx, name, value)) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+    if (this.writeEffectParam(fx, name, value)) {
+      this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+      fx.paramsTouched = true
+    }
     // A bone, or a point that now follows someone, lands on the next frame's
     // evaluation; resolving it now as well means a paused scene shows it too.
     if (fx.paramBindings.has(name)) this.evaluateEffectParams()
@@ -7792,7 +7804,10 @@ export class Engine {
         transport ??= this.transportTime()
         dirty = this.evaluateLag(fx, p, transport) || dirty
       }
-      if (dirty) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+      if (dirty) {
+        this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+        fx.paramsTouched = true
+      }
     }
     this.applyXray()
   }
@@ -8175,6 +8190,8 @@ export class Engine {
     const transport = this.transportTime()
     for (const fx of this.effects) {
       fx.simReset = false
+      fx.simNudge = fx.paramsTouched
+      fx.paramsTouched = false
       const keyed = fx.influenceTrack ? sampleParamTrack(fx.influenceTrack, transport) : null
       const level = typeof keyed === "number" ? Math.min(1, Math.max(0, keyed)) : fx.influence
       if (!fx.window || fx.window.length === 0) {
