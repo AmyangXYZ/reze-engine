@@ -69,11 +69,16 @@ export type EffectParamOption = { id: string; labelZh?: string }
  */
 export type EffectParamDecl = {
   name: string
-  kind: "float" | "color" | "vec3" | "bool" | "enum" | "int" | "point" | "bone"
-  /** Numbers for float/vec3/int/point, 0 or 1 for bool, the option's index for
-   *  enum, a bone's NAME for bone; `#rrggbb` for a colour, which the host
-   *  converts. */
+  kind: "float" | "color" | "vec3" | "bool" | "enum" | "int" | "point" | "bone" | "text" | "lag"
+  /** Numbers for float/vec3/int/point/lag, 0 or 1 for bool, the option's index
+   *  for enum, a bone's NAME for bone, the words for text; `#rrggbb` for a
+   *  colour, which the host converts. */
   value: number | [number, number, number] | string
+  /** lag only: the float dial it trails, how many seconds it holds after that
+   *  dial falls, and how much it then drains per second. */
+  source?: string
+  hold?: number
+  rate?: number
   /** float and int only, and only when the author gave a range. */
   min?: number
   max?: number
@@ -172,6 +177,12 @@ export type EffectDirectives = {
    */
   xray: { x: string; y: string; width: string; height: string } | null
   /**
+   * `#font <css font, without the size> [tracking <em>]` — the face every
+   * `#param text` dial of this effect is set in, e.g. `#font 500 Georgia, serif
+   * tracking 0.12`. Null sets them in the platform's serif.
+   */
+  font: { css: string; tracking: number } | null
+  /**
    * How long ONE firing of this effect lasts, in seconds. 0 = undeclared.
    *
    * An effect is one of two things, and only its author knows which. A HIT has
@@ -206,6 +217,7 @@ const SPEC = {
   mirror: 0,
   stepped: 0,
   xray: 4,
+  font: "rest",
   duration: 1,
   ground: "rest",
 } as const
@@ -286,6 +298,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     mirror: false,
     stepped: false,
     xray: null,
+    font: null,
     duration: 0,
   }
   const errors: string[] = []
@@ -402,6 +415,26 @@ export function parseDirectives(wgsl: string): DirectiveResult {
           d.params.push({ name, kind: "bone", value: rest[0], ...labels })
           return
         }
+        if (kind === "text") {
+          // Words, set by the engine into a picture the field module reads
+          // through rzText_NAME(uv). The default is the rest of the line up to
+          // its note, spaces kept as one.
+          d.params.push({ name, kind: "text", value: rest.join(" "), ...labels })
+          return
+        }
+        if (kind === "lag") {
+          // A float dial trailing another: what a game's health bar draws as
+          // the chunk just lost. Derived by the engine, so a host draws no
+          // control for it.
+          const hold = num(rest[1])
+          const rate = num(rest[2])
+          if (rest.length !== 3 || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(rest[0]) || hold === null || hold < 0 || rate === null || rate <= 0) {
+            errors.push(`${at}: #param lag ${name} takes the dial it trails, a hold in seconds and a drain per second, like "HEALTH 0.8 0.6"`)
+            return
+          }
+          d.params.push({ name, kind: "lag", value: 0, source: rest[0], hold, rate, ...labels })
+          return
+        }
         if (kind === "enum") {
           // Each choice is `id` or `id|中文`; a leading `*` marks the default,
           // else the first is.
@@ -458,7 +491,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
           d.params.push({ name, kind: "float", value: v, ...(lo !== null && hi !== null ? { min: lo, max: hi } : {}), ...labels })
           return
         }
-        errors.push(`${at}: #param kind must be float, int, color, vec3, point, bone, bool or enum`)
+        errors.push(`${at}: #param kind must be float, int, color, vec3, point, bone, bool, enum, text or lag`)
         return
       }
       case "halfres":
@@ -536,6 +569,18 @@ export function parseDirectives(wgsl: string): DirectiveResult {
       case "xray":
         d.xray = { x: args[0], y: args[1], width: args[2], height: args[3] }
         return
+      case "font": {
+        const words = args.join(" ")
+        const m = /^(.*?)(?:\s+tracking\s+(-?[\d.]+))?$/.exec(words)
+        const css = (m?.[1] ?? "").trim()
+        const tracking = m?.[2] !== undefined ? num(m[2]) : 0
+        if (!css || tracking === null) {
+          errors.push(`${at}: #font takes a CSS font without its size, like "500 Georgia, serif", and optionally "tracking 0.1"`)
+          return
+        }
+        d.font = { css, tracking }
+        return
+      }
       case "duration": {
         // SECONDS, like every other time a directive states (see #dissolve).
         // The document above works in frames and converts once; an author
@@ -569,6 +614,13 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     for (const name of [d.xray.x, d.xray.y, d.xray.width, d.xray.height]) {
       if (d.params.find((p) => p.name === name)?.kind !== "float") errors.push(`#xray: ${name} has to be a #param float`)
     }
+  }
+
+  // A lag trails a number that has to be there.
+  for (const p of d.params) {
+    if (p.kind !== "lag") continue
+    const src = d.params.find((q) => q.name === p.source)
+    if (src?.kind !== "float" && src?.kind !== "int") errors.push(`#param lag ${p.name}: ${p.source} has to be a #param float or int`)
   }
 
   // Duplicates are an author editing one line and forgetting another; last-wins

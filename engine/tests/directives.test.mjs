@@ -54,7 +54,7 @@ test("wrong arity is named, with its line", () => {
     ["#param float D 1 0\n", /both a min and a max/],
     ["#param color C red\n", /like #3b82f6/],
     ["#param vec3 W 0 1\n", /three numbers/],
-    ["#param list B 1\n", /float, int, color, vec3, point, bone, bool or enum/],
+    ["#param list B 1\n", /float, int, color, vec3, point, bone, bool, enum, text or lag/],
   ]) {
     const r = parseDirectives(src)
     assert.equal(r.errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
@@ -228,4 +228,24 @@ test("a whole number, a place and a bone are dials too", () => {
   for (const src of ["#param int N 1.5\n", "#param int N 2 1\n", "#param point P 0 1\n", "#param bone B\n", "#param bone B 左 右\n"]) {
     assert.equal(parseDirectives(src).errors.length, 1, `expected one error for ${JSON.stringify(src)}`)
   }
+})
+
+test("a text dial takes the rest of its line as words, its note apart", () => {
+  const d = ok("#param text NAME Malenia, Blade of Miquella — Name | 名字\n")
+  assert.deepEqual(d.params[0], { name: "NAME", kind: "text", value: "Malenia, Blade of Miquella", label: "Name", labelZh: "名字" })
+  assert.equal(ok("#param text EMPTY\n").params[0].value, "")
+})
+
+test("a lag names the float it trails, a hold and a drain", () => {
+  const d = ok("#param float HEALTH 1 0 1\n#param lag CHUNK HEALTH 0.8 0.6\n")
+  assert.deepEqual(d.params[1], { name: "CHUNK", kind: "lag", value: 0, source: "HEALTH", hold: 0.8, rate: 0.6 })
+  assert.match(parseDirectives("#param lag CHUNK NOPE 0.8 0.6\n").errors[0], /NOPE has to be a #param float/)
+  assert.equal(parseDirectives("#param float H 1\n#param lag C H 0.8\n").errors.length, 1)
+  assert.equal(parseDirectives("#param float H 1\n#param lag C H 0.8 0\n").errors.length, 1)
+})
+
+test("#font is a CSS font without its size, with an optional tracking", () => {
+  assert.deepEqual(ok('#font 500 "Times New Roman", serif tracking 0.12\n').font, { css: '500 "Times New Roman", serif', tracking: 0.12 })
+  assert.deepEqual(ok("#font serif — the face\n").font, { css: "serif", tracking: 0 })
+  assert.equal(ok("").font, null)
 })

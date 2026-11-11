@@ -62,6 +62,7 @@ import {
 import { packHalf, type HdrImage } from "./hdr"
 import { evalIrradianceSH, projectIrradianceSH, gradientIrradianceSH } from "./ibl"
 import { LYRIC_ATLAS_MAX_H, LYRIC_ATLAS_MAX_W, LYRICS_FLOATS, lyricsApi, packLyrics, type LyricLine, type LyricRect } from "./shaders/lyrics-api"
+import { effectTextFont, effectTextWgsl, rasterEffectText, EFFECT_TEXT_PX, type EffectTextFont } from "./shaders/text-api"
 import {
   sceneTargets as sceneTargetsFor,
   sceneColorFormats,
@@ -608,10 +609,10 @@ type SunOptions = {
   shadow?: number
 }
 
-/** An effect param: number → f32, vector-like → vec3f (see setEffect).
- *  Structural {x,y,z} rather than the Vec3 class so JSON-derived values (a
- *  shared scene document's params) pass straight in. */
-export type EffectParamValue = number | { x: number; y: number; z: number } | EffectPointValue | EffectBoneValue
+/** An effect param: number → f32, vector-like → vec3f, words → a text dial
+ *  (see setEffect). Structural {x,y,z} rather than the Vec3 class so
+ *  JSON-derived values (a shared scene document's params) pass straight in. */
+export type EffectParamValue = number | string | { x: number; y: number; z: number } | EffectPointValue | EffectBoneValue
 
 /** A `point` dial: a world position, or — with `model` — an offset from where
  *  that character stands, so the point travels with her. */
@@ -1664,6 +1665,10 @@ const TEXTURE_EXTENSION_GUESSES = [".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dd
  */
 function paramValue(p: EffectParamDecl, given: EffectParamValue | undefined): EffectParamValue {
   if (p.kind === "bone") return isBoneValue(given) ? given : { bone: typeof p.value === "string" ? p.value : "", model: null }
+  if (p.kind === "text") return typeof given === "string" ? given : typeof p.value === "string" ? p.value : ""
+  // A lag is filled from the dial it trails, every frame.
+  if (p.kind === "lag") return 0
+  if (typeof given === "string") given = undefined
   if (given !== undefined) return p.kind === "int" && typeof given === "number" ? Math.round(given) : given
   if (p.kind === "color" && typeof p.value === "string") {
     const n = parseInt(p.value.slice(1), 16)
@@ -1697,6 +1702,8 @@ function castSubjectKey(subjects: readonly string[] | null): string {
 }
 
 const EFFECT_PARAMS_BINDING = 7
+/** The field module's binding for an effect's words — see text-api. */
+const EFFECT_TEXT_BINDING = 33
 const EFFECT_PARAMS_BINDING_GRID = 9
 
 /** How a mount receives the effect's declared dials: a generator for the struct
@@ -1705,7 +1712,8 @@ const EFFECT_PARAMS_BINDING_GRID = 9
  *  emitted — WGSL has no empty struct, and a bound buffer nothing reads is a
  *  layout mismatch. */
 type EffectParamsBinding = {
-  wgsl: (binding: number) => string
+  /** `text` is true only for the field module, where the words are bound. */
+  wgsl: (binding: number, text?: boolean) => string
   buffer: GPUBuffer | null
 }
 
@@ -1871,6 +1879,17 @@ const FIELD_LAYER_BLEND_ADDITIVE: GPUBlendState = {
   alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
 }
 
+/** An effect's text dials: every string they can show (values and keys), the
+ *  picture those are set in, and which one each dial shows now. */
+type EffectText = {
+  font: EffectTextFont
+  strings: Set<string>
+  rects: Map<string, LyricRect>
+  texture: GPUTexture | null
+  view: GPUTextureView | null
+  shown: Map<string, string>
+}
+
 /**
  * One installed effect, whole.
  *
@@ -1892,15 +1911,18 @@ interface EffectInstance {
   /** One firing's length in seconds, from `#duration`. 0 = ambient. Reported
    *  back at install so a host can place the effect at its own length. */
   duration: number
-  paramLayout: Map<string, { offset: number; comps: 1 | 3 }>
+  paramLayout: Map<string, { offset: number; comps: 1 | 3 | 4 }>
   paramsBuffer: GPUBuffer | null
   paramsData: Float32Array<ArrayBuffer>
+  /** The words its text dials can show, set into one picture — see text-api.
+   *  Null when it declares none. */
+  text: EffectText | null
   /** The dials the engine resolves every frame rather than once: each bone
    *  dial's bone and character, and each point dial set to follow one. */
   paramBindings: Map<string, EffectBoneValue | EffectPointValue>
   /** Dials driven by keys, by name — see setEffectParamTrack. Bone keys index
    *  `bones`, since the sampler carries numbers. */
-  paramTracks: Map<string, { keys: ParamKey[]; bones: EffectBoneValue[]; last: ParamValue | null }>
+  paramTracks: Map<string, { keys: ParamKey[]; bones: EffectBoneValue[]; texts: string[]; last: ParamValue | null }>
   /** This effect IS a mirror — see the `#mirror` directive. Draws no shader;
    *  the engine reads its dials and folds the scene through the plane. */
   hasMirror: boolean
@@ -1993,6 +2015,9 @@ interface EffectInstance {
   simStep: number
   /** Empty the particle pool and the grid before this frame's step. */
   simReset: boolean
+  /** The cast its pool and grid were last stepped against — subject mask and
+   *  count. A scheduled effect held still re-seeds when this moves. */
+  seededCast: number
   /**
    * The four durations this effect's `#dissolve` takes the cast apart over, as
    * its source wrote them. Null unless it declared one. A dial of the same name
@@ -5210,6 +5235,7 @@ export class Engine {
           { binding: 19, resource: { buffer: this.midiBuffer } },
           { binding: 24, resource: { buffer: this.lyricsBuffer } },
           { binding: 25, resource: this.lyricsTextureView },
+          { binding: EFFECT_TEXT_BINDING, resource: owner.text?.view ?? this.trailFallbackView },
           // The size uniform for the pair THIS effect draws into.
           { binding: 14, resource: { buffer: this.fieldUniformBuffers[owner.fieldLayer] } },
           { binding: 22, resource: { buffer: owner.fieldClock ?? this.fieldUniformBuffers[owner.fieldLayer] } },
@@ -5705,7 +5731,7 @@ export class Engine {
     // over the declared default; a name it passes that the source never declared
     // is ignored, because a field nothing reads is a binding nothing reads.
     const entries: [string, EffectParamValue][] = d.params.map((p) => [p.name, paramValue(p, params?.[p.name])])
-    const layout = new Map<string, { offset: number; comps: 1 | 3 }>()
+    const layout = new Map<string, { offset: number; comps: 1 | 3 | 4 }>()
     const fields: string[] = []
     let cursor = 0
     for (const p of d.params) {
@@ -5727,6 +5753,15 @@ export class Engine {
         }
         continue
       }
+      if (p.kind === "text") {
+        // The rect of the string it shows in the effect's picture: u0, vTop,
+        // u1, vBottom — read through rzText_NAME().
+        const offset = Math.ceil(cursor / 16) * 16
+        layout.set(p.name, { offset: offset / 4, comps: 4 })
+        fields.push(`  ${p.name}: vec4f,`)
+        cursor = offset + 16
+        continue
+      }
       const isVec = p.kind === "color" || p.kind === "vec3" || p.kind === "point"
       const align = isVec ? 16 : 4
       const offset = Math.ceil(cursor / align) * align
@@ -5744,6 +5779,8 @@ export class Engine {
         paramBindings.set(name, value)
         continue
       }
+      // Words get their rect once the picture is set, after the mounts build.
+      if (typeof value === "string") continue
       if (typeof value === "number") paramsData[slot.offset] = value
       else {
         if ("model" in value && value.model) paramBindings.set(name, value)
@@ -5772,11 +5809,13 @@ export class Engine {
      * one states the number it can spare. Empty when nothing is declared: WGSL
      * has no empty struct, and a binding nothing reads is a layout mismatch.
      */
-    const paramsWgsl = (binding: number) =>
+    const textNames = d.params.filter((p) => p.kind === "text").map((p) => p.name)
+    const paramsWgsl = (binding: number, text = false) =>
       entries.length
-        ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(${binding}) var<uniform> params: EffectParams;\n${boneWgsl}`
+        ? `struct EffectParams {\n${fields.join("\n")}\n}\n@group(0) @binding(${binding}) var<uniform> params: EffectParams;\n${boneWgsl}` +
+          effectTextWgsl(textNames, text, EFFECT_TEXT_BINDING, "_rzGridSamp")
         : ""
-    const paramsDecl = paramsWgsl(EFFECT_PARAMS_BINDING)
+    const paramsDecl = paramsWgsl(EFFECT_PARAMS_BINDING, true)
 
     // ── Compile with validation captured, not thrown at the console. Line
     // numbers in diagnostics are rebased to the USER's source.
@@ -5980,6 +6019,16 @@ export class Engine {
         paramLayout: layout,
         paramsBuffer,
         paramsData,
+        text: textNames.length
+          ? {
+              font: d.font,
+              strings: new Set(entries.flatMap(([, v]) => (typeof v === "string" && v ? [v] : []))),
+              rects: new Map(),
+              texture: null,
+              view: null,
+              shown: new Map(entries.flatMap(([n, v]) => (typeof v === "string" ? [[n, v] as [string, string]] : []))),
+            }
+          : null,
         paramBindings,
         paramTracks: new Map(),
         hasMirror: d.mirror,
@@ -6022,6 +6071,7 @@ export class Engine {
         sim: { start: null, time: null },
         simStep: 0,
         simReset: false,
+        seededCast: -1,
         dissolve: d.dissolve ? dissolveConstants(authored) : null,
         ground: d.ground ? { color: new Vec3(...d.ground.color), noise: d.ground.noise } : null,
         // Its OWN resolution, no longer the scene's: an effect that never asked
@@ -6055,6 +6105,8 @@ export class Engine {
         trails,
         lights,
     }
+    // Before the swap binds it, so the field's first frame already has words.
+    if (instance.text) this.layoutEffectText(instance)
     return { ok: true, instance, warnings }
   }
 
@@ -6113,6 +6165,7 @@ export class Engine {
       const [identity, gamma] = await this.compositePipelines(false, false)
       for (const e of this.effects) {
       e.paramsBuffer?.destroy()
+      e.text?.texture?.destroy()
       e.lights?.uniform.destroy()
       e.fieldClock?.destroy()
     }
@@ -6192,6 +6245,7 @@ export class Engine {
     // that was running is only torn down now.
     for (const e of this.effects) {
       e.paramsBuffer?.destroy()
+      e.text?.texture?.destroy()
       e.lights?.uniform.destroy()
       e.fieldClock?.destroy()
     }
@@ -6834,12 +6888,20 @@ export class Engine {
         count.dispatchWorkgroups(1)
         count.end()
       }
-      const cp = encoder.beginComputePass({ label: "particles" })
-      cp.setPipeline(p.compute)
-      cp.setBindGroup(0, bind)
-      if (p.live) cp.dispatchWorkgroupsIndirect(p.live.indirect, 0)
-      else cp.dispatchWorkgroups(Math.ceil(p.count / 64))
-      cp.end()
+      // A reset runs the pool TWICE: once to spawn every slot, once to step
+      // what spawned, at dt 0. A dispatch either inits a slot or steps it, and
+      // an effect that poses in its step (Pochita's bones, which its triangles
+      // are drawn from) has no pose after the init alone. Playing, the next
+      // frame's step supplied it; paused at a clip's start no next frame
+      // steps, and the pet stayed collapsed — invisible — until play.
+      for (let pass = e.simReset ? 2 : 1; pass > 0; pass--) {
+        const cp = encoder.beginComputePass({ label: "particles" })
+        cp.setPipeline(p.compute)
+        cp.setBindGroup(0, bind)
+        if (p.live) cp.dispatchWorkgroupsIndirect(p.live.indirect, 0)
+        else cp.dispatchWorkgroups(Math.ceil(p.count / 64))
+        cp.end()
+      }
     }
   }
 
@@ -7625,7 +7687,10 @@ export class Engine {
       if (isBoneValue(value)) fx.paramBindings.set(name, value)
       return false
     }
-    if (isBoneValue(value)) return false
+    if (decl.kind === "text") return typeof value === "string" ? this.showEffectText(fx, name, value) : false
+    // A lag is its source's, trailing; nothing writes it by hand.
+    if (decl.kind === "lag") return false
+    if (isBoneValue(value) || typeof value === "string") return false
     if (typeof value === "number") {
       fx.paramsData[slot.offset] = decl.kind === "int" ? Math.round(value) : value
       return true
@@ -7657,8 +7722,10 @@ export class Engine {
       fx.paramTracks.delete(name)
       return true
     }
-    const holds = decl.kind === "bool" || decl.kind === "enum" || decl.kind === "bone"
+    if (decl.kind === "lag") return false
+    const holds = decl.kind === "bool" || decl.kind === "enum" || decl.kind === "bone" || decl.kind === "text"
     const bones: EffectBoneValue[] = []
+    const texts: string[] = []
     const sorted = [...keys].sort((a, b) => a.time - b.time)
     const track: ParamKey[] = []
     for (const k of sorted) {
@@ -7666,7 +7733,11 @@ export class Engine {
       if (decl.kind === "bone") {
         if (!isBoneValue(k.value)) continue
         v = bones.push(k.value) - 1
-      } else if (typeof k.value === "number") v = k.value
+      } else if (decl.kind === "text") {
+        if (typeof k.value !== "string") continue
+        v = texts.push(k.value) - 1
+      } else if (typeof k.value === "string") continue
+      else if (typeof k.value === "number") v = k.value
       else if (isBoneValue(k.value)) continue
       else v = [k.value.x, k.value.y, k.value.z]
       track.push({
@@ -7676,7 +7747,10 @@ export class Engine {
         ...(!holds && k.curve && k.ease !== "hold" ? { b: k.curve } : {}),
       })
     }
-    fx.paramTracks.set(name, { keys: track, bones, last: null })
+    fx.paramTracks.set(name, { keys: track, bones, texts, last: null })
+    // Every word a key can show goes into the picture now, so playing past a
+    // key is a rect write and never a redraw.
+    if (fx.text && texts.some((t) => t && !fx.text!.strings.has(t))) this.layoutEffectText(fx)
     this.evaluateEffectParams()
     return true
   }
@@ -7701,6 +7775,9 @@ export class Engine {
         if (decl?.kind === "bone") {
           const bone = typeof v === "number" ? track.bones[v] : undefined
           if (bone) fx.paramBindings.set(name, bone)
+        } else if (decl?.kind === "text") {
+          const words = typeof v === "number" ? track.texts[v] : undefined
+          if (words !== undefined) dirty = this.showEffectText(fx, name, words) || dirty
         } else if (typeof v === "number") {
           dirty = this.writeEffectParam(fx, name, v) || dirty
         } else {
@@ -7710,9 +7787,138 @@ export class Engine {
         }
       }
       if (fx.paramBindings.size) dirty = this.resolveParamBindings(fx) || dirty
+      for (const p of fx.paramDecls) {
+        if (p.kind !== "lag") continue
+        transport ??= this.transportTime()
+        dirty = this.evaluateLag(fx, p, transport) || dirty
+      }
       if (dirty) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
     }
     this.applyXray()
+  }
+
+  /**
+   * A `lag` dial at time t: its source, trailing — what a game's health bar
+   * draws as the chunk just lost. After the source falls it HOLDS where it was
+   * for `hold` seconds, then drains at `rate` a second until it meets the
+   * source again; a rise is met at once.
+   *
+   * Sampled from the source's KEYS, never from what the frames before this one
+   * happened to see, so a scrub, a loop and a frame-by-frame export all draw
+   * the same chunk. A source with no keys has no past: the lag is the source.
+   */
+  private evaluateLag(fx: EffectInstance, p: EffectParamDecl, t: number): boolean {
+    const slot = fx.paramLayout.get(p.name)
+    const src = p.source ? fx.paramLayout.get(p.source) : undefined
+    if (!slot || !src) return false
+    const d = fx.paramsData
+    let v = d[src.offset]
+    const track = p.source ? fx.paramTracks.get(p.source) : undefined
+    if (track && track.keys.length > 0) {
+      const hold = p.hold ?? 0
+      const rate = Math.max(p.rate ?? 1, 1e-6)
+      const decl = fx.paramDecls.find((q) => q.name === p.source)
+      const range = decl?.min !== undefined && decl.max !== undefined ? Math.abs(decl.max - decl.min) : 1
+      // Far enough back that anything older has drained past the full range.
+      const span = hold + range / rate
+      const at = (s: number) => {
+        const sv = sampleParamTrack(track.keys, s)
+        if (typeof sv !== "number") return
+        v = Math.max(v, sv - rate * Math.max(0, t - s - hold))
+      }
+      // A fine grid, plus every key in the window exactly — a hit is a key,
+      // and the instant before it is the value the chunk holds.
+      const step = 1 / 120
+      for (let s = t; s >= t - span; s -= step) at(s)
+      for (const k of track.keys) {
+        if (k.t > t || k.t < t - span) continue
+        at(k.t)
+        at(k.t - 1e-4)
+      }
+    }
+    if (d[slot.offset] === v) return false
+    d[slot.offset] = v
+    return true
+  }
+
+  /** Show `words` on a text dial: its rect into the block. A string the
+   *  picture has never held is set into it first, which redraws the picture
+   *  and writes the block itself. Returns whether the caller still has to. */
+  private showEffectText(fx: EffectInstance, name: string, words: string): boolean {
+    const t = fx.text
+    if (!t) return false
+    t.shown.set(name, words)
+    if (words && !t.strings.has(words)) {
+      this.layoutEffectText(fx)
+      return false
+    }
+    return this.writeTextRect(fx, name, words)
+  }
+
+  private writeTextRect(fx: EffectInstance, name: string, words: string): boolean {
+    const slot = fx.paramLayout.get(name)
+    if (!slot || !fx.text) return false
+    const r = fx.text.rects.get(words) ?? [0, 0, 0, 0]
+    const d = fx.paramsData
+    let moved = false
+    for (let k = 0; k < 4; k++) {
+      if (d[slot.offset + k] === r[k]) continue
+      d[slot.offset + k] = r[k]
+      moved = true
+    }
+    return moved
+  }
+
+  /**
+   * Set every string an effect's text dials can show into its picture, upload
+   * it and point each dial at its row. Re-binds only when the picture changes
+   * SIZE. Once the face has loaded, a second pass sets it again — a web font
+   * the page has not fetched yet draws in the fallback the first time.
+   */
+  private layoutEffectText(fx: EffectInstance, fontLoaded = false): void {
+    const t = fx.text
+    if (!t || !this.device) return
+    // What the dials show now and what their keys can show — rebuilt rather
+    // than added to, so typing a name does not keep every half-typed word.
+    t.strings = new Set([...t.shown.values(), ...[...fx.paramTracks.values()].flatMap((k) => k.texts)].filter((w) => w.length > 0))
+    const sheet = rasterEffectText([...t.strings], t.font)
+    t.rects = sheet?.rects ?? new Map()
+    const w = sheet?.width ?? 1
+    const h = sheet?.height ?? 1
+    if (!t.texture || t.texture.width !== w || t.texture.height !== h) {
+      t.texture?.destroy()
+      t.texture = this.device.createTexture({
+        label: "effect text",
+        size: [w, h],
+        format: "r8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      t.view = t.texture.createView()
+      if (this.effects.includes(fx)) this.rebuildFieldBindGroup()
+    }
+    // premultipliedAlpha, as the lyric atlas: white glyphs on a clear canvas
+    // arrive with coverage in red, antialiased edges intact.
+    if (sheet) {
+      this.device.queue.copyExternalImageToTexture(
+        { source: sheet.source },
+        { texture: t.texture, premultipliedAlpha: true },
+        [w, h],
+      )
+    }
+    for (const [name, words] of t.shown) this.writeTextRect(fx, name, words)
+    if (fx.paramsBuffer) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
+    const fonts = typeof document !== "undefined" ? document.fonts : undefined
+    if (!fontLoaded && fonts && t.font) {
+      const css = effectTextFont(t.font, EFFECT_TEXT_PX)
+      if (!fonts.check(css, [...t.strings].join(""))) {
+        fonts
+          .load(css, [...t.strings].join(""))
+          .then(() => {
+            if (this.effects.includes(fx)) this.layoutEffectText(fx, true)
+          })
+          .catch(() => {})
+      }
+    }
   }
 
   /**
@@ -7984,6 +8190,15 @@ export class Engine {
       fx.sim = sim.clock
       fx.simStep = sim.step
       fx.simReset = sim.reset
+      // A pool held still is seeded ONCE, against whoever was in the cast on
+      // that frame. A scene opened paused at its first frame seeds before her
+      // model has loaded, so an effect that spawns off the cast (chicks round
+      // her feet) is born empty — and a held pool is never stepped again to
+      // ask. So the seed is taken again when the cast it read has changed. The
+      // cast was written earlier this frame (updateCameraUniforms).
+      const cast = fx.subjectMask * 16 + fx.subjectCount
+      if (sim.clock.start !== null && !fx.simReset && fx.simStep === 0 && cast !== fx.seededCast) fx.simReset = true
+      if (fx.simReset || fx.simStep > 0) fx.seededCast = cast
       // Its own clock, expressed the way the mounts read it. Every mount
       // derives time from the epoch against sceneClock, so this one write moves
       // the field, the particles, the ribbons, lightEmit and the grid together
@@ -8603,6 +8818,8 @@ export class Engine {
         { binding: 24, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
         // The lyric line atlas, for rzLyricText.
         { binding: 25, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+        // This effect's own words, for rzText_NAME — a 1x1 when it has none.
+        { binding: EFFECT_TEXT_BINDING, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         // This effect's own clock — see the field shader's note on why it is
         // not viewU[6].x.
