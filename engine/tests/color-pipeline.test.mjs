@@ -285,8 +285,8 @@ test("the outline's struct describes the buffer that is actually bound", () => {
     .slice(shader.indexOf("struct MaterialUniforms"), shader.indexOf("@group(0) @binding(0)"))
     .replace(/\/\*[\s\S]*?\*\//g, "")
   // edgeColor 0..16, edgeSize 16..20, dissolve 20..24, widthScale 24..28,
-  // textured 28..32, colorOverride 32..48, shadowColor 48..64.
-  assert.match(struct, /edgeColor: vec4f,\s*edgeSize: f32,\s*dissolve: f32,\s*widthScale: f32,\s*textured: f32,\s*colorOverride: vec4f,\s*shadowColor: vec4f,/)
+  // textured 28..32, colorOverride 32..48, shadowColor 48..64, xray 64..80.
+  assert.match(struct, /edgeColor: vec4f,\s*edgeSize: f32,\s*dissolve: f32,\s*widthScale: f32,\s*textured: f32,\s*colorOverride: vec4f,\s*shadowColor: vec4f,\s*xray: vec4f,/)
   assert.doesNotMatch(struct, /_skip/, "no reach into the material block's layout")
   assert.match(shader, /export const RZ_OUTLINE_DISSOLVE_OFFSET = 20/)
   assert.match(shader, /export const RZ_OUTLINE_WIDTH_OFFSET = 24/)
@@ -295,7 +295,7 @@ test("the outline's struct describes the buffer that is actually bound", () => {
   assert.match(shader, /export const RZ_OUTLINE_SHADOW_OFFSET = 48/)
 
   const engine = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
-  // SIXTEEN FLOATS, the struct's 64 bytes. A count that disagrees with the
+  // TWENTY FLOATS, the struct's 80 bytes. A count that disagrees with the
   // struct is the same validation failure from the other direction.
   const at = engine.indexOf("mat.edgeColor[0]")
   const made = engine
@@ -306,8 +306,8 @@ test("the outline's struct describes the buffer that is actually bound", () => {
     .replace("new Float32Array([", "")
   assert.equal(
     made.split(",").filter((l) => l.trim().length).length,
-    16,
-    "the outline uniform is sixteen floats",
+    20,
+    "the outline uniform is twenty floats",
   )
   // Written through the shared constant, never a literal — the two ends cannot
   // drift if only one of them names the number.

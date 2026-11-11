@@ -96,7 +96,30 @@ fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
 /** A model's ObjectLight as WGSL declares it (see the layout below). One copy
  *  for every pass that binds it, so their layouts cannot drift. */
 export const OBJECT_LIGHT_STRUCT_WGSL =
-  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: vec4f }"
+  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: vec4f, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16> }"
+
+/**
+ * The see-through window (#xray): a rectangle on the frame, in pixels —
+ * xray[0] is (left, top, right, bottom), xray[3].x is 1 while a window is open
+ * on this model — and which of the model's materials it cuts: a bit a
+ * material, by its 1-based draw index (materialId), up to 512. Tested against
+ * the fragment's own position, so it sits where the lens is, whatever moves
+ * behind it. Declared after the pass's own `objectLight` binding.
+ */
+export const XRAY_WGSL = /* wgsl */ `
+fn rz_xray_inside(fp: vec4f) -> bool {
+  if (objectLight.xray[3].x < 0.5) { return false; }
+  let r = objectLight.xray[0];
+  return fp.x >= r.x && fp.y >= r.y && fp.x <= r.z && fp.y <= r.w;
+}
+fn rz_xray_cut(fp: vec4f, materialId: f32) -> bool {
+  let i = u32(materialId);
+  if (i >= 512u) { return false; }
+  let word = objectLight.xrayMask[i / 128u][(i / 32u) % 4u];
+  if (((word >> (i % 32u)) & 1u) == 0u) { return false; }
+  return rz_xray_inside(fp);
+}
+`
 
 export const COMMON_BINDINGS_WGSL = /* wgsl */ `
 
@@ -297,6 +320,7 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 //             outlines write.
 ${OBJECT_LIGHT_STRUCT_WGSL}
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
+${XRAY_WGSL}
 
 ${JELLY_VERTEX_WGSL}
 /** The light arriving at a surface of this object facing n: its own ambient

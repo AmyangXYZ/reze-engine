@@ -27,7 +27,7 @@
 // attachment, and that answer does not exist at import time. The constant could
 // not have taken the outputs at all, which is most of why it did not have them.
 
-import { DISSOLVE_WGSL, JELLY_VERTEX_WGSL } from "../materials/common"
+import { DISSOLVE_WGSL, JELLY_VERTEX_WGSL, OBJECT_LIGHT_STRUCT_WGSL, XRAY_WGSL } from "../materials/common"
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
 
 export function transparentDepthPrepassWgsl(): string {
@@ -55,8 +55,9 @@ struct MaterialUniforms {
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 // The model's ObjectLight, for its jelly eyes: depth goes down where the colour
 // pass will draw the iris.
-struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12> }
+${OBJECT_LIGHT_STRUCT_WGSL}
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
+${XRAY_WGSL}
 ${JELLY_VERTEX_WGSL}
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
@@ -118,6 +119,7 @@ override CUTOFF: f32 = 0.5;
   // her: you would see sky through her, which is the failure this line exists
   // to prevent.
   if (material.dissolve < 0.9995 && rz_dissolve_threshold(in.restPos) > material.dissolve) { discard; }
+  if (rz_xray_cut(in.position, material.materialId)) { discard; }
   var out: PrepassOut;
   out.color = vec4f(0.0);
   out.mask = vec4f(0.0);

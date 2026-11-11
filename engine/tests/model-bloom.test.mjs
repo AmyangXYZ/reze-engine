@@ -13,14 +13,15 @@ const src = (p) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8")
 const engine = src("engine.ts")
 
 test("every model starts in the bloom", () => {
-  assert.match(engine, /const objectLight = new Float32Array\(100\)\n\s+objectLight\[96\] = 1\n/)
+  // 180: the lights, the jelly eyes and bloom (100), then the see-through window.
+  assert.match(engine, /const objectLight = new Float32Array\(180\)\n\s+objectLight\[96\] = 1\n/)
 })
 
 test("setModelBloom writes the slot the shaders read", () => {
   const setter = engine.slice(engine.indexOf("setModelBloom(name: string, on: boolean)"))
   assert.match(setter.slice(0, 400), /inst\.objectLight\[96\] = on \? 1 : 0/)
   assert.match(setter.slice(0, 400), /writeBuffer\(inst\.lightBuffer, 96 \* 4, inst\.objectLight, 96, 4\)/)
-  assert.match(src("shaders/materials/common.ts"), /jelly: array<vec4f, 12>, bloom: vec4f \}/, "bloom follows the 48 jelly words")
+  assert.match(src("shaders/materials/common.ts"), /jelly: array<vec4f, 12>, bloom: vec4f, xray:/, "bloom follows the 48 jelly words")
 })
 
 test("surfaces and outlines write the model's bloom as the mask", () => {

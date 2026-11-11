@@ -17,7 +17,7 @@
 // a string baked at import cannot know what the device said.
 
 import { sceneFsOutWgsl, sceneIdPadWgsl } from "./scene-contract"
-import { DISSOLVE_WGSL, OBJECT_LIGHT_STRUCT_WGSL } from "../materials/common"
+import { DISSOLVE_WGSL, OBJECT_LIGHT_STRUCT_WGSL, XRAY_WGSL } from "../materials/common"
 
 /**
  * Where `dissolve` sits in the outline's own uniform, in bytes.
@@ -79,6 +79,9 @@ struct MaterialUniforms {
    *  material's own alpha still holds — a line its author made sheer stays so. */
   colorOverride: vec4f,
   shadowColor: vec4f,
+  /** x: the material's 1-based draw index, as the colour pass's materialId —
+   *  what lets the see-through window cut a garment's line and keep hers. */
+  xray: vec4f,
 };
 
 struct OutlineLight { direction: vec4f, color: vec4f, };
@@ -91,6 +94,7 @@ struct OutlineLights { ambientColor: vec4f, lights: array<OutlineLight, 4>, };
 @group(1) @binding(0) var<storage, read> skinMats: array<mat4x4f>;
 ${OBJECT_LIGHT_STRUCT_WGSL}
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
+${XRAY_WGSL}
 @group(2) @binding(0) var<uniform> material: MaterialUniforms;
 @group(2) @binding(1) var diffuseTexture: texture_2d<f32>;
 /** A look's outline tint (ShaderGraph.outline.tint): one of its images, white
@@ -269,6 +273,8 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
   // bind-pose position — three passes, one rule, or they disagree about which
   // pieces are still there.
   if (material.dissolve < 0.9995 && rz_dissolve_threshold(input.restPos) > material.dissolve) { discard; }
+  // The see-through window cuts the lines of what it cuts, and keeps hers.
+  if (rz_xray_cut(input.position, material.xray.x)) { discard; }
   let tex = textureSample(diffuseTexture, edgeSampler, input.uv);
   let texA = tex.a;
   if (texA < 0.05) {

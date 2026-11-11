@@ -107,7 +107,9 @@ function prelude(renderClass: RenderClass, alphaMode: AlphaMode, blend: StyleBle
   const flip =
     renderClass === "eye" ? "" : "\n  n = select(-n, n, dot(n, v) >= 0.0);"
   return `@fragment fn fs(input: VertexOutput) -> FSOut {
-${PLAIN_SAMPLE}  // MMD alpha semantics: material alpha × texture alpha, capped at 1 as MMD
+${PLAIN_SAMPLE}  // The see-through window (#xray): her clothes are not drawn inside it.
+  if (rz_xray_cut(input.position, material.materialId)) { discard; }
+  // MMD alpha semantics: material alpha × texture alpha, capped at 1 as MMD
   // does (a PMX can author alpha above 1; blended, it burns the material white).
   let alpha = saturate(material.alpha * tex_s.a);
 ${discard}
@@ -155,7 +157,9 @@ ${gate}
   // only by its own lamps — must not light it through the fallback.
   let rz_keyed = (light.dirLayers[rz_key] & objectLight.layers.x) != 0u;
   let sun = select(vec3f(0.0), light.lights[rz_key].color.xyz * light.lights[rz_key].color.w, rz_keyed);
-  let shadow = sampleShadow(input.worldPos, n);
+  // Lit through the see-through window: what it reveals would otherwise wear
+  // the shadow of the clothes it cut, which reads as dirt rather than as cloth.
+  let shadow = select(sampleShadow(input.worldPos, n), 1.0, rz_xray_inside(input.position));
   // The ambient: this object's own where loaded data gave it one — the game
   // gives every renderer its own — else the world's flat colour or the HDRI's
   // irradiance at this normal.

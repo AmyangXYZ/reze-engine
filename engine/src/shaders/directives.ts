@@ -163,6 +163,15 @@ export type EffectDirectives = {
    */
   stepped: boolean
   /**
+   * `#xray X Y WIDTH HEIGHT` — a see-through window held in front of the
+   * lens, as X-ray glasses are: a rectangle on the frame, four float dials in
+   * fractions of the frame — X and Y its offset from the frame's centre (Y
+   * up), WIDTH and HEIGHT its size. Behind it, the materials the host marks on the characters it is aimed
+   * at (setXrayMaterials — their clothes) are not drawn, so what is under them
+   * shows. Whole while the effect plays at all. Null without.
+   */
+  xray: { x: string; y: string; width: string; height: string } | null
+  /**
    * How long ONE firing of this effect lasts, in seconds. 0 = undeclared.
    *
    * An effect is one of two things, and only its author knows which. A HIT has
@@ -196,6 +205,7 @@ const SPEC = {
   dissolve: 0,
   mirror: 0,
   stepped: 0,
+  xray: 4,
   duration: 1,
   ground: "rest",
 } as const
@@ -275,6 +285,7 @@ export function parseDirectives(wgsl: string): DirectiveResult {
     ground: null,
     mirror: false,
     stepped: false,
+    xray: null,
     duration: 0,
   }
   const errors: string[] = []
@@ -522,6 +533,9 @@ export function parseDirectives(wgsl: string): DirectiveResult {
       case "stepped":
         d.stepped = true
         return
+      case "xray":
+        d.xray = { x: args[0], y: args[1], width: args[2], height: args[3] }
+        return
       case "duration": {
         // SECONDS, like every other time a directive states (see #dissolve).
         // The document above works in frames and converts once; an author
@@ -549,6 +563,13 @@ export function parseDirectives(wgsl: string): DirectiveResult {
       }
     }
   })
+
+  // #xray names four dials, which have to be there and be numbers.
+  if (d.xray) {
+    for (const name of [d.xray.x, d.xray.y, d.xray.width, d.xray.height]) {
+      if (d.params.find((p) => p.name === name)?.kind !== "float") errors.push(`#xray: ${name} has to be a #param float`)
+    }
+  }
 
   // Duplicates are an author editing one line and forgetting another; last-wins
   // is a coin toss they never see resolved.

@@ -128,7 +128,7 @@ test("aiming an effect is a setter, not a reinstall", () => {
 test("the install says whether aiming means anything", () => {
   // Rain falls on the scene and a glitch is on the lens. A host that offers the
   // control anyway offers one that does nothing.
-  assert.match(engine, /readsCast: \/\\brz\(\?:Subject\|SubjectCount\|SubjectId\|Anchor\|Trail\|TrailCount\|CastDistance\)\\s\*\\\(\/\.test\(wgsl\) \|\|\n\s+anchors\.length > 0,/)
+  assert.match(engine, /readsCast: \/\\brz\(\?:Subject\|SubjectCount\|SubjectId\|Anchor\|Trail\|TrailCount\|CastDistance\)\\s\*\\\(\/\.test\(wgsl\) \|\|\n\s+anchors\.length > 0 \|\|\n\s+d\.xray !== null,/)
   assert.match(engine, /readsCast: built\.instance\.readsCast,/, "reported off the instance, not a second parse")
 })
 

@@ -1181,6 +1181,12 @@ interface ModelInstance {
    *  hiddenMaterials so a morph switching a part off never clobbers the user's
    *  own visibility toggle, and vice versa. */
   morphHiddenMaterials: Set<string>
+  /** Each PMX material's 1-based draw index (the shaders' materialId), by
+   *  name — what setXrayMaterials marks. */
+  materialIdByName: Map<string, number>
+  /** The see-through window last written into objectLight, as text, so an
+   *  unmoved window is not re-uploaded every frame. */
+  xrayKey: string
   /** Materials the reflection probe leaves out (setMaterialInProbe). */
   probeHiddenMaterials: Set<string>
   /** Material-morph targets, or null when the model has no type-8 morphs. */
@@ -1900,6 +1906,8 @@ interface EffectInstance {
   hasMirror: boolean
   /** `#stepped` — the cast it is aimed at moves on twos. */
   stepped: boolean
+  /** `#xray` — its see-through window's four dials, or null. */
+  xray: { x: string; y: string; width: string; height: string } | null
   /** Mounted under the scene. */
   hasBackground: boolean
   /** Mounted over the finished frame — and the reason the scene pass has to
@@ -5637,7 +5645,7 @@ export class Engine {
     // reflection re-renders the scene from a folded camera, which is a pass and
     // not a shader, so the effect declares it and draws nothing itself.
     // #stepped too: it decides when a pose reaches the screen, not what is drawn.
-    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails && !hasLightEmit(wgsl) && !d.mirror && !d.stepped) {
+    if (!hasBackground && !hasForeground && !wantsParticles && !wantsTrails && !hasLightEmit(wgsl) && !d.mirror && !d.stepped && !d.xray) {
       return { ok: false, diagnostics: [
           "an effect must define fn background(ray: vec3f, uv: vec2f, time: f32) -> vec4f, " +
             "fn foreground(ray: vec3f, uv: vec2f, time: f32, depth: f32) -> vec4f, " +
@@ -5976,6 +5984,7 @@ export class Engine {
         paramTracks: new Map(),
         hasMirror: d.mirror,
         stepped: d.stepped,
+        xray: d.xray,
         hasBackground,
         hasForeground,
         // The author's OWN source, not the assembled module: the assembled one
@@ -5987,9 +5996,11 @@ export class Engine {
         // Every route to the cast, in one test, and the author's own source for
         // the reason readsIds gives. `#anchor` counts: a file declaring one asks
         // the engine to record a bone for it, whether or not the accessor is
-        // spelled out in a line this matches.
+        // spelled out in a line this matches. `#xray` counts too: whom its
+        // window cuts is whom it is aimed at.
         readsCast: /\brz(?:Subject|SubjectCount|SubjectId|Anchor|Trail|TrailCount|CastDistance)\s*\(/.test(wgsl) ||
-          anchors.length > 0,
+          anchors.length > 0 ||
+          d.xray !== null,
         // Aimed at nobody in particular — the whole cast, which is what every
         // effect did before it could be aimed. A host narrows it afterwards, the
         // way it sets influence and a schedule.
@@ -7701,6 +7712,71 @@ export class Engine {
       if (fx.paramBindings.size) dirty = this.resolveParamBindings(fx) || dirty
       if (dirty) this.device.queue.writeBuffer(fx.paramsBuffer, 0, fx.paramsData)
     }
+    this.applyXray()
+  }
+
+  /**
+   * Each `#xray` effect's window, onto every character it is aimed at: a
+   * rectangle on the frame from its X, Y, WIDTH and HEIGHT dials (fractions of
+   * the frame; X and Y from its centre, Y up), in pixels at the size the scene
+   * draws at — so it sits in
+   * the same place in a preview and a 4K export. It is whole while the effect
+   * plays at all — the effect draws its own border and cannot read its fade,
+   * so a window that shrank with it would part from the border it sits in. A
+   * model no window is on is written closed.
+   */
+  private applyXray(): void {
+    const W = this.canvas.width
+    const H = this.canvas.height
+    const rects = new Map<string, Float32Array>()
+    for (const fx of this.effects) {
+      const x = fx.xray
+      if (!x || fx.weight < 0.001) continue
+      const d = fx.paramsData
+      const read = (name: string, fallback: number): number => {
+        const s = fx.paramLayout.get(name)
+        return s ? d[s.offset] : fallback
+      }
+      // The frame's pixels run y down; the dial runs up from the centre.
+      const cx = (0.5 + read(x.x, 0)) * W
+      const cy = (0.5 - read(x.y, 0)) * H
+      const hw = Math.abs(read(x.width, 0.25)) * 0.5 * W
+      const hh = Math.abs(read(x.height, 0.25)) * 0.5 * H
+      const rect = new Float32Array(16)
+      rect[0] = cx - hw
+      rect[1] = cy - hh
+      rect[2] = cx + hw
+      rect[3] = cy + hh
+      rect[12] = 1
+      for (const name of this.castSubjectNames(fx.subjects)) rects.set(name, rect)
+    }
+    for (const [name, inst] of this.modelInstances) {
+      const rect = rects.get(name)
+      const key = rect ? rect.join(",") : ""
+      if (key === inst.xrayKey) continue
+      inst.xrayKey = key
+      inst.objectLight.set(rect ?? new Float32Array(16), 100)
+      this.device.queue.writeBuffer(inst.lightBuffer, 100 * 4, inst.objectLight, 100, 16)
+    }
+  }
+
+  /**
+   * Which of a model's materials a see-through window (#xray) cuts — her
+   * clothes, by PMX material name. Everything else (skin, face, hair, eyes) is
+   * drawn behind the window as anywhere else. Null or empty: none.
+   */
+  setXrayMaterials(modelName: string, names: readonly string[] | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    const mask = new Uint32Array(inst.objectLight.buffer, 116 * 4, 64)
+    mask.fill(0)
+    for (const n of names ?? []) {
+      const id = inst.materialIdByName.get(n)
+      if (id === undefined || id >= 512) continue
+      mask[id >> 5] |= 1 << (id & 31)
+    }
+    this.device.queue.writeBuffer(inst.lightBuffer, 116 * 4, inst.objectLight, 116, 64)
+    return true
   }
 
   /** Bones and followed points into the block, where they stand this frame. */
@@ -15765,7 +15841,9 @@ export class Engine {
     // layers [0..3] (y: a stage, which takes the cast's shadow —
     // rzRoofedCastShadow), ambient flag [4..7], SH [8..43], fill [44..47],
     // jelly eyes [48..95], bloom [96..99] — see materials/common.ts.
-    const objectLight = new Float32Array(100)
+    // 100 for the lights, the jelly eyes and the bloom flag; 16 for the
+    // see-through window and 64 for the materials it cuts (XRAY_WGSL).
+    const objectLight = new Float32Array(180)
     objectLight[96] = 1
     const objectLayers = new Uint32Array(objectLight.buffer)
     objectLayers[0] =
@@ -15862,6 +15940,8 @@ export class Engine {
       skinMatricesDirty: true,
       hiddenMaterials: new Set(),
       morphHiddenMaterials: new Set(),
+      materialIdByName: new Map(),
+      xrayKey: "",
       probeHiddenMaterials: new Set(),
       materialMorphTargets: null,
       materialMorphByIndex: null,
@@ -16431,6 +16511,7 @@ export class Engine {
       const indexCount = mat.vertexCount
       if (indexCount === 0) continue
       materialId++
+      inst.materialIdByName.set(mat.name, materialId)
 
       let diffuseTexture = await loadTextureByIndex(mat.diffuseTextureIndex)
       if (!diffuseTexture) {
@@ -16564,6 +16645,12 @@ export class Engine {
           this.outlineColor[3],
           // The graph outline's shadow colour, at RZ_OUTLINE_SHADOW_OFFSET.
           0,
+          0,
+          0,
+          0,
+          // The material's draw index, for the see-through window's cut — the
+          // colour pass's materialId — padded to the vector it sits in.
+          materialId,
           0,
           0,
           0,
