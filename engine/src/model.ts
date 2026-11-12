@@ -3183,7 +3183,8 @@ export class Model {
     for (const b of boneIndices) if (b >= 0 && b < n) this.physicsDriven[b] = 1
 
     // Bones to recompute after a step: anything that INHERITS from a simulated
-    // bone, everything under it, and anything inheriting from those in turn.
+    // bone or hangs under one, everything under those, and anything inheriting
+    // from them in turn.
     // Simulated bones themselves are deliberately excluded — their world matrix
     // IS the simulation's output, and recomputing it from a local pose the
     // simulation never wrote would throw the step away.
@@ -3198,7 +3199,9 @@ export class Model {
         const ap = b.appendParentIndex
         const inheritsAffected =
           (b.appendRotate || b.appendMove) && ap !== undefined && ap >= 0 && ap < n && (this.physicsDriven[ap] || affected[ap])
-        const parentAffected = b.parentIndex >= 0 && affected[b.parentIndex]
+        // A plain child of a simulated bone — one with no body of its own, like
+        // 瞳 inside Koishi's third eye — rides on the simulated world matrix.
+        const parentAffected = b.parentIndex >= 0 && (affected[b.parentIndex] || this.physicsDriven[b.parentIndex])
         if (inheritsAffected || parentAffected) {
           affected[i] = 1
           changed = true
@@ -3251,12 +3254,12 @@ export class Model {
   applyPhysicsAppend(): void {
     const order = this.physicsAppendOrder
     const sources = this.physicsAppendSources
-    if (!order || !sources || !this.appendRotOverride || !this.appendRotOverrideSet) return
+    if (!order || !this.appendRotOverride || !this.appendRotOverrideSet) return
     const bones = this.skeleton.bones
     const worldMats = this.runtimeSkeleton.worldMatrices
 
     this.appendRotOverrideSet.fill(0)
-    for (let s = 0; s < sources.length; s++) {
+    for (let s = 0; sources && s < sources.length; s++) {
       const i = sources[s]
       const w = worldMats[i].values
       const p = bones[i].parentIndex

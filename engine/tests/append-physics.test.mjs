@@ -45,8 +45,8 @@ function findModels(limit = 6) {
 
 /**
  * The affected set, as Model.setPhysicsDrivenBones computes it: a bone that
- * inherits from a simulated bone, everything under it, and anything inheriting
- * from those in turn — MINUS the simulated bones themselves, whose world matrix
+ * inherits from a simulated bone or hangs under one, everything under those,
+ * and anything inheriting from them in turn — MINUS the simulated bones themselves, whose world matrix
  * IS the simulation's output and must never be recomputed from a local pose the
  * simulation never wrote.
  */
@@ -62,7 +62,7 @@ function affectedSet(bones, physicsDriven) {
       const ap = b.appendParentIndex
       const inherits =
         (b.appendRotate || b.appendMove) && ap !== undefined && ap >= 0 && ap < n && (physicsDriven[ap] || affected[ap])
-      const parented = b.parentIndex >= 0 && affected[b.parentIndex]
+      const parented = b.parentIndex >= 0 && (affected[b.parentIndex] || physicsDriven[b.parentIndex])
       if (inherits || parented) { affected[i] = 1; changed = true }
     }
   }
@@ -90,12 +90,23 @@ test("a simulated append parent is never itself in the recompute set", () => {
   assert.equal(a[0], 0, "an unrelated bone is left alone")
 })
 
-test("a rig with no append-from-physics costs nothing", () => {
-  // The common case: the pass returns immediately, so models that do not need
-  // this never pay for it.
+test("a fully simulated chain costs nothing", () => {
+  // The common case: every bone of the chain owns a body, so the pass returns
+  // immediately and models that do not need it never pay for it.
   const bones = [{ parentIndex: -1 }, { parentIndex: 0 }, { parentIndex: 1 }]
-  const a = affectedSet(bones, new Uint8Array([0, 1, 0]))
-  assert.equal(a.reduce((s, v) => s + v, 0), 0, "nothing inherits, so nothing is revisited")
+  const a = affectedSet(bones, new Uint8Array([0, 1, 1]))
+  assert.equal(a.reduce((s, v) => s + v, 0), 0, "every chain bone is simulated, so nothing is revisited")
+})
+
+test("a plain child of a simulated bone rides on the simulation", () => {
+  // Miy式 古明地こいし: the third eye's ball (サードボーン) is simulated and
+  // its iris bone (瞳) is an ordinary child with no body. Left out, the iris
+  // stayed at the animated pose while the ball sagged 0.7 below it.
+  const bones = [{ parentIndex: -1 }, { parentIndex: 0 }, { parentIndex: 1 }, { parentIndex: 2 }]
+  const a = affectedSet(bones, new Uint8Array([0, 1, 0, 0]))
+  assert.equal(a[1], 0, "the simulated bone keeps the step's result")
+  assert.equal(a[2], 1, "its plain child is recomputed from it")
+  assert.equal(a[3], 1, "and everything under that child")
 })
 
 test("append-from-physics is a real rig, not a hypothetical", { skip: models.length === 0 ? "no PMX models on this machine" : false }, () => {
