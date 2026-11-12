@@ -20,6 +20,7 @@ export {
   type MaterialPresetMap,
   type ModelTransform,
   type SceneLight,
+  type CastKey,
   RENDERING_LAYER_DEFAULT,
   RENDERING_LAYER_CHARACTER,
   type ModelAttachment,

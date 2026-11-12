@@ -96,7 +96,7 @@ fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
 /** A model's ObjectLight as WGSL declares it (see the layout below). One copy
  *  for every pass that binds it, so their layouts cannot drift. */
 export const OBJECT_LIGHT_STRUCT_WGSL =
-  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: vec4f, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16> }"
+  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: vec4f, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16>, matLayers: array<vec4u, 128> }"
 
 /**
  * The see-through window (#xray): a rectangle on the frame, in pixels —
@@ -118,6 +118,24 @@ fn rz_xray_cut(fp: vec4f, materialId: f32) -> bool {
   let word = objectLight.xrayMask[i / 128u][(i / 32u) % 4u];
   if (((word >> (i % 32u)) & 1u) == 0u) { return false; }
   return rz_xray_inside(fp);
+}
+`
+
+/**
+ * The rendering layers this draw is on: its material's own where the model
+ * gives it some (objectLight.matLayers, by the 1-based materialId, up to 511),
+ * else the model's. A game lights its renderers one by one — URP hands each
+ * object its own few lamps — and a converted stage is one model of many such
+ * renderers, so the bits a light is tested against have to be able to differ
+ * from material to material. Zero, which every model leaves there, is "the
+ * model's". Declared after the pass's own `objectLight` and `material` bindings.
+ */
+export const DRAW_LAYERS_WGSL = /* wgsl */ `
+fn rzDrawLayers() -> u32 {
+  let i = u32(material.materialId);
+  if (i >= 512u) { return objectLight.layers.x; }
+  let own = objectLight.matLayers[i / 4u][i % 4u];
+  return select(objectLight.layers.x, own, own != 0u);
 }
 `
 
@@ -335,11 +353,17 @@ fn rzObjectAmbient(n: vec3f) -> vec3f {
   return max(c, vec3f(0.0));
 }
 
-/** The directional light slot that lights this draw: the first whose layers
- *  it shares, else the sun's. */
+/** The directional light slot that lights this draw: a light kept to layers
+ *  of its own that this draw is on (the cast's key, beside a stage's sun),
+ *  else the first whose layers it shares, else the sun's. A light that
+ *  reaches every layer stands in for nobody. */
 fn rzMainLight() -> u32 {
+  let mine = rzDrawLayers();
+  for (var k = 1u; k < 4u; k++) {
+    if (light.dirLayers[k] != 0xffffffffu && (light.dirLayers[k] & mine) != 0u) { return k; }
+  }
   for (var k = 0u; k < 4u; k++) {
-    if ((light.dirLayers[k] & objectLight.layers.x) != 0u) { return k; }
+    if ((light.dirLayers[k] & mine) != 0u) { return k; }
   }
   return 0u;
 }
@@ -679,4 +703,4 @@ fn rz_dissolve_threshold(restPos: vec3f) -> f32 {
 // The FSOut struct is NOT in here any more — see commonFsOutWgsl above. Every
 // consumer of this constant appends it immediately, which is where it was.
 export const COMMON_MATERIAL_PRELUDE_WGSL =
-  COMMON_BINDINGS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6, "objectLight.layers.x", { binding: 9, sampler: "diffuseSampler" }) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL
+  COMMON_BINDINGS_WGSL + DRAW_LAYERS_WGSL + WORLD_AMBIENT_WGSL + lightsApi(0, 6, "rzDrawLayers()", { binding: 9, sampler: "diffuseSampler" }) + SAMPLE_SHADOW_WGSL + COMMON_VS_WGSL

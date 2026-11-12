@@ -2129,6 +2129,17 @@ export type SceneLight = {
 }
 
 /**
+ * A KEY LIGHT FOR THE CAST that turns with the camera, as Aether Gazer lights
+ * its characters: CharacterEffect's _localLight* puts the key in the frame of
+ * the camera's view flattened to the ground (sim_TowardMatrix), so whatever
+ * the shot she is lit from the viewer's side — `inclination` degrees above
+ * the ground, `azimuth` degrees round from straight behind the camera. Drawn
+ * as a directional light on `layers` (RENDERING_LAYER_CHARACTER when
+ * omitted), standing in for the sun there.
+ */
+export type CastKey = { color: XYZ; strength: number; inclination: number; azimuth: number; layers?: number }
+
+/**
  * Rendering layers, as the game's pipeline (URP's rendering layers) uses them:
  * every drawing carries layer bits and a light reaches it only where its mask
  * shares one. A stage, prop or plane draws on DEFAULT; the cast on DEFAULT and
@@ -8000,6 +8011,29 @@ export class Engine {
     return true
   }
 
+  /**
+   * Each named material's own rendering layers, the bits a light's are tested
+   * against (RENDERING_LAYER_*), in place of the model's. A game lights each
+   * renderer by its own few lamps — URP's per-object lights, four on Aether
+   * Gazer's stages — and a stage converted to one model carries that as a
+   * layer per group of renderers that share lamps, and each lamp on the
+   * groups it lights. Materials left out, or the whole map null, take the
+   * model's layers again.
+   */
+  setMaterialLayers(modelName: string, layers: Readonly<Record<string, number>> | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    const table = new Uint32Array(inst.objectLight.buffer, 180 * 4, 512)
+    table.fill(0)
+    for (const [n, bits] of Object.entries(layers ?? {})) {
+      const id = inst.materialIdByName.get(n)
+      if (id === undefined || id >= 512) continue
+      table[id] = bits >>> 0
+    }
+    this.device.queue.writeBuffer(inst.lightBuffer, 180 * 4, inst.objectLight, 180, 512)
+    return true
+  }
+
   /** Bones and followed points into the block, where they stand this frame. */
   private resolveParamBindings(fx: EffectInstance): boolean {
     const d = fx.paramsData
@@ -12531,6 +12565,56 @@ export class Engine {
     }
   }
 
+  private castKey: CastKey | null = null
+  private castKeyAim: [number, number, number] = [0, 0, 0]
+
+  /**
+   * The cast's own key light, turning with the camera (CastKey). It takes the
+   * last directional slot; null gives the slot back to the scene's lights.
+   */
+  setCastKey(key: CastKey | null): void {
+    this.castKey = key
+    this.castKeyAim = [0, 0, 0]
+    if (!key) {
+      this.setLights(this.sceneLights)
+      return
+    }
+    this.updateCastKey()
+  }
+
+  /** The cast key's direction for this frame's camera: the toward frame is the
+   *  view's back (towards the eye) flattened to the ground, up, and their cross. */
+  private updateCastKey() {
+    const key = this.castKey
+    if (!key || !this.camera) return
+    const v = this.camera.getViewMatrix().values
+    let bx = v[2], bz = v[10]
+    const bl = Math.hypot(bx, bz)
+    if (bl < 1e-4) {
+      bx = 0
+      bz = 1
+    } else {
+      bx /= bl
+      bz /= bl
+    }
+    const inc = (key.inclination * Math.PI) / 180
+    const az = (key.azimuth * Math.PI) / 180
+    // towards the light: back·cos(az) + right·sin(az) round the ground, up by inc
+    const rx = bz, rz = -bx
+    const tx = (bx * Math.cos(az) + rx * Math.sin(az)) * Math.cos(inc)
+    const ty = Math.sin(inc)
+    const tz = (bz * Math.cos(az) + rz * Math.sin(az)) * Math.cos(inc)
+    const aim: [number, number, number] = [-tx, -ty, -tz]
+    const was = this.castKeyAim
+    if (Math.abs(aim[0] - was[0]) < 1e-5 && Math.abs(aim[1] - was[1]) < 1e-5 && Math.abs(aim[2] - was[2]) < 1e-5) return
+    this.castKeyAim = aim
+    const base = 4 + 3 * 8
+    const s = Math.max(key.strength, 0)
+    this.lightData.set([aim[0], aim[1], aim[2], 0, key.color.x * s, key.color.y * s, key.color.z * s, 1], base)
+    this.lightDataWords[DIR_LAYERS_AT + 3] = (key.layers ?? RENDERING_LAYER_CHARACTER) >>> 0
+    this.updateLightBuffer()
+  }
+
   /**
    * The scene's positional lights — an ADDITIVE layer over the sun, which stays
    * the key light and keeps the toon ramp to itself.
@@ -12559,7 +12643,8 @@ export class Engine {
     // The directional ones go to the light uniform's slots beside the sun's —
     // three of them, in order; the rest are records the grid indexes.
     const directional = (lights ?? []).filter((l) => l.kind === "directional")
-    for (let k = 1; k < 4; k++) {
+    // the last slot is the cast's key while one is set (setCastKey)
+    for (let k = 1; k < (this.castKey ? 3 : 4); k++) {
       const l = directional[k - 1]
       const base = 4 + k * 8
       const a = l?.aim
@@ -16076,8 +16161,10 @@ export class Engine {
     // rzRoofedCastShadow), ambient flag [4..7], SH [8..43], fill [44..47],
     // jelly eyes [48..95], bloom [96..99] — see materials/common.ts.
     // 100 for the lights, the jelly eyes and the bloom flag; 16 for the
-    // see-through window and 64 for the materials it cuts (XRAY_WGSL).
-    const objectLight = new Float32Array(180)
+    // see-through window and 64 for the materials it cuts (XRAY_WGSL); 512
+    // for each material's own rendering layers (DRAW_LAYERS_WGSL), 0 = the
+    // model's.
+    const objectLight = new Float32Array(692)
     objectLight[96] = 1
     const objectLayers = new Uint32Array(objectLight.buffer)
     objectLayers[0] =
@@ -18410,6 +18497,7 @@ export class Engine {
     }
 
     const hasModels = this.modelInstances.size > 0
+    this.updateCastKey()
     this.syncSteppedFromEffects()
     if (hasModels) {
       this.updateInstances(deltaTime)

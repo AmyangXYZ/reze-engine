@@ -155,7 +155,7 @@ ${gate}
   // NO KEY WHERE NONE REACHES: rzMainLight falls back to the sun's slot, and
   // a sun kept off this draw's layers — the cast's alone, beside a stage lit
   // only by its own lamps — must not light it through the fallback.
-  let rz_keyed = (light.dirLayers[rz_key] & objectLight.layers.x) != 0u;
+  let rz_keyed = (light.dirLayers[rz_key] & rzDrawLayers()) != 0u;
   let sun = select(vec3f(0.0), light.lights[rz_key].color.xyz * light.lights[rz_key].color.w, rz_keyed);
   // Lit through the see-through window: what it reveals would otherwise wear
   // the shadow of the clothes it cut, which reads as dirt rather than as cloth.
