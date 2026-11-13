@@ -355,7 +355,7 @@ export function compileGraph(graph: ShaderGraph, opts: CompileOptions = {}): Com
     // Lit is the SURFACE only when it is the graph's output: then it shades the
     // lamps' diffuse by its own albedo, as URP does. Mixed in as a layer (a
     // toon look's gloss), the lamps stay the epilogue's, on the whole material.
-    if (node.type === "lit" && node.id !== out.node) return spec(node).emit!(raw).replace(/, true\)$/, ", false)")
+    if (node.type === "lit" && node.id !== out.node) return spec(node).emit!(raw).replace(/input\.worldPos, true\)/, "input.worldPos, false)")
     return spec(node).emit!(raw)
   }
 

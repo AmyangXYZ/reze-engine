@@ -392,6 +392,15 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     outputs: { value: "float" },
     contextOutputs: { value: "material.shininess" },
   },
+  // The PMX ambient colour, live: a host rewrites it per frame with
+  // setMaterialUniforms({ ambient }), so a graph that multiplies by it has a
+  // per-material dial on the clock (a game stage's scene tint, which its show
+  // moves with the music).
+  material_ambient: {
+    inputs: {},
+    outputs: { color: "color" },
+    contextOutputs: { color: "material.ambient" },
+  },
 
   material_diffuse: {
     inputs: {},
@@ -738,12 +747,20 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
        *  (Schlick), as Blender's Principled; 0 is URP's fixed reflectance. */
       fresnel: F(0),
       normal: { type: "vector", contextDefault: "n" },
+      /** Its whole result scaled — lamps, reflections and glow alike, as a game
+       *  stage's last multiply (SimSceneTint) scales it. Inside the node rather
+       *  than after it, because Lit is the SURFACE only as the graph's output
+       *  (it then shades the lamps itself; see compile.ts emitExpr). */
+      tint: C([1, 1, 1]),
     },
     outputs: { color: "color", alpha: "float" },
     outputSelect: { color: ".rgb", alpha: ".a" },
-    emit: (a) =>
-      `urp_lit(${a.base_color}, ${a.metallic}, ${a.smoothness}, ${a.specular}, ${a.occlusion}, ${a.emission}, ${a.alpha}, ${a.fresnel}, ` +
-      `${a.normal}, l, v, sun, amb, shadow, input.worldPos, true)`,
+    emit: (a) => {
+      const call =
+        `urp_lit(${a.base_color}, ${a.metallic}, ${a.smoothness}, ${a.specular}, ${a.occlusion}, ${a.emission}, ${a.alpha}, ${a.fresnel}, ` +
+        `${a.normal}, l, v, sun, amb, shadow, input.worldPos, true)`
+      return a.tint === "vec3f(1.0)" ? call : `(${call} * vec4f(${a.tint}, 1.0))`
+    },
     takesLight: true,
   },
 
