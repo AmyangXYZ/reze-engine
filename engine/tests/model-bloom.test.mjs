@@ -13,8 +13,9 @@ const src = (p) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8")
 const engine = src("engine.ts")
 
 test("every model starts in the bloom", () => {
-  // 180: the lights, the jelly eyes and bloom (100), then the see-through window.
-  assert.match(engine, /const objectLight = new Float32Array\(180\)\n\s+objectLight\[96\] = 1\n/)
+  // 692: the lights, the jelly eyes and bloom (100), the see-through window (to
+  // 180), then each material's rendering layers (512).
+  assert.match(engine, /const objectLight = new Float32Array\(692\)\n\s+objectLight\[96\] = 1\n/)
 })
 
 test("setModelBloom writes the slot the shaders read", () => {

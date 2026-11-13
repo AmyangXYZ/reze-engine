@@ -340,7 +340,8 @@ test("the header has exactly one writer", () => {
   // the count — correct on the GPU only by queue ordering, and a trap on the
   // CPU: the first path that uploads lightsData whole would zero the count.
   const engineSrc = readFileSync(new URL("../src/engine.ts", import.meta.url), "utf8")
-  const at = engineSrc.indexOf("setLights(")
+  // the method, not its first call (the cast-key and lamp-rig paths call it above)
+  const at = engineSrc.search(/\n  setLights\(/)
   const body = engineSrc.slice(at, engineSrc.indexOf("\n  }", at))
   assert.match(body, /LIGHT_HEADER \* 4,\s*\n\s*this\.lightsData\.buffer/, "setLights must write records only, offset past the header")
   // TWO offset-0 writes are legitimate: the one-time zero-fill at buffer
