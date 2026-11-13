@@ -209,6 +209,13 @@ fn rzProject(p: vec3f) -> vec3f {
 fn rzCamPos() -> vec3f { return cam.camPos; }
 `
 
+/** `fn particleStep(p, dt, id: u32)`: the step is told the particle's slot, as
+ *  particleInit is, so it can read the slot's emitter. Two parameters is the
+ *  usual step and is called as before. */
+function stepTakesId(wgsl: string): boolean {
+  return /\bfn\s+particleStep\s*\([^)]*,[^)]*,[^)]*\)/.test(wgsl)
+}
+
 /** Does the source define the particle contract? All three are required
  *  together; `cover` is optional and only means anything to a cutout, and
  *  `count` is optional and bounds the frame's work — see particleCount. */
@@ -302,7 +309,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // its life staggers the pool, which is the difference between snow and a
     // pulse of snow arriving all at once every few seconds.
   } else {
-    p = particleStep(p, pu.dt);
+    p = particleStep(p, pu.dt${stepTakesId(src.wgsl) ? ", i" : ""});
     p.age = p.age + pu.dt;
   }
   particles[i] = p;
@@ -376,7 +383,12 @@ struct VSOut {
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut {
   var out: VSOut;
   out.id = ii;
-  let p = particles[ii];
+${/\bfn\s+particleWorld\s*\(/.test(src.wgsl) ? `  // the effect keeps the pool in its emitters' own frames (Unity's Local
+  // simulation space: a beam riding a moving head); particleWorld puts this
+  // one in the world as its emitter stands now, before the card is built
+  let p = particleWorld(particles[ii], ii);
+` : `  let p = particles[ii];
+`}
   // Two triangles, corners in the order 0,1,2, 2,1,3.
   let quad = array<vec2f, 6>(
     vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
