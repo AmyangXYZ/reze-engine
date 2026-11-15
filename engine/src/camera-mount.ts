@@ -23,8 +23,10 @@ export interface CameraMountOptions {
   mode: CameraMountMode
   /** The bone the camera rides. POV 頭 (the head), selfie 右手首 (a wrist). */
   bone?: string
-  /** Seconds the camera's turn trails the bone, eased (POV 0.12, selfie 0.25):
-   *  a dance's head snaps read as a jolt without it. 0 is rigid. */
+  /** Seconds the camera's turn trails the bone, eased (POV 0.3, selfie 0.25):
+   *  a dance's head snaps read as a jolt without it. 0 is rigid. In POV the
+   *  turn is eased twice over and the nod and the lens's travel take their
+   *  own share of it — see POV_PITCH_TAU and POV_POS_TAU. */
   smoothing?: number
   /** POV: keep the horizon level, dropping the head's tilt. Default true. */
   level?: boolean
@@ -51,13 +53,32 @@ const EYES_UP_FALLBACK = 1.1
 /** Selfie: the nearest the phone comes to her face, as a share of `distance`. */
 const SELFIE_MIN = 0.55
 const UP = new Vec3(0, 1, 0)
+/**
+ * POV is a STABILISED head cam, the way a gimbal or a game's first-person view
+ * is: a dancer's head bobs and nods on every beat, and a lens bolted to it
+ * shakes the whole frame with each one. So:
+ *  - the turn is split into yaw and pitch and each eased twice over (two
+ *    first-order lags in a row: a soft start and a soft stop, where one lag
+ *    jerks into motion);
+ *  - the nod is slower still (POV_PITCH_TAU × smoothing) and only
+ *    POV_PITCH of it reaches the view — the head looks down and up far more
+ *    than a person's gaze does;
+ *  - the lens's travel is eased too (POV_POS_TAU × smoothing), so the bob of
+ *    her head is smoothed out of the eye point. The head is hidden from this
+ *    camera, so a lens a frame behind it never shows the inside of her face.
+ */
+const POV_PITCH = 0.6
+const POV_PITCH_TAU = 1.6
+const POV_POS_TAU = 0.5
+/** The shortest signed turn from a to b, radians. */
+const wrapAngle = (a: number): number => Math.atan2(Math.sin(a), Math.cos(a))
 
 export function resolveMountOptions(o: CameraMountOptions): Required<CameraMountOptions> {
   const pov = o.mode !== "selfie"
   return {
     mode: pov ? "pov" : "selfie",
     bone: o.bone || (pov ? HEAD : "右手首"),
-    smoothing: Math.min(2, Math.max(0, o.smoothing ?? (pov ? 0.12 : 0.25))),
+    smoothing: Math.min(2, Math.max(0, o.smoothing ?? (pov ? 0.3 : 0.25))),
     level: o.level ?? true,
     distance: Math.min(40, Math.max(2, o.distance ?? 7)),
   }
@@ -153,6 +174,12 @@ export class CameraMount {
   /** Selfie: from her face toward the phone, eased. */
   private readonly arm = new Vec3(0, 0, -1)
   private reach = 0
+  /** POV: yaw and pitch through two lags each ([first, second]), and the
+   *  lens point through two. */
+  private readonly yaw = [0, 0]
+  private readonly pitch = [0, 0]
+  private readonly eye1 = new Vec3(0, 0, 0)
+  private readonly eye2 = new Vec3(0, 0, 0)
 
   constructor(
     readonly model: Model,
@@ -179,10 +206,10 @@ export class CameraMount {
     const k = !this.seeded || o.smoothing <= 0 || dt <= 0 ? 1 : 1 - Math.exp(-dt / o.smoothing)
     // A big jump (a seek, a tab come back) is no move to glide through.
     const snap = !this.seeded || dt > 0.25
-    return o.mode === "pov" ? this.pov(snap ? 1 : k) : this.selfie(snap ? 1 : k)
+    return o.mode === "pov" ? this.pov(snap ? 0 : dt, snap) : this.selfie(snap ? 1 : k)
   }
 
-  private pov(k: number): MountPose | null {
+  private pov(dt: number, snap: boolean): MountPose | null {
     const m = this.model
     const h = m.getBoneWorldMatrix(this.options.bone) ?? m.getBoneWorldMatrix(HEAD)
     if (!h) return null
@@ -190,15 +217,40 @@ export class CameraMount {
     if (!face) return null
     // MMD rests facing −Z: forward is the head's negated third column, up its second.
     const fwd = dirToWorld(m, -h[8], -h[9], -h[10])
-    const up = this.options.level && Math.abs(fwd.y) < 0.97 ? UP : dirToWorld(m, h[4], h[5], h[6])
-    ease(this.forward, fwd, k)
-    ease(this.up, up, k)
+    const yawT = Math.atan2(fwd.x, fwd.z)
+    const pitchT = Math.asin(Math.max(-1, Math.min(1, fwd.y))) * POV_PITCH
+    const tau = this.options.smoothing
+    const lag = (t: number) => (snap || t <= 0 ? 1 : 1 - Math.exp(-dt / t))
+    const kYaw = lag(tau)
+    const kPitch = lag(tau * POV_PITCH_TAU)
+    const kPos = lag(tau * POV_POS_TAU)
+    if (snap) {
+      this.yaw[0] = this.yaw[1] = yawT
+      this.pitch[0] = this.pitch[1] = pitchT
+      this.eye1.set(face)
+      this.eye2.set(face)
+    } else {
+      this.yaw[0] += wrapAngle(yawT - this.yaw[0]) * kYaw
+      this.yaw[1] += wrapAngle(this.yaw[0] - this.yaw[1]) * kYaw
+      this.pitch[0] += (pitchT - this.pitch[0]) * kPitch
+      this.pitch[1] += (this.pitch[0] - this.pitch[1]) * kPitch
+      const e1 = this.eye1
+      e1.setXYZ(e1.x + (face.x - e1.x) * kPos, e1.y + (face.y - e1.y) * kPos, e1.z + (face.z - e1.z) * kPos)
+      const e2 = this.eye2
+      e2.setXYZ(e2.x + (e1.x - e2.x) * kPos, e2.y + (e1.y - e2.y) * kPos, e2.z + (e1.z - e2.z) * kPos)
+    }
+    const cp = Math.cos(this.pitch[1])
+    const f = new Vec3(Math.sin(this.yaw[1]) * cp, Math.sin(this.pitch[1]), Math.cos(this.yaw[1]) * cp)
+    this.forward.set(f)
+    // The tilt only when asked for, and then eased like the turn.
+    const up = this.options.level || Math.abs(f.y) > 0.97 ? UP : dirToWorld(m, h[4], h[5], h[6])
+    ease(this.up, up, kYaw)
     this.seeded = true
-    const f = this.forward
     const s = POV_FORWARD * m.scale
+    const e = this.eye2
     return {
-      eye: new Vec3(face.x + f.x * s, face.y + f.y * s, face.z + f.z * s),
-      forward: new Vec3(f.x, f.y, f.z),
+      eye: new Vec3(e.x + f.x * s, e.y + f.y * s, e.z + f.z * s),
+      forward: f,
       up: new Vec3(this.up.x, this.up.y, this.up.z),
     }
   }

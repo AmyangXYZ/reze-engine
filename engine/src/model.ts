@@ -75,9 +75,12 @@ const BLINK_PAIRS: [string, string][] = [
 const BLINK_CLOSE = 0.09
 const BLINK_HOLD = 0.04
 const BLINK_OPEN = 0.2
-/** How often a blink is doubled, and how soon the second follows (at speed 1). */
+/** How often a blink is doubled, and how soon the second follows (at speed 1).
+ *  Start to start: 0.6 s leaves the eyes clearly open for about a quarter
+ *  second between the two. At 0.4 the second began while the first was still
+ *  opening, and the pair read as one long, stuttering blink. */
 const BLINK_DOUBLE = 0.15
-const BLINK_DOUBLE_GAP = 0.4
+const BLINK_DOUBLE_GAP = 0.6
 
 /** What setAutoBlink asks for. */
 export interface AutoBlinkOptions {
