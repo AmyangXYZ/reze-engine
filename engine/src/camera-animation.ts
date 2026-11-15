@@ -89,7 +89,12 @@ export class CameraAnimation {
     // Keys one frame apart are a cut: MMD never draws between them, so the
     // earlier key holds until the later one's frame. A time meant as that frame
     // can land a hair under it (11/30 * 30), and still cuts.
-    if (b.frame - a.frame === 1) return this.pose(frame < b.frame - 1e-4 ? a : b)
+    //
+    // Not inside a run of keys on every frame, though: that is a baked camera
+    // (a converter's or a capture's), whose keys are samples of one move. Held,
+    // it steps at 30 fps, and at 60 fps each pose shows twice, a judder. A
+    // baked track's own cut is the one step far bigger than its neighbours.
+    if (b.frame - a.frame === 1 && this.isCut(lo)) return this.pose(frame < b.frame - 1e-4 ? a : b)
     const span = b.frame - a.frame
     const localT = span > 0 ? (frame - a.frame) / span : 0
     // The incoming interpolation curve is stored on the segment's end keyframe (b).
@@ -115,7 +120,33 @@ export class CameraAnimation {
     }
   }
 
+  /** Whether the one-frame step from key i to i + 1 is a cut, not a baked sample. */
+  private isCut(i: number): boolean {
+    const f = this.frames
+    const before = i > 0 && f[i].frame - f[i - 1].frame === 1
+    const after = i + 2 < f.length && f[i + 2].frame - f[i + 1].frame === 1
+    if (!before && !after) return true
+    const step = cameraStep(f[i], f[i + 1])
+    const near = Math.max(before ? cameraStep(f[i - 1], f[i]) : 0, after ? cameraStep(f[i + 1], f[i + 2]) : 0)
+    return step > CUT_RATIO * near + CUT_FLOOR
+  }
+
   private pose(f: CameraKeyframe): CameraPose {
     return { target: f.target, rotation: f.rotation, distance: f.distance, fov: f.fov * DEG2RAD }
   }
+}
+
+/** A baked step this many times its neighbours' (plus the floor) is a cut. */
+const CUT_RATIO = 6
+const CUT_FLOOR = 0.05
+
+/**
+ * How far the camera moves in one step: its eye travel in model units plus the
+ * turn in radians and the fov change in degrees scaled to read alike, so a
+ * cut on any channel (a jump, a swing, a zoom) stands out from a smooth run.
+ */
+function cameraStep(a: CameraKeyframe, b: CameraKeyframe): number {
+  const t = Math.hypot(b.target.x - a.target.x, b.target.y - a.target.y, b.target.z - a.target.z)
+  const r = Math.hypot(b.rotation.x - a.rotation.x, b.rotation.y - a.rotation.y, b.rotation.z - a.rotation.z)
+  return t + Math.abs(b.distance - a.distance) + r * 10 + Math.abs(b.fov - a.fov) * 0.2
 }

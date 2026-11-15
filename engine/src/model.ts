@@ -75,12 +75,15 @@ const BLINK_PAIRS: [string, string][] = [
 const BLINK_CLOSE = 0.09
 const BLINK_HOLD = 0.04
 const BLINK_OPEN = 0.2
-/** How often a blink is doubled, and how soon the second follows (at speed 1).
- *  Start to start: 0.6 s leaves the eyes clearly open for about a quarter
- *  second between the two. At 0.4 the second began while the first was still
- *  opening, and the pair read as one long, stuttering blink. */
-const BLINK_DOUBLE = 0.15
-const BLINK_DOUBLE_GAP = 0.6
+/** How often a blink is doubled, how soon the second follows (start to start,
+ *  at speed 1) and how much quicker both blinks of the pair run. A double is a
+ *  flutter: two quick blinks with a glimpse of open eye between, about half a
+ *  second in all. Two ordinary blinks 0.6 s apart read as just two blinks, and
+ *  at 15% one came every half minute, so nobody saw it. At 1.8x a blink takes
+ *  0.18 s, which leaves the eyes open about 0.12 s before the second. */
+const BLINK_DOUBLE = 0.3
+const BLINK_DOUBLE_GAP = 0.3
+const BLINK_DOUBLE_PACE = 1.8
 
 /** What setAutoBlink asks for. */
 export interface AutoBlinkOptions {
@@ -1362,6 +1365,8 @@ export class Model {
     count: number
     /** Whether the current blink is the first of a double. */
     double: boolean
+    /** Whether it is either blink of a double: those run quicker. */
+    pair: boolean
     options: Required<AutoBlinkOptions>
   } | null = null
 
@@ -1411,6 +1416,7 @@ export class Model {
       next: blinkGap(0, opts.interval),
       count: 0,
       double: false,
+      pair: false,
       options: opts,
     }
     return true
@@ -1447,6 +1453,7 @@ export class Model {
       b.start = -1
       b.count = 0
       b.double = false
+      b.pair = false
       b.next = blinkGap(0, interval)
     }
     // A loop, so a long jump forward lands on the blink it is in, not on each one passed.
@@ -1454,10 +1461,12 @@ export class Model {
       b.start = b.next
       b.count++
       // Now and then a second blink follows straight after the first — never a third.
-      b.double = double && !b.double && blinkHash(b.count * 7 + 3) < BLINK_DOUBLE
+      const second = b.double
+      b.double = double && !second && blinkHash(b.count * 7 + 3) < BLINK_DOUBLE
+      b.pair = b.double || second
       b.next = b.start + (b.double ? BLINK_DOUBLE_GAP / speed : blinkGap(b.count, interval))
     }
-    const w = blinkCurve((b.clock - b.start) * speed)
+    const w = blinkCurve((b.clock - b.start) * speed * (b.pair ? BLINK_DOUBLE_PACE : 1))
     let changed = false
     for (let i = 0; i < b.morphs.length; i++) {
       if (weights[b.morphs[i]] !== w) {

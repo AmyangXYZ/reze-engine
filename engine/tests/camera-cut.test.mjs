@@ -18,3 +18,17 @@ test("keys further apart still interpolate", () => {
   const d = anim.sample(1 / 30).distance
   assert.ok(d < -40 && d > -60)
 })
+
+// A baked camera keys every frame; held, each pose shows twice at 60 fps.
+const run = (n, at = (i) => -40 - i) => Array.from({ length: n }, (_, i) => kf(i, at(i), 30))
+
+test("a run of keys on every frame is a baked move: it interpolates", () => {
+  const anim = new CameraAnimation(run(20))
+  assert.ok(Math.abs(anim.sample(5.5 / 30).distance + 45.5) < 0.01)
+})
+
+test("a baked run's own cut, one step far past its neighbours, still cuts", () => {
+  const anim = new CameraAnimation(run(20, (i) => (i < 10 ? -40 - i : -200 - i)))
+  assert.equal(anim.sample(9.5 / 30).distance, -49)
+  assert.ok(Math.abs(anim.sample(4.5 / 30).distance + 44.5) < 0.01)
+})

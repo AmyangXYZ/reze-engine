@@ -103,3 +103,20 @@ test("a shorter interval blinks more often", SKIP, () => {
   }
   assert.ok(count(1.5) > count(8), `${count(1.5)} vs ${count(8)}`)
 })
+
+// A double is a flutter: two quick blinks with open eyes between, close enough
+// to read as one gesture. 0.6 s apart at full length they read as two blinks,
+// and at 15% one came every half minute, so nobody saw one.
+test("doubles come often enough, quick and close", SKIP, () => {
+  const model = PmxLoader.loadFromBuffer(toAB(readFileSync(RIG)))
+  model.setAutoBlink({ interval: 4, double: true })
+  const w = run(model)
+  const shut = []
+  for (let i = 1; i < w.length; i++) if (w[i] >= 0.99 && w[i - 1] < 0.99) shut.push(i)
+  const pairs = shut.filter((f, k) => k > 0 && f - shut[k - 1] <= 20)
+  assert.ok(pairs.length >= 1, `a double within 20 s (${shut.join(",")})`)
+  for (const f of pairs) {
+    const between = w.slice(f - 18, f - 3)
+    assert.ok(between.some((x) => x < 0.05), "open between the two")
+  }
+})
