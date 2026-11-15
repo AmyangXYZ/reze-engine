@@ -134,6 +134,7 @@ import {
   EFFECT_TRAIL_SAMPLES,
 } from "./shaders/passes/composite"
 import { SUBSURFACE_WGSL, SSS_SPIKE } from "./shaders/passes/subsurface"
+import { EFFECT_SUBJECTS_ALL } from "./shaders/cast-layout"
 import {
   buildParticleComputeShader,
   buildParticleRenderShader,
@@ -1989,7 +1990,7 @@ interface EffectInstance {
    */
   subjects: readonly string[] | null
   /** The above as the shaders read it: one bit per cast slot, recomputed every
-   *  frame. 0xf — the whole cast — while `subjects` is null. */
+   *  frame. EFFECT_SUBJECTS_ALL — the whole cast — while `subjects` is null. */
   subjectMask: number
   /** How many subjects this effect actually HAS this frame: the mask's bits,
    *  counted against the live cast. What sizes the ribbons' instance count. */
@@ -5005,7 +5006,7 @@ export class Engine {
         continue
       }
       e.distVariant = this.castDistanceVariants.length
-      const data = new Float32Array([0xf, 0, 0, 0])
+      const data = new Float32Array([EFFECT_SUBJECTS_ALL, 0, 0, 0])
       const uniform = device.createBuffer({
         label: `cast distance seeds (${key})`,
         size: data.byteLength,
@@ -5020,9 +5021,9 @@ export class Engine {
       })
       this.castDistanceVariants.push({
         subjects: e.subjects,
-        // 0xf is what the buffer above was written with; the first frame's
+        // EFFECT_SUBJECTS_ALL is what the buffer above was written with; the first frame's
         // updateSubjectMasks narrows it to the live cast.
-        mask: 0xf,
+        mask: EFFECT_SUBJECTS_ALL,
         uniform,
         data,
         seedBind: device.createBindGroup({
@@ -6090,7 +6091,7 @@ export class Engine {
         // effect did before it could be aimed. A host narrows it afterwards, the
         // way it sets influence and a schedule.
         subjects: null,
-        subjectMask: 0xf,
+        subjectMask: EFFECT_SUBJECTS_ALL,
         subjectCount: 0,
         distVariant: 0,
         anchors,
@@ -21012,9 +21013,13 @@ export class Engine {
           pz += pos.z
           break
         }
-        u[44 + n * 4] = px
-        u[45 + n * 4] = py
-        u[46 + n * 4] = pz
+        // The view uniform keeps only the first four: its slot 15 is the tone
+        // curve. Every reader goes through the cast buffer, which holds all.
+        if (n < 4) {
+          u[44 + n * 4] = px
+          u[45 + n * 4] = py
+          u[46 + n * 4] = pz
+        }
         this.writeCastEntry(inst, n, px, py, pz)
         n++
       })
@@ -21063,7 +21068,7 @@ export class Engine {
     const live = this.castSubjectCount
     const all = live === 0 ? 0 : (1 << live) - 1
     for (const e of this.effects) {
-      let mask = 0xf
+      let mask = EFFECT_SUBJECTS_ALL
       if (e.subjects) {
         mask = 0
         for (const name of e.subjects) {
@@ -21079,7 +21084,7 @@ export class Engine {
     // The floods, one per distinct target set. Their masks are written here for
     // the same reason the effects' are: the slots have just been decided.
     for (const v of this.castDistanceVariants) {
-      let mask = 0xf
+      let mask = EFFECT_SUBJECTS_ALL
       if (v.subjects) {
         mask = 0
         for (const name of v.subjects) {

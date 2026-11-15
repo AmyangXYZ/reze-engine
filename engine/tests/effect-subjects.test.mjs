@@ -85,7 +85,7 @@ test("a mask is resolved where the cast slots are decided", () => {
   assert.match(write, /this\.castSlotOf\.set\(inst\.name, n\)/, "the slot is recorded as it is assigned")
   assert.match(write, /this\.updateSubjectMasks\(\)/, "and every effect's mask follows in the same pass")
   const masks = engine.slice(engine.indexOf("private updateSubjectMasks()"), engine.indexOf("One character's slice of the effect API"))
-  assert.match(masks, /let mask = 0xf/, "aimed at nobody in particular is the whole cast")
+  assert.match(masks, /let mask = EFFECT_SUBJECTS_ALL/, "aimed at nobody in particular is the whole cast")
   assert.match(masks, /this\.castSlotOf\.get\(name\)/)
   assert.match(masks, /e\.subjectCount = n/, "and the CPU-side count the ribbons are sized by")
 })

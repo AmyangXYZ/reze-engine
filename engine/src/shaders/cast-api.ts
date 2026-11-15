@@ -32,7 +32,14 @@
 // — the field clock's z, the particle and trail pads, the grid's and the light
 // emitter's blocks — and each of those is written once a frame by the engine.
 
-import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES, EFFECT_SUBJECT_VEC4S } from "./cast-layout"
+import {
+  EFFECT_ANCHORS,
+  EFFECT_SUBJECTS,
+  EFFECT_SUBJECTS_ALL,
+  EFFECT_TRAIL_BASE,
+  EFFECT_TRAIL_SAMPLES,
+  EFFECT_SUBJECT_VEC4S,
+} from "./cast-layout"
 
 export const CAST_API = /* wgsl */ `
 const RZ_SUBJECTS: i32 = ${EFFECT_SUBJECTS};
@@ -212,4 +219,4 @@ fn _rzSubjectMask() -> u32 { return ${mask}; }
  *  composite's own module, where nothing user-written lands and the accessors
  *  exist only so the shared API compiles — and the value the engine writes for
  *  an effect the scene has not aimed at anybody in particular. */
-export const CAST_MASK_ALL = "0xfu"
+export const CAST_MASK_ALL = `${EFFECT_SUBJECTS_ALL}u`

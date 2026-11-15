@@ -3,7 +3,7 @@ import { sceneTapApi } from "../scene-tap"
 import { anchorAliasWgsl } from "../anchor-table"
 import { CAST_API, CAST_MASK_ALL, subjectMaskApi } from "../cast-api"
 import { clockApi, EFFECT_MATH_API, PARTICLE_STRUCT_WGSL, trailSlotsApi, viewportApi } from "./hosted-api"
-import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
+import { EFFECT_ANCHORS, EFFECT_SUBJECTS, EFFECT_SUBJECT_VEC4S, EFFECT_TRAIL_BASE, EFFECT_TRAIL_SAMPLES } from "../cast-layout"
 import { audioApi } from "../audio-api"
 import { idApi } from "../id-api"
 import { sceneLightApi } from "../scene-light-api"
@@ -154,7 +154,8 @@ override APPLY_GAMMA: bool = true;
 // viewU[9] = (grade slope.rgb, grade flags) — bit 0 the CDL grade(), bit 1 the
 //            scene's own LUT (setStageGrade) — see _rzGradeScene() below.
 // viewU[10] = (camera world position, _) — refreshed with the basis above.
-// viewU[11..14] = the cast's positions (effects; count in viewU[10].w).
+// viewU[11..14] = the first four of the cast's positions (count in viewU[10].w);
+//   rzSubjectHip reads the cast buffer instead, which holds all of them.
 // viewU[15] = (soft curve contrast, pixel filter weights for offsets 0, ±1, ±2)
 //            — 1, 0, 0 is no filter; see _rzPixelFiltered.
 // invGamma = 1/gamma precomputed on CPU — avoids a per-pixel divide.
@@ -543,7 +544,12 @@ fn bgSubjectCount() -> i32 { return rzSubjectCount(); }
  * mapping is the identity for an effect aimed at nobody in particular, which is
  * every scene published before one could be aimed.
  */
-fn rzSubjectHip(i: i32) -> vec3f { return viewU[11 + clamp(_rzSubjectSlot(i), 0, 3)].xyz; }
+//
+// Read from the cast buffer's centre, the same point the engine writes to both.
+// It was viewU[11..14], which holds only four: viewU[15] is the tone curve.
+fn rzSubjectHip(i: i32) -> vec3f {
+  return _rzCast[clamp(_rzSubjectSlot(i), 0, RZ_SUBJECTS - 1) * ${EFFECT_SUBJECT_VEC4S} + 1].xyz;
+}
 
 fn bgSubjectPos(i: i32) -> vec3f { return rzSubjectHip(i); }
 

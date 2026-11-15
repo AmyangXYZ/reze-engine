@@ -13,7 +13,9 @@
  * and the first thing to touch the cycle throws ReferenceError at module load —
  * the whole engine failing to start on an import order nobody chose.
  */
-export const EFFECT_SUBJECTS = 4
+export const EFFECT_SUBJECTS = 8
+/** Every subject slot's bit: an effect aimed at nobody in particular. */
+export const EFFECT_SUBJECTS_ALL = (1 << EFFECT_SUBJECTS) - 1
 /** vec4 slots per subject: root+dissolve, hip+objectId, bounds, gaze+looking. */
 export const EFFECT_SUBJECT_VEC4S = 4
 /**
