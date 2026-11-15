@@ -40,6 +40,7 @@ export {
   type ViewLut,
   type CullDiagnostics,
   type MidiNote,
+  type MotionBlurOptions,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
 export { parseMidi } from "./midi-loader"
@@ -228,7 +229,8 @@ export {
  * Pure strings, no GPU: importing them costs a host nothing.
  */
 export { EFFECT_MATH_API, PARTICLE_STRUCT_WGSL } from "./shaders/passes/hosted-api"
-export type { EyeTrackingOptions } from "./model"
+export type { EyeTrackingOptions, AutoBlinkOptions } from "./model"
+export type { CameraMountOptions, CameraMountMode } from "./camera-mount"
 export type { JellyEyeOptions } from "./jelly-eyes"
 
 /**

@@ -1,9 +1,10 @@
 import { Camera } from "./camera"
+import { CameraMount, headMaterials, type CameraMountOptions } from "./camera-mount"
 import { EFFECT_SUBJECT_VEC4S } from "./shaders/cast-layout"
 import { decodeDds, isDds } from "./dds-loader"
 import { Mat4, Quat, Vec3 } from "./math"
 import { decodePsd, isPsd } from "./psd-loader"
-import { Model, MATERIAL_MORPH_MULTIPLY, type EyeTrackingOptions, type Material, type Skeleton } from "./model"
+import { Model, MATERIAL_MORPH_MULTIPLY, type AutoBlinkOptions, type EyeTrackingOptions, type Material, type Skeleton } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
@@ -198,6 +199,19 @@ import { STOCKINGS_GRAPH } from "./graph/presets/stockings"
 import { METAL_GRAPH } from "./graph/presets/metal"
 import { CLOTH_SMOOTH_GRAPH } from "./graph/presets/cloth_smooth"
 import { CLOTH_ROUGH_GRAPH } from "./graph/presets/cloth_rough"
+import {
+  MOTION_BLUR_UNIFORM_FLOATS,
+  MOTION_BLUR_WGSL,
+  MOTION_VELOCITY_FORMAT,
+  motionVelocityWgsl,
+} from "./shaders/passes/motion-blur"
+
+/** What setMotionBlur asks for. */
+export interface MotionBlurOptions {
+  /** The fraction of a 1/30 s frame the shutter is open: 0.5 is film's 180°.
+   *  0.05–1, default 0.5. */
+  shutter?: number
+}
 
 /** Grow sphere `s` (x, y, z, radius; radius 0 = empty) to hold another: the
  *  standard union, keeping the larger if one contains the other, else growing
@@ -1190,6 +1204,9 @@ interface ModelInstance {
   xrayKey: string
   /** Materials the reflection probe leaves out (setMaterialInProbe). */
   probeHiddenMaterials: Set<string>
+  /** Materials the main camera leaves out, shadow and mirror keeping them —
+   *  her own head while the camera is mounted at her eyes (setCameraMount). */
+  cameraHiddenMaterials: Set<string>
   /** Material-morph targets, or null when the model has no type-8 morphs. */
   materialMorphTargets: MaterialMorphTarget[] | null
   /** The same targets by PMX material index, so a named offset is one lookup. */
@@ -3258,6 +3275,8 @@ export class Engine {
   private cameraFollowYaw = 0
   private cameraFollowPitch = 0
   private cameraTargetOffset: Vec3 = new Vec3(0, 0, 0)
+  /** The camera on a bone (setCameraMount), and whose rig it rides. */
+  private cameraMount: { name: string; mount: CameraMount } | null = null
 
   private lastFrameTime = performance.now()
   // Smoothness metrics are computed over a ring buffer of true frame intervals
@@ -10127,7 +10146,8 @@ export class Engine {
         label: "HDR resolve target",
         size: [width, height],
         format: this.hdrFormat,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        // COPY_DST: motion blur writes its gather back here.
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       })
 
       // The id attachment. Multisampled like the rest of the pass, and with NO
@@ -11276,6 +11296,63 @@ export class Engine {
     const ox = o.x
     o.x = ox * c + o.z * sn
     o.z = -ox * sn + o.z * c
+  }
+
+  /**
+   * The camera on a bone: through her eyes ("pov", on 頭) or held in her hand
+   * and aimed back at her face ("selfie", on a wrist). See camera-mount.ts.
+   *
+   * Placed every frame after her pose and physics, before the camera is
+   * written, so it never trails her and an export renders what the editor
+   * showed. Outranks the orbit and the follow — which stay as they were
+   * underneath, and come back when the mount goes — but not a camera VMD or
+   * setCameraPose. In POV her head (hair, face, eyes: the materials skinned
+   * mostly to 頭 and below) leaves the camera, and only the camera: her shadow
+   * and her mirror image keep it.
+   *
+   * Null takes the camera off. False when the model is not loaded.
+   */
+  setCameraMount(model: string | Model | null, options: CameraMountOptions | null): boolean {
+    const prev = this.cameraMount
+    if (!model || !options) {
+      if (prev) this.dropCameraMount()
+      return true
+    }
+    let modelName = typeof model === "string" ? model : ""
+    if (typeof model !== "string") for (const i of this.modelInstances.values()) if (i.model === model) modelName = i.name
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    if (prev && prev.name === modelName) prev.mount.setOptions(options)
+    else {
+      if (prev) this.dropCameraMount()
+      this.cameraMount = { name: modelName, mount: new CameraMount(inst.model, options) }
+    }
+    const pov = this.cameraMount!.mount.options.mode === "pov"
+    inst.cameraHiddenMaterials = new Set(pov ? headMaterials(inst.model) : [])
+    this.writeCullHidden(true)
+    return true
+  }
+
+  getCameraMount(): (Required<CameraMountOptions> & { model: string }) | null {
+    const m = this.cameraMount
+    return m ? { ...m.mount.options, model: m.name } : null
+  }
+
+  /** The materials a POV mount keeps out of the camera, for a host to show. */
+  getCameraHiddenMaterials(modelName: string): string[] {
+    return [...(this.modelInstances.get(modelName)?.cameraHiddenMaterials ?? [])]
+  }
+
+  private dropCameraMount(): void {
+    const prev = this.cameraMount
+    if (!prev) return
+    this.cameraMount = null
+    this.camera.mountPose = null
+    const inst = this.modelInstances.get(prev.name)
+    if (inst && inst.cameraHiddenMaterials.size > 0) {
+      inst.cameraHiddenMaterials = new Set()
+      this.writeCullHidden(true)
+    }
   }
 
   /** True while the orbit target is riding a model bone (setCameraFollow). */
@@ -14867,6 +14944,12 @@ export class Engine {
           const eye = this.camera.getEyePosition()
           const m = inst.model
           _gazeScratch.setXYZ(eye.x - m.position.x, eye.y - m.position.y, eye.z - m.position.z)
+          // Her own first-person camera sits between her eyes: looking AT it
+          // crosses them. She looks where it looks, far ahead along the view.
+          if (this.cameraMount?.name === inst.name && this.cameraMount.mount.options.mode === "pov") {
+            const v = this.camera.getViewMatrix().values
+            _gazeScratch.setXYZ(_gazeScratch.x + v[2] * 100, _gazeScratch.y + v[6] * 100, _gazeScratch.z + v[10] * 100)
+          }
           Quat.rotateVecInvInto(m.rotation, _gazeScratch, _gazeScratch)
           const inv = 1 / Math.max(m.scale, 1e-6)
           _gazeScratch.setXYZ(_gazeScratch.x * inv, _gazeScratch.y * inv, _gazeScratch.z * inv)
@@ -15164,10 +15247,12 @@ export class Engine {
     let changed = force
     for (let i = 0; i < this.cullDraws.length; i++) {
       const { inst, draw } = this.cullDraws[i]
-      // bit 0: switched off; bit 1: drawn by its native look, not its graph
+      // bit 0: switched off; bit 1: drawn by its native look, not its graph;
+      // bit 2: out of the camera alone (a POV mount's head)
       const v =
         (inst.hiddenMaterials.has(draw.materialName) || inst.morphHiddenMaterials.has(draw.materialName) ? 1 : 0) |
-        (this.nativeLooks?.dresses(inst.name, draw.materialName) ? 2 : 0)
+        (this.nativeLooks?.dresses(inst.name, draw.materialName) ? 2 : 0) |
+        (inst.cameraHiddenMaterials.has(draw.materialName) ? 4 : 0)
       if (out[i] !== v) {
         out[i] = v
         changed = true
@@ -16264,6 +16349,7 @@ export class Engine {
       materialIdByName: new Map(),
       xrayKey: "",
       probeHiddenMaterials: new Set(),
+      cameraHiddenMaterials: new Set(),
       materialMorphTargets: null,
       materialMorphByIndex: null,
       physics,
@@ -18446,6 +18532,27 @@ export class Engine {
     this.onRaycast(hitModel, hitMaterial, hitBone, screenX, screenY)
   }
 
+  /** See setTimeScale. */
+  private timeScale = 1
+
+  /**
+   * Global playback speed: every clock the frame advances — clips and their
+   * morphs, the camera VMD, physics, tweens, jelly eyes, auto blink, effect
+   * time (rzTime), particles, trails, dissolves, param tracks, scheduled
+   * effects and the camera follow's lag — runs on `delta × scale`, live
+   * (render) and offline (renderFrame) alike. So 0.5 is true slow motion: hair
+   * falls slowly, a sparkle drifts at half pace, and an export stepped at
+   * 1/fps covers half as much of the clip per frame. 0.25–2; frame stats stay
+   * on wall time. The host keeps the music in step (it plays the audio).
+   */
+  setTimeScale(scale: number): void {
+    this.timeScale = Number.isFinite(scale) ? Math.min(4, Math.max(0.1, scale)) : 1
+  }
+
+  getTimeScale(): number {
+    return this.timeScale
+  }
+
   render() {
     if (!this.multisampleTexture || !this.camera || !this.device) return
 
@@ -18457,7 +18564,8 @@ export class Engine {
 
   /**
    * Render one frame advancing every clock — animation, physics, tweens, and the
-   * camera VMD — by exactly `deltaSeconds`, independent of wall time. This is the
+   * camera VMD — by exactly `deltaSeconds` (times the time scale, see
+   * setTimeScale), independent of wall time. This is the
    * offline-rendering primitive (video export): call it N times with 1/fps and the
    * result is deterministic whether the machine renders faster or slower than
    * realtime. Also resets the realtime clock so a later render() (returning to the
@@ -18469,7 +18577,9 @@ export class Engine {
     this.renderWithDelta(deltaSeconds)
   }
 
-  private renderWithDelta(deltaTime: number) {
+  private renderWithDelta(wallDelta: number) {
+    // Every clock in the frame runs on the scaled delta — see setTimeScale.
+    const deltaTime = wallDelta * this.timeScale
     // The bind groups first, then the textures they used to name. A retired
     // texture is freed only once a frame has been rebuilt without it — freeing
     // it while a group still points at it is what "destroyed texture used in a
@@ -18548,6 +18658,14 @@ export class Engine {
         this.camera.target.y = f.y + this.cameraTargetOffset.y
         this.camera.target.z = f.z + this.cameraTargetOffset.z
       }
+      // The camera on a bone, from this frame's pose (setCameraMount). A rig
+      // that has gone (removed, replaced) takes the mount with it.
+      const cm = this.cameraMount
+      if (cm) {
+        const inst = this.modelInstances.get(cm.name)
+        if (!inst || inst.model !== cm.mount.model) this.dropCameraMount()
+        else this.camera.mountPose = cm.mount.step(deltaTime)
+      }
     }
 
     // Who holds the shot this frame. An external pose is a statement about
@@ -18604,7 +18722,10 @@ export class Engine {
     // The scattering pass is the third reader: it rejects taps across a depth
     // step and scales its width by distance, so a scene wearing a subsurface
     // look stores depth for as long as it does.
-    const depthRead = dofOn || this.aovCapture || this.effects.some((e) => e.hasForeground) || this.subsurfaceInUse()
+    // Motion blur is a fourth: its velocity pass tests against this depth and
+    // its gather rebuilds the camera's motion from it.
+    const depthRead =
+      dofOn || this.aovCapture || this.effects.some((e) => e.hasForeground) || this.subsurfaceInUse() || this.motionBlur !== null
     this.renderPassDescriptor.depthStencilAttachment!.depthStoreOp = depthRead ? "store" : "discard"
     if (depthRead) this.writeDepthOfFieldUniforms()
 
@@ -18831,6 +18952,9 @@ export class Engine {
     // Skin scattering, on the resolved scene and before anything reads it:
     // bloom should bleed the scattered skin, not the raw one.
     this.renderSubsurface(encoder)
+    // Motion blur, on the finished scene and before bloom, so a streak blooms
+    // as a camera's would.
+    this.renderMotionBlur(encoder, deltaTime)
     // The field mounts, likewise: after the scene so foregrounds can read its
     // depth, before the composite that samples both layers.
     this.renderFieldPass(encoder)
@@ -18886,9 +19010,10 @@ export class Engine {
       this.resolvePickResult(pick.x / dpr, pick.y / dpr)
     }
 
-    // Feed the true vsync-to-vsync interval (deltaTime, computed at frame start), not the
-    // CPU time spent in render() — that's what actually reflects perceived smoothness.
-    this.updateStats(deltaTime * 1000)
+    // Feed the true vsync-to-vsync interval (the wall delta, before the time
+    // scale), not the CPU time spent in render() — that's what actually reflects
+    // perceived smoothness.
+    this.updateStats(wallDelta * 1000)
   }
 
   private drawInstanceShadow(sp: GPURenderPassEncoder | GPURenderBundleEncoder, inst: ModelInstance, cascade: number): void {
@@ -19286,6 +19411,285 @@ export class Engine {
     if (!inst) return false
     inst.model.setEyeTracking(options)
     return true
+  }
+
+  /**
+   * Auto blink, per model — see Model.setAutoBlink. She blinks on her own
+   * every few seconds, over a morph motion's own blinks. Null hands the morph
+   * back. False for a model that is not loaded or has no closing morph.
+   */
+  setAutoBlink(modelName: string, options: AutoBlinkOptions | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    return inst.model.setAutoBlink(options)
+  }
+
+  getAutoBlink(modelName: string): Required<AutoBlinkOptions> | null {
+    return this.modelInstances.get(modelName)?.model.getAutoBlink() ?? null
+  }
+
+  // ─── Motion blur (shaders/passes/motion-blur.ts) ───────────────────────
+  private motionBlur: Required<MotionBlurOptions> | null = null
+  private mbVelocityPipeline: GPURenderPipeline | null = null
+  private mbVelocityPending = false
+  private mbGatherPipeline: GPURenderPipeline | null = null
+  private mbFrameLayout: GPUBindGroupLayout | null = null
+  private mbInstanceLayout: GPUBindGroupLayout | null = null
+  private mbFrameBindGroup: GPUBindGroup | null = null
+  private mbPrevCameraBuffer: GPUBuffer | null = null
+  private mbUniformBuffer: GPUBuffer | null = null
+  private readonly mbUniformData = new Float32Array(MOTION_BLUR_UNIFORM_FLOATS)
+  private mbVelocityMs: GPUTexture | null = null
+  private mbVelocity: GPUTexture | null = null
+  private mbScratch: GPUTexture | null = null
+  private mbGatherBindGroup: GPUBindGroup | null = null
+  private mbGatherDepthView: GPUTextureView | null = null
+  private mbSampler: GPUSampler | null = null
+  /** Last frame's camera view-projection, or null after a cut or on the first frame. */
+  private mbPrevViewProj: Float32Array | null = null
+  /** Per model: last frame's skin matrices on the GPU, and the CPU copy they came from. */
+  private readonly mbInstances = new WeakMap<
+    ModelInstance,
+    { prev: GPUBuffer; bindGroup: GPUBindGroup; last: Float32Array | null; skin: GPUBuffer; light: GPUBuffer }
+  >()
+
+  /**
+   * Motion blur on everything that moves: her limbs, hair and cloth from the
+   * pose, everything else from the camera. Per pixel, live and in an export
+   * (the shutter follows the frame's own delta, so a 30 fps export and a
+   * 120 Hz screen streak alike). `shutter` is the fraction of a 1/30 s frame
+   * the shutter is open: 0.5 is film's 180°. Null switches it off, and then it
+   * costs nothing. See shaders/passes/motion-blur.ts.
+   */
+  setMotionBlur(options: MotionBlurOptions | null): void {
+    if (!options) {
+      this.motionBlur = null
+      this.mbPrevViewProj = null
+      return
+    }
+    this.motionBlur = { shutter: Math.min(1, Math.max(0.05, options.shutter ?? 0.5)) }
+  }
+
+  getMotionBlur(): Required<MotionBlurOptions> | null {
+    return this.motionBlur ? { ...this.motionBlur } : null
+  }
+
+  private mbEnsurePipelines(): boolean {
+    if (this.mbVelocityPipeline && this.mbGatherPipeline) return true
+    if (this.mbVelocityPending) return false
+    this.mbVelocityPending = true
+    const device = this.device
+    this.mbFrameLayout = device.createBindGroupLayout({
+      label: "motion velocity per-frame",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      ],
+    })
+    this.mbInstanceLayout = device.createBindGroupLayout({
+      label: "motion velocity per-instance",
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      ],
+    })
+    this.mbPrevCameraBuffer = device.createBuffer({
+      label: "motion blur previous camera",
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.mbUniformBuffer = device.createBuffer({
+      label: "motion blur uniforms",
+      size: MOTION_BLUR_UNIFORM_FLOATS * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    this.mbSampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" })
+    this.mbFrameBindGroup = device.createBindGroup({
+      label: "motion velocity per-frame",
+      layout: this.mbFrameLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.cameraUniformBuffer } },
+        { binding: 1, resource: { buffer: this.mbPrevCameraBuffer } },
+        { binding: 2, resource: this.materialSampler },
+      ],
+    })
+    const velocityModule = device.createShaderModule({ label: "motion velocity", code: motionVelocityWgsl() })
+    const gatherModule = device.createShaderModule({ label: "motion blur gather", code: MOTION_BLUR_WGSL })
+    const velocity = device.createRenderPipelineAsync({
+      label: "motion velocity",
+      layout: device.createPipelineLayout({
+        label: "motion velocity",
+        bindGroupLayouts: [this.mbFrameLayout, this.mbInstanceLayout, this.mainPerMaterialBindGroupLayout],
+      }),
+      vertex: { module: velocityModule, entryPoint: "vs", buffers: this.materialVertexBufferLayouts.slice(0, 3) as GPUVertexBufferLayout[] },
+      fragment: { module: velocityModule, entryPoint: "fs", targets: [{ format: MOTION_VELOCITY_FORMAT }] },
+      primitive: { cullMode: "none" },
+      multisample: { count: Engine.MULTISAMPLE_COUNT },
+      depthStencil: { format: this.depthFormat, depthWriteEnabled: false, depthCompare: this.depthAhead },
+    })
+    const gather = device.createRenderPipelineAsync({
+      label: "motion blur gather",
+      layout: "auto",
+      vertex: { module: gatherModule, entryPoint: "vs" },
+      fragment: { module: gatherModule, entryPoint: "fs", targets: [{ format: this.hdrFormat }] },
+      primitive: { topology: "triangle-list" },
+    })
+    Promise.all([velocity, gather])
+      .then(([v, g]) => {
+        this.mbVelocityPipeline = v
+        this.mbGatherPipeline = g
+      })
+      .catch((e) => console.warn("[motion blur] pipelines failed:", e))
+    return false
+  }
+
+  /** The motion pass and the gather, on the resolved HDR before bloom. */
+  private renderMotionBlur(encoder: GPUCommandEncoder, deltaTime: number): void {
+    const mb = this.motionBlur
+    if (!mb || !this.device || !this.hdrResolveTexture || !this.depthReadView) return
+    const viewProj = this.camera.getProjectionMatrix().multiply(this.camera.getViewMatrix()).values
+    // The shutter: this frame's motion is deltaTime's worth; the streak is the
+    // shutter's worth of it. No delta (a paused export's first frame, a seek)
+    // or a hitch long enough to be a cut: no blur, and nothing carried over.
+    const scale = deltaTime > 1e-4 && deltaTime < 0.25 ? (mb.shutter / 30) / deltaTime : 0
+    const prevVP = this.mbPrevViewProj ?? viewProj
+    if (!this.mbEnsurePipelines() || scale === 0) {
+      this.mbStorePrev(viewProj)
+      return
+    }
+    const device = this.device
+    const w = this.hdrResolveTexture.width
+    const h = this.hdrResolveTexture.height
+    if (!this.mbVelocity || this.mbVelocity.width !== w || this.mbVelocity.height !== h) {
+      this.mbVelocityMs?.destroy()
+      this.mbVelocity?.destroy()
+      this.mbScratch?.destroy()
+      this.mbVelocityMs = device.createTexture({
+        label: "motion velocity (msaa)",
+        size: [w, h],
+        sampleCount: Engine.MULTISAMPLE_COUNT,
+        format: MOTION_VELOCITY_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      })
+      this.mbVelocity = device.createTexture({
+        label: "motion velocity",
+        size: [w, h],
+        format: MOTION_VELOCITY_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      this.mbScratch = device.createTexture({
+        label: "motion blur scratch",
+        size: [w, h],
+        format: this.hdrFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      })
+      this.mbGatherBindGroup = null
+    }
+    // The HDR resolve and depth are rebuilt on resize; the group follows them.
+    if (!this.mbGatherBindGroup || this.mbGatherDepthView !== this.depthReadView) {
+      this.mbGatherDepthView = this.depthReadView
+      this.mbGatherBindGroup = device.createBindGroup({
+        label: "motion blur gather",
+        layout: this.mbGatherPipeline!.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.hdrResolveTexture.createView() },
+          { binding: 1, resource: this.mbVelocity.createView() },
+          { binding: 2, resource: this.depthReadView },
+          { binding: 3, resource: { buffer: this.mbUniformBuffer! } },
+          { binding: 4, resource: this.mbSampler! },
+        ],
+      })
+    }
+
+    // Last frame's camera and poses, then this frame's kept for the next.
+    device.queue.writeBuffer(this.mbPrevCameraBuffer!, 0, prevVP as Float32Array<ArrayBuffer>)
+    const u = this.mbUniformData
+    const inv = new Float32Array(16)
+    if (!Mat4.inverseInto(viewProj, inv)) inv.set(viewProj)
+    u.set(inv, 0)
+    u.set(prevVP, 16)
+    u[32] = scale
+    u[33] = Math.max(8, 0.06 * w)
+    u[34] = w
+    u[35] = h
+    u[36] = this.depthClear
+    device.queue.writeBuffer(this.mbUniformBuffer!, 0, u)
+
+    const depthAtt = this.renderPassDescriptor.depthStencilAttachment!
+    const pass = encoder.beginRenderPass({
+      label: "motion velocity",
+      colorAttachments: [
+        {
+          view: this.mbVelocityMs!.createView(),
+          resolveTarget: this.mbVelocity.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: "clear",
+          storeOp: "discard",
+        },
+      ],
+      depthStencilAttachment: { view: depthAtt.view, depthReadOnly: true, stencilReadOnly: true },
+    })
+    pass.setPipeline(this.mbVelocityPipeline!)
+    pass.setBindGroup(0, this.mbFrameBindGroup!)
+    this.forEachInstance((inst) => {
+      if (!inst.model.drawn) return
+      const s = this.mbInstance(inst)
+      const cur = inst.model.getSkinMatrices()
+      device.queue.writeBuffer(s.prev, 0, (s.last ?? cur) as Float32Array<ArrayBuffer>)
+      if (!s.last || s.last.length !== cur.length) s.last = new Float32Array(cur.length)
+      s.last.set(cur)
+      this.setModelDrawState(pass, inst)
+      pass.setBindGroup(1, s.bindGroup)
+      for (const draw of inst.drawCalls) {
+        if (draw.type !== "opaque" && draw.type !== "transparent") continue
+        pass.setBindGroup(2, draw.bindGroup)
+        this.issueDraw(pass, draw, "camera")
+      }
+    })
+    pass.end()
+
+    const gather = encoder.beginRenderPass({
+      label: "motion blur gather",
+      colorAttachments: [{ view: this.mbScratch!.createView(), loadOp: "clear", clearValue: [0, 0, 0, 0], storeOp: "store" }],
+    })
+    gather.setPipeline(this.mbGatherPipeline!)
+    gather.setBindGroup(0, this.mbGatherBindGroup)
+    gather.draw(3)
+    gather.end()
+    encoder.copyTextureToTexture({ texture: this.mbScratch! }, { texture: this.hdrResolveTexture }, [w, h])
+    this.mbStorePrev(viewProj)
+  }
+
+  private mbStorePrev(viewProj: Float32Array): void {
+    if (!this.mbPrevViewProj) this.mbPrevViewProj = new Float32Array(16)
+    this.mbPrevViewProj.set(viewProj)
+  }
+
+  /** A model's last-frame skin buffer and its velocity bind group, rebuilt if
+   *  the model's own buffers were replaced. */
+  private mbInstance(inst: ModelInstance) {
+    let s = this.mbInstances.get(inst)
+    if (s && s.skin === inst.skinMatrixBuffer && s.light === inst.lightBuffer) return s
+    s?.prev.destroy()
+    const prev = this.device.createBuffer({
+      label: `${inst.name}: previous skin`,
+      size: inst.skinMatrixBuffer.size,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    const bindGroup = this.device.createBindGroup({
+      label: `${inst.name}: motion velocity`,
+      layout: this.mbInstanceLayout!,
+      entries: [
+        { binding: 0, resource: { buffer: inst.skinMatrixBuffer } },
+        { binding: 1, resource: { buffer: inst.lightBuffer } },
+        { binding: 2, resource: { buffer: prev } },
+      ],
+    })
+    s = { prev, bindGroup, last: null, skin: inst.skinMatrixBuffer, light: inst.lightBuffer }
+    this.mbInstances.set(inst, s)
+    return s
   }
 
   /**

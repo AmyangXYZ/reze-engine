@@ -135,8 +135,11 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
   // and still its shadow, which the engine's pass casts for every material.
   let shown = (hidden[i] & 1u) == 0u;
   let graph = (hidden[i] & 2u) == 0u;
+  // bit 2: kept out of the camera alone — her own head under a POV mount, which
+  // her shadow and her mirror image still carry.
+  let toCamera = (hidden[i] & 4u) == 0u;
   let castsShadow = (dm.flags & DRAW_CASTS_SHADOW) != 0u;
-  cameraArgs[i * 5u + 1u] = select(0u, 1u, (inCamera || off) && shown && graph);
+  cameraArgs[i * 5u + 1u] = select(0u, 1u, (inCamera || off) && shown && graph && toCamera);
   shadowArgs[i * 5u + 1u] = select(0u, 1u, ((inLight && castsShadow) || off) && shown);
   mirrorArgs[i * 5u + 1u] = select(0u, 1u, (inMirror || off) && shown && graph);
 }

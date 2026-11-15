@@ -52,6 +52,70 @@ const smooth01 = (a: number, b: number, x: number): number => {
 const rangeMap = (v: number, inMax: number, out: number): number =>
   (Math.min(Math.abs(v), inMax) / inMax) * out * Math.sign(v)
 
+// ─── Auto blink (see Model.setAutoBlink) ───
+/** Morphs that close both eyes, in order of preference. */
+const BLINK_BOTH = ["まばたき", "blink", "Blink", "eye_close", "Fcl_EYE_Close"]
+/** Left and right pairs, for a model without one. ウィンク２ is the plain
+ *  closed eye; ウィンク often comes with a smile, so it is the last resort. */
+const BLINK_PAIRS: [string, string][] = [
+  ["ウィンク２", "ウィンク２右"],
+  ["ｳｨﾝｸ２", "ｳｨﾝｸ２右"],
+  ["blink_L", "blink_R"],
+  ["Fcl_EYE_Close_L", "Fcl_EYE_Close_R"],
+  ["ウィンク", "ウィンク右"],
+  ["ｳｨﾝｸ", "ｳｨﾝｸ右"],
+  ["wink", "wink_R"],
+  ["Wink", "Wink_R"],
+]
+/** A blink's shape at speed 1, seconds — about 0.33 s in all, the 6–8 frames
+ *  an anime blink runs at 24 fps. Measured blinks close in 75–100 ms, rest shut
+ *  10–50 ms and open about twice as slowly, quick at first and then settling
+ *  (the lid lifts against the orbit's pull), so the close is short and the
+ *  open long with a tail. A symmetric ease reads mechanical. */
+const BLINK_CLOSE = 0.09
+const BLINK_HOLD = 0.04
+const BLINK_OPEN = 0.2
+/** How often a blink is doubled, and how soon the second follows (at speed 1). */
+const BLINK_DOUBLE = 0.15
+const BLINK_DOUBLE_GAP = 0.4
+
+/** What setAutoBlink asks for. */
+export interface AutoBlinkOptions {
+  /** The average gap between blinks, seconds; each gap is drawn from half to
+   *  one and a half times it. 1–10, default 4. */
+  interval?: number
+  /** How fast one blink is: 2 takes half as long. 0.5–2, default 1. */
+  speed?: number
+  /** Whether a blink is now and then followed straight by a second. Default true. */
+  double?: boolean
+}
+/** A fixed value in 0..1 for an integer — the same sequence every take. */
+const blinkHash = (n: number): number => {
+  let h = Math.imul(n ^ 0x9e3779b9, 0x85ebca6b)
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35)
+  h ^= h >>> 16
+  return (h >>> 0) / 4294967296
+}
+const blinkGap = (n: number, interval: number): number => interval * (0.5 + blinkHash(n))
+/** How shut the eyes are t seconds into a blink at speed 1. The close is a
+ *  quick smooth drop; the open leaves fast and settles slowly (a cubic ease-out,
+ *  most of the lift in the first third and the rest a long approach to open). */
+const blinkCurve = (t: number): number => {
+  if (t < 0) return 0
+  if (t < BLINK_CLOSE) {
+    const x = t / BLINK_CLOSE
+    return x * x * (3 - 2 * x)
+  }
+  t -= BLINK_CLOSE
+  if (t < BLINK_HOLD) return 1
+  t -= BLINK_HOLD
+  if (t < BLINK_OPEN) {
+    const x = 1 - t / BLINK_OPEN
+    return x * x * x
+  }
+  return 0
+}
+
 /** What setEyeTracking asks for. */
 export interface EyeTrackingOptions {
   /** 0..1 — how much of the solved gaze replaces the motion's own. Default 1. */
@@ -1276,6 +1340,132 @@ export class Model {
 
   hasEyeTracking(): boolean {
     return this.eyeTracking !== null
+  }
+
+  // ─── Auto blink ──────────────────────────────────────────────────────
+  /** The closing morphs auto blink drives (one for both eyes, or a left and
+   *  right pair), or null while it is off. */
+  private autoBlink: {
+    morphs: number[]
+    /** Each morph's weight without the blink: what the motion or the host set,
+     *  handed back when the blink goes off. */
+    base: number[]
+    /** What the blink last wrote, to tell a fresh write from our own. */
+    written: number[]
+    clock: number
+    /** When the current blink started, and the next. */
+    start: number
+    next: number
+    count: number
+    /** Whether the current blink is the first of a double. */
+    double: boolean
+    options: Required<AutoBlinkOptions>
+  } | null = null
+
+  /**
+   * Auto blink: she blinks every few seconds on her own, as eyes do — a
+   * natural irregular gap around `interval`, now and then a double blink.
+   *
+   * A MORPH, on the model's own closing morph (まばたき, or a left and right
+   * wink pair when there is none). It OWNS that morph while on, as eye
+   * tracking owns the eye bones: a morph motion's own まばたき keys are
+   * replaced, and handed back when it goes off. Its other expressions (a
+   * smile, a wince) play as keyed. Steps on the scene clock (the delta
+   * update() is handed, every frame, playing or paused) through a fixed
+   * sequence of gaps.
+   *
+   * Null hands the morph back. Returns false for a model with no closing morph.
+   */
+  setAutoBlink(options: AutoBlinkOptions | null): boolean {
+    if (!options) {
+      const b = this.autoBlink
+      if (b) {
+        b.morphs.forEach((m, i) => (this.runtimeMorph.weights[m] = b.base[i]))
+        this.morphsDirty = true
+      }
+      this.autoBlink = null
+      return true
+    }
+    const opts: Required<AutoBlinkOptions> = {
+      interval: Math.min(10, Math.max(1, options.interval ?? 4)),
+      speed: Math.min(2, Math.max(0.5, options.speed ?? 1)),
+      double: options.double ?? true,
+    }
+    if (this.autoBlink) {
+      // A new interval takes from the next gap on; the current one stands.
+      this.autoBlink.options = opts
+      return true
+    }
+    const morphs = this.blinkMorphs()
+    if (!morphs) return false
+    const weights = this.runtimeMorph.weights
+    this.autoBlink = {
+      morphs,
+      base: morphs.map((m) => weights[m]),
+      written: morphs.map((m) => weights[m]),
+      clock: 0,
+      start: -1,
+      next: blinkGap(0, opts.interval),
+      count: 0,
+      double: false,
+      options: opts,
+    }
+    return true
+  }
+
+  getAutoBlink(): Required<AutoBlinkOptions> | null {
+    return this.autoBlink ? { ...this.autoBlink.options } : null
+  }
+
+  /** The morphs that close both eyes, by the names MMD, VRoid and the usual
+   *  converters give them. A smile or a wince closes them too and is no blink. */
+  private blinkMorphs(): number[] | null {
+    const ni = this.runtimeMorph.nameIndex
+    for (const n of BLINK_BOTH) if (ni[n] !== undefined) return [ni[n]]
+    for (const [l, r] of BLINK_PAIRS) if (ni[l] !== undefined && ni[r] !== undefined) return [ni[l], ni[r]]
+    return null
+  }
+
+  /** One frame of auto blink, after the pose sources set the morphs and before
+   *  they are applied. True when it moved a weight. */
+  private stepAutoBlink(dt: number): boolean {
+    const b = this.autoBlink!
+    const { interval, speed, double } = b.options
+    const weights = this.runtimeMorph.weights
+    // A weight that is not what we wrote was set afresh this frame.
+    for (let i = 0; i < b.morphs.length; i++) {
+      const w = weights[b.morphs[i]]
+      if (w !== b.written[i]) b.base[i] = w
+    }
+    if (dt > 0) b.clock += dt
+    // A seek back (or a scrub to the start) begins the sequence again.
+    if (dt < 0) {
+      b.clock = 0
+      b.start = -1
+      b.count = 0
+      b.double = false
+      b.next = blinkGap(0, interval)
+    }
+    // A loop, so a long jump forward lands on the blink it is in, not on each one passed.
+    while (b.clock >= b.next) {
+      b.start = b.next
+      b.count++
+      // Now and then a second blink follows straight after the first — never a third.
+      b.double = double && !b.double && blinkHash(b.count * 7 + 3) < BLINK_DOUBLE
+      b.next = b.start + (b.double ? BLINK_DOUBLE_GAP / speed : blinkGap(b.count, interval))
+    }
+    const w = blinkCurve((b.clock - b.start) * speed)
+    let changed = false
+    for (let i = 0; i < b.morphs.length; i++) {
+      if (weights[b.morphs[i]] !== w) {
+        weights[b.morphs[i]] = w
+        changed = true
+      }
+      // Read back: the weights are float32, and a float64 kept here never
+      // compares equal, so our own write passed for the motion's next frame.
+      b.written[i] = weights[b.morphs[i]]
+    }
+    return changed
   }
 
   /**
@@ -2959,6 +3149,9 @@ export class Model {
       const r = this.runtimeSkeleton.localRotations[idx]
       Quat.multiplyInto(r, offset, r)
     }
+
+    // The blink over whatever the motion and the host set this frame.
+    if (this.autoBlink !== null && this.stepAutoBlink(deltaTime)) this.morphsDirty = true
 
     // Apply morphs if tweens changed morphs or animation changed morphs
     const verticesChanged = this.morphsDirty || tweensChangedMorphs

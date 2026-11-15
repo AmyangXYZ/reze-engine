@@ -219,10 +219,26 @@ export class Camera {
    * to be left.
    */
   getEyePosition(): Vec3 {
-    return this.vmdDriven ? this.vmdEye() : this.getPosition()
+    if (this.vmdDriven) return this.vmdEye()
+    const m = this.mountPose
+    if (m) return new Vec3(m.eye.x, m.eye.y, m.eye.z)
+    return this.getPosition()
   }
 
+  /**
+   * The shot as a bone holds it (Engine.setCameraMount): an eye, a look and an
+   * up, set by the engine each frame. Outranks the orbit, not a VMD — the
+   * orbit's own alpha/beta/radius stay untouched underneath, so taking the
+   * mount off puts back the shot that was there. Null while unmounted.
+   */
+  mountPose: { eye: Vec3; forward: Vec3; up: Vec3 } | null = null
+
   getViewMatrix(): Mat4 {
+    if (!this.vmdDriven && this.mountPose) {
+      const { eye, forward: f, up: u } = this.mountPose
+      Mat4.lookAtInto(this._viewMat.values, eye.x, eye.y, eye.z, eye.x + f.x, eye.y + f.y, eye.z + f.z, u.x, u.y, u.z)
+      return this._viewMat
+    }
     if (this.vmdDriven) {
       const eye = this.vmdEye()
       const s = this._quatScratch
@@ -409,6 +425,12 @@ export class Camera {
   private updateNearFromRadius(): void {
     const lo = this.reversedZ ? NEAR_MIN_REVERSED : NEAR_MIN_UNORM
     const hi = this.reversedZ ? NEAR_MAX_REVERSED : NEAR_MAX_UNORM
+    // A mounted lens sits at her face or a hand's length from it: the orbit
+    // radius says nothing about that, and her own hands come right up to it.
+    if (this.mountPose && !this.vmdDriven) {
+      this.near = lo
+      return
+    }
     this.near = Math.min(hi, Math.max(lo, this.radius / 50))
   }
 
@@ -495,7 +517,8 @@ export class Camera {
   }
 
   private onMouseMove(e: MouseEvent) {
-    if (this.inputLocked || this.vmdDriven) return // VMD owns the camera; orbit/pan is inert
+    // A VMD or a mount owns the camera; orbit/pan is inert.
+    if (this.inputLocked || this.vmdDriven || this.mountPose) return
     if (!this.isDragging) return
 
     const deltaX = e.clientX - this.lastMousePos.x
@@ -520,7 +543,7 @@ export class Camera {
 
   private onWheel(e: WheelEvent) {
     e.preventDefault()
-    if (this.vmdDriven) return // VMD owns the camera; zoom is inert
+    if (this.vmdDriven || this.mountPose) return // VMD or mount owns the camera; zoom is inert
 
     // Update camera radius (zoom)
     this.radius += e.deltaY * this.wheelPrecision
@@ -572,7 +595,7 @@ export class Camera {
     // native touch scrolling in every UI panel layered above the canvas.
     if (!this.isDragging && !this.isPinching) return
     e.preventDefault()
-    if (this.vmdDriven) return // VMD owns the camera; pinch/pan/rotate is inert
+    if (this.vmdDriven || this.mountPose) return // VMD or mount owns the camera; pinch/pan/rotate is inert
 
     if (this.isPinching && e.touches.length === 2) {
       // Two-finger gesture: can be pinch zoom or pan
