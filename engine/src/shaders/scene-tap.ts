@@ -201,9 +201,19 @@ fn rzSceneHit(uv: vec2f) -> bool {
  * is the identity, so writing it out is both safer and equivalent.
  */
 fn rzSceneDisplay(uv: vec2f) -> vec3f {
-  var c = max(viewTransform(rzScene(uv) * exp2(viewU[0].x)), vec3f(0.0));
-  if (viewU[9].w > 0.5) { c = _rzGradeScene(c); }
-  return pow(max(c, vec3f(0.0)), vec3f(viewU[0].y));
+  return rzDisplay(rzScene(uv));
+}
+
+/**
+ * Scene-linear light to what the screen shows, the way the scene's own pixels
+ * get there: exposure, the view transform, the grade, the output gamma. For an
+ * effect that shades in light (rzWorldSpecular, rzSunColor) and returns
+ * display colour, so a highlight it draws rolls off exactly as hers do.
+ */
+fn rzDisplay(c: vec3f) -> vec3f {
+  var o = max(viewTransform(c * exp2(viewU[0].x)), vec3f(0.0));
+  if (viewU[9].w > 0.5) { o = _rzGradeScene(o); }
+  return pow(max(o, vec3f(0.0)), vec3f(viewU[0].y));
 }
 
 /**
@@ -277,6 +287,7 @@ fn rzSceneFar() -> f32 { return 1e9; }
 fn rzSceneHit(uv: vec2f) -> bool { return false; }
 fn rzSceneAlpha(uv: vec2f) -> f32 { return 0.0; }
 fn rzSceneDisplay(uv: vec2f) -> vec3f { return vec3f(0.0); }
+fn rzDisplay(c: vec3f) -> vec3f { return c; }
 fn rzSceneFrame(uv: vec2f) -> vec3f { return vec3f(0.0); }
 fn rzBackground() -> vec4f { return vec4f(0.0); }
 `

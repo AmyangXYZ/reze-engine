@@ -113,6 +113,7 @@ const EXCEPTIONS = {
   rzSceneFar: "derived from the depth uniform, bound to the field group only",
   rzSceneHit: "same",
   rzSceneDisplay: "runs the composite view transform; only the field pass has it",
+  rzDisplay: "same",
   rzSceneAlpha: "reads the scene mask, bound to the field group only",
   rzSceneFrame: "same",
   rzBackground: "reads the composite view uniform, bound to the field group only",

@@ -114,6 +114,12 @@ export const SCENE_LIGHT_API_BINDINGS = 4
  * `rzWorldAmbient(n)`: the world's light arriving at a surface facing `n` —
  * the materials' own ambient, so an effect's shade can match hers.
  *
+ * `rzSunDir()` points toward the sun; `rzSunColor()` is the light it brings,
+ * the materials' colour × intensity. `rzWorldSpecular(dir, roughness)` is the
+ * sky seen along `dir` — the HDRI at the materials' own blur for that
+ * roughness, or the ambient by direction where the world has no picture or
+ * the module has no sky bound. All scene-linear.
+ *
  * With `on`, declares four bindings from `binding`:
  *   +0 the light uniform (ambient, the sun — direction, and in .w the shadow
  *      switch — and the HDRI's irradiance)
@@ -126,23 +132,67 @@ export const SCENE_LIGHT_API_BINDINGS = 4
  * own N·L. The point is nudged toward the sun instead, which lifts a blade's
  * root off a stage floor that casts into the same map.
  */
-export function sceneLightApi(on: boolean, group: number, binding: number): string {
+export function sceneLightApi(
+  on: boolean,
+  group: number,
+  binding: number,
+  opts: {
+    /** Bind the shadow block, atlas and comparison sampler at binding+1..+3.
+     *  Off, only the light uniform is bound and rzShadow answers lit. */
+    shadow?: boolean
+    /** The world's sky (equirect, prefiltered by roughness) and a mip sampler. */
+    sky?: { texture: number; sampler: number }
+  } = {},
+): string {
   if (!on) {
     return /* wgsl */ `
 fn rzShadow(p: vec3f) -> f32 { return 1.0; }
 fn rzWorldAmbient(n: vec3f) -> vec3f { return vec3f(0.0); }
 fn rzWorldAmbientAvg() -> vec3f { return vec3f(0.0); }
+fn rzSunDir() -> vec3f { return vec3f(0.0, 1.0, 0.0); }
+fn rzSunColor() -> vec3f { return vec3f(0.0); }
+fn rzWorldSpecular(dir: vec3f, roughness: f32) -> vec3f { return vec3f(0.0); }
 `
   }
-  const n = SHADOW_CASCADES.length
-  return /* wgsl */ `
+  const shadow = opts.shadow ?? true
+  const sky = opts.sky
+    ? /* wgsl */ `
+@group(${group}) @binding(${opts.sky.texture}) var _rzSkyTex: texture_2d<f32>;
+@group(${group}) @binding(${opts.sky.sampler}) var _rzSkySamp: sampler;
+fn rzWorldSpecular(dir: vec3f, roughness: f32) -> vec3f {
+  // The materials' lookup (nodes.ts), restated against this module's names:
+  // 2 in sh[0].w means an HDRI is installed; otherwise the ambient by
+  // direction is the honest blurred sky, and the bound 1x1 is never read.
+  if (_rzLight.sh[0].w < 1.5) { return rzWorldAmbient(normalize(dir)); }
+  let d = normalize(dir);
+  let u = 0.5 + atan2(d.x, d.z) * 0.15915494309;
+  let v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) * 0.31830988618;
+  let levels = f32(textureNumLevels(_rzSkyTex) - 1u);
+  let lod = clamp(sqrt(clamp(roughness, 0.0, 1.0)) * levels, 0.0, levels);
+  return textureSampleLevel(_rzSkyTex, _rzSkySamp, vec2f(u, v), lod).rgb * _rzLight.ambientColor.w;
+}
+`
+    : /* wgsl */ `
+fn rzWorldSpecular(dir: vec3f, roughness: f32) -> vec3f { return rzWorldAmbient(normalize(dir)); }
+`
+  const sun = /* wgsl */ `
+fn rzSunDir() -> vec3f { return normalize(-_rzLight.lights[0].direction.xyz); }
+fn rzSunColor() -> vec3f { return _rzLight.lights[0].color.rgb * _rzLight.lights[0].color.w; }
+`
+  const head = /* wgsl */ `
 // The light uniform, as the materials lay it out; lights[0] is the sun.
 struct _RzSceneLight { direction: vec4f, color: vec4f, }
 struct _RzSceneLightU { ambientColor: vec4f, lights: array<_RzSceneLight, 4>, sh: array<vec4f, 9>, }
+@group(${group}) @binding(${binding}) var<uniform> _rzLight: _RzSceneLightU;
+`
+  if (!shadow) {
+    return head + sun + sky + "\nfn rzShadow(p: vec3f) -> f32 { return 1.0; }\n" + worldAmbientWgsl("_rzLight")
+  }
+  const n = SHADOW_CASCADES.length
+  return head + sun + sky + /* wgsl */ `
 // The cascades' matrices, inner to outer, then every caster in one sphere
 // (x, y, z, radius): radius 0 = nothing casts, negative = do not test.
 struct _RzShadowBlock { viewProj: array<mat4x4f, ${n}>, casters: vec4f, }
-@group(${group}) @binding(${binding}) var<uniform> _rzLight: _RzSceneLightU;
 @group(${group}) @binding(${binding + 1}) var<uniform> _rzShadowVP: _RzShadowBlock;
 @group(${group}) @binding(${binding + 2}) var _rzShadowAtlas: texture_depth_2d;
 @group(${group}) @binding(${binding + 3}) var _rzShadowCmp: sampler_comparison;

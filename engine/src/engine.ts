@@ -128,6 +128,9 @@ import {
   buildCompositeShader,
   EFFECT_SCENE_API,
   buildFieldShader,
+  FIELD_LIGHT_BINDING,
+  FIELD_SKY_BINDING,
+  FIELD_SKY_SAMPLER_BINDING,
   EFFECT_ANCHORS,
   EFFECT_SUBJECTS,
   EFFECT_TRAIL_BASE,
@@ -5254,6 +5257,9 @@ export class Engine {
     // Captured, so the null guards above survive into the closure.
     const depth = this.depthReadView
     const bloom = this.compositeBloomView
+    // The sky the materials reflect; a new world rebuilds these groups (see
+    // setWorldEquirect and the retire step in the frame).
+    const sky = this.worldEquirectView ?? this.fallbackEquirectView
     const build = (
       owner: EffectInstance,
       grid: GPUTextureView,
@@ -5292,6 +5298,9 @@ export class Engine {
           { binding: 40, resource: (this.viewLutTexture ?? this.stageGradeFallback).createView({ dimension: "3d" }) },
           { binding: 1, resource: bloom },
           { binding: 4, resource: this.maskResolveView },
+          { binding: FIELD_LIGHT_BINDING, resource: { buffer: this.lightUniformBuffer } },
+          { binding: FIELD_SKY_BINDING, resource: sky },
+          { binding: FIELD_SKY_SAMPLER_BINDING, resource: this.materialSampler },
         ],
       })
     // Per effect: the params buffer and the grid are both its own, so two
@@ -5502,6 +5511,7 @@ export class Engine {
     this.worldBindingsDirty = true
     this.rebuildPerFrameBindGroups()
     this.rebuildCompositeBindGroup()
+    this.rebuildFieldBindGroup()
     // The probe's compose step binds the sky it lays in behind the stage.
     this.dropProbeCapture()
     this.captureReflectionProbe()
@@ -8936,6 +8946,13 @@ export class Engine {
         // reads a half-transparent ground as a dark opaque one.
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        // The scene's light: the sun, the world's ambient and its sky, so an
+        // effect that reflects (a bubble, glass, water) shows the world the
+        // materials do. The sky is the sixteenth sampled texture — the default
+        // per-stage cap — which is why the shadow atlas stays out.
+        { binding: FIELD_LIGHT_BINDING, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: FIELD_SKY_BINDING, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: FIELD_SKY_SAMPLER_BINDING, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
       ],
     })
     this.fieldPipelineLayout = this.device.createPipelineLayout({
@@ -18590,6 +18607,8 @@ export class Engine {
       // that was replaced, which is a frame drawn against the wrong one.
       const perFrame = this.rebuildPerFrameBindGroups()
       const composite = this.rebuildCompositeBindGroup()
+      // The field groups bind the sky too.
+      this.rebuildFieldBindGroup()
       this.worldBindingsDirty = !(perFrame && composite)
     }
     // The scene clock, and the only clock a trail may sample on: renderFrame()

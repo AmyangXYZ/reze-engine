@@ -269,11 +269,15 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) f32 {
  * holding a very large number, so an effect keyed on it draws nothing instead of
  * failing to compile. Same rule the grid's accessor follows, and the id
  * accessors before it: an author should never have to guard a name.
+ *
+ * `sampler` names a sampler the module already declares. It used to declare
+ * its own at the grid sampler's binding, which WGSL accepts until one entry
+ * point uses both — an effect calling rzGrid AND rzCastDistance then failed to
+ * install with "multiple variables that use the same resource binding".
  */
-export function castDistanceApi(group: number, tex: number, samp: number, scale: number): string {
+export function castDistanceApi(group: number, tex: number, sampler: string, scale: number): string {
   return /* wgsl */ `
 @group(${group}) @binding(${tex}) var _rzCastDistTex: texture_2d<f32>;
-@group(${group}) @binding(${samp}) var _rzCastDistSamp: sampler;
 
 /**
  * Distance from this point to the nearest pixel the CAST drew, in SCREEN pixels.
@@ -301,7 +305,7 @@ export function castDistanceApi(group: number, tex: number, samp: number, scale:
  */
 fn rzCastDistance(uv: vec2f) -> f32 {
   let flipped = vec2f(clamp(uv.x, 0.0, 1.0), 1.0 - clamp(uv.y, 0.0, 1.0));
-  let d = textureSampleLevel(_rzCastDistTex, _rzCastDistSamp, flipped, 0.0).x;
+  let d = textureSampleLevel(_rzCastDistTex, ${sampler}, flipped, 0.0).x;
   return d * ${scale > 0 ? scale : 1}.0;
 }
 `

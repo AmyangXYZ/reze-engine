@@ -843,6 +843,14 @@ export function buildCompositeShader(effect?: CompositeEffectSource | null): str
     body
 }
 
+/** The field pass's light: the materials' light uniform, the world's sky and a
+ *  mip sampler for it — rzSunDir, rzSunColor, rzWorldAmbient, rzWorldSpecular.
+ *  The sky is the field layout's sixteenth sampled texture, which is WebGPU's
+ *  default per-stage cap, so the sun's shadow atlas is not bound here. */
+export const FIELD_LIGHT_BINDING = 34
+export const FIELD_SKY_BINDING = 35
+export const FIELD_SKY_SAMPLER_BINDING = 36
+
 /**
  * The field pass: the user's background/foreground mounts at half resolution,
  * into two rgba16f targets the composite bilinearly upsamples.
@@ -890,13 +898,16 @@ export function buildFieldShader(effect: CompositeEffectSource): string {
     viewportApi("viewU[6].w") +
     trailSlotsApi(effect.trailCount) +
     idApi(effect.ids === true, 0, 23) +
-    sceneLightApi(false, 0, 0) +
+    sceneLightApi(true, 0, FIELD_LIGHT_BINDING, {
+      shadow: false,
+      sky: { texture: FIELD_SKY_BINDING, sampler: FIELD_SKY_SAMPLER_BINDING },
+    }) +
     pointsApi(false) +
     textureApi(0) +
     // Distance to the cast, in SCREEN pixels: the field is half-res, so a field
     // texel is CAST_FIELD_DIV of them and the accessor scales on the way out.
     // An author writes the width they mean and never learns how it is built.
-    castDistanceApi(0, 26, 18, CAST_FIELD_DIV) +
+    castDistanceApi(0, 26, "_rzGridSamp", CAST_FIELD_DIV) +
     sceneTapApi(0, 27, 28, [29, 30, 31, 32]) +
     "\n// ── user effect (setEffect) ──\n" +
     effect.paramsDecl +
