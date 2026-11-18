@@ -157,6 +157,7 @@ import {
   SIM_FORMAT,
   GRID_MAX,
   buildSimShader,
+  GRID_CAST_DISTANCE_BINDING,
   gridEntryPoint,
 } from "./shaders/passes/grid"
 import {
@@ -5253,6 +5254,8 @@ export class Engine {
    * change that only ever toggles between two known states.
    */
   private rebuildFieldBindGroup(): void {
+    // The grids name the same distance textures, so they follow the same calls.
+    if (this.device && this.castDistFallbackView) this.rebindGrids()
     if (!this.device || !this.depthReadView || !this.compositeBloomView || this.fieldUniformBuffers.length === 0) return
     // Captured, so the null guards above survive into the closure.
     const depth = this.depthReadView
@@ -5348,6 +5351,9 @@ export class Engine {
       params: GPUBuffer | null
     },
     i: number,
+    /** The cast's distance field this effect reads; the "unreachably far"
+     *  fallback until its flood exists. */
+    dist: GPUTextureView = this.castDistFallbackView!,
   ): GPUBindGroup {
     return this.device.createBindGroup({
       layout: g.layout,
@@ -5364,8 +5370,17 @@ export class Engine {
         // The grid is the one pass whose own bindings reach 8, so its params sit
         // above them rather than everything else shifting for one mount.
         ...(g.params ? [{ binding: EFFECT_PARAMS_BINDING_GRID, resource: { buffer: g.params } }] : []),
+        { binding: GRID_CAST_DISTANCE_BINDING, resource: dist },
       ],
     })
+  }
+
+  /** Every grid's bind groups, re-pointed at the distance field its effect
+   *  reads NOW — which a resize, a retarget or a new prop has just replaced. */
+  private rebindGrids(): void {
+    for (const e of this.effects) {
+      if (e.grid) e.grid.binds = [this.gridBindGroup(e.grid, 0, this.castDistViewFor(e)), this.gridBindGroup(e.grid, 1, this.castDistViewFor(e))]
+    }
   }
 
   /**
@@ -5400,7 +5415,6 @@ export class Engine {
         e.particles.mirrorRenderBinds = b.mirrorRenderBinds
         if (e.particles.live && b.countBinds) e.particles.live.binds = b.countBinds
       }
-      if (e.grid) e.grid.binds = [this.gridBindGroup(e.grid, 0), this.gridBindGroup(e.grid, 1)]
       if (e.lights) e.lights.bind = this.lightEmitBindGroup(e.lights.layout, e.lights.uniform, e.lights.params)
     }
   }
@@ -7580,6 +7594,11 @@ export class Engine {
         ...(params.buffer
           ? [{ binding: EFFECT_PARAMS_BINDING_GRID, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" as const } }]
           : []),
+        {
+          binding: GRID_CAST_DISTANCE_BINDING,
+          visibility: GPUShaderStage.COMPUTE,
+          texture: { sampleType: "float", viewDimension: "2d" },
+        },
       ],
     })
 

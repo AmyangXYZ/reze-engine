@@ -43,6 +43,8 @@ import { textureApi } from "../texture-api"
 // actually bounds this is the STEP: one invocation per texel per frame, each
 // taking a dozen samples, so doubling the side quadruples the work.
 export const GRID_MAX = 1024
+/** Where the step reads the cast's distance field. Above the params (9). */
+export const GRID_CAST_DISTANCE_BINDING = 10
 /** rgba16float, ping-ponged. Two of these is the whole memory cost. */
 export const SIM_FORMAT: GPUTextureFormat = "rgba16float"
 
@@ -174,6 +176,11 @@ fn rzGrid(uv: vec2f) -> vec4f { return rzGridPrev(uv); }
     sceneLightApi(false, 0, 0) +
     pointsApi(false) +
     textureApi(0) +
+    // The cast's silhouette distance, as the LAST frame left it: the step runs
+    // inside the scene pass, before this frame's flood. One frame behind is
+    // what a kernel that measures her and eases toward it wants anyway. An
+    // effect that reads no distance binds the 1x1 "unreachably far" fallback.
+    //
     // Inlined rather than imported from cast-distance, and NOT for tidiness.
     //
     // This module and composite.ts import each other — grid takes
@@ -183,10 +190,14 @@ fn rzGrid(uv: vec2f) -> vec4f { return rzGridPrev(uv); }
     // grid's own evaluation order, which is enough to change where a bundler
     // enters the cycle: Node's loader tolerated it and a browser one threw
     // "Cannot access 'grid' before initialization" at load.
-    //
-    // One line of WGSL is not worth an import into a module that is already in a
-    // cycle. The other mounts import it normally — none of them is.
-    "fn rzCastDistance(uv: vec2f) -> f32 { return 1.0e30; }\n" +
+    /* wgsl */ `
+@group(0) @binding(${GRID_CAST_DISTANCE_BINDING}) var _rzCastDistTex: texture_2d<f32>;
+/** Screen pixels to the cast's silhouette, last frame: 0 on her, positive outside. */
+fn rzCastDistance(uv: vec2f) -> f32 {
+  let flipped = vec2f(clamp(uv.x, 0.0, 1.0), 1.0 - clamp(uv.y, 0.0, 1.0));
+  return textureSampleLevel(_rzCastDistTex, _rzGridSamp, flipped, 0.0).x;
+}
+` +
     "\n// ── user effect (setEffect) ──\n" +
     wgsl +
     /* wgsl */ `
