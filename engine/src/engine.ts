@@ -409,9 +409,12 @@ type GroupInstall = {
   pipelineNoDepthWrite: GPURenderPipeline
   /** hair render-class only: the stencil-matched IS_OVER_EYES=true variant. */
   overEyesPipeline?: GPURenderPipeline
+  /** eye render-class only: the same eye without its stencil stamp, drawn for
+   *  a model whose see-through hair is off (setModelSeeThroughHair). */
+  unstampedPipeline?: GPURenderPipeline
   /** The same three for each blend a member keys apart from the group's
    *  (StyleGroup.blendByMaterial) — an eye shadow multiplying in the eye group. */
-  byBlend: Partial<Record<StyleBlend, Pick<GroupInstall, "pipeline" | "pipelineNoDepthWrite" | "overEyesPipeline">>>
+  byBlend: Partial<Record<StyleBlend, Pick<GroupInstall, "pipeline" | "pipelineNoDepthWrite" | "overEyesPipeline" | "unstampedPipeline">>>
   uniformBuffer: GPUBuffer
   /** The group's own image maps, uploaded once per apply and owned here — the
    *  install destroys them when it is replaced, so a re-apply cannot leak. */
@@ -1133,6 +1136,10 @@ interface ModelInstance {
   /** Its jelly eyes' springs, or null while its eyes are still — see
    *  setModelJellyEyes. */
   jellyEyes: JellyEyes | null
+  /** Her eyes show through her hair (the eye's stencil stamp and the hair's
+   *  faint over-eyes pass). Off, her hair covers them as any surface would —
+   *  see setModelSeeThroughHair. */
+  seeThroughHair: boolean
   basePath: string
   assetReader: AssetReader
   gpuBuffers: GPUBuffer[]
@@ -14858,6 +14865,26 @@ export class Engine {
   }
 
   /**
+   * See-through hair: her eyes show faintly through the hair over them, as in
+   * MMD toon looks — the eye stamps the stencil, the hair skips the stamp and a
+   * second, faint hair pass draws over it. On by default. Off, the eye draws
+   * without the stamp and her hair covers it like any surface. Only eye- and
+   * hair-class groups take part, so it changes nothing on a model without them.
+   */
+  setModelSeeThroughHair(modelName: string, on: boolean): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    if (inst.seeThroughHair === on) return true
+    inst.seeThroughHair = on
+    this.bundlesDirty = true
+    return true
+  }
+
+  getModelSeeThroughHair(modelName: string): boolean {
+    return this.modelInstances.get(modelName)?.seeThroughHair ?? true
+  }
+
+  /**
    * Jelly eyes: her irises shrink and spring back as her lids move, swell as her
    * head turns or moves, and wobble back. MMD's 果冻眼, on any PMX and under
    * any eye graph. Null stills them again.
@@ -16354,6 +16381,7 @@ export class Engine {
       simulateWhileHidden: false,
       castShadow: true,
       jellyEyes: null,
+      seeThroughHair: true,
       basePath,
       assetReader,
       gpuBuffers,
@@ -19936,7 +19964,8 @@ export class Engine {
         // The depth-write-off twin: stage transparency draws with it (see
         // pipelineForDrawCall), and a future OIT path would too.
         variant(false, false),
-        renderClass === "hair" ? variant(true, true) : undefined,
+        // Hair's over-eyes pass; an eye's unstamped twin (setModelSeeThroughHair).
+        renderClass === "hair" || renderClass === "eye" ? variant(true, true) : undefined,
       ])
       // Handled below either way; this keeps a rejection off the console while
       // the diagnostics are read.
@@ -19963,12 +19992,17 @@ export class Engine {
     let pipeline: GPURenderPipeline
     let pipelineNoDepthWrite: GPURenderPipeline
     let overEyesPipeline: GPURenderPipeline | undefined
+    let unstampedPipeline: GPURenderPipeline | undefined
     const byBlend: GroupInstall["byBlend"] = {}
     try {
       const sets = await Promise.all(builds.map((build) => build.variants))
-      ;[pipeline, pipelineNoDepthWrite, overEyesPipeline] = sets[0]
-      sets.slice(1).forEach(([p, noDepth, overEyes], i) => {
-        byBlend[blends[i + 1]] = { pipeline: p, pipelineNoDepthWrite: noDepth, overEyesPipeline: overEyes }
+      // The third variant is hair's over-eyes pass or an eye's unstamped twin.
+      const third = (p: GPURenderPipeline | undefined) =>
+        renderClass === "eye" ? { unstampedPipeline: p } : { overEyesPipeline: p }
+      ;[pipeline, pipelineNoDepthWrite] = sets[0]
+      ;({ overEyesPipeline, unstampedPipeline } = third(sets[0][2]))
+      sets.slice(1).forEach(([p, noDepth, extra], i) => {
+        byBlend[blends[i + 1]] = { pipeline: p, pipelineNoDepthWrite: noDepth, ...third(extra) }
       })
     } catch (e) {
       diagnostics.push({ severity: "error", message: `pipeline creation failed: ${(e as Error).message}` })
@@ -19999,6 +20033,7 @@ export class Engine {
       pipeline,
       pipelineNoDepthWrite,
       overEyesPipeline,
+      unstampedPipeline,
       byBlend,
       uniformBuffer,
       images: this.uploadGroupImages(group),
@@ -20178,7 +20213,8 @@ export class Engine {
   /**
    * Render-class pipeline state. A group's compiled graph swaps the fragment shading; the
    * render-class owns pass integration (stencil interplay, depth bias, cull). auto = plain;
-   * eye = stencil stamp; hair = stencil-test (+ the over-eyes variant). Cull comes from
+   * eye = stencil stamp (overEyes: the unstamped twin); hair = stencil-test (+ the
+   * over-eyes variant). Cull comes from
    * the material's double-sided flag (sidedPipeline).
    */
   private createRenderClassPipeline(
@@ -20225,7 +20261,7 @@ export class Engine {
         stencilReadMask: 0xff,
         stencilWriteMask: 0,
       }
-    } else if (renderClass === "eye") {
+    } else if (renderClass === "eye" && !overEyes) {
       depthStencil = {
         ...plainDepth,
         // No depth bias, and none was ever in effect: this carried
@@ -20490,7 +20526,11 @@ export class Engine {
       const install = inst.styleGroups.get(dc.groupId)
       if (install) {
         const own = this.memberPipelines(install, dc)
-        return stageGlass ? own.pipelineNoDepthWrite : own.pipeline
+        if (stageGlass) return own.pipelineNoDepthWrite
+        // No stamp, so the hair's stencil test passes over the eye and its
+        // depth decides, as for any surface.
+        if (!inst.seeThroughHair && own.unstampedPipeline) return own.unstampedPipeline
+        return own.pipeline
       }
     }
     return stageGlass ? this.neutralPipelineNoDepthWrite : this.neutralPipeline
@@ -20892,6 +20932,8 @@ export class Engine {
     inst: ModelInstance,
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
   ): void {
+    // Nothing stamped, so nothing to draw over.
+    if (!inst.seeThroughHair) return
     let bound = false
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
@@ -20923,7 +20965,7 @@ export class Engine {
 
   /** A member's pipelines: those of the blend it keys for itself, else the
    *  group's (StyleGroup.blendByMaterial). */
-  private memberPipelines(install: GroupInstall, dc: DrawCall): Pick<GroupInstall, "pipeline" | "pipelineNoDepthWrite" | "overEyesPipeline"> {
+  private memberPipelines(install: GroupInstall, dc: DrawCall): Pick<GroupInstall, "pipeline" | "pipelineNoDepthWrite" | "overEyesPipeline" | "unstampedPipeline"> {
     const blend = install.group.blendByMaterial?.[dc.materialName]
     return (blend && install.byBlend[blend]) || install
   }
