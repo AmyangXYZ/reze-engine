@@ -229,7 +229,7 @@ export {
  * Pure strings, no GPU: importing them costs a host nothing.
  */
 export { EFFECT_MATH_API, PARTICLE_STRUCT_WGSL } from "./shaders/passes/hosted-api"
-export type { EyeTrackingOptions, AutoBlinkOptions } from "./model"
+export type { EyeTrackingOptions, HeadTrackingOptions, AutoBlinkOptions } from "./model"
 export type { CameraMountOptions, CameraMountMode } from "./camera-mount"
 export type { JellyEyeOptions } from "./jelly-eyes"
 

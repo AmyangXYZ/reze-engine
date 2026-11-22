@@ -52,6 +52,48 @@ const smooth01 = (a: number, b: number, x: number): number => {
 const rangeMap = (v: number, inMax: number, out: number): number =>
   (Math.min(Math.abs(v), inMax) / inMax) * out * Math.sign(v)
 
+// ─── Head on a target (see Model.setHeadTracking) ───
+/** How far the turn reaches from the motion's own facing, in degrees:
+ *  sideways, up, down — soft limits, eased into rather than hit. */
+const HEAD_YAW_MAX = 60
+const HEAD_UP_MAX = 50
+const HEAD_DOWN_MAX = 50
+/** How much of the way to the target the turn goes. A person's head takes
+ *  most of a look and leaves the rest to the eyes, and what it leaves keeps
+ *  some of the motion's own head movement in: a head locked on is a turret. */
+const HEAD_SHARE = 0.75
+/** Up and down go further: a look up or down the head barely made read as
+ *  no look at all. */
+const HEAD_PITCH_SHARE = 1
+/** Past this many degrees off her facing the target is behind her, and the
+ *  head holds the turn it had rather than chasing round over a shoulder. */
+const HEAD_GIVE_UP = 115
+/** How fast the look follows the target, 1/s: an exponential ease on the
+ *  point looked at, answering at once and settling in about a quarter second. */
+const HEAD_FOLLOW = 12
+/** How fast the turn fades in and out (switched, or letting go behind her), 1/s. */
+const HEAD_FADE = 6
+/** The turn down the chain: upper chest, neck, then the head with the rest.
+ *  The chest only turns sideways: a chest that tips with a look leans her
+ *  back. */
+const CHEST_SHARE = 0.1
+const NECK_SHARE = 0.35
+/** A soft limit: slope 1 through zero, easing into ±max with no kink. */
+const softLimit = (x: number, max: number): number => max * Math.tanh(x / max)
+const _headHx = new Vec3(0, 0, 0)
+const _headHy = new Vec3(0, 0, 0)
+const _headHz = new Vec3(0, 0, 0)
+const _headDir = new Vec3(0, 0, 0)
+const _headAim = new Vec3(0, 0, 0)
+const _headQ = Quat.identity()
+const _headW = Quat.identity()
+const _headWi = Quat.identity()
+const _headTurn = Quat.identity()
+const _headNeck = Quat.identity()
+const _headP = Quat.identity()
+const _headPi = Quat.identity()
+const _headDone = Quat.identity()
+
 // ─── Auto blink (see Model.setAutoBlink) ───
 /** Morphs that close both eyes, in order of preference. */
 const BLINK_BOTH = ["まばたき", "blink", "Blink", "eye_close", "Fcl_EYE_Close"]
@@ -129,6 +171,13 @@ export interface EyeTrackingOptions {
   /** Degrees of yaw the eye reaches with the camera 75° to the side. The
    *  vertical reaches a fraction of it. Default 20. */
   range?: number
+}
+
+/** What setHeadTracking asks for. */
+export interface HeadTrackingOptions {
+  /** 0..1 — how much of the turn toward the target the head and neck take.
+   *  Default 1. */
+  strength?: number
 }
 
 // Scratch for the post-physics append recovery — see applyPhysicsAppend.
@@ -1348,6 +1397,76 @@ export class Model {
     return this.eyeTracking !== null
   }
 
+  // ─── Head on a target ────────────────────────────────────────────────
+  /** What setHeadTracking asked for, or null while the head is the motion's.
+   *  `releasing` while it eases back after being switched off. */
+  private headTracking: { strength: number; releasing: boolean } | null = null
+  /** Whether this frame's target is one the head should turn to — see
+   *  setGazeTarget's `head`. */
+  private headTargetSet = false
+  /** The point the head looks at, MODEL space, eased toward the target. */
+  private readonly headLook = new Vec3(0, 0, 0)
+  private headLookSet = false
+  /** How much of the turn is taken, 0..1, faded rather than switched. */
+  private headWeight = 0
+  /** The turn held while the target is behind her (degrees, before the
+   *  weight), and how much of it stands over the live one: 1 the moment the
+   *  target goes behind, easing back to 0 as it comes round. */
+  private headHeldYaw = 0
+  private headHeldPitch = 0
+  private headHold = 0
+  /** 上半身2, 首 and 頭 as the motion had them before the solve turned them:
+   *  put back at the start of the next update, since a clip writes only the
+   *  bones it keys and the turn would otherwise pile up frame on frame. */
+  private readonly headBase: [Quat, Quat, Quat] = [Quat.identity(), Quat.identity(), Quat.identity()]
+  private headWritten = false
+  private headSubset: Int32Array | null = null
+
+  /**
+   * Head on a target — the camera, as the host uses it. 首 and 頭 turn toward
+   * it over whatever the motion does, so she faces the shot while she dances.
+   *
+   * LIVE, EVERY FRAME, after IK and before the eyes (which then cover the
+   * rest) and before physics, so the hair swings with the turn.
+   *
+   * What makes it read as a person rather than a turret:
+   *  - OVER THE MOTION. Measured each frame in the head's frame as the motion
+   *    left it, and only three quarters of the way sideways (all the way up
+   *    and down): the eyes take the rest,
+   *    and a quarter of the motion's own head movement stays in.
+   *  - DOWN THE CHAIN. The upper chest takes a little of a sideways turn, the
+   *    neck a third, the head the rest, no roll.
+   *  - SOFT LIMITS. Sideways about 60°, up and down 50°, eased into, and
+   *    measured from between the eyes.
+   *  - EASED ON THE POINT, not the turn: the point looked at follows the
+   *    camera quickly, so a moving camera is followed smoothly and a still one
+   *    is held, whatever the dance does.
+   *  - BEHIND HER, THE TURN HOLDS. Past 115° off her facing it keeps the
+   *    turn it had, as the eyes do, rather than resetting or whipping over
+   *    to the other shoulder, and eases back onto the camera as it comes
+   *    round.
+   *
+   * Null fades the turn out, then hands the head back to the motion.
+   */
+  setHeadTracking(options: HeadTrackingOptions | null): void {
+    if (!options) {
+      if (this.headTracking) this.headTracking.releasing = true
+      return
+    }
+    const strength = Math.min(1, Math.max(0, options.strength ?? 1))
+    if (!this.headTracking) {
+      this.headLookSet = false
+      this.headWeight = 0
+      this.headHeldYaw = this.headHeldPitch = this.headHold = 0
+    }
+    this.headTracking = { strength, releasing: false }
+  }
+
+  /** True while the head is turned, or still easing back. */
+  hasHeadTracking(): boolean {
+    return this.headTracking !== null
+  }
+
   // ─── Auto blink ──────────────────────────────────────────────────────
   /** The closing morphs auto blink drives (one for both eyes, or a left and
    *  right pair), or null while it is off. */
@@ -1529,16 +1648,174 @@ export class Model {
     return new Vec3(hx.x * x + hy.x * y + hz.x * z, hx.y * x + hy.y * y + hz.y * z, hx.z * x + hy.z * y + hz.z * z).normalizeInPlace()
   }
 
-  /** Where the eyes look, in MODEL space. Set each frame before update();
-   *  null leaves them to the motion until a target is set again. */
-  setGazeTarget(target: Vec3 | null): void {
+  /** Where the eyes (and the head, under setHeadTracking) look, in MODEL
+   *  space. Set each frame before update(); null leaves them to the motion
+   *  until a target is set again. `head` false keeps the head off it this
+   *  frame — her own first-person camera, which turning toward would chase
+   *  itself — and the head eases back to the motion's. */
+  setGazeTarget(target: Vec3 | null, head = true): void {
     if (!target) {
       this.gazeTargetSet = false
       this.gazeDirSet = false
+      this.headTargetSet = false
       return
     }
     this.gazeTarget.set(target)
     this.gazeTargetSet = true
+    this.headTargetSet = head
+  }
+
+  /**
+   * The head solve — see setHeadTracking. Reads the head as IK left it,
+   * writes 首 and 頭, and brings the world matrices under them up to date
+   * for the eyes, the skin and physics.
+   */
+  private solveHead(dt: number): void {
+    const t = this.headTracking
+    if (!t) return
+    const ni = this.runtimeSkeleton.nameIndex
+    const head = ni["頭"]
+    if (head === undefined) return
+    const neck = ni["首"]
+    const chest = ni["上半身2"]
+    const bones = this.skeleton.bones
+    const rots = this.runtimeSkeleton.localRotations
+    const worldMats = this.runtimeSkeleton.worldMatrices
+    const hm = worldMats[head].values
+    const deg = 180 / Math.PI
+    const step = dt > 0 ? dt : 0
+    const hx = _headHx.setXYZ(hm[0], hm[1], hm[2]).normalizeInPlace()
+    const hy = _headHy.setXYZ(hm[4], hm[5], hm[6]).normalizeInPlace()
+    const hz = _headHz.setXYZ(hm[8], hm[9], hm[10]).normalizeInPlace()
+
+    // The point looked at, eased toward the target; it starts on the target,
+    // the fade-in being the ease into the turn.
+    let wantWeight = 0
+    let behind = false
+    if (!t.releasing && this.headTargetSet) {
+      const g = this.gazeTarget
+      const l = this.headLook
+      if (!this.headLookSet) {
+        l.set(g)
+        this.headLookSet = true
+      } else {
+        const a = 1 - Math.exp(-HEAD_FOLLOW * step)
+        l.setXYZ(l.x + (g.x - l.x) * a, l.y + (g.y - l.y) * a, l.z + (g.z - l.z) * a)
+      }
+      const d = _headDir.setXYZ(g.x - hm[12], g.y - hm[13], g.z - hm[14]).normalizeInPlace()
+      const off = Math.acos(Math.max(-1, Math.min(1, -(d.x * hz.x + d.y * hz.y + d.z * hz.z)))) * deg
+      behind = off >= HEAD_GIVE_UP
+      wantWeight = t.strength
+    }
+    this.headWeight += (wantWeight - this.headWeight) * (1 - Math.exp(-HEAD_FADE * step))
+    // Faded out after a switch-off: hand the head over.
+    if (t.releasing && this.headWeight < 0.002) {
+      this.headTracking = null
+      this.headWeight = 0
+      this.headLookSet = false
+      return
+    }
+    if (this.headWeight < 1e-4 || !this.headLookSet) return
+
+    // The eased point in the motion's head frame this frame, softly limited.
+    // Seen from between the eyes, not the head bone at the base of the skull:
+    // from there a camera level with her eyes is above her, and she lifts her
+    // chin to it.
+    const le = ni["左目"]
+    const re = ni["右目"]
+    let ox = hm[12], oy = hm[13], oz = hm[14]
+    if (le !== undefined && re !== undefined) {
+      const lm = worldMats[le].values
+      const rm = worldMats[re].values
+      ox = (lm[12] + rm[12]) * 0.5
+      oy = (lm[13] + rm[13]) * 0.5
+      oz = (lm[14] + rm[14]) * 0.5
+    }
+    const l = this.headLook
+    const d = _headDir.setXYZ(l.x - ox, l.y - oy, l.z - oz).normalizeInPlace()
+    const lx = d.x * hx.x + d.y * hx.y + d.z * hx.z
+    const ly = d.x * hy.x + d.y * hy.y + d.z * hy.z
+    const lz = -(d.x * hz.x + d.y * hz.y + d.z * hz.z)
+    const rawPitch = Math.asin(Math.max(-1, Math.min(1, ly))) * deg
+    const liveYaw = softLimit(Math.atan2(lx, lz) * deg, HEAD_YAW_MAX)
+    const livePitch = softLimit(rawPitch, rawPitch > 0 ? HEAD_UP_MAX : HEAD_DOWN_MAX)
+    // Behind her the held turn takes over at once — it is the last live one,
+    // so nothing jumps — and lets go gradually as the camera comes round.
+    // Going behind again mid-way back holds the turn as it then stands.
+    if (behind) {
+      if (this.headHold < 1) {
+        this.headHeldYaw = liveYaw + (this.headHeldYaw - liveYaw) * this.headHold
+        this.headHeldPitch = livePitch + (this.headHeldPitch - livePitch) * this.headHold
+        this.headHold = 1
+      }
+    } else {
+      this.headHold -= this.headHold * (1 - Math.exp(-HEAD_FADE * step))
+      if (this.headHold < 0.001) this.headHold = 0
+    }
+    const k = HEAD_SHARE * this.headWeight
+    const hold = this.headHold
+    const turnYaw = (liveYaw + (this.headHeldYaw - liveYaw) * hold) * k
+    const turnPitch = (livePitch + (this.headHeldPitch - livePitch) * hold) * HEAD_PITCH_SHARE * this.headWeight
+
+    // The turn in the head's own frame (forward -Z), then in model space:
+    // H · q · H⁻¹, H the head's world rotation as the motion left it.
+    const turnFor = (yawShare: number, pitchShare: number, out: Quat): Quat => {
+      const ry = (turnYaw * yawShare) / deg
+      const rp = (turnPitch * pitchShare) / deg
+      const aim = _headAim.setXYZ(Math.sin(ry) * Math.cos(rp), Math.sin(rp), -Math.cos(ry) * Math.cos(rp))
+      Quat.fromUnitVectorsInto(_eyeFwd, aim, _headQ)
+      Quat.multiplyInto(_headW, _headQ, out)
+      return Quat.multiplyInto(out, _headWi, out)
+    }
+    Mat4.toQuatFromArrayInto(worldMats[head].values, 0, _headW).normalize()
+    Quat.conjugateInto(_headW, _headWi)
+    // A bone turned by a model-space rotation R keeps its parent: its local
+    // becomes P⁻¹ · R · P · local, P the parent's world rotation.
+    const turnBone = (idx: number, r: Quat, parentWorld: Quat): void => {
+      Quat.conjugateInto(parentWorld, _headPi)
+      const q = rots[idx]
+      Quat.multiplyInto(parentWorld, q, q)
+      Quat.multiplyInto(r, q, q)
+      Quat.multiplyInto(_headPi, q, q)
+      q.normalize()
+    }
+    const parentRot = (idx: number, out: Quat): Quat => {
+      const p = bones[idx].parentIndex
+      if (p < 0) return out.setIdentity()
+      return Mat4.toQuatFromArrayInto(worldMats[p].values, 0, out).normalize()
+    }
+
+    // Down the chain, each link taking its share of the whole turn. A link's
+    // turn moves everything under it, so the next link's parent is that turn
+    // over what it was, and the next link takes only what is still left.
+    this.headWritten = true
+    this.headBase[2].set(rots[head])
+    if (neck !== undefined) this.headBase[1].set(rots[neck])
+    if (chest !== undefined) this.headBase[0].set(rots[chest])
+    _headDone.setIdentity()
+    let yawShare = 0
+    let pitchShare = 0
+    for (const [idx, yawPart, pitchPart] of [
+      [chest, CHEST_SHARE, 0],
+      [neck, NECK_SHARE, NECK_SHARE],
+      [head, 1, 1],
+    ] as [number | undefined, number, number][]) {
+      if (idx === undefined) continue
+      yawShare = idx === head ? 1 : Math.min(1, yawShare + yawPart)
+      pitchShare = idx === head ? 1 : Math.min(1, pitchShare + pitchPart)
+      // This link's turn: the turn up to here, less what is already done.
+      turnFor(yawShare, pitchShare, _headTurn)
+      Quat.conjugateInto(_headDone, _headNeck)
+      Quat.multiplyInto(_headTurn, _headNeck, _headNeck)
+      parentRot(idx, _headP)
+      // The parent's world as it stood before this solve, so put the turns
+      // already done over it — only the chest's parent is untouched.
+      Quat.multiplyInto(_headDone, _headP, _headP)
+      turnBone(idx, _headNeck, _headP)
+      _headDone.set(_headTurn)
+    }
+    this.headSubset ??= this.eyeFollowers([chest ?? neck ?? head])
+    this.computeWorldMatrices(this.headSubset)
   }
 
   /**
@@ -3136,6 +3413,19 @@ export class Model {
       }
     }
 
+    // 首 and 頭 back to the motion's before the pose sources run — see headBase.
+    if (this.headWritten) {
+      this.headWritten = false
+      const ni = this.runtimeSkeleton.nameIndex
+      const rots = this.runtimeSkeleton.localRotations
+      const chest = ni["上半身2"]
+      const neck = ni["首"]
+      const head = ni["頭"]
+      if (chest !== undefined) rots[chest].set(this.headBase[0])
+      if (neck !== undefined) rots[neck].set(this.headBase[1])
+      if (head !== undefined) rots[head].set(this.headBase[2])
+    }
+
     if (!this.clipApplySuspended) {
       if (this.oneShot !== null) {
         this.applyOneShot(deltaTime)
@@ -3188,7 +3478,9 @@ export class Model {
       this.computeWorldMatrices()
     }
 
-    // The eyes, last of all: they read the head as IK left it.
+    // The head toward the target, then the eyes last of all: they read the
+    // head as IK and the head turn left it.
+    if (this.headTracking !== null) this.solveHead(deltaTime)
     if (this.eyeTracking !== null && this.gazeTargetSet) this.solveEyes()
 
     return verticesChanged

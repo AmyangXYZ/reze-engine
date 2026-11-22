@@ -4,7 +4,7 @@ import { EFFECT_SUBJECT_VEC4S } from "./shaders/cast-layout"
 import { decodeDds, isDds } from "./dds-loader"
 import { Mat4, Quat, Vec3 } from "./math"
 import { decodePsd, isPsd } from "./psd-loader"
-import { Model, MATERIAL_MORPH_MULTIPLY, type AutoBlinkOptions, type EyeTrackingOptions, type Material, type Skeleton } from "./model"
+import { Model, MATERIAL_MORPH_MULTIPLY, type AutoBlinkOptions, type EyeTrackingOptions, type HeadTrackingOptions, type Material, type Skeleton } from "./model"
 import { MORPH_COMPUTE_WGSL } from "./shaders/passes/morph"
 import { CULL_COMPUTE_WGSL } from "./shaders/passes/cull"
 import { buildAnchorTable, anchorAliasWgsl, EMPTY_ANCHOR_TABLE, type AnchorTable } from "./shaders/anchor-table"
@@ -15004,20 +15004,23 @@ export class Engine {
       if (!stageIdle) {
         // The camera in the model's own space, for the eyes — the placement
         // undone, since bones live in model space.
-        if (inst.model.hasEyeTracking()) {
+        if (inst.model.hasEyeTracking() || inst.model.hasHeadTracking()) {
           const eye = this.camera.getEyePosition()
           const m = inst.model
           _gazeScratch.setXYZ(eye.x - m.position.x, eye.y - m.position.y, eye.z - m.position.z)
           // Her own first-person camera sits between her eyes: looking AT it
-          // crosses them. She looks where it looks, far ahead along the view.
-          if (this.cameraMount?.name === inst.name && this.cameraMount.mount.options.mode === "pov") {
+          // crosses them. She looks where it looks, far ahead along the view —
+          // with the eyes only: a head turning toward a camera it carries
+          // would chase it.
+          const pov = this.cameraMount?.name === inst.name && this.cameraMount.mount.options.mode === "pov"
+          if (pov) {
             const v = this.camera.getViewMatrix().values
             _gazeScratch.setXYZ(_gazeScratch.x + v[2] * 100, _gazeScratch.y + v[6] * 100, _gazeScratch.z + v[10] * 100)
           }
           Quat.rotateVecInvInto(m.rotation, _gazeScratch, _gazeScratch)
           const inv = 1 / Math.max(m.scale, 1e-6)
           _gazeScratch.setXYZ(_gazeScratch.x * inv, _gazeScratch.y * inv, _gazeScratch.z * inv)
-          inst.model.setGazeTarget(_gazeScratch)
+          inst.model.setGazeTarget(_gazeScratch, !pov)
         }
         verticesChanged = inst.model.update(deltaTime, inst.isStage || inst.isPlane ? false : this.ikEnabled)
         inst.skinMatricesDirty = true
@@ -19477,6 +19480,18 @@ export class Engine {
     const inst = this.modelInstances.get(modelName)
     if (!inst) return false
     inst.model.setEyeTracking(options)
+    return true
+  }
+
+  /**
+   * Head on the camera, per model — see Model.setHeadTracking. Live: 首 and
+   * 頭 turn toward wherever the camera is, over the motion, eased and within
+   * a person's reach. Null eases the head back to the motion.
+   */
+  setHeadTracking(modelName: string, options: HeadTrackingOptions | null): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst) return false
+    inst.model.setHeadTracking(options)
     return true
   }
 
