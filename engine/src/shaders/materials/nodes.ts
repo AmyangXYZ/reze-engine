@@ -1254,6 +1254,21 @@ fn bsdf_urp(N: vec3f, L: vec3f, V: vec3f, NL: f32, roughness: f32) -> f32 {
 // the shaded base, .spa (2) adds — so a graph asks for the effect and the model
 // decides which it meant. Mode 0, or a material with no sphere texture (the 1×1
 // white fallback is bound then), is an exact no-op.
+// The PMX toon ramp, top row lit (fac 1) to bottom row shadowed (fac 0), down
+// the first column as MMD samples it. Rows are loaded and blended here rather
+// than sampled: a sampler would wrap the bottom row into the top, and a load
+// is legal in any control flow a graph puts it in.
+fn pmx_toon_map(fac: f32) -> vec3f {
+  let size = textureDimensions(toonTexture, 0);
+  let last = max(size.y, 1u) - 1u;
+  let v = clamp(1.0 - fac, 0.0, 1.0) * f32(last);
+  let y0 = min(u32(floor(v)), last);
+  let y1 = min(y0 + 1u, last);
+  let a = textureLoad(toonTexture, vec2u(0u, y0), 0).rgb;
+  let b = textureLoad(toonTexture, vec2u(0u, y1), 0).rgb;
+  return mix(a, b, v - floor(v));
+}
+
 fn pmx_sphere_map(base: vec3f, strength: f32, N: vec3f) -> vec3f {
   if (material.sphereMode < 0.5) {
     return base;

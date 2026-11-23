@@ -419,6 +419,17 @@ export const NODE_REGISTRY: Record<string, NodeSpec> = {
     emit: (a) => `pmx_sphere_map(${a.base}, ${a.strength}, n)`,
   },
 
+  // The PMX material's own toon ramp, read where MMD reads it: `fac` 1 is the
+  // lit top row, 0 the bottom row — the colour MMD multiplies into the shaded
+  // side under self-shadow. This is where an MMD artist paints a material's
+  // shadow hue. A material with no toon file of its own reads white, so
+  // multiplying by it is an exact no-op.
+  toon_map: {
+    inputs: { fac: F(0) },
+    outputs: { color: "color" },
+    emit: (a) => `pmx_toon_map(${a.fac})`,
+  },
+
   // ── Blender 5.2 Math node, full operation set ──
   "math/absolute": { inputs: { a: F(0) }, outputs: { value: "float" }, emit: (a) => `math_absolute(${a.a})` },
   "math/sqrt": { inputs: { a: F(0) }, outputs: { value: "float" }, emit: (a) => `math_sqrt(${a.a})` },

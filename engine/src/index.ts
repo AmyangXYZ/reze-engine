@@ -43,6 +43,7 @@ export {
   type MotionBlurOptions,
 } from "./engine"
 export { parsePmxFolderInput, pmxFileAtRelativePath, type PmxFolderInputResult } from "./folder-upload"
+export { normalizeAssetPath } from "./asset-reader"
 export { parseMidi } from "./midi-loader"
 // Radiance .hdr, for HDRI worlds — the host fetches the file and hands the
 // parsed image to setWorldEquirect. Not setBackdropEquirect: that one is the

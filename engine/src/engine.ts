@@ -2271,7 +2271,6 @@ export class Engine {
   private materialVertexBufferLayouts!: (GPUVertexBufferLayout | null)[]
   // 1×64 vertical ramp for shared-toon materials: lit (top) → soft shadow
   // tone (bottom). Stand-in for MMD's toon01–10.bmp, which we can't ship.
-  private defaultToonRampTexture!: GPUTexture
   private groundShadowPipeline!: GPURenderPipeline
   /** The soft-edge variant, built the first time a scene asks for one. Null while
    *  no scene has, which is most of them — a pipeline nobody draws with is still
@@ -3248,6 +3247,20 @@ export class Engine {
   private materialSampler!: GPUSampler
   private fallbackMaterialTexture!: GPUTexture
   private textureCache = new Map<string, GPUTexture>()
+  /** Each asset reader is its own namespace in the texture cache. A path names a
+   *  file only within the upload it came from: two characters uploaded apart
+   *  both have a `hair.png`, and keying by path alone drew the second with the
+   *  first one's. Fetch readers are one shared reader, so a URL still loads once. */
+  private readerScopes = new WeakMap<AssetReader, number>()
+  private textureScope(reader: AssetReader, logicalPath: string): string {
+    let id = this.readerScopes.get(reader)
+    if (id === undefined) {
+      id = ++this.readerScopeCount
+      this.readerScopes.set(reader, id)
+    }
+    return `${id}:${logicalPath}`
+  }
+  private readerScopeCount = 0
   // Downsampled CPU alpha channel per texture (≤128², ~16KB) — kept so materials
   // can be classified as SHEER at load by sampling alpha at their own UVs (the
   // GPU texture can't be read back cheaply, and PMX diffuse alpha is usually 1.0
@@ -9059,28 +9072,6 @@ export class Engine {
       [1, 1],
     )
 
-    // Generic shared-toon ramp: lit white down to a soft cool shadow tone with
-    // a tight terminator around the midpoint, approximating MMD's toon ramps.
-    const TOON_H = 64
-    const toonData = new Uint8Array(TOON_H * 4)
-    for (let y = 0; y < TOON_H; y++) {
-      const v = y / (TOON_H - 1)
-      // smoothstep terminator centered at 0.55, width ~0.1
-      const t = Math.min(1, Math.max(0, (v - 0.5) / 0.1))
-      const s = t * t * (3 - 2 * t)
-      toonData[y * 4 + 0] = Math.round(255 - s * (255 - 196))
-      toonData[y * 4 + 1] = Math.round(255 - s * (255 - 186))
-      toonData[y * 4 + 2] = Math.round(255 - s * (255 - 205))
-      toonData[y * 4 + 3] = 255
-    }
-    this.defaultToonRampTexture = this.device.createTexture({
-      label: "default toon ramp (1x64)",
-      size: [1, TOON_H],
-      format: "rgba8unorm-srgb",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    })
-    this.device.queue.writeTexture({ texture: this.defaultToonRampTexture }, toonData, { bytesPerRow: 4 }, [1, TOON_H])
-
     // Shared vertex buffer layouts
     const fullVertexBuffers: GPUVertexBufferLayout[] = [
       {
@@ -13342,10 +13333,10 @@ export class Engine {
     ])
 
     if (options.transform) this.setModelTransform(key, options.transform)
-    // Kept so a moving card can push frames into it. The cache is keyed by the
-    // texture's logical path, which is derived rather than stored anywhere the
-    // caller can see — and deriving it twice is how the two would drift.
-    const tex = this.textureCache.get(texturePath)
+    // Kept so a moving card can push frames into it. A card has exactly one
+    // texture, and its instance recorded the key it was cached under.
+    const cardKey = this.modelInstances.get(key)?.textureCacheKeys[0]
+    const tex = cardKey ? this.textureCache.get(cardKey) : undefined
     if (tex) this.planeTextures.set(key, tex)
     return key
   }
@@ -17003,7 +16994,7 @@ export class Engine {
 
       const materialAlpha = mat.diffuse[3]
       const diffusePath = texLogicalPath(mat.diffuseTextureIndex)
-      const alphaSampler = diffusePath ? this.textureAlphaCache.get(diffusePath) : null
+      const alphaSampler = diffusePath ? this.textureAlphaCache.get(this.textureScope(inst.assetReader, diffusePath)) : null
       const stats = materialAlphaStats(meshVertices, meshIndices, currentIndexOffset, indexCount, alphaSampler)
       // babylon-mmd parity (its default DepthWriteAlphaBlendingWithEvaluation
       // method): the bucket decision is BINARY. A material with ANY translucent
@@ -17031,12 +17022,10 @@ export class Engine {
         if (!sphereTexture) sphereMode = 0
       }
 
-      // Toon ramp: model-local file, or the generic ramp for the shared
-      // toon01–10 set. No toon → white (no ramp modulation), MMD behavior.
+      // Toon ramp: the model's own file. The shared toon01–10 set is MMD's and
+      // does not ship here, so a shared toon reads as none — white.
       let toonTexture: GPUTexture | null = null
-      if (mat.sharedToon) {
-        toonTexture = this.defaultToonRampTexture
-      } else if (mat.toonTextureIndex >= 0) {
+      if (!mat.sharedToon && mat.toonTextureIndex >= 0) {
         toonTexture = await loadTextureByIndex(mat.toonTextureIndex)
       }
 
@@ -17397,7 +17386,7 @@ export class Engine {
   }
 
   private async createTextureFromLogicalPath(inst: ModelInstance, logicalPath: string): Promise<GPUTexture | null> {
-    const cacheKey = logicalPath
+    const cacheKey = this.textureScope(inst.assetReader, logicalPath)
     const cached = this.textureCache.get(cacheKey)
     if (cached) {
       // Record the reference on THIS instance too — the cache is engine-global
@@ -17484,6 +17473,33 @@ export class Engine {
         )
         return null
       }
+    }
+
+    // A picture larger than this GPU's largest texture is drawn at the largest
+    // it holds, rather than not at all.
+    const limit = this.device.limits.maxTextureDimension2D
+    if (width > limit || height > limit) {
+      const scale = Math.min(limit / width, limit / height)
+      const w = Math.max(1, Math.floor(width * scale))
+      const h = Math.max(1, Math.floor(height * scale))
+      try {
+        const full =
+          source ?? (await createImageBitmap(new ImageData(new Uint8ClampedArray(rgba!.buffer as ArrayBuffer, rgba!.byteOffset, rgba!.byteLength), width, height)))
+        source = await createImageBitmap(full, {
+          resizeWidth: w,
+          resizeHeight: h,
+          resizeQuality: "high",
+          premultiplyAlpha: "none",
+          colorSpaceConversion: "none",
+        })
+        rgba = null
+      } catch (e) {
+        console.warn(`[reze] texture too large to scale: ${logicalPath}`, e instanceof Error ? e.message : e)
+        return null
+      }
+      console.warn(`[reze] ${logicalPath} is ${width}x${height}; this GPU holds ${limit}, so it is drawn at ${w}x${h}`)
+      width = w
+      height = h
     }
 
     // CPU alpha sampler for sheerness classification (see textureAlphaCache).

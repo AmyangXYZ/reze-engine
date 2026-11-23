@@ -4,11 +4,19 @@ export type AssetReader = {
   readBinary(logicalPath: string): Promise<ArrayBuffer>
 }
 
-/** Normalize PMX-style paths: backslashes, trim, strip leading ./ */
+/** Normalize PMX-style paths: backslashes, trim, NFC, and `.` / `..` segments
+ *  resolved. NFC because macOS hands over file names decomposed (NFD) while a
+ *  PMX spells them composed: ド in a folder name would otherwise never match. */
 export function normalizeAssetPath(p: string): string {
-  let s = p.replace(/\\/g, "/").trim()
-  if (s.startsWith("./")) s = s.slice(2)
-  return s
+  const s = p.replace(/\\/g, "/").trim().normalize("NFC")
+  const out: string[] = []
+  const parts = s.split("/")
+  parts.forEach((part) => {
+    if (part === ".") return
+    if (part === ".." && out.length && out[out.length - 1] !== ".." && out[out.length - 1] !== "") out.pop()
+    else out.push(part)
+  })
+  return out.join("/")
 }
 
 /** Join PMX directory prefix and texture-relative path (both may be ""). */
@@ -17,7 +25,7 @@ export function joinAssetPath(baseDir: string, relative: string): string {
   if (!rel) return normalizeAssetPath(baseDir)
   const base = baseDir.endsWith("/") ? baseDir.slice(0, -1) : baseDir
   if (!base) return rel
-  return `${base}/${rel}`
+  return normalizeAssetPath(`${base}/${rel}`)
 }
 
 /** Same rules as the original engine string split: supports absolute site paths like `/models/a/b.pmx`. */
@@ -27,14 +35,17 @@ export function deriveBasePathFromPmxPath(pmxPath: string): string {
   return pathParts.join("/") + (pathParts.length > 0 ? "/" : "")
 }
 
+const fetchReader: AssetReader = {
+  async readBinary(logicalPath: string) {
+    const r = await fetch(logicalPath)
+    if (!r.ok) throw new Error(`Failed to fetch ${logicalPath}: ${r.status} ${r.statusText}`)
+    return r.arrayBuffer()
+  },
+}
+
+/** The one reader for URLs: a URL names the same file whoever asks. */
 export function createFetchAssetReader(): AssetReader {
-  return {
-    async readBinary(logicalPath: string) {
-      const r = await fetch(logicalPath)
-      if (!r.ok) throw new Error(`Failed to fetch ${logicalPath}: ${r.status} ${r.statusText}`)
-      return r.arrayBuffer()
-    },
-  }
+  return fetchReader
 }
 
 /** Keys must be normalized paths relative to the selected folder root (see fileListToMap). */
@@ -42,28 +53,21 @@ export function createFileMapAssetReader(files: Map<string, File>): AssetReader 
   return {
     async readBinary(logicalPath: string) {
       const key = normalizeAssetPath(logicalPath)
-      let file = files.get(key)
-      if (!file) {
-        const lower = key.toLowerCase()
-        for (const [k, f] of files) {
-          if (k.toLowerCase() === lower) {
-            file = f
-            break
-          }
-        }
+      // The path as written, then in any case (PMX paths are Windows paths),
+      // then the bare name: mobile pickers cannot select folders, so a flat
+      // selection's `body.png` has to answer for `tex/body.png`. The two
+      // fallbacks answer only when ONE file matches. A model can hold hair.png,
+      // spa/hair.png and toon/hair.png, and picking among them by upload order
+      // is how a sphere map got drawn as hair.
+      const lower = key.toLowerCase()
+      const base = lower.split("/").pop()!
+      const only = (match: (k: string) => boolean) => {
+        const hits = [...files.keys()].filter(match)
+        if (hits.length > 1) console.warn(`[reze] ${key} is ambiguous in this folder: ${hits.join(", ")}`)
+        return hits.length === 1 ? files.get(hits[0]) : undefined
       }
-      if (!file) {
-        // Last resort: basename match. Mobile pickers can't select folders — a flat
-        // multi-file selection loses directory structure, so `tex/body.png` must
-        // find a bare `body.png`. Also rescues wrongly-cased directory names.
-        const base = key.split("/").pop()!.toLowerCase()
-        for (const [k, f] of files) {
-          if (k.split("/").pop()!.toLowerCase() === base) {
-            file = f
-            break
-          }
-        }
-      }
+      const file =
+        files.get(key) ?? only((k) => k.toLowerCase() === lower) ?? only((k) => k.toLowerCase().split("/").pop() === base)
       if (!file) throw new Error(`Missing file in folder: ${key}`)
       return file.arrayBuffer()
     },
@@ -89,7 +93,7 @@ export function findFirstPmxFileInList(files: FileList | File[]): File | null {
   list.sort((a, b) => {
     const pa = (a as File & { webkitRelativePath?: string }).webkitRelativePath || a.name
     const pb = (b as File & { webkitRelativePath?: string }).webkitRelativePath || b.name
-    return pa.localeCompare(pb)
+    return pa < pb ? -1 : pa > pb ? 1 : 0
   })
   return list[0] ?? null
 }

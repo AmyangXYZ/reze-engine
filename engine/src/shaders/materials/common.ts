@@ -369,8 +369,8 @@ fn rzMainLight() -> u32 {
 }
 @group(2) @binding(0) var diffuseTexture: texture_2d<f32>;
 @group(2) @binding(1) var<uniform> material: MaterialUniforms;
-// Reserved for future sphere/toon graph nodes; graphs that don't read them get the
-// 1×1 white fallback bound here.
+// The PMX toon ramp and sphere map, read by the toon_map and sphere_map nodes. A
+// material without one gets the 1×1 white fallback bound here.
 @group(2) @binding(2) var toonTexture: texture_2d<f32>;
 @group(2) @binding(3) var sphereTexture: texture_2d<f32>;
 // Extra maps supplied by the STYLE GROUP rather than by the PMX — the lightmap /

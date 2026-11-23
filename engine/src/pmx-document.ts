@@ -320,12 +320,17 @@ class Sink {
   vec(v: readonly number[]) {
     for (const n of v) this.f32(n)
   }
+  // The header fixes each index's width, and a value past it would wrap into a
+  // different vertex, bone or texture: an edit that outgrew the width fails.
   uindex(size: number, v: number) {
+    if (size < 4 && (v < 0 || v >= 1 << (8 * size))) throw new Error(`PMX: vertex index ${v} does not fit ${size} byte(s)`)
     if (size === 1) this.u8(v)
     else if (size === 2) this.u16(v)
     else this.i32(v | 0)
   }
   index(size: number, v: number) {
+    if (size < 4 && (v < -(1 << (8 * size - 1)) || v >= 1 << (8 * size - 1)))
+      throw new Error(`PMX: index ${v} does not fit ${size} byte(s)`)
     if (size === 1) this.u8(v & 0xff)
     else if (size === 2) this.u16(v & 0xffff)
     else this.i32(v)
@@ -449,6 +454,8 @@ export function readPmxDocument(buffer: ArrayBuffer): PmxDocument {
         v.weights = [c.f32()]
         v.sdef = { c: c.vec3(), r0: c.vec3(), r1: c.vec3() }
         break
+      default:
+        throw new Error(`PMX: vertex ${i} has unknown weight type ${v.weightType}`)
     }
     v.edgeScale = c.f32()
     doc.vertices[i] = v
@@ -708,6 +715,8 @@ export function writePmxDocument(doc: PmxDocument): ArrayBuffer {
         w.vec(v.sdef!.r0)
         w.vec(v.sdef!.r1)
         break
+      default:
+        throw new Error(`PMX: unknown weight type ${v.weightType}`)
     }
     w.f32(v.edgeScale)
   }
