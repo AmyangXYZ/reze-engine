@@ -255,19 +255,19 @@ ${ID_WRITE}  return out;
   }
   if (renderClass === "hair") {
     return `${ALBEDO}  var outAlpha = ${alphaBase};
-  if (IS_OVER_EYES) { outAlpha = ${alphaBase} * 0.25; }
+  if (IS_OVER_EYES) { outAlpha = ${alphaBase} * objectLight.hairOverEyes; }
 
   var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
 ${CAST}${FOG}  out.color = rz_finite(out.color);
-  out.mask = vec4f(objectLight.bloom.x, 1.0, _rzSubsurface, out.color.a);
+  out.mask = vec4f(objectLight.bloom, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
   return `${ALBEDO}  var out: FSOut;
   out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
 ${CAST}${FOG}  out.color = rz_finite(out.color);
-  out.mask = vec4f(objectLight.bloom.x, 1.0, _rzSubsurface, out.color.a);
+  out.mask = vec4f(objectLight.bloom, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
 }

@@ -2191,6 +2191,10 @@ function toHalf(v: number): number {
   return m === 1024 ? ((e + 16) << 10) : ((e + 15) << 10) | m
 }
 
+/** How opaque hair is over the eyes in the see-through pass until a model is
+ *  given its own (Engine.setModelHairOverEyes). */
+export const HAIR_OVER_EYES_DEFAULT = 0.25
+
 export class Engine {
   private static instance: Engine | null = null
 
@@ -13473,7 +13477,7 @@ export class Engine {
     const inst = this.modelInstances.get(name)
     if (!inst || !this.device) return false
     inst.objectLight[96] = on ? 1 : 0
-    this.device.queue.writeBuffer(inst.lightBuffer, 96 * 4, inst.objectLight, 96, 4)
+    this.device.queue.writeBuffer(inst.lightBuffer, 96 * 4, inst.objectLight, 96, 1)
     return true
   }
 
@@ -14873,6 +14877,19 @@ export class Engine {
 
   getModelSeeThroughHair(modelName: string): boolean {
     return this.modelInstances.get(modelName)?.seeThroughHair ?? true
+  }
+
+  /**
+   * How opaque her hair is where it lies over her eyes while see-through hair
+   * is on: 0 shows the eyes clear through it, 1 covers them as if it were off.
+   * 0.25 until set.
+   */
+  setModelHairOverEyes(modelName: string, opacity: number): boolean {
+    const inst = this.modelInstances.get(modelName)
+    if (!inst || !this.device) return false
+    inst.objectLight[97] = Math.min(1, Math.max(0, Number.isFinite(opacity) ? opacity : HAIR_OVER_EYES_DEFAULT))
+    this.device.queue.writeBuffer(inst.lightBuffer, 97 * 4, inst.objectLight, 97, 1)
+    return true
   }
 
   /**
@@ -16309,6 +16326,7 @@ export class Engine {
     // model's.
     const objectLight = new Float32Array(692)
     objectLight[96] = 1
+    objectLight[97] = HAIR_OVER_EYES_DEFAULT
     const objectLayers = new Uint32Array(objectLight.buffer)
     objectLayers[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0

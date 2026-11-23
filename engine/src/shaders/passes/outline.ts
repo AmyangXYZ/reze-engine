@@ -292,7 +292,7 @@ ${sceneFsOutWgsl({ name: "FSOut", aux: "mask" })}
     rgb = tex.rgb * tint * mix(material.shadowColor.rgb, rgb, lit);
   }
   out.color = vec4f(rgb, material.edgeColor.a * texA * input.coverage);
-  out.mask = vec4f(objectLight.bloom.x, 1.0, 0.0, out.color.a);
+  out.mask = vec4f(objectLight.bloom, 1.0, 0.0, out.color.a);
 ${sceneIdPadWgsl("out")}  return out;
 }
 `

@@ -96,7 +96,7 @@ fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
 /** A model's ObjectLight as WGSL declares it (see the layout below). One copy
  *  for every pass that binds it, so their layouts cannot drift. */
 export const OBJECT_LIGHT_STRUCT_WGSL =
-  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: vec4f, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16>, matLayers: array<vec4u, 128> }"
+  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: f32, hairOverEyes: f32, _pad: vec2f, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16>, matLayers: array<vec4u, 128> }"
 
 /**
  * The see-through window (#xray): a rectangle on the frame, in pixels —
@@ -333,9 +333,11 @@ fn _rzCastShadow(wp: vec3f) -> f32 {
 //               [9] the right's
 //               [10] left highlight scale x, y, forward push (bind units), 0
 //               [11] the right's
-//   bloom.x   1 while it feeds the bloom, 0 when it is left out
+//   bloom     1 while it feeds the bloom, 0 when it is left out
 //             (Engine.setModelBloom): the bloom mask its surfaces and
 //             outlines write.
+//   hairOverEyes  how opaque its hair is where it covers its eyes, in the
+//             see-through-hair pass (Engine.setModelHairOverEyes), 0.25 unset.
 ${OBJECT_LIGHT_STRUCT_WGSL}
 @group(1) @binding(1) var<uniform> objectLight: ObjectLight;
 ${XRAY_WGSL}

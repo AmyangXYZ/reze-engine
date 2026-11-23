@@ -21,17 +21,29 @@ test("every model starts in the bloom", () => {
 test("setModelBloom writes the slot the shaders read", () => {
   const setter = engine.slice(engine.indexOf("setModelBloom(name: string, on: boolean)"))
   assert.match(setter.slice(0, 400), /inst\.objectLight\[96\] = on \? 1 : 0/)
-  assert.match(setter.slice(0, 400), /writeBuffer\(inst\.lightBuffer, 96 \* 4, inst\.objectLight, 96, 4\)/)
-  assert.match(src("shaders/materials/common.ts"), /jelly: array<vec4f, 12>, bloom: vec4f, xray:/, "bloom follows the 48 jelly words")
+  assert.match(setter.slice(0, 400), /writeBuffer\(inst\.lightBuffer, 96 \* 4, inst\.objectLight, 96, 1\)/)
+  assert.match(
+    src("shaders/materials/common.ts"),
+    /jelly: array<vec4f, 12>, bloom: f32, hairOverEyes: f32, _pad: vec2f, xray:/,
+    "bloom follows the 48 jelly words, then the hair over the eyes, in one vec4's room",
+  )
+})
+
+test("setModelHairOverEyes writes the word after bloom, which the over-eyes pass reads", () => {
+  const setter = engine.slice(engine.indexOf("setModelHairOverEyes(modelName: string, opacity: number)"))
+  assert.match(setter.slice(0, 500), /inst\.objectLight\[97\] = /)
+  assert.match(setter.slice(0, 500), /writeBuffer\(inst\.lightBuffer, 97 \* 4, inst\.objectLight, 97, 1\)/)
+  assert.match(engine, /objectLight\[97\] = HAIR_OVER_EYES_DEFAULT/)
+  assert.match(src("graph/slots.ts"), /if \(IS_OVER_EYES\) \{ outAlpha = \$\{alphaBase\} \* objectLight\.hairOverEyes; \}/)
 })
 
 test("surfaces and outlines write the model's bloom as the mask", () => {
   const slots = src("graph/slots.ts")
-  assert.equal(slots.match(/out\.mask = vec4f\(objectLight\.bloom\.x, 1\.0, _rzSubsurface, out\.color\.a\);/g)?.length, 2)
+  assert.equal(slots.match(/out\.mask = vec4f\(objectLight\.bloom, 1\.0, _rzSubsurface, out\.color\.a\);/g)?.length, 2)
   assert.doesNotMatch(slots, /out\.mask = vec4f\(1\.0,/)
   const outline = src("shaders/passes/outline.ts")
   assert.match(outline, /@group\(1\) @binding\(1\) var<uniform> objectLight: ObjectLight;/)
-  assert.match(outline, /out\.mask = vec4f\(objectLight\.bloom\.x, 1\.0, 0\.0, out\.color\.a\);/)
+  assert.match(outline, /out\.mask = vec4f\(objectLight\.bloom, 1\.0, 0\.0, out\.color\.a\);/)
 })
 
 test("one ObjectLight declaration for every pass", () => {
