@@ -247,7 +247,7 @@ test("hair inline body matches the hand-written shader (snapshot)", () => {
 test("hair renderClass: over-eyes override present, style block absent when inlined", () => {
   const r = compileGraph(HAIR_GRAPH, { inlineParams: true, renderClass: "hair" })
   assert.ok(r.wgsl.includes("override IS_OVER_EYES: bool = false;"))
-  assert.ok(r.wgsl.includes("if (IS_OVER_EYES) { outAlpha = alpha * 0.25; }"))
+  assert.ok(r.wgsl.includes("if (IS_OVER_EYES) { outAlpha = alpha * objectLight.hairOverEyes; }"))
   assert.ok(!r.wgsl.includes("StyleUniforms"))
 })
 

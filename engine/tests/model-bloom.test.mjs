@@ -29,6 +29,17 @@ test("setModelBloom writes the slot the shaders read", () => {
   )
 })
 
+test("the hair over the eyes is drawn for both buckets, each in its own phase", () => {
+  // Hair with soft edges sorts transparent; it skips the eyes all the same, so
+  // without its own pass the eyes showed through it clear and the dial did nothing.
+  const opaque = engine.slice(engine.indexOf("private renderModelOpaquePhase("))
+  assert.match(opaque.slice(0, 3000), /this\.drawHairOverEyes\(pass, inst, view, "opaque"\)/)
+  const transparent = engine.slice(engine.indexOf("private renderModelTransparentPhase("))
+  assert.match(transparent.slice(0, 2000), /this\.drawHairOverEyes\(pass, inst, view, "transparent"\)/)
+  const draw = engine.slice(engine.indexOf("private drawHairOverEyes("))
+  assert.match(draw.slice(0, 1000), /if \(draw\.type !== type\) continue/)
+})
+
 test("setModelHairOverEyes writes the word after bloom, which the over-eyes pass reads", () => {
   const setter = engine.slice(engine.indexOf("setModelHairOverEyes(modelName: string, opacity: number)"))
   assert.match(setter.slice(0, 500), /inst\.objectLight\[97\] = /)

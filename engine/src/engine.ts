@@ -20794,7 +20794,7 @@ export class Engine {
     this.drawMaterials(pass, inst, "opaque", view, "non-hair")
     this.drawHairDepthPrime(pass, inst, view)
     this.drawMaterials(pass, inst, "opaque", view, "hair")
-    this.drawHairOverEyes(pass, inst, view)
+    this.drawHairOverEyes(pass, inst, view, "opaque")
   }
 
   /** Depth-only prime of the hair's alpha-1 texels, stencil-fenced off the eye
@@ -20950,6 +20950,9 @@ export class Engine {
     //   · depth-write OFF layering: every overlap visible everywhere — MORE
     //     gray patches and texture artifacts in practice.
     this.drawMaterials(pass, inst, "transparent", view)
+    // Hair with soft edges sorts here, and it skips the eyes as opaque hair
+    // does; without its own faint pass the eyes showed through it clear.
+    this.drawHairOverEyes(pass, inst, view, "transparent")
   }
 
   /** Depth-only re-draw of transparent-bucket materials (see depth-prepass.ts).
@@ -20980,13 +20983,15 @@ export class Engine {
     pass: GPURenderPassEncoder | GPURenderBundleEncoder,
     inst: ModelInstance,
     view: { perFrame: GPUBindGroup; args: "camera" | "mirror"; outlines: boolean },
+    /** The bucket whose hair this covers: each phase covers its own. */
+    type: "opaque" | "transparent",
   ): void {
     // Nothing stamped, so nothing to draw over.
     if (!inst.seeThroughHair) return
     let bound = false
     let currentPipeline: GPURenderPipeline | null = null
     for (const draw of inst.drawCalls) {
-      if (draw.type !== "opaque") continue
+      if (draw.type !== type) continue
       const hairOverEyes = this.overEyesPipelineFor(inst, draw)
       if (!hairOverEyes) continue
       const overEyes = this.sidedPipeline(hairOverEyes, draw, view.args === "mirror")
