@@ -902,7 +902,7 @@ export interface GizmoDragEvent {
   /** Computed target local rotation (for "rotate") / target local translation (for "translate"). */
   localRotation: Quat
   localTranslation: Vec3
-  /** Drag start (mousedown) or end (mouseup). Undefined during drag moves. */
+  /** Drag start (mousedown / touchstart) or end (mouseup / touchend). Undefined during drag moves. */
   phase?: "start" | "end"
 }
 
@@ -915,7 +915,9 @@ export interface GizmoDragEvent {
  * write, or mutate an animation clip keyframe and re-seek).
  *
  * Fires once with phase="start" on mousedown, on every mousemove (no phase),
- * and once with phase="end" on mouseup.
+ * and once with phase="end" on mouseup. A one-finger touch that lands on a
+ * handle drives the same sequence (touchstart / touchmove / touchend or
+ * touchcancel, or a second finger arriving, which ends the drag).
  */
 export type GizmoDragCallback = (event: GizmoDragEvent) => void
 
@@ -2392,6 +2394,11 @@ export class Engine {
   private static readonly GIZMO_WORLD_SIZE = 1.5
   private static readonly GIZMO_THICKNESS_PX = 15.0
   private static readonly GIZMO_PICK_THRESHOLD_PX = 17.0
+  // A fingertip covers far more than a cursor's hotspot and hides the handle
+  // it lands on, so a touch picks with a wider band than the mouse. Still well
+  // inside the ring's radius on screen at any sane zoom, so the axis-vs-ring
+  // ordering in hitTestGizmo keeps deciding which handle a touch means.
+  private static readonly GIZMO_TOUCH_PICK_THRESHOLD_PX = 28.0
 
   // Drag state — set on mousedown if the pointer is over a gizmo handle; cleared
   // on mouseup. While non-null, the camera is locked and mousemove/up are routed
@@ -2413,6 +2420,11 @@ export class Engine {
     initialAngle: number
     initialAxisParam: number
   } | null = null
+  // Touch.identifier of the finger driving gizmoDrag, or null when the drag (if
+  // any) belongs to the mouse. Keeps the two input paths from feeding each
+  // other's drag on a hybrid device, and lets touchmove/touchend pick out the
+  // one finger that owns the drag among everything else on the glass.
+  private gizmoTouchId: number | null = null
   private mainPerFrameBindGroupLayout!: GPUBindGroupLayout
   private mainPerInstanceBindGroupLayout!: GPUBindGroupLayout
   /** What a model with no fill of its own binds: zero light. */
@@ -10100,6 +10112,16 @@ export class Engine {
     this.canvas.addEventListener("mousedown", this.handleGizmoMouseDown, { capture: true })
     window.addEventListener("mousemove", this.handleGizmoMouseMove)
     window.addEventListener("mouseup", this.handleGizmoMouseUp)
+    // Touch twin of the above, for a device with no mouse. touchstart in capture
+    // for the same reason: the camera's touchstart is also on the canvas, and a
+    // finger that lands on a handle must never start an orbit. passive:false so
+    // preventDefault can cancel the page's own pan/zoom and the compatibility
+    // mouse events a touch otherwise synthesises (which would re-enter the mouse
+    // path above). move/end/cancel on window so the drag tracks off-canvas.
+    this.canvas.addEventListener("touchstart", this.handleGizmoTouchStart, { capture: true, passive: false })
+    window.addEventListener("touchmove", this.handleGizmoTouchMove, { passive: false })
+    window.addEventListener("touchend", this.handleGizmoTouchEnd)
+    window.addEventListener("touchcancel", this.handleGizmoTouchEnd)
   }
 
   /** When set, render resolution is pinned to this size instead of tracking the
@@ -13012,6 +13034,10 @@ export class Engine {
     this.canvas.removeEventListener("mousedown", this.handleGizmoMouseDown, { capture: true })
     window.removeEventListener("mousemove", this.handleGizmoMouseMove)
     window.removeEventListener("mouseup", this.handleGizmoMouseUp)
+    this.canvas.removeEventListener("touchstart", this.handleGizmoTouchStart, { capture: true })
+    window.removeEventListener("touchmove", this.handleGizmoTouchMove)
+    window.removeEventListener("touchend", this.handleGizmoTouchEnd)
+    window.removeEventListener("touchcancel", this.handleGizmoTouchEnd)
 
     if (this.resizeObserver) {
       this.resizeObserver.disconnect()
@@ -17659,6 +17685,12 @@ export class Engine {
 
   private handleCanvasTouch = (event: TouchEvent) => {
     if (!this.onRaycast || this.modelInstances.size === 0) return
+    // The lift of a finger that was dragging the gizmo is not a tap. This runs
+    // at the canvas, before the window-level handleGizmoTouchEnd clears the id.
+    if (this.gizmoTouchId !== null && this.findTouch(event.changedTouches, this.gizmoTouchId)) {
+      this.lastTouchTime = 0
+      return
+    }
 
     // Prevent default to avoid triggering mouse events
     event.preventDefault()
@@ -18362,20 +18394,89 @@ export class Engine {
   }
 
   private handleGizmoMouseDown = (e: MouseEvent) => {
-    if (!this.gizmoEnabled || !this.selectedBone || !this.camera || !this.device || e.button !== 0) return
+    if (e.button !== 0) return
+    // Mouse claims the whole bounding sphere (see beginGizmoDrag): a click near
+    // a handle that misses it is still eaten rather than orbiting the camera.
+    this.beginGizmoDrag(e.clientX, e.clientY, Engine.GIZMO_PICK_THRESHOLD_PX, true, () => {
+      e.stopImmediatePropagation()
+      e.preventDefault()
+    })
+  }
+
+  // One finger landing on a handle drags it, exactly as the left button does,
+  // and the camera never sees that touch. Unlike the mouse, a touch claims ONLY
+  // on an actual handle hit, not on the whole bounding sphere: a finger is the
+  // only way to orbit on a touch device, and the selected bone (hence the
+  // sphere) is usually right where the person is looking, so eating near-misses
+  // would leave a dead zone over the character that neither orbits nor drags.
+  //
+  // A second finger arriving mid-drag ENDS the drag (phase "end" at the pose
+  // reached so far) and is let through, so the camera sees a two-finger
+  // touchstart and starts its pinch/pan as it always does. Two fingers mean
+  // "the view" everywhere else on this canvas; ignoring the second one would
+  // leave the camera locked under a gesture that plainly asks for it.
+  private handleGizmoTouchStart = (e: TouchEvent) => {
+    if (this.gizmoDrag) {
+      if (this.gizmoTouchId !== null) this.endGizmoDrag()
+      return // a mouse drag in progress: leave the touch to the camera's own lock
+    }
+    if (e.touches.length !== 1) return
+    const t = e.changedTouches[0]
+    if (!t) return
+    const started = this.beginGizmoDrag(t.clientX, t.clientY, Engine.GIZMO_TOUCH_PICK_THRESHOLD_PX, false, () => {
+      e.stopImmediatePropagation()
+      e.preventDefault()
+    })
+    if (started) this.gizmoTouchId = t.identifier
+  }
+
+  private handleGizmoTouchMove = (e: TouchEvent) => {
+    if (this.gizmoTouchId === null || !this.gizmoDrag) return
+    const t = this.findTouch(e.touches, this.gizmoTouchId)
+    if (!t) return
+    // Ours: keep iOS from scrolling/zooming the page under the drag.
+    e.preventDefault()
+    this.moveGizmoDrag(t.clientX, t.clientY)
+  }
+
+  private handleGizmoTouchEnd = (e: TouchEvent) => {
+    if (this.gizmoTouchId === null) return
+    if (!this.findTouch(e.changedTouches, this.gizmoTouchId)) return
+    this.endGizmoDrag()
+  }
+
+  private findTouch(list: TouchList, id: number): Touch | null {
+    for (let i = 0; i < list.length; i++) if (list[i].identifier === id) return list[i]
+    return null
+  }
+
+  // Shared by mouse and touch. Hit-tests the gizmo at a client-space point and,
+  // on a handle hit, snapshots the drag and fires phase "start". `claim` is
+  // called at the moment the event becomes the gizmo's (so the caller can
+  // stopImmediatePropagation before the camera's listener runs): as soon as the
+  // ray is inside the bounding sphere when `claimSphere`, otherwise only on a
+  // handle hit. Returns whether a drag started.
+  private beginGizmoDrag(
+    clientX: number,
+    clientY: number,
+    thresholdPx: number,
+    claimSphere: boolean,
+    claim: () => void,
+  ): boolean {
+    if (!this.gizmoEnabled || !this.selectedBone || !this.camera || !this.device) return false
     const inst = this.modelInstances.get(this.selectedBone.modelName)
-    if (!inst) return
+    if (!inst) return false
     const worldMats = inst.model.getWorldMatrices()
     const boneMat = worldMats[this.selectedBone.boneIndex]
-    if (!boneMat) return
+    if (!boneMat) return false
     const bonePos = boneMat.getPosition()
     const boneWorldRot = boneMat.toQuat().normalize()
 
     const rect = this.canvas.getBoundingClientRect()
-    const px = e.clientX - rect.left
-    const py = e.clientY - rect.top
+    const px = clientX - rect.left
+    const py = clientY - rect.top
     const ray = this.buildMouseRay(px, py)
-    if (!ray) return
+    if (!ray) return false
 
     const gizmoSize = Engine.GIZMO_WORLD_SIZE
 
@@ -18387,17 +18488,17 @@ export class Engine {
     const f = ray.origin.subtract(bonePos)
     const fd = f.dot(ray.dir)
     const rayInsideSphere = fd * fd - (f.dot(f) - sphereR * sphereR) >= 0
-    if (!rayInsideSphere) return
+    if (!rayInsideSphere) return false
 
-    // We're inside the gizmo's claim area — the event is ours regardless of hit.
-    e.stopImmediatePropagation()
-    e.preventDefault()
+    // We're inside the gizmo's claim area — for the mouse the event is ours
+    // regardless of hit.
+    if (claimSphere) claim()
 
     // Pick threshold stays pixel-based — clicking should feel the same at any zoom.
     const camPos = this.camera.getEyePosition()
     const dist = Math.max(0.01, bonePos.subtract(camPos).length())
     const worldPerPixel = (dist * Math.tan(this.camera.fov * 0.5) * 2) / Math.max(1, this.canvas.clientHeight)
-    const worldThreshold = Engine.GIZMO_PICK_THRESHOLD_PX * worldPerPixel
+    const worldThreshold = thresholdPx * worldPerPixel
 
     // World-rotated local axes (where the visible gizmo arms actually point).
     const worldAxes: [Vec3, Vec3, Vec3] = [
@@ -18407,7 +18508,8 @@ export class Engine {
     ]
 
     const hit = this.hitTestGizmo(ray, bonePos, gizmoSize, worldThreshold, worldAxes)
-    if (!hit) return // Inside sphere but didn't hit a handle — event consumed, no drag.
+    if (!hit) return false // Inside sphere but no handle hit — mouse event consumed, no drag.
+    if (!claimSphere) claim()
 
     this.camera.setInputLocked(true)
 
@@ -18461,17 +18563,30 @@ export class Engine {
         phase: "start",
       })
     }
+    return true
   }
 
+  // Mouse move/up only drive a drag the mouse started; a finger's drag is fed
+  // by the touch handlers (gizmoTouchId set).
   private handleGizmoMouseMove = (e: MouseEvent) => {
+    if (this.gizmoTouchId !== null) return
+    this.moveGizmoDrag(e.clientX, e.clientY)
+  }
+
+  private handleGizmoMouseUp = () => {
+    if (this.gizmoTouchId !== null) return
+    this.endGizmoDrag()
+  }
+
+  private moveGizmoDrag(clientX: number, clientY: number) {
     const drag = this.gizmoDrag
     if (!drag || !this.selectedBone || !this.camera) return
     const inst = this.modelInstances.get(this.selectedBone.modelName)
     if (!inst) return
 
     const rect = this.canvas.getBoundingClientRect()
-    const px = e.clientX - rect.left
-    const py = e.clientY - rect.top
+    const px = clientX - rect.left
+    const py = clientY - rect.top
     const ray = this.buildMouseRay(px, py)
     if (!ray) return
 
@@ -18512,8 +18627,9 @@ export class Engine {
     })
   }
 
-  private handleGizmoMouseUp = () => {
+  private endGizmoDrag() {
     const drag = this.gizmoDrag
+    this.gizmoTouchId = null
     if (!drag) return
     if (this.onGizmoDrag && this.selectedBone) {
       const inst = this.modelInstances.get(this.selectedBone.modelName)
