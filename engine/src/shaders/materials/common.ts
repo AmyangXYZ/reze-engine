@@ -96,7 +96,7 @@ fn rzJellyVertex(p: vec3f, joints: vec4<u32>, nw: vec4f) -> vec3f {
 /** A model's ObjectLight as WGSL declares it (see the layout below). One copy
  *  for every pass that binds it, so their layouts cannot drift. */
 export const OBJECT_LIGHT_STRUCT_WGSL =
-  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: f32, hairOverEyes: f32, _pad: vec2f, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16>, matLayers: array<vec4u, 128> }"
+  "struct ObjectLight { layers: vec4u, ambient: vec4f, sh: array<vec4f, 9>, fill: vec4f, jelly: array<vec4f, 12>, bloom: f32, hairOverEyes: f32, rim: f32, _pad: f32, xray: array<vec4f, 4>, xrayMask: array<vec4u, 16>, matLayers: array<vec4u, 128> }"
 
 /**
  * The see-through window (#xray): a rectangle on the frame, in pixels —
@@ -177,6 +177,9 @@ struct LightUniforms {
   /** The rendering layers each directional light reaches, slot by slot — a
    *  draw is lit by the first whose bits it shares (rzMainLight). */
   dirLayers: vec4u,
+  /** The cast's rim light (Engine.setRimLight): colour × intensity,
+   *  power; then unused. Black is off. */
+  rim: array<vec4f, 2>,
 };
 
 // Per-material uniforms. Every material binds this layout even if it ignores fields;

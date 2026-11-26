@@ -786,6 +786,32 @@ export const DEFAULT_DEPTH_OF_FIELD_OPTIONS: DepthOfFieldOptions = {
   quality: "balanced",
 }
 
+/** The cast's rim light, the textbook term: color × intensity ×
+ *  (1 − N·V)^power, added after each character's graph, on the mesh's own
+ *  normals. Brightest exactly at the silhouette and falling away smoothly
+ *  inward, on every edge alike — a light straight behind her. Past the bloom
+ *  threshold it glows: the halo is the bloom, which it feeds like any bright
+ *  pixel. Stages, planes and props take none: a wall seen edge-on faces away
+ *  from the lens across its whole width and would light up end to end. Off,
+ *  it costs one uniform branch. */
+export type RimLightOptions = {
+  enabled: boolean
+  /** Scene-linear light at the very edge. */
+  intensity: number
+  /** The falloff's exponent: 2 a broad sheen, 4 the usual rim, 8 and up a
+   *  thin line of light. */
+  power: number
+  /** Tint, linear. */
+  color: Vec3
+}
+
+export const DEFAULT_RIM_LIGHT_OPTIONS: RimLightOptions = {
+  enabled: false,
+  intensity: 2,
+  power: 4,
+  color: new Vec3(1, 1, 1),
+}
+
 /** How the scene-linear frame becomes a display image: exposure, then a tone
  *  transform, then display gamma. */
 export type ViewTransformOptions = {
@@ -2227,7 +2253,10 @@ export class Engine {
   // shadow on a stage at [88..107] (colour, amount; its view-projection).
   // …and the directional slots' rendering layers at [108..111], as u32 bits
   // through lightDataWords — never through a float.
-  private lightData = new Float32Array(112)
+  // …and the rim light at [112..119]: colour × intensity, power; then
+  // four unused — see writeRimLight.
+  private lightData = new Float32Array(120)
+  private rimLight: RimLightOptions = { ...DEFAULT_RIM_LIGHT_OPTIONS, color: new Vec3(1, 1, 1) }
   private lightDataWords = new Uint32Array(this.lightData.buffer)
   private sunLayers = ALL_LAYERS
   private castShadow: StageCastShadow | null = null
@@ -11807,10 +11836,11 @@ export class Engine {
   private setupLighting() {
     this.lightUniformBuffer = this.device.createBuffer({
       label: "light uniforms",
-      size: 112 * 4, // ambient (4) + 4 lights x 2 vec4 (32) + irradiance SH 9 x vec4 (36) + fog 4 x vec4 (16) + cast shadow (4 + 16)
+      size: 120 * 4, // ambient (4) + 4 lights x 2 vec4 (32) + irradiance SH 9 x vec4 (36) + fog 4 x vec4 (16) + cast shadow (4 + 16) + layers (4) + rim (8)
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
     this.lightData.fill(0)
+    this.writeRimLight()
     this.lightCount = 0
     this.writeWorld()
     this.writeSun(0)
@@ -12463,6 +12493,37 @@ export class Engine {
    * shows of its haze. Emission-only graphs take none, as the game's effect
    * shaders take none. Null clears.
    */
+  /** Patch the cast's rim light (see RimLightOptions). */
+  setRimLight(patch: Partial<RimLightOptions>): void {
+    const r = this.rimLight
+    if (patch.enabled !== undefined) r.enabled = patch.enabled
+    if (patch.intensity !== undefined) r.intensity = patch.intensity
+    if (patch.power !== undefined) r.power = patch.power
+    if (patch.color !== undefined) r.color = new Vec3(patch.color.x, patch.color.y, patch.color.z)
+    this.writeRimLight()
+    if (this.device && this.lightUniformBuffer) this.updateLightBuffer()
+  }
+
+  getRimLight(): RimLightOptions {
+    return { ...this.rimLight, color: new Vec3(this.rimLight.color.x, this.rimLight.color.y, this.rimLight.color.z) }
+  }
+
+  /** The rim into the light uniform. Nothing in it depends on the camera, so
+   *  nothing here runs per frame. */
+  private writeRimLight(): void {
+    const r = this.rimLight
+    const u = this.lightData
+    const k = r.enabled ? Math.max(r.intensity, 0) : 0
+    u[112] = r.color.x * k
+    u[113] = r.color.y * k
+    u[114] = r.color.z * k
+    u[115] = Math.min(Math.max(r.power, 0.1), 64)
+    u[116] = 0
+    u[117] = 0
+    u[118] = 0
+    u[119] = 0
+  }
+
   setSceneFog(fog: SceneFog | null): void {
     this.sceneFog = fog
     const u = this.lightData
@@ -16353,6 +16414,8 @@ export class Engine {
     const objectLight = new Float32Array(692)
     objectLight[96] = 1
     objectLight[97] = HAIR_OVER_EYES_DEFAULT
+    // The rim light reaches characters only (RimLightOptions).
+    objectLight[98] = isStage || isPlane || isProp ? 0 : 1
     const objectLayers = new Uint32Array(objectLight.buffer)
     objectLayers[0] =
       isStage || isPlane || isProp ? RENDERING_LAYER_DEFAULT : (RENDERING_LAYER_DEFAULT | RENDERING_LAYER_CHARACTER) >>> 0

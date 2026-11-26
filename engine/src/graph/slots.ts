@@ -222,6 +222,19 @@ function epilogue(renderClass: RenderClass, alphaMode: AlphaMode, hasOpacity: bo
 
   const ALBEDO = `  let albedo = tex_color;
 `
+  // The cast's rim light (Engine.setRimLight), ADDED after the graph like the
+  // lamps: the textbook term, color × intensity × (1 − N·V)^power, smooth
+  // from the silhouette inward on every edge alike. |N·V| rather than a clamp
+  // so a double-sided sheet seen from behind is not lit across its whole back.
+  // Only on a graph that takes light, and only on a character (objectLight.rim).
+  const RIM = takesLight
+    ? `  var rim = vec3f(0.0);
+  if (objectLight.rim > 0.5 && max(light.rim[0].x, max(light.rim[0].y, light.rim[0].z)) > 0.0) {
+    rim = light.rim[0].xyz * pow(max(1.0 - abs(dot(n, normalize(camera.viewPos - input.worldPos))), 0.0), light.rim[0].w);
+  }
+`
+    : ""
+  const RIM_ADD = takesLight ? " + rim" : ""
   // The dissolve's burning edge, ADDED after the graph and after the lights —
   // it is emission, not a surface colour, so nothing may ramp or shadow it. Zero
   // on every fragment of every material that is not dissolving, which is what
@@ -254,18 +267,18 @@ ${ID_WRITE}  return out;
 `
   }
   if (renderClass === "hair") {
-    return `${ALBEDO}  var outAlpha = ${alphaBase};
+    return `${ALBEDO}${RIM}  var outAlpha = ${alphaBase};
   if (IS_OVER_EYES) { outAlpha = ${alphaBase} * objectLight.hairOverEyes; }
 
   var out: FSOut;
-  out.color = vec4f(final_color${LIT}${BURN}, outAlpha);
+  out.color = vec4f(final_color${LIT}${RIM_ADD}${BURN}, outAlpha);
 ${CAST}${FOG}  out.color = rz_finite(out.color);
   out.mask = vec4f(objectLight.bloom, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
 `
   }
-  return `${ALBEDO}  var out: FSOut;
-  out.color = vec4f(final_color${LIT}${BURN}, ${alphaBase});
+  return `${ALBEDO}${RIM}  var out: FSOut;
+  out.color = vec4f(final_color${LIT}${RIM_ADD}${BURN}, ${alphaBase});
 ${CAST}${FOG}  out.color = rz_finite(out.color);
   out.mask = vec4f(objectLight.bloom, 1.0, _rzSubsurface, out.color.a);
 ${ID_WRITE}  return out;
