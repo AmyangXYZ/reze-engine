@@ -426,6 +426,60 @@ fn _rzLightCellMask(p: vec3f) -> _RzLampMask {
 }
 
 /**
+ * THE ONE WALK over the lamps that can reach p: the document's, by the bits of
+ * its grid cell (lowest first), then the effects' (all of them, in order).
+ *
+ * One loop, so each walk calls its per-lamp function from ONE place. It used
+ * to be a function per mask word, called eight times, plus a loop for the
+ * effects' lamps: D3D's compiler inlines every call, so a material shader
+ * carried nine copies of the whole lamp — tube integration, cone, cookie —
+ * twice over (diffuse and specular), and spent ~85% of its compile on them
+ * (4.4 s of a material's compile on Windows, and it is every material).
+ *
+ * Use: \`var w = _rzLampWalkStart(p); loop { let i = _rzLampWalkNext(&w);
+ * if (i == RZ_LAMP_WALK_END) { break; } … }\`.
+ */
+const RZ_LAMP_WALK_END: u32 = 0xffffffffu;
+struct _RzLampWalk { words: array<u32, 8>, w: u32, bits: u32, next: u32, count: u32 };
+fn _rzLampWalkStart(p: vec3f) -> _RzLampWalk {
+  var walk: _RzLampWalk;
+  let docs = _rzLightDocCount();
+  walk.count = rzLightCount();
+  walk.next = docs;
+  // w = 8: no document words to read
+  walk.w = 8u;
+  walk.bits = 0u;
+  if (docs > 0u) {
+    let m = _rzLightCellMask(p);
+    walk.words = array<u32, 8>(m.lo.x, m.lo.y, m.lo.z, m.lo.w, m.hi.x, m.hi.y, m.hi.z, m.hi.w);
+    walk.w = 0u;
+    walk.bits = walk.words[0];
+  }
+  return walk;
+}
+fn _rzLampWalkNext(walk: ptr<function, _RzLampWalk>) -> u32 {
+  loop {
+    if ((*walk).bits != 0u) {
+      let i = (*walk).w * 32u + firstTrailingBit((*walk).bits);
+      (*walk).bits = (*walk).bits & ((*walk).bits - 1u);
+      return i;
+    }
+    if ((*walk).w < 7u) {
+      (*walk).w = (*walk).w + 1u;
+      (*walk).bits = (*walk).words[(*walk).w];
+      continue;
+    }
+    (*walk).w = 8u;
+    if ((*walk).next < (*walk).count) {
+      let i = (*walk).next;
+      (*walk).next = (*walk).next + 1u;
+      return i;
+    }
+    return RZ_LAMP_WALK_END;
+  }
+}
+
+/**
  * One light's contribution at a surface point.
  *
  * A LIGHT FALLS OFF AS THE INVERSE SQUARE, the curve Unity, Unreal, Blender and
@@ -483,19 +537,6 @@ fn _rzLightOne(i: u32, p: vec3f, n: vec3f) -> vec3f {
   return rzLightColor(i) * rzLightCookie(i, toLight) * (ndl * falloff * aim * aim);
 }
 
-/** The lamps named by one word of a cell's bits, lowest first. */
-fn _rzLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f) -> vec3f {
-  var acc = vec3f(0.0);
-  var bits = bits0;
-  loop {
-    if (bits == 0u) { break; }
-    let i = base + firstTrailingBit(bits);
-    bits = bits & (bits - 1u);
-    acc = acc + _rzLightOne(i, p, n);
-  }
-  return acc;
-}
-
 /**
  * Every positional light's contribution at a surface point, as light — not as a
  * finished colour. Multiply by whatever the surface's albedo is.
@@ -529,19 +570,13 @@ fn rzLightsDiffuseOnce(p: vec3f, n: vec3f) -> vec3f {
 }
 
 fn _rzLightsIrradiance(p: vec3f, n: vec3f) -> vec3f {
+  // The document's lamps the grid says can reach this cell, then the effects'
+  // (which move every frame on the GPU): all in one walk, one call site.
   var acc = vec3f(0.0);
-  let count = rzLightCount();
-  let docs = _rzLightDocCount();
-  // The document's lamps: only those the grid says can reach this cell.
-  if (docs > 0u) {
-    let m = _rzLightCellMask(p);
-    acc = acc + _rzLightWord(m.lo.x, 0u, p, n) + _rzLightWord(m.lo.y, 32u, p, n) +
-      _rzLightWord(m.lo.z, 64u, p, n) + _rzLightWord(m.lo.w, 96u, p, n) +
-      _rzLightWord(m.hi.x, 128u, p, n) + _rzLightWord(m.hi.y, 160u, p, n) +
-      _rzLightWord(m.hi.z, 192u, p, n) + _rzLightWord(m.hi.w, 224u, p, n);
-  }
-  // The effects' lamps, which move every frame on the GPU: all of them.
-  for (var i = docs; i < count; i = i + 1u) {
+  var walk = _rzLampWalkStart(p);
+  loop {
+    let i = _rzLampWalkNext(&walk);
+    if (i == RZ_LAMP_WALK_END) { break; }
     acc = acc + _rzLightOne(i, p, n);
   }
   return acc;

@@ -1468,45 +1468,17 @@ fn _rzLampOne(i: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPa
   return out;
 }
 
-fn _rzLampWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> _RzLampPair {
-  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
-  var bits = bits0;
-  loop {
-    if (bits == 0u) { break; }
-    let i = base + firstTrailingBit(bits);
-    bits = bits & (bits - 1u);
-    let one = _rzLampOne(i, p, n, v, roughness);
-    acc.d = acc.d + one.d;
-    acc.s = acc.s + one.s;
-    acc.p = acc.p + one.p;
-    acc.q = acc.q + one.q;
-  }
-  return acc;
-}
-
 fn rzLampsSpecular(p: vec3f, n: vec3f, v: vec3f, roughness: f32) -> vec3f {
   var d = vec3f(0.0);
   var s = vec3f(0.0);
   var pr = vec3f(0.0);
   var q = vec3f(0.0);
-  let count = rzLightCount();
-  let docs = _rzLightDocCount();
-  if (docs > 0u) {
-    let m = _rzLightCellMask(p);
-    let w0 = _rzLampWord(m.lo.x, 0u, p, n, v, roughness);
-    let w1 = _rzLampWord(m.lo.y, 32u, p, n, v, roughness);
-    let w2 = _rzLampWord(m.lo.z, 64u, p, n, v, roughness);
-    let w3 = _rzLampWord(m.lo.w, 96u, p, n, v, roughness);
-    let w4 = _rzLampWord(m.hi.x, 128u, p, n, v, roughness);
-    let w5 = _rzLampWord(m.hi.y, 160u, p, n, v, roughness);
-    let w6 = _rzLampWord(m.hi.z, 192u, p, n, v, roughness);
-    let w7 = _rzLampWord(m.hi.w, 224u, p, n, v, roughness);
-    d = d + w0.d + w1.d + w2.d + w3.d + w4.d + w5.d + w6.d + w7.d;
-    s = s + w0.s + w1.s + w2.s + w3.s + w4.s + w5.s + w6.s + w7.s;
-    pr = pr + w0.p + w1.p + w2.p + w3.p + w4.p + w5.p + w6.p + w7.p;
-    q = q + w0.q + w1.q + w2.q + w3.q + w4.q + w5.q + w6.q + w7.q;
-  }
-  for (var i = docs; i < count; i = i + 1u) {
+  // One walk, one call site (see _rzLampWalkStart): the grid's lamps for this
+  // cell, then the effects'.
+  var walk = _rzLampWalkStart(p);
+  loop {
+    let i = _rzLampWalkNext(&walk);
+    if (i == RZ_LAMP_WALK_END) { break; }
     let one = _rzLampOne(i, p, n, v, roughness);
     d = d + one.d;
     s = s + one.s;
@@ -1563,38 +1535,13 @@ fn _rzAddLightOne(i: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
   return out;
 }
 
-fn _rzAddLightWord(bits0: u32, base: u32, p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
-  var acc = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
-  var bits = bits0;
-  loop {
-    if (bits == 0u) { break; }
-    let i = base + firstTrailingBit(bits);
-    bits = bits & (bits - 1u);
-    let one = _rzAddLightOne(i, p, n, v, e);
-    acc.d = acc.d + one.d;
-    acc.s = acc.s + one.s;
-  }
-  return acc;
-}
-
 fn rz_additional_lights(p: vec3f, n: vec3f, v: vec3f, e: f32) -> _RzLampPair {
   var acc = _RzLampPair(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
-  let count = rzLightCount();
-  let docs = _rzLightDocCount();
-  if (docs > 0u) {
-    let m = _rzLightCellMask(p);
-    let w0 = _rzAddLightWord(m.lo.x, 0u, p, n, v, e);
-    let w1 = _rzAddLightWord(m.lo.y, 32u, p, n, v, e);
-    let w2 = _rzAddLightWord(m.lo.z, 64u, p, n, v, e);
-    let w3 = _rzAddLightWord(m.lo.w, 96u, p, n, v, e);
-    let w4 = _rzAddLightWord(m.hi.x, 128u, p, n, v, e);
-    let w5 = _rzAddLightWord(m.hi.y, 160u, p, n, v, e);
-    let w6 = _rzAddLightWord(m.hi.z, 192u, p, n, v, e);
-    let w7 = _rzAddLightWord(m.hi.w, 224u, p, n, v, e);
-    acc.d = w0.d + w1.d + w2.d + w3.d + w4.d + w5.d + w6.d + w7.d;
-    acc.s = w0.s + w1.s + w2.s + w3.s + w4.s + w5.s + w6.s + w7.s;
-  }
-  for (var i = docs; i < count; i = i + 1u) {
+  // One walk, one call site (see _rzLampWalkStart in lights.ts).
+  var walk = _rzLampWalkStart(p);
+  loop {
+    let i = _rzLampWalkNext(&walk);
+    if (i == RZ_LAMP_WALK_END) { break; }
     let one = _rzAddLightOne(i, p, n, v, e);
     acc.d = acc.d + one.d;
     acc.s = acc.s + one.s;
@@ -1698,11 +1645,14 @@ fn urp_lit(base: vec3f, metallic: f32, smoothness: f32, spec: f32, occlusion: f3
   let reflectivity = 1.0 - oneMinusReflectivity;
   let diffuse = base * oneMinusReflectivity * a;
   let specular = mix(vec3f(f), base, m);
-  // The lamps first: their walk caches the diffuse layer it passes over.
+  // The lamps first: their walk caches the diffuse layer it passes over, and
+  // this reads that cache rather than calling rzLightsDiffuseOnce — whose
+  // fallback walk can never run after rzLampsSpecular, but would still be
+  // compiled in (D3D inlines every call): a whole second lamp walk per material.
   let lampSpec = rzLampsSpecular(wp, N, V, r);
   var lampDiff = vec3f(0.0);
   if (surface) {
-    lampDiff = rzLightsDiffuseOnce(wp, N);
+    lampDiff = select(_rzLampDiffuse, vec3f(0.0), _rzLampDiffuseTaken);
     _rzLampDiffuseTaken = true;
   }
   let ao = clamp(occlusion, 0.0, 1.0);

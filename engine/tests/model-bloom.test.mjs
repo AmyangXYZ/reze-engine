@@ -24,8 +24,8 @@ test("setModelBloom writes the slot the shaders read", () => {
   assert.match(setter.slice(0, 400), /writeBuffer\(inst\.lightBuffer, 96 \* 4, inst\.objectLight, 96, 1\)/)
   assert.match(
     src("shaders/materials/common.ts"),
-    /jelly: array<vec4f, 12>, bloom: f32, hairOverEyes: f32, _pad: vec2f, xray:/,
-    "bloom follows the 48 jelly words, then the hair over the eyes, in one vec4's room",
+    /jelly: array<vec4f, 12>, bloom: f32, hairOverEyes: f32, rim: f32, _pad: f32, xray:/,
+    "bloom follows the 48 jelly words, then the hair over the eyes and the rim, in one vec4's room",
   )
 })
 

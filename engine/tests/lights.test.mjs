@@ -32,15 +32,25 @@ test("the buffer is the header, the records, then the grid", () => {
 })
 
 test("a cell's lamp bits are two vec4u, and the shader walks all eight words", () => {
-  // The walk is unrolled over m.lo.x..m.hi.w. Raising the cap past 256 without
-  // widening both would drop lamps 256 and up in silence.
+  // The walk reads m.lo.x..m.hi.w as words 0..7, lamp = word * 32 + bit.
+  // Raising the cap past 256 without widening both would drop lamps 256 and up
+  // in silence.
   assert.equal(LIGHT_MASK_WORDS, 8)
   assert.equal(MAX_LIGHTS, LIGHT_MASK_WORDS * 32)
-  const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
-  const words = [["lo", "x"], ["lo", "y"], ["lo", "z"], ["lo", "w"], ["hi", "x"], ["hi", "y"], ["hi", "z"], ["hi", "w"]]
-  for (const [k, [half, w]] of words.entries()) {
-    assert.match(body, new RegExp(`_rzLightWord\\(m\\.${half}\\.${w}, ${k * 32}u, p, n\\)`))
-  }
+  assert.match(wgsl, /walk\.words = array<u32, 8>\(m\.lo\.x, m\.lo\.y, m\.lo\.z, m\.lo\.w, m\.hi\.x, m\.hi\.y, m\.hi\.z, m\.hi\.w\);/)
+  assert.match(wgsl, /let i = \(\*walk\)\.w \* 32u \+ firstTrailingBit\(\(\*walk\)\.bits\);/)
+  assert.match(wgsl, /if \(\(\*walk\)\.w < 7u\) \{/)
+})
+
+test("each walk calls its lamp from one place, so D3D compiles it once", () => {
+  // D3D's compiler inlines every call. A lamp called once per mask word plus
+  // once for the effects' lamps was nine copies of it in every material, ~85%
+  // of the material's compile on Windows.
+  const calls = (src, name) => (src.match(new RegExp(`\\b${name}\\(`, "g")) ?? []).length - 1
+  assert.equal(calls(wgsl, "_rzLightOne"), 1, "_rzLightOne: one call site besides its definition")
+  const nodes = readFileSync(new URL("../src/shaders/materials/nodes.ts", import.meta.url), "utf8")
+  assert.equal(calls(nodes, "_rzLampOne"), 1, "_rzLampOne: one call site")
+  assert.equal(calls(nodes, "_rzAddLightOne"), 1, "_rzAddLightOne: one call site")
 })
 
 test("the accessors read the slots the writer writes", () => {
@@ -63,17 +73,22 @@ test("the count is clamped in the shader, not only by the writer", () => {
 })
 
 test("the loop is bounded by the count, so zero lights runs nothing", () => {
-  const body = wgsl.slice(wgsl.indexOf("fn rzLightsDiffuse"))
-  assert.match(body, /let count = rzLightCount\(\);/)
-  // The grid is consulted only when the document placed lamps, and the
-  // effects' walk starts where the document's end: with none, neither runs.
-  assert.match(body, /if \(docs > 0u\) \{/)
-  assert.match(body, /for \(var i = docs; i < count; i = i \+ 1u\)/)
+  const start = wgsl.slice(wgsl.indexOf("fn _rzLampWalkStart"))
+  assert.match(start, /walk\.count = rzLightCount\(\);/)
+  // The grid is consulted only when the document placed lamps (w = 8 means no
+  // words to read), and the effects' walk starts where the document's end and
+  // stops at the count: with none, neither runs.
+  assert.match(start, /walk\.next = docs;/)
+  assert.match(start, /walk\.w = 8u;/)
+  assert.match(start, /if \(docs > 0u\) \{/)
+  assert.match(wgsl, /if \(\(\*walk\)\.next < \(\*walk\)\.count\) \{/)
   // Starts at zero and only ever accumulates inside the loop, so with no
   // lights it returns exactly vec3f(0.0) — and adding that to a colour is an
   // exact float operation, which is what makes "bit-identical" true rather
   // than "close enough".
+  const body = wgsl.slice(wgsl.indexOf("fn _rzLightsIrradiance"))
   assert.match(body, /var acc = vec3f\(0\.0\);/)
+  assert.match(body, /if \(i == RZ_LAMP_WALK_END\) \{ break; \}/)
   assert.match(body, /return acc;/)
 })
 
