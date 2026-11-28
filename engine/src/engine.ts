@@ -4856,6 +4856,70 @@ export class Engine {
     console.error(`[reze] WebGPU validation: ${message}`)
   }
 
+  /**
+   * Every object this device creates, and every command buffer it finishes,
+   * inside its own validation scope, so an error arrives with the call and the
+   * label that raised it. Safari's whole message is "Validation failure." — the
+   * label is the only thing that says which pipeline, bind group or texture
+   * it was. A caught error does not reach uncapturederror, so nothing is
+   * reported twice. Inside a scope the engine opened itself (a capability
+   * probe, an effect's compile check) the call is left to that scope, which
+   * is the one waiting for the answer.
+   */
+  private nameGpuErrors(device: GPUDevice): void {
+    const push = device.pushErrorScope.bind(device)
+    const pop = device.popErrorScope.bind(device)
+    let open = 0
+    device.pushErrorScope = (filter) => (open++, push(filter))
+    device.popErrorScope = () => (open--, pop())
+    const scoped = <D extends { label?: string } | undefined, R>(
+      what: string,
+      build: (desc: D) => R,
+    ): ((desc: D) => R) => (desc) => {
+      if (open > 0) return build(desc)
+      push("validation")
+      const made = build(desc)
+      void pop().then((err) => {
+        if (err) this.noteGpuError(`${what} "${desc?.label ?? "unlabelled"}": ${err.message}`)
+      })
+      return made
+    }
+    const wrap = (name: keyof GPUDevice) => {
+      const original = (device[name] as (desc: { label?: string }) => unknown).bind(device)
+      Object.defineProperty(device, name, { value: scoped(name, original), configurable: true })
+    }
+    for (const name of [
+      "createBuffer",
+      "createTexture",
+      "createSampler",
+      "createBindGroupLayout",
+      "createPipelineLayout",
+      "createBindGroup",
+      "createShaderModule",
+      "createRenderPipeline",
+      "createComputePipeline",
+      "createRenderBundleEncoder",
+      "createQuerySet",
+    ] as const) {
+      wrap(name)
+    }
+    const createEncoder = device.createCommandEncoder.bind(device)
+    device.createCommandEncoder = (desc?: GPUCommandEncoderDescriptor) => {
+      const encoder = createEncoder(desc)
+      const passes: string[] = []
+      const beginRender = encoder.beginRenderPass.bind(encoder)
+      const beginCompute = encoder.beginComputePass.bind(encoder)
+      encoder.beginRenderPass = (d) => (passes.push(d.label ?? "render pass"), beginRender(d))
+      encoder.beginComputePass = (d) => (passes.push(d?.label ?? "compute pass"), beginCompute(d))
+      const finish = encoder.finish.bind(encoder)
+      encoder.finish = (d) => {
+        const label = `${desc?.label ?? "encoder"} [${passes.join(", ")}]`
+        return scoped<GPUCommandBufferDescriptor | undefined, GPUCommandBuffer>("finish", () => finish(d))({ label })
+      }
+      return encoder
+    }
+  }
+
   /** Distinct uncaptured validation messages → how many times each arrived. */
   private readonly gpuErrors = new Map<string, number>()
 
@@ -8732,6 +8796,7 @@ export class Engine {
       const message = (e as GPUUncapturedErrorEvent).error.message
       this.noteGpuError(message)
     })
+    this.nameGpuErrors(device)
     if (hasRg11b10) this.hdrFormat = "rg11b10ufloat"
     // The override has the last word, including over a device that would have
     // been left on the fallback anyway — asking for the format you are already
